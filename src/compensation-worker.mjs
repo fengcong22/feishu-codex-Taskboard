@@ -25,10 +25,7 @@ export function createCompensationWorker({
     })()
       .catch((error) => {
         // Do not include arbitrary error messages or event payloads in logs.
-        const code = typeof error?.code === "string" && error.code
-          ? error.code
-          : "COMPENSATION_SWEEP_FAILED";
-        logger.error?.(`Bridge compensation sweep failed: ${code}`);
+        logger.error?.("Bridge compensation sweep failed");
       })
       .finally(() => {
         active = null;

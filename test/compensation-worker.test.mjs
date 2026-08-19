@@ -172,8 +172,7 @@ test("reports sweep failures without stopping future scheduling", async () => {
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(calls, 1);
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /Bridge compensation sweep failed/);
+  assert.deepEqual(errors, ["Bridge compensation sweep failed"]);
   assert.doesNotMatch(errors[0], /secret/);
   assert.equal(timers.callbacks.size, 1);
   await worker.stop();
