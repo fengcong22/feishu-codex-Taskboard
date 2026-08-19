@@ -65,7 +65,10 @@ export function createBridgeServer({ host, port, configSummary, handleEvent, get
           });
         }
         const outcome = await handleEvent(event);
-        const status = outcome.duplicate ? 200 : outcome.kind === "ready" || outcome.kind === "blocked" ? 201 : 200;
+        const status = outcome.duplicate ? 200
+          : outcome.kind === "ready" || outcome.kind === "blocked" ? 201
+            : outcome.kind === "pending" || outcome.kind === "dead_letter" ? 202
+              : 200;
         return sendJson(response, status, outcome);
       }
       sendJson(response, 404, { error: { code: "NOT_FOUND", message: "Route not found" } });

@@ -64,19 +64,46 @@ $taskboard = Get-JsonEndpoint 'Taskboard' $taskboardUrl
 $bridge = Get-JsonEndpoint 'Bridge' $bridgeUrl
 if ($bridge.ok -ne $true) { throw 'Bridge health check returned ok=false.' }
 
-$listenerState = [string]$bridge.feishuListener
-if ([string]::IsNullOrWhiteSpace($listenerState)) { $listenerState = 'unknown' }
-if ($RequireFeishu -and $listenerState -ne 'connected') {
-  throw "Feishu listener is not connected (state: $listenerState)."
+$listenerState = if ($bridge.feishuListener -and $bridge.feishuListener.state) {
+  [string]$bridge.feishuListener.state
+} elseif ($bridge.feishuListener) {
+  [string]$bridge.feishuListener
+} else {
+  'unknown'
 }
+if ([string]::IsNullOrWhiteSpace($listenerState)) { $listenerState = 'unknown' }
+if ($RequireFeishu -and $listenerState -notin @('sdk_managed')) {
+  throw "Feishu listener is not SDK-managed (state: $listenerState)."
+}
+
+$queue = $bridge.queue
+if ($null -eq $queue) {
+  $queue = [pscustomobject]@{ pending = 0; processing = 0; retryWait = 0; deadLetter = 0 }
+}
+function Get-QueueCount([object]$Queue, [string]$Name) {
+  $value = $Queue.$Name
+  if ($null -eq $value -or $value -is [bool] -or "$value" -notmatch '^\d+$') {
+    throw "Bridge health queue counter is invalid: $Name."
+  }
+  return [int]$value
+}
+$queuePending = Get-QueueCount $queue 'pending'
+$queueProcessing = Get-QueueCount $queue 'processing'
+$queueRetryWait = Get-QueueCount $queue 'retryWait'
+$queueDeadLetter = Get-QueueCount $queue 'deadLetter'
 
 Write-Host "Node: $nodeVersionOutput"
 Write-Host "Config: ok (tables=$($configSummary.tables), packages=$($configSummary.packages))"
 Write-Host "Taskboard: ok ($taskboardUrl)"
 Write-Host "Bridge: ok ($bridgeUrl)"
-Write-Host "Feishu listener: $listenerState"
-if (-not $RequireFeishu -and $listenerState -ne 'connected') {
-  Write-Warning 'Feishu listener is not connected; rerun with -RequireFeishu when real events are required.'
+if ($RequireFeishu) {
+  Write-Host 'Feishu listener: sdk_managed (the installed SDK does not expose a public socket-confirmed state; verify by a test-table event).'
+} else {
+  Write-Host "Feishu listener: $listenerState"
+}
+Write-Host "Queue: pending=$queuePending processing=$queueProcessing retryWait=$queueRetryWait deadLetter=$queueDeadLetter"
+if (-not $RequireFeishu -and $listenerState -ne 'sdk_managed') {
+  Write-Warning 'Feishu listener is not SDK-managed; rerun with -RequireFeishu when real events are required.'
 }
 Write-Host 'Local stack check passed.'
 exit 0

@@ -2,7 +2,7 @@
 
 > 将飞书多维表格的状态变化，安全地转换为可追踪的 Taskboard 任务。
 
-这是一个仅在本机运行的自动化桥接服务：当飞书多维表格中的记录进入 `待剪辑`，本地 Bridge 会通过飞书官方 SDK 接收事件、校验和整理数据，并在 Taskboard 创建一张手动待办任务。Bridge 只负责创建任务；是否在 Taskboard 中手动启动 Codex，由使用者和所接入的 Taskboard 决定。
+这是一个仅在本机运行的自动化桥接服务：当飞书多维表格中的记录进入 `待剪辑`，本地 Bridge 会通过飞书官方 SDK 接收事件、校验和整理数据，并在 Taskboard 创建一张手动待办任务。投递记录会持久化，临时故障可以有限重试并在重启后恢复；Bridge 只负责创建任务，是否在 Taskboard 中手动启动 Codex，由使用者和所接入的 Taskboard 决定。
 
 ## 数据流
 
@@ -25,7 +25,10 @@ flowchart LR
 | 幂等去重 | 同一 `event_id` 重放不会创建第二个 Taskboard 任务。 |
 | 任务标题回退 | 优先读取“视频名称”，其次“集合文档”，失败时回退到飞书记录 ID。 |
 | Taskboard 集成 | 向已配置的本地 Taskboard 自动创建待办；Bridge 不启动 Codex。 |
-| 健康检查 | 一条命令检查 Node、配置、Taskboard、Bridge 和飞书监听器状态。 |
+| 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
+| 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
+| SDK-managed 监听 | 显式启用官方 SDK 自动重连；健康状态使用 `sdk_managed`，不伪造物理连接确认。 |
+| 健康检查 | 一条命令检查 Node、配置、Taskboard、Bridge、监听器状态和 pending/retry/dead-letter 队列计数。 |
 
 ## 界面展示
 
@@ -79,13 +82,23 @@ npm install
 .\scripts\check-local.ps1
 ```
 
-它会检查 Node.js 版本、本地配置、Taskboard 和 Bridge 健康接口，并显示飞书监听器状态；不会停止进程、创建任务或打印凭据。需要确认真实飞书长连接时，再运行：
+它会检查 Node.js 版本、本地配置、Taskboard 和 Bridge 健康接口，并显示 `sdk_managed` 监听器状态及 pending、processing、retryWait、deadLetter 数量；不会停止进程、创建任务或打印凭据。需要确认真实飞书长连接时，再运行：
 
 ```powershell
 .\scripts\check-local.ps1 -RequireFeishu
 ```
 
-交接验收标准是：`npm test` 全部通过；模拟事件第一次只创建一个任务；重放同一事件返回 duplicate 且不创建第二个任务；真实测试表记录改为 `待剪辑` 后能创建一个对应任务。
+交接验收标准是：`npm test` 全部通过；模拟事件第一次只创建一个任务；重放同一事件返回 duplicate 且不创建第二个任务；真实测试表记录改为 `待剪辑` 后能创建一个对应任务。`-RequireFeishu` 只证明 SDK 已接管监听（`sdk_managed`），当前 SDK 没有公开的物理 socket 确认或连接回调，必须再用指定测试表事件做端到端验证。
+
+### Taskboard 故障恢复演练
+
+在指定测试配置下执行一次安全演练：
+
+1. 暂停 Taskboard，调用现有 `simulate-ready.ps1` 发送一条匹配事件，确认接口返回 `202` 且队列出现 `retryWait`。
+2. 恢复 Taskboard，等待退避窗口，确认队列计数归零并且只创建一张任务。
+3. 重放同一事件，确认返回 `duplicate: true`，不会创建第二张任务。
+
+只使用测试表和本地示例，不要通过删除状态文件来“修复”重复任务。
 
 ## 启用真实飞书长连接
 
@@ -104,7 +117,7 @@ npm install
 .\scripts\start-local.ps1 -EnableFeishu
 ```
 
-健康状态可从 <http://127.0.0.1:47824/health> 查看。监听器注册的事件为 `drive.file.bitable_record_changed_v1`；收到事件后只创建手动待办，不会自动启动 Codex，也不会回写飞书记录。
+健康状态可从 <http://127.0.0.1:47824/health> 查看。监听器注册的事件为 `drive.file.bitable_record_changed_v1`，由官方 SDK 管理断线自动重连；收到事件后只创建手动待办，不会自动启动 Codex，也不会回写飞书记录。`sdk_managed` 表示 SDK 已接管生命周期，不代表应用拿到了公开的物理 socket 状态。
 
 ## 停止服务
 
@@ -120,5 +133,7 @@ npm install
 - Taskboard 的手动启动与网页展示属于外部 Taskboard 能力，不由 Bridge 实现或验证。
 - Bridge 不会自动启动 Codex；所有任务均需由使用者在所接入的 Taskboard 中手动处理。
 - 不会回写飞书记录。
-- 不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障。
+- 当前 SDK 没有公开的物理 socket 确认或连接生命周期回调；健康接口不会伪造 `connected` 状态。
+- 暂无人工 `dead_letter` 重试 endpoint；需要人工处理时先依据队列计数和脱敏日志定位，并按评审流程操作。
+- 不提供多实例高可用（HA）；补偿 worker 在单个 Bridge 进程内串行运行。
 - 不处理真实视频，也不提供自动配音、自动剪辑或视频导出能力。

@@ -21,6 +21,13 @@ test("check script exposes a sanitized, opt-in Feishu health contract", async ()
   assert.match(source, /127\.0\.0\.1:47824\/health/);
   assert.match(source, /Invoke-RestMethod/);
   assert.match(source, /LASTEXITCODE|exit\s+1/i);
+  assert.match(source, /\$bridge\.feishuListener\.state/);
+  assert.match(source, /\$bridge\.queue/);
+  assert.match(source, /sdk_managed/);
+  assert.match(source, /retryWait/);
+  assert.match(source, /deadLetter/);
+  assert.match(source, /public socket|socket-confirmed|物理.*连接|socket/i);
+  assert.doesNotMatch(source, /lastError\.message/);
   assert.doesNotMatch(source, /Get-Content[^\r\n]*\.env\.local/i);
   assert.doesNotMatch(source, /FEISHU_APP_SECRET\s*=/i);
 });
@@ -71,7 +78,11 @@ test("README presents the verified bridge capabilities without claiming unsuppor
   assert.match(source, /完成本地配置后/);
   assert.match(source, /团队提供的匹配测试配置/);
   assert.match(source, /Taskboard 的手动启动与网页展示属于外部 Taskboard 能力/);
-  assert.match(source, /不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障/);
+  assert.match(source, /持久化重试|自动重试/);
+  assert.match(source, /死信|dead.?letter/i);
+  assert.match(source, /SDK.*自动重连/);
+  assert.match(source, /sdk_managed/);
+  assert.doesNotMatch(source, /不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障/);
   assert.doesNotMatch(source, /打开任务后点击“启动 Codex”/);
 });
 
