@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { validateDeliveryPolicy } from "./retry-policy.mjs";
+
 function plainObject(value, name) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${name} must be an object`);
@@ -104,6 +106,7 @@ export function validateConfig(input) {
     port: input.port,
     taskboardUrl: taskboard.origin,
     stateFile: absolutePath(input.stateFile, "stateFile"),
+    delivery: validateDeliveryPolicy(input.delivery),
     tables,
     packages,
   };

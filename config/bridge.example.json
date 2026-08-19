@@ -3,6 +3,13 @@
   "port": 47824,
   "taskboardUrl": "http://127.0.0.1:47823",
   "stateFile": "D:\\codex\\codex-feishu\\.runtime\\bridge\\state.json",
+  "delivery": {
+    "maxAttempts": 8,
+    "initialDelayMs": 5000,
+    "maxDelayMs": 300000,
+    "leaseMs": 30000,
+    "pollIntervalMs": 1000
+  },
   "tables": [
     {
       "baseToken": "bas_replace_with_feishu_base_token",
