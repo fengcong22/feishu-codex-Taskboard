@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -30,6 +30,31 @@ test("claims an event into a versioned processing record", async () => {
   assert.deepEqual((await store.get(original.eventId)).event.fields, {});
 });
 
+test("rejects empty owners and non-positive or non-finite lease durations", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  const invalidOwners = ["", "   ", null, 42];
+  for (const ownerId of invalidOwners) {
+    await assert.rejects(
+      () => store.claimEvent(event(`evt_owner_${String(ownerId)}`), { ownerId, now: 0, leaseMs: 10 }),
+      /ownerId must be a non-empty string/,
+    );
+    await assert.rejects(
+      () => store.claimNextDue({ ownerId, now: 0, leaseMs: 10 }),
+      /ownerId must be a non-empty string/,
+    );
+  }
+  for (const leaseMs of [0, -1, 1.5, Infinity, NaN, "10"]) {
+    await assert.rejects(
+      () => store.claimEvent(event(`evt_lease_${String(leaseMs)}`), { ownerId: "one", now: 0, leaseMs }),
+      /leaseMs must be a finite positive integer/,
+    );
+    await assert.rejects(
+      () => store.claimNextDue({ ownerId: "one", now: 0, leaseMs }),
+      /leaseMs must be a finite positive integer/,
+    );
+  }
+});
+
 test("only one store instance can claim the same event", async () => {
   const filename = await stateFilename();
   const [left, right] = [new JsonStateStore(filename), new JsonStateStore(filename)];
@@ -38,6 +63,39 @@ test("only one store instance can claim the same event", async () => {
     right.claimEvent(event(), { ownerId: "right", now: 100, leaseMs: 1_000 }),
   ]);
   assert.deepEqual([first.kind, second.kind].sort(), ["claimed", "deferred"]);
+});
+
+test("stale-lock takeover keeps concurrent claims mutually exclusive", async () => {
+  const filename = await stateFilename();
+  const lockPath = `${filename}.lock`;
+  await mkdir(lockPath);
+  const staleTime = new Date(Date.now() - 120_000);
+  await utimes(lockPath, staleTime, staleTime);
+
+  // A sizeable snapshot keeps the first writer inside the critical section
+  // long enough for all stale contenders to observe the same old lock. The
+  // result must still contain every event exactly once; a stale contender
+  // must never remove a lock acquired by another contender.
+  const payload = "x".repeat(1_000_000);
+  const makeEvent = (index) => ({
+    ...event(`evt_stale_${index}`),
+    fields: { payload },
+  });
+  const results = await Promise.all(
+    Array.from({ length: 8 }, (_, index) => (
+      new JsonStateStore(filename).claimEvent(makeEvent(index), {
+        ownerId: `worker-${index}`,
+        now: 1,
+        leaseMs: 10_000,
+      })
+    )),
+  );
+  assert.equal(results.filter((result) => result.kind === "claimed").length, 8);
+  const persisted = JSON.parse(await readFile(filename, "utf8"));
+  assert.deepEqual(Object.keys(persisted).sort(), Array.from(
+    { length: 8 },
+    (_, index) => `evt_stale_${index}`,
+  ));
 });
 
 test("preserves concurrent atomic claims for separate events", async () => {
@@ -72,6 +130,24 @@ test("does not claim retry work before its due time", async () => {
   assert.equal(claimed.attempts, 2);
 });
 
+test("requires retry failures to schedule strictly after the failure time", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  await store.claimEvent(event(), { ownerId: "one", now: 0, leaseMs: 100 });
+  for (const nextAttemptAt of [0, -1, 1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await assert.rejects(
+      () => store.fail("evt_state", {
+        ownerId: "one",
+        error: { code: "TASKBOARD_UNAVAILABLE" },
+        nextAttemptAt,
+        deadLetter: false,
+        now: 1,
+      }),
+      /nextAttemptAt must be a finite timestamp greater than now/,
+    );
+  }
+  assert.equal((await store.get("evt_state")).deliveryState, "processing");
+});
+
 test("recovers expired processing leases and leaves active leases untouched", async () => {
   const store = new JsonStateStore(await stateFilename());
   await store.claimEvent(event("evt_expired"), { ownerId: "one", now: 0, leaseMs: 10 });
@@ -100,6 +176,40 @@ test("completes a claimed event without changing its captured event", async () =
   assert.deepEqual(result.outcome, { kind: "ready", taskId: "task_1" });
   assert.equal(result.lease, null);
   assert.deepEqual(result.event, captured);
+});
+
+test("persists only the normalized event snapshot fields", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  const incoming = {
+    ...event(),
+    recordTitle: "标题",
+    action: "record_edited",
+    fieldId: "fld_progress",
+    fieldValuesById: { fld_package: "demo" },
+    workspacePath: "C:\\should-never-be-persisted",
+    command: "del *",
+    prompt: "untrusted prompt",
+    nestedSecret: { token: "secret" },
+  };
+  await store.claimEvent(incoming, { ownerId: "one", now: 0, leaseMs: 100 });
+  const saved = (await store.get(incoming.eventId)).event;
+  assert.deepEqual(saved, {
+    eventId: incoming.eventId,
+    baseToken: incoming.baseToken,
+    tableId: incoming.tableId,
+    recordId: incoming.recordId,
+    recordTitle: incoming.recordTitle,
+    action: incoming.action,
+    fieldId: incoming.fieldId,
+    fieldName: incoming.fieldName,
+    beforeValue: incoming.beforeValue,
+    afterValue: incoming.afterValue,
+    fields: incoming.fields,
+    fieldValuesById: incoming.fieldValuesById,
+  });
+  for (const forbidden of ["workspacePath", "command", "prompt", "nestedSecret"]) {
+    assert.equal(Object.hasOwn(saved, forbidden), false);
+  }
 });
 
 test("records retry failures and caps safe failure history", async () => {
@@ -214,4 +324,32 @@ test("does not claim a v2 pending record that has no event snapshot", async () =
   }));
   const store = new JsonStateStore(filename);
   assert.equal(await store.claimNextDue({ ownerId: "one", now: 100, leaseMs: 10 }), null);
+});
+
+test("normalizes legacy v2 snapshots before a due record is persisted again", async () => {
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    evt_extra: {
+      schemaVersion: 2,
+      eventId: "evt_extra",
+      event: {
+        ...event("evt_extra"),
+        command: "should-not-survive",
+      },
+      deliveryState: "pending",
+      decision: null,
+      attempts: 0,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: null,
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+  const store = new JsonStateStore(filename);
+  const claimed = await store.claimNextDue({ ownerId: "one", now: 100, leaseMs: 10 });
+  assert.equal(claimed.event.command, undefined);
+  assert.equal((await store.get("evt_extra")).event.command, undefined);
 });

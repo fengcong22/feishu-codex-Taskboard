@@ -1,17 +1,56 @@
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_STALE_MS = 60_000;
+const LOCK_OWNER_FILE = "owner.json";
 const TERMINAL_STATES = new Set(["succeeded", "dead_letter"]);
 const MAX_FAILURE_HISTORY = 10;
+const EVENT_SNAPSHOT_FIELDS = Object.freeze([
+  "eventId",
+  "baseToken",
+  "tableId",
+  "recordId",
+  "recordTitle",
+  "action",
+  "fieldId",
+  "fieldName",
+  "beforeValue",
+  "afterValue",
+  "fields",
+  "fieldValuesById",
+]);
+
+function normalizeEventSnapshot(event) {
+  const snapshot = {};
+  for (const field of EVENT_SNAPSHOT_FIELDS) {
+    if (Object.hasOwn(event, field)) snapshot[field] = structuredClone(event[field]);
+  }
+  return snapshot;
+}
+
+function assertClaimOptions({ ownerId, leaseMs }) {
+  if (typeof ownerId !== "string" || ownerId.trim() === "") {
+    throw new Error("ownerId must be a non-empty string");
+  }
+  if (!Number.isFinite(leaseMs) || !Number.isInteger(leaseMs) || leaseMs <= 0) {
+    throw new Error("leaseMs must be a finite positive integer");
+  }
+}
+
+function assertRetrySchedule(nextAttemptAt, now) {
+  if (!Number.isFinite(nextAttemptAt) || nextAttemptAt <= now) {
+    throw new Error("nextAttemptAt must be a finite timestamp greater than now");
+  }
+}
 
 function newRecord(event, now) {
   return {
     schemaVersion: 2,
     eventId: event.eventId,
-    event: structuredClone(event),
+    event: normalizeEventSnapshot(event),
     deliveryState: "pending",
     decision: null,
     attempts: 0,
@@ -61,7 +100,13 @@ function legacyRecord(eventId, value, now) {
 }
 
 function normalizeRecord(eventId, value, now) {
-  if (value?.schemaVersion === 2) return value;
+  if (value?.schemaVersion === 2) {
+    const record = structuredClone(value);
+    if (record.event && typeof record.event === "object" && !Array.isArray(record.event)) {
+      record.event = normalizeEventSnapshot(record.event);
+    }
+    return record;
+  }
   return legacyRecord(eventId, value, now);
 }
 
@@ -116,6 +161,144 @@ function stateObject() {
   return Object.create(null);
 }
 
+function lockOwnerPath(lockPath) {
+  return path.join(lockPath, LOCK_OWNER_FILE);
+}
+
+async function readLockOwner(lockPath) {
+  try {
+    const value = JSON.parse(await readFile(lockOwnerPath(lockPath), "utf8"));
+    if (!value || typeof value !== "object") return null;
+    return value;
+  } catch (error) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+async function writeLockOwner(lockPath, token) {
+  const owner = {
+    token,
+    pid: process.pid,
+    createdAt: Date.now(),
+  };
+  const filename = lockOwnerPath(lockPath);
+  await writeFile(filename, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+  await chmod(filename, 0o600);
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but cannot be signalled. On Windows
+    // this is the only reliable distinction available to an unprivileged
+    // process.
+    return error.code === "EPERM";
+  }
+}
+
+async function isStaleLock(lockPath) {
+  let lockStat;
+  try {
+    lockStat = await stat(lockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (Date.now() - lockStat.mtimeMs <= LOCK_STALE_MS) return false;
+  const owner = await readLockOwner(lockPath);
+  // A live owner is never forcefully removed just because its operation has
+  // been quiet for a while. This prevents a stale-checking contender from
+  // deleting a lock that was refreshed or is still being released.
+  if (owner && processIsAlive(owner.pid)) return false;
+  return true;
+}
+
+async function releaseOwnedDirectory(lockPath, token) {
+  const quarantine = `${lockPath}.release.${token}`;
+  try {
+    // Rename first so a new owner can never be removed by a delayed cleanup
+    // from the previous owner. The canonical path is then free for a waiter.
+    await rename(lockPath, quarantine);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  const owner = await readLockOwner(quarantine);
+  if (owner?.token === token) {
+    await rm(quarantine, { recursive: true, force: true });
+    return;
+  }
+  // The identity changed while we were releasing. Put the moved directory
+  // back only when the canonical path is still vacant; never overwrite a
+  // newer owner that won the race.
+  await rename(quarantine, lockPath).catch((error) => {
+    if (error.code !== "EEXIST") throw error;
+  });
+}
+
+async function reclaimStaleMarker(markerPath) {
+  if (!(await isStaleLock(markerPath))) return false;
+  const quarantine = `${markerPath}.stale.${randomUUID()}`;
+  try {
+    // Rename is an atomic identity check: two contenders cannot both move
+    // the same stale marker, and neither can remove a marker created after
+    // its own stale observation.
+    await rename(markerPath, quarantine);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    throw error;
+  }
+  await rm(quarantine, { recursive: true, force: true });
+  return true;
+}
+
+async function tryTakeover(lockPath, markerPath, token) {
+  try {
+    await mkdir(markerPath);
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    await writeLockOwner(markerPath, token);
+    if (!(await isStaleLock(lockPath))) return false;
+
+    const observedOwner = await readLockOwner(lockPath);
+    const quarantine = `${lockPath}.stale.${token}`;
+    try {
+      await rename(lockPath, quarantine);
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+
+    const movedOwner = await readLockOwner(quarantine);
+    const sameIdentity = observedOwner?.token
+      ? movedOwner?.token === observedOwner.token
+      : !movedOwner?.token;
+    if (!sameIdentity) {
+      // The lock identity changed between observation and takeover. Never
+      // delete or overwrite the moved directory; leave it for stale cleanup.
+      return false;
+    }
+    await rm(quarantine, { recursive: true, force: true });
+    try {
+      await mkdir(lockPath);
+      await writeLockOwner(lockPath, token);
+      return true;
+    } catch (error) {
+      if (error.code === "EEXIST") return false;
+      throw error;
+    }
+  } finally {
+    await releaseOwnedDirectory(markerPath, token);
+  }
+}
+
 export class JsonStateStore {
   #filename;
   #writeQueue = Promise.resolve();
@@ -147,22 +330,37 @@ export class JsonStateStore {
 
   async #withFileLock(operation) {
     const lockPath = `${this.#filename}.lock`;
+    const markerPath = `${lockPath}.takeover`;
+    const token = randomUUID();
     await mkdir(path.dirname(this.#filename), { recursive: true });
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    let acquired = false;
     while (true) {
+      if (await reclaimStaleMarker(markerPath)) {
+        // A stale marker was reclaimed. Continue below and compete for the
+        // canonical lock; a fresh marker remains visible and forces a wait.
+      }
+      try {
+        await stat(markerPath);
+        if (Date.now() >= deadline) throw new Error(`Timed out acquiring state lock: ${lockPath}`);
+        await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+        continue;
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
       try {
         await mkdir(lockPath);
+        await writeLockOwner(lockPath, token);
+        acquired = true;
         break;
       } catch (error) {
-        if (error.code !== "EEXIST") throw error;
-        try {
-          const lockAge = Date.now() - (await stat(lockPath)).mtimeMs;
-          if (lockAge > LOCK_STALE_MS) {
-            await rm(lockPath, { recursive: true, force: true });
-            continue;
-          }
-        } catch (statError) {
-          if (statError.code !== "ENOENT") throw statError;
+        if (error.code !== "EEXIST") {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+        if (await tryTakeover(lockPath, markerPath, token)) {
+          acquired = true;
+          break;
         }
         if (Date.now() >= deadline) throw new Error(`Timed out acquiring state lock: ${lockPath}`);
         await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
@@ -171,7 +369,7 @@ export class JsonStateStore {
     try {
       return await operation();
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      if (acquired) await releaseOwnedDirectory(lockPath, token);
     }
   }
 
@@ -199,6 +397,7 @@ export class JsonStateStore {
 
   async claimEvent(event, { ownerId, now, leaseMs }) {
     assertEvent(event);
+    assertClaimOptions({ ownerId, leaseMs });
     return this.#mutate((state) => {
       let record = Object.hasOwn(state, event.eventId) ? state[event.eventId] : null;
       if (!record) {
@@ -239,6 +438,7 @@ export class JsonStateStore {
   }
 
   async claimNextDue({ ownerId, now, leaseMs }) {
+    assertClaimOptions({ ownerId, leaseMs });
     return this.#mutate((state) => {
       const due = Object.values(state)
         .filter((record) => (
@@ -278,6 +478,7 @@ export class JsonStateStore {
       const record = state[eventId];
       if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
       assertLeaseOwner(record, ownerId, now);
+      if (!deadLetter) assertRetrySchedule(nextAttemptAt, now);
       const summary = summarizeError(error, now);
       record.lastError = summary;
       record.failureHistory = [...record.failureHistory, summary].slice(-MAX_FAILURE_HISTORY);
