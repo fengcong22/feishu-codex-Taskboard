@@ -35,7 +35,7 @@
 ```text
 Feishu WebSocket
       │
-      │ 断线自动重连
+      │ 官方 SDK 内建断线自动重连
       ▼
 事件标准化与业务判定
       │
@@ -89,6 +89,12 @@ pending → processing → succeeded
 
 不保存飞书应用密钥，也不把任意路径、命令或用户提供的 prompt 写入补偿控制字段。
 
+### 旧状态文件兼容
+
+旧版本的终态结果（ready、blocked、ignored）迁移为 `succeeded`，并保留原有结果。旧版本的 `pending` 记录没有保存完整事件快照，Bridge 不能安全地自动补投；升级时必须将它标记为 `dead_letter`，错误码为 `LEGACY_EVENT_SNAPSHOT_MISSING`，而不是猜测记录内容或删除状态文件。
+
+如果飞书随后重放同一 `eventId` 并携带完整事件，Bridge 可以用该事件快照重新进入标准幂等查找/投递流程；在创建前仍先查询 Taskboard，避免旧请求其实已成功但响应丢失时重复建任务。
+
 ## 处理流程
 
 ### 新事件
@@ -128,25 +134,23 @@ Bridge 启动时扫描状态文件：
 
 目标是“至少一次处理 + 幂等建任务”，不宣称绝对 exactly-once。后续若 Taskboard 提供原生幂等键或按事件 ID 查询接口，可再增强这一层。
 
-## Feishu 长连接重连
+## Feishu 长连接重连与观测
 
-在现有 SDK listener 外增加 supervisor：
+当前使用的官方 Node SDK 已内建 WebSocket 自动重连，并按 Feishu 服务端下发的重连次数、间隔和随机延迟工作。第一版必须显式开启该能力，但不得在 SDK 外重复建立“销毁并新建客户端”的重连 supervisor；SDK 当前公开接口没有安全的连接生命周期订阅或停止接口，双重重连会造成旧客户端残留或重复连接。
 
-- 首次启动失败或连接断开后自动重试；
-- 使用指数退避和抖动，设置最大重连间隔；
-- 停止服务时取消待执行的重连计时器，不再建立新连接；
-- 每次连接使用明确的 generation，旧连接回调不能覆盖新连接状态；
-- 重连期间已进入 Bridge 的事件继续由投递队列处理，重连成功后重复事件仍由 `eventId` 去重。
+Bridge 的 listener 观测状态采用诚实含义：
 
-健康状态至少记录：
+- `disabled`：未启用真实监听；
+- `starting`：已向 SDK 请求启动，尚无公开的连接确认；
+- `sdk_managed`：SDK 已接管连接和自动重连；
+- `error`：启动调用本身失败，或事件处理发生错误；
+- `stopped`：仅当底层客户端提供公开停止方法且已调用时使用。
 
-- `state`：`disabled`、`starting`、`connected`、`reconnecting`、`error`、`stopped`；
-- `lastConnectedAt`；
-- `lastEventAt`；
-- `lastError` 的错误码和时间；
-- 当前事件队列深度。
+健康状态记录 `lastEventAt`、最近安全错误摘要和当前事件队列深度。由于 SDK 没有公开的 `onOpen`/`onClose`/`onError` 和 `stop`/`dispose` 接口，第一版不把 `sdk_managed` 误报为 `connected`，也不伪造 `lastConnectedAt`。
 
-断线重连只解决事件接收连续性，不替代投递补偿队列；两者独立运行。
+重连期间已进入 Bridge 的事件继续由投递队列处理，重连成功后重复事件仍由 `eventId` 去重。断线重连只解决事件接收连续性，不替代投递补偿队列。
+
+后续只有在官方 SDK 提供文档化生命周期接口后，才增加严格的 `connected`/`reconnecting`、generation 和可取消重连控制；若要依赖 SDK 私有字段或日志字符串，必须先单独评审并固定 SDK 版本。
 
 ## 健康检查与人工操作
 
@@ -156,8 +160,7 @@ Bridge 启动时扫描状态文件：
 {
   "ok": true,
   "feishuListener": {
-    "state": "connected",
-    "lastConnectedAt": "...",
+    "state": "sdk_managed",
     "lastEventAt": "...",
     "lastError": null
   },
@@ -200,11 +203,11 @@ Bridge 启动时扫描状态文件：
 4. Bridge 重启或 processing 租约过期后可以恢复；
 5. 两个并发 worker 不能同时领取同一事件；
 6. 已存在的 Taskboard 任务在重试时被复用；
-7. WebSocket 启动失败、断线和停止分别触发正确的重连/取消行为；
+7. WebSocket 显式启用官方 SDK 的自动重连；启动失败、活动时间和公开停止能力分别产生正确的观测状态；
 8. `/health` 返回队列和 listener 的脱敏状态；
 9. 现有模拟流程、字段筛选、别名白名单和 loopback 约束保持通过。
 
-验收标准：暂停 Taskboard 后发送一条匹配事件，恢复 Taskboard，事件最终只产生一张任务；重启 Bridge 后未完成事件继续处理；模拟或真实长连接断开后能够自动恢复；重放同一事件不会产生重复任务。
+验收标准：暂停 Taskboard 后发送一条匹配事件，恢复 Taskboard，事件最终只产生一张任务；重启 Bridge 后未完成事件继续处理；真实长连接由 SDK 自动重连且重复事件不会产生重复任务；重放同一事件不会产生重复任务。
 
 ## 分阶段实施
 
@@ -214,15 +217,15 @@ Bridge 启动时扫描状态文件：
 - Bridge 引入有限重试、补偿 worker 和启动恢复；
 - 增加状态统计和测试。
 
-### 阶段二：长连接 supervisor
+### 阶段二：SDK 托管连接观测
 
-- 增加断线检测、退避重连、停止取消和 generation 防护；
-- 扩展 `/health` 与检查脚本；
-- 增加断线/重连测试。
+- 显式启用官方 SDK 自动重连；
+- 扩展 `/health` 与检查脚本，使用 SDK 托管的诚实状态语义；
+- 增加启动、活动和公开停止能力测试。
 
 ### 阶段三：人工诊断与规模化优化
 
 - 增加安全的人工重试入口；
 - 评估 Taskboard 原生幂等查询；
 - 根据事件量评估 JSON 到 SQLite 的迁移。
-
+- 仅在官方 SDK 提供文档化生命周期接口后，评估严格的连接状态和外部监督控制。
