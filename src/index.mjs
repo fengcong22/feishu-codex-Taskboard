@@ -72,9 +72,14 @@ const app = createBridgeServer({
     packages: Object.keys(config.packages),
   },
   handleEvent: (event) => bridge.handle(event),
-  getHealth: () => ({
+  getHealth: async () => ({
     ok: true,
-    feishuListener: feishuListener?.state ?? "disabled",
+    feishuListener: feishuListener?.health ?? {
+      state: "disabled",
+      lastEventAt: null,
+      lastError: null,
+    },
+    queue: await bridge.getQueueStats(),
   }),
 });
 const address = await app.listen();
@@ -99,14 +104,16 @@ if (listenerEnabled) {
       handleEvent: (event) => bridge.handle(event),
       sdk,
       logger: console,
-      onStatus: (status, error) => {
-        if (status === "error" && error) console.error(`Feishu listener error: ${error.message}`);
+      onStatus: (status, detail) => {
+        if (status === "error" && detail?.code) {
+          console.error(`Feishu listener error: ${detail.code}`);
+        }
       },
     });
     void feishuListener.start().then(() => {
       console.log("Feishu WebSocket listener started");
-    }).catch((error) => {
-      console.error(`Feishu WebSocket listener failed: ${error.message}`);
+    }).catch(() => {
+      console.error("Feishu WebSocket listener failed: FEISHU_LISTENER_START_FAILED");
     });
   } catch (error) {
     await compensationWorker.stop();
