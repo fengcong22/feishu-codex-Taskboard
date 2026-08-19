@@ -13,6 +13,7 @@ export function createCompensationWorker({
   let timer = null;
   let active = null;
   let stopped = false;
+  let started = false;
 
   function runOnce() {
     if (active) return active;
@@ -46,6 +47,8 @@ export function createCompensationWorker({
 
   return {
     start() {
+      if (started && !stopped) return;
+      started = true;
       stopped = false;
       void runOnce();
       schedule();
@@ -53,6 +56,7 @@ export function createCompensationWorker({
 
     async stop() {
       stopped = true;
+      started = false;
       if (timer !== null) timers.clearTimeout(timer);
       timer = null;
       await active;

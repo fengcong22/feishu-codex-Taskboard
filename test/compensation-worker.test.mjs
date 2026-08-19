@@ -72,6 +72,25 @@ test("start performs an immediate sweep and schedules the next one", async () =>
   assert.equal(timers.callbacks.size, 0);
 });
 
+test("start is idempotent while the worker is running", async () => {
+  const timers = fakeTimers();
+  const worker = createCompensationWorker({
+    bridge: {
+      recover: async () => {},
+      processDue: async () => null,
+    },
+    pollIntervalMs: 100,
+    timers,
+    logger: { error: assert.fail },
+  });
+
+  worker.start();
+  await worker.runOnce();
+  worker.start();
+  assert.equal(timers.callbacks.size, 1);
+  await worker.stop();
+});
+
 test("does not overlap a scheduled tick with an active sweep", async () => {
   const timers = fakeTimers();
   let release;
