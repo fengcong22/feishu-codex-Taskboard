@@ -14,6 +14,7 @@ test("classifies temporary Taskboard failures", () => {
   })).retryable, true);
   assert.equal(classifyDeliveryError(new TaskboardError("busy", { status: 429 })).retryable, true);
   assert.equal(classifyDeliveryError(new TaskboardError("bad gateway", { status: 502 })).retryable, true);
+  assert.equal(classifyDeliveryError(new TaskboardError("invalid status", { status: 600 })).retryable, false);
   assert.equal(classifyDeliveryError(new TaskboardError("invalid task", { status: 400 })).retryable, false);
 });
 

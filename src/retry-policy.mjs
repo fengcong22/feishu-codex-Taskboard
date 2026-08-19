@@ -61,7 +61,7 @@ export function classifyDeliveryError(error) {
   return {
     code,
     status,
-    retryable: code === "TASKBOARD_UNAVAILABLE" || status === 429 || status >= 500,
+    retryable: code === "TASKBOARD_UNAVAILABLE" || status === 429 || (status >= 500 && status < 600),
   };
 }
 
