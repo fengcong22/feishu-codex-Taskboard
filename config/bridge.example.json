@@ -1,0 +1,33 @@
+{
+  "host": "127.0.0.1",
+  "port": 47824,
+  "taskboardUrl": "http://127.0.0.1:47823",
+  "stateFile": "D:\\codex\\codex-feishu\\.runtime\\bridge\\state.json",
+  "tables": [
+    {
+      "baseToken": "bas_replace_with_feishu_base_token",
+      "tableId": "tbl_replace_with_feishu_table_id",
+      "name": "示例多维表格",
+      "mode": "manual",
+      "triggerField": "视频整体进度",
+      "triggerFieldId": "fld_replace_with_trigger_field_id",
+      "triggerValue": "待剪辑",
+      "triggerOptionId": null,
+      "titleField": "视频名称",
+      "titleFieldId": "fld_replace_with_title_field_id",
+      "fallbackTitleField": "集合文档",
+      "fallbackTitleFieldId": "fld_replace_with_fallback_title_field_id",
+      "packageField": null,
+      "packageFieldId": null,
+      "defaultPackageAlias": "Auto-cut-copyA"
+    }
+  ],
+  "packages": {
+    "Auto-cut-copyA": {
+      "projectId": "auto-cut-copy-a",
+      "projectName": "Auto-cut-copyA",
+      "workspacePath": "D:\\codex\\codex-feishu\\examples\\harmless-auto-cut",
+      "prompt": "阅读 AGENTS.md，完成其中描述的无害演示任务。不要处理真实视频、上传文件或访问工作区外的路径。"
+    }
+  }
+}

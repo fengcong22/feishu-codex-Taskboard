@@ -1,0 +1,26 @@
+{
+  "name": "codex-feishu-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.36.0"
+  },
+  "description": "这是一个仅在本机运行的 MVP。它会把飞书多维表格中“进入待剪辑”的记录变成 Taskboard 任务，并由用户手动启动 Codex。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples",
+    "test": "test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
