@@ -82,6 +82,15 @@ function assertEvent(event) {
   }
 }
 
+function hasEventSnapshot(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  for (const field of ["eventId", "baseToken", "tableId", "recordId", "fieldName"]) {
+    if (typeof event[field] !== "string" || event[field].trim() === "") return false;
+  }
+  if (!Object.hasOwn(event, "beforeValue") || !Object.hasOwn(event, "afterValue")) return false;
+  return Boolean(event.fields && typeof event.fields === "object" && !Array.isArray(event.fields));
+}
+
 function assertLeaseOwner(record, ownerId, now) {
   const leaseUntil = record.lease?.leaseUntil;
   if (
@@ -193,6 +202,7 @@ export class JsonStateStore {
     return this.#mutate((state) => {
       let record = Object.hasOwn(state, event.eventId) ? state[event.eventId] : null;
       if (!record) {
+        if (!hasEventSnapshot(event)) throw new Error("event snapshot is incomplete");
         record = newRecord(event, now);
         state[event.eventId] = record;
       } else if (
@@ -200,6 +210,7 @@ export class JsonStateStore {
         && record.event === null
         && record.lastError?.code === "LEGACY_EVENT_SNAPSHOT_MISSING"
       ) {
+        if (!hasEventSnapshot(event)) return { kind: "terminal", record: structuredClone(record) };
         record = newRecord(event, now);
         state[event.eventId] = record;
       }
@@ -232,7 +243,7 @@ export class JsonStateStore {
       const due = Object.values(state)
         .filter((record) => (
           (record.deliveryState === "pending" || record.deliveryState === "retry_wait")
-          && record.event !== null
+          && hasEventSnapshot(record.event)
           && (record.nextAttemptAt === null || record.nextAttemptAt <= now)
         ))
         .sort((left, right) => left.createdAt - right.createdAt)[0];

@@ -188,3 +188,30 @@ test("rejects updates when a processing lease has no finite expiry", async () =>
     /lease is not owned by one/,
   );
 });
+
+test("does not rehydrate a legacy pending record from an incomplete event", async () => {
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({ evt_old: { kind: "pending" } }));
+  const store = new JsonStateStore(filename);
+  const result = await store.claimEvent({ eventId: "evt_old" }, { ownerId: "one", now: 100, leaseMs: 10 });
+  assert.equal(result.kind, "terminal");
+  assert.equal(result.record.deliveryState, "dead_letter");
+  assert.equal(result.record.lastError.code, "LEGACY_EVENT_SNAPSHOT_MISSING");
+});
+
+test("does not claim a v2 pending record that has no event snapshot", async () => {
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    evt_malformed: {
+      schemaVersion: 2,
+      eventId: "evt_malformed",
+      deliveryState: "pending",
+      attempts: 0,
+      nextAttemptAt: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+  const store = new JsonStateStore(filename);
+  assert.equal(await store.claimNextDue({ ownerId: "one", now: 100, leaseMs: 10 }), null);
+});
