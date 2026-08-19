@@ -6,6 +6,7 @@ import test from "node:test";
 const checkUrl = new URL("../scripts/check-local.ps1", import.meta.url);
 const agentsUrl = new URL("../AGENTS.md", import.meta.url);
 const readmeUrl = new URL("../README.md", import.meta.url);
+const taskboardScreenshotUrl = new URL("../docs/assets/taskboard-kanban-demo.jpg", import.meta.url);
 
 function windowsPath(url) {
   return decodeURIComponent(url.pathname).replace(/^\/(?:([A-Za-z]:))/, "$1");
@@ -53,4 +54,34 @@ test("README points team members to the operating contract", async () => {
   const source = await readFile(readmeUrl, "utf8");
   assert.match(source, /AGENTS\.md/);
   assert.match(source, /check-local\.ps1/);
+});
+
+test("README presents the verified bridge capabilities without claiming unsupported features", async () => {
+  const source = await readFile(readmeUrl, "utf8");
+  assert.match(source, /飞书 Bridge × Codex Taskboard/);
+  assert.match(source, /```mermaid/);
+  assert.match(source, /飞书多维表格/);
+  assert.match(source, /官方 SDK/);
+  assert.match(source, /Taskboard/);
+  assert.match(source, /当前已支持/);
+  assert.match(source, /5 分钟快速体验/);
+  assert.match(source, /不会自动启动 Codex/);
+  assert.match(source, /不会回写飞书记录/);
+  assert.match(source, /不处理真实视频/);
+  assert.match(source, /完成本地配置后/);
+  assert.match(source, /团队提供的匹配测试配置/);
+  assert.match(source, /Taskboard 的手动启动与网页展示属于外部 Taskboard 能力/);
+  assert.match(source, /不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障/);
+  assert.doesNotMatch(source, /打开任务后点击“启动 Codex”/);
+});
+
+test("README embeds a real Taskboard screenshot labeled as local test data", async () => {
+  const [source, screenshot] = await Promise.all([
+    readFile(readmeUrl, "utf8"),
+    readFile(taskboardScreenshotUrl),
+  ]);
+  assert.match(source, /docs\/assets\/taskboard-kanban-demo\.jpg/);
+  assert.match(source, /本地测试数据/);
+  assert.ok(screenshot.length > 50_000, "screenshot should be a substantive JPEG asset");
+  assert.deepEqual([...screenshot.subarray(0, 3)], [0xff, 0xd8, 0xff]);
 });
