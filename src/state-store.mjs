@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 
 import { safeDeliveryErrorCode } from "./retry-policy.mjs";
@@ -366,11 +373,50 @@ export class JsonStateStore {
   }
 
   async #writeState(state) {
-    const temporary = `${this.#filename}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    await chmod(temporary, 0o600);
-    await rename(temporary, this.#filename);
-    await chmod(this.#filename, 0o600);
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
+    let temporary = null;
+    let handle = null;
+    for (let attempt = 0; attempt < 3 && !handle; attempt += 1) {
+      temporary = `${this.#filename}.${randomUUID()}.tmp`;
+      try {
+        handle = await open(temporary, "wx", 0o600);
+      } catch (error) {
+        if (error?.code !== "EEXIST" || attempt === 2) throw error;
+      }
+    }
+
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.nlink !== 1) {
+        const error = new Error("STATE_TEMP_UNSUPPORTED: temporary state file must be a single-link regular file");
+        error.code = "STATE_TEMP_UNSUPPORTED";
+        throw error;
+      }
+      await handle.writeFile(serialized, "utf8");
+      await handle.chmod(0o600);
+      await handle.sync();
+      const written = await handle.stat();
+      if (!written.isFile() || written.nlink !== 1) {
+        const error = new Error("STATE_TEMP_UNSUPPORTED: temporary state file changed while writing");
+        error.code = "STATE_TEMP_UNSUPPORTED";
+        throw error;
+      }
+      await handle.close();
+      handle = null;
+      const target = await lstat(temporary);
+      if (!target.isFile() || target.nlink !== 1) {
+        const error = new Error("STATE_TEMP_UNSUPPORTED: temporary state path is not a single-link regular file");
+        error.code = "STATE_TEMP_UNSUPPORTED";
+        throw error;
+      }
+      await rename(temporary, this.#filename);
+      temporary = null;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      if (temporary) await unlink(temporary).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+    }
   }
 
   async #mutate(operation, now = Date.now(), clock = () => now) {

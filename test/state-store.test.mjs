@@ -855,6 +855,27 @@ test("fails closed when the durable state file is not an object map", async () =
   assert.deepEqual(JSON.parse(await readFile(filename, "utf8")), []);
 });
 
+test("does not follow a pre-created predictable temporary hard link during state replacement", async () => {
+  const filename = await stateFilename();
+  const victim = `${filename}.victim`;
+  const predictableTemporary = `${filename}.${process.pid}.tmp`;
+  const originalVictim = "keep this file unchanged\n";
+  await writeFile(victim, originalVictim, { mode: 0o600 });
+  await link(victim, predictableTemporary);
+
+  const store = new JsonStateStore(filename);
+  const result = await store.claimEvent(event("evt_temp_link"), {
+    ownerId: "worker",
+    now: 0,
+    leaseMs: 100,
+  });
+
+  assert.equal(result.kind, "claimed");
+  assert.equal(await readFile(victim, "utf8"), originalVictim);
+  assert.equal(await readFile(predictableTemporary, "utf8"), originalVictim);
+  assert.deepEqual(JSON.parse(await readFile(filename, "utf8")).evt_temp_link.event, event("evt_temp_link"));
+});
+
 test("does not rehydrate a legacy pending record from an incomplete event", async () => {
   const filename = await stateFilename();
   await writeFile(filename, JSON.stringify({ evt_old: { kind: "pending" } }));
