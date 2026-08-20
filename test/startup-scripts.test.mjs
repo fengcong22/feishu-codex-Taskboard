@@ -4,6 +4,9 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const files = {
+  startBatch: new URL("../启动-Taskboard.bat", import.meta.url),
+  checkBatch: new URL("../检查-Taskboard.bat", import.meta.url),
+  stopBatch: new URL("../停止-Taskboard.bat", import.meta.url),
   start: new URL("../scripts/start-local.ps1", import.meta.url),
   stop: new URL("../scripts/stop-local.ps1", import.meta.url),
   simulate: new URL("../scripts/simulate-ready.ps1", import.meta.url),
@@ -41,6 +44,30 @@ test("bridge startup tracks listener mode and replaces a mismatched process", as
   assert.match(source, /bridgeModeFile/);
 });
 
+test("double-click batch launchers delegate to the repository scripts", async () => {
+  const start = await readFile(files.startBatch, "utf8");
+  const check = await readFile(files.checkBatch, "utf8");
+  const stop = await readFile(files.stopBatch, "utf8");
+  assert.match(start, /@echo off/i);
+  assert.match(start, /scripts\\start-local\.ps1/i);
+  assert.match(start, /-EnableFeishu/i);
+  assert.match(start, /%~dp0/i);
+  assert.match(check, /scripts\\check-local\.ps1/i);
+  assert.match(check, /-RequireFeishu/i);
+  assert.match(stop, /scripts\\stop-local\.ps1/i);
+  assert.match(check, /\)\s*echo\.\s*pause\s*endlocal/is);
+  for (const source of [start, check, stop]) {
+    assert.match(source, /powershell\.exe/i);
+    assert.match(source, /-NoProfile/i);
+  }
+});
+
+test("local check keeps the Node validation import quoted for Windows PowerShell", async () => {
+  const source = await readFile(new URL("../scripts/check-local.ps1", import.meta.url), "utf8");
+  assert.match(source, /from '\.\/src\/config\.mjs'/);
+  assert.doesNotMatch(source, /from "\.\/src\/config\.mjs"/);
+});
+
 test("stop script stops only validated PIDs from runtime files", async () => {
   const source = await readFile(files.stop, "utf8");
   assert.match(source, /taskboard\.pid/);
@@ -62,8 +89,9 @@ test("simulation sends a deterministic transition to 待剪辑", async () => {
   assert.match(source, /api\/simulate\/record-changed/);
 });
 
-test("Windows PowerShell 5 can parse every startup script", () => {
+test("Windows PowerShell 5 can parse every PowerShell startup script", () => {
   for (const [name, url] of Object.entries(files)) {
+    if (!url.pathname.toLowerCase().endsWith(".ps1")) continue;
     const filename = decodeURIComponent(url.pathname).replace(/^\/(?:([A-Za-z]:))/, "$1");
     const command = [
       "$tokens=$null",
