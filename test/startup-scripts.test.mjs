@@ -36,12 +36,48 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /FEISHU_LISTENER_ENABLED/);
 });
 
-test("bridge startup tracks listener mode and replaces a mismatched process", async () => {
+test("bridge startup tracks listener mode and only replaces an owned mismatched process", async () => {
   const source = await readFile(files.start, "utf8");
   assert.match(source, /bridge\.feishu-mode/);
   assert.match(source, /RequestedMode/);
   assert.match(source, /taskkill\.exe \/PID/);
   assert.match(source, /bridgeModeFile/);
+  assert.match(source, /runtime ownership marker/);
+});
+
+test("Feishu-enabled startup waits for SDK-managed readiness and cleans up on failure", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /Wait-FeishuReady/);
+  assert.match(source, /feishuListener/);
+  assert.match(source, /sdk_managed/);
+  assert.match(source, /AddSeconds\(30\)/);
+  assert.match(source, /startedNodes/);
+  assert.match(source, /Stop-ValidatedNode/);
+});
+
+test("startup tracks the exact PID returned by the detached launcher", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /launcherOutput/);
+  assert.match(source, /launchedPid/);
+  assert.match(source, /startedNodes\[\$launchedPid\]/);
+  assert.match(source, /ProcessId=\$launchedPid/);
+});
+
+test("startup ties readiness checks to the process that owns the service port", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /Get-NetTCPConnection/);
+  assert.match(source, /OwningProcess/);
+  assert.match(source, /ExpectedPid/);
+  assert.match(source, /47824/);
+});
+
+test("startup serializes launches and preserves process identity during cleanup", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /System\.Threading\.Mutex/);
+  assert.match(source, /WaitOne/);
+  assert.match(source, /CreationDate/);
+  assert.match(source, /StartedAt/);
+  assert.match(source, /ReleaseMutex/);
 });
 
 test("double-click batch launchers delegate to the repository scripts", async () => {

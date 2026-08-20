@@ -68,6 +68,7 @@ test("detached launcher returns while its logged child remains alive", async () 
     assert.equal(result.status, 0, result.stderr || result.stdout);
     pid = Number(await readFile(pidFile, "utf8"));
     assert.equal(Number.isInteger(pid) && pid > 0, true);
+    assert.equal(result.stdout.trim().split(/\r?\n/).length, 1);
     assert.equal(processExists(pid), true, `child ${pid} exited with its launcher`);
 
     const deadline = Date.now() + 2_000;
@@ -81,6 +82,42 @@ test("detached launcher returns while its logged child remains alive", async () 
     }
     assert.match(stdout, /ready:inherited/);
     assert.match(stderr, /diagnostic/);
+  } finally {
+    if (pid && processExists(pid)) {
+      process.kill(pid, "SIGTERM");
+      await waitForProcessExit(pid);
+      if (processExists(pid)) process.kill(pid, "SIGKILL");
+      await waitForProcessExit(pid);
+    }
+    await removeEventually(directory);
+  }
+});
+
+test("detached launcher reports the child PID even when PID-file persistence fails", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-feishu-launcher-failure-"));
+  const childScript = path.join(directory, "child.mjs");
+  const invalidPidFile = path.join(directory, "missing", "child.pid");
+  const stdoutFile = path.join(directory, "child.stdout.log");
+  const stderrFile = path.join(directory, "child.stderr.log");
+  let pid = null;
+
+  try {
+    await writeFile(childScript, "setTimeout(() => {}, 1000);\n");
+    const result = spawnSync(process.execPath, [
+      launcher,
+      "--script", childScript,
+      "--cwd", directory,
+      "--pid-file", invalidPidFile,
+      "--stdout", stdoutFile,
+      "--stderr", stderrFile,
+    ], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+
+    assert.notEqual(result.status, 0);
+    pid = Number(result.stdout.trim());
+    assert.equal(Number.isInteger(pid) && pid > 0, true);
   } finally {
     if (pid && processExists(pid)) {
       process.kill(pid, "SIGTERM");

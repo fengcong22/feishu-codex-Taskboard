@@ -44,13 +44,23 @@ function main(argv = process.argv.slice(2)) {
       windowsHide: true,
       stdio: ["ignore", stdout, stderr],
     });
-    writeFileSync(pidFile, `${child.pid}\n`, "utf8");
+    const pidText = `${child.pid}\n`;
+    process.stdout.write(pidText);
+    try {
+      writeFileSync(pidFile, pidText, "utf8");
+    } catch (error) {
+      try {
+        child.kill();
+      } catch {
+        // Best-effort cleanup; the caller can still use the reported PID.
+      }
+      throw error;
+    }
   } finally {
     closeSync(stdout);
     closeSync(stderr);
   }
   child.unref();
-  process.stdout.write(`${child.pid}\n`);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

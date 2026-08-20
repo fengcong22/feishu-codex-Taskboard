@@ -85,7 +85,7 @@ npm install
 | `检查-Taskboard.bat` | 检查 Node.js、配置、Taskboard、Bridge、飞书长连接和队列状态。 |
 | `停止-Taskboard.bat` | 停止本地 Taskboard 和 Bridge。 |
 
-这些文件使用自身所在目录定位仓库，因此可以从资源管理器直接双击；它们仍复用 `scripts` 下的正式脚本，不会改变 `127.0.0.1` 监听边界。`启动-Taskboard.bat` 默认带 `-EnableFeishu`，用于真实多维表格事件；`检查-Taskboard.bat` 会要求监听器处于 `sdk_managed`。首次启动前仍需完成本地配置并安装 Node.js、Codex 和外部 Taskboard 依赖，不要把凭据写入批处理文件。
+这些文件使用自身所在目录定位仓库，因此可以从资源管理器直接双击；它们仍复用 `scripts` 下的正式脚本，不会改变 `127.0.0.1` 监听边界。`启动-Taskboard.bat` 默认带 `-EnableFeishu`，会在打开页面前最多等待 30 秒，直到监听器进入 `sdk_managed`；启动器会用精确 PID 和监听端口核对服务，避免把同路径的其他 Node 进程当作已启动实例。失败、超时或 Bridge 提前退出时会清理本次启动的进程，并提示查看 `.runtime/logs/bridge.stderr.log`；检测到未标记的冲突 Bridge 时会提示先停止它。浏览器自动打开失败不会停止已经启动的服务。`检查-Taskboard.bat` 会要求监听器处于 `sdk_managed`。首次启动前仍需完成本地配置并安装 Node.js、Codex 和外部 Taskboard 依赖，不要把凭据写入批处理文件。
 
 ### 任务生命周期边界
 
