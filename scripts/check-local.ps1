@@ -29,7 +29,7 @@ if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
 }
 
 $validationCode = @'
-import { loadConfig } from "./src/config.mjs";
+import { loadConfig } from './src/config.mjs';
 const config = await loadConfig(process.argv[1]);
 console.log(JSON.stringify({ tables: config.tables.length, packages: Object.keys(config.packages).length }));
 '@
