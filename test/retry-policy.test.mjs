@@ -13,6 +13,7 @@ test("classifies temporary Taskboard failures", () => {
     code: "TASKBOARD_UNAVAILABLE",
   })).retryable, true);
   assert.equal(classifyDeliveryError(new TaskboardError("busy", { status: 429 })).retryable, true);
+  assert.equal(classifyDeliveryError(new TaskboardError("request timed out", { status: 408 })).retryable, true);
   assert.equal(classifyDeliveryError(new TaskboardError("bad gateway", { status: 502 })).retryable, true);
   assert.equal(classifyDeliveryError(new TaskboardError("invalid status", { status: 600 })).retryable, false);
   assert.equal(classifyDeliveryError(new TaskboardError("invalid task", { status: 400 })).retryable, false);
@@ -50,4 +51,49 @@ test("summarizes errors without preserving raw line breaks", () => {
   }), 99);
   assert.deepEqual(summary, { code: "TASKBOARD_UNAVAILABLE", status: 0, at: 99 });
   assert.equal("message" in summary, false);
+});
+
+test("bounds untrusted error codes before exposing them", () => {
+  const error = Object.assign(new Error("do not expose"), {
+    code: "fake-app-secret-do-not-log",
+    status: 503,
+  });
+  assert.deepEqual(classifyDeliveryError(error), {
+    code: "DELIVERY_FAILED",
+    status: 503,
+    retryable: true,
+  });
+  assert.deepEqual(summarizeDeliveryError(error, 100), {
+    code: "DELIVERY_FAILED",
+    status: 503,
+    at: 100,
+  });
+});
+
+test("preserves explicitly approved local and Bridge error codes", () => {
+  const codes = [
+    "INVALID_FIELD",
+    "PROJECT_EXISTS",
+    "PROJECT_NOT_FOUND",
+    "BRIDGE_FAILURE",
+    "EVENT_RECORD_INVALID",
+    "EVENT_SNAPSHOT_MISSING",
+    "FEISHU_TITLE_LOOKUP_TIMEOUT",
+    "STATE_FILE_INVALID",
+    "TASKBOARD_INVALID_RESPONSE",
+    "TASKBOARD_UNAVAILABLE",
+    "TASK_NOT_FOUND",
+    "VERSION_CONFLICT",
+    "STATE_LOCK_TIMEOUT",
+    "STATE_LOCK_TARGET_CHANGED",
+    "STATE_LOCK_TARGET_UNSUPPORTED",
+    "STATE_LOCK_UNSUPPORTED_PLATFORM",
+  ];
+  for (const code of codes) {
+    assert.equal(classifyDeliveryError({ code, status: 400 }).code, code);
+  }
+});
+
+test("treats a local lock timeout as a bounded retry", () => {
+  assert.equal(classifyDeliveryError({ code: "STATE_LOCK_TIMEOUT" }).retryable, true);
 });

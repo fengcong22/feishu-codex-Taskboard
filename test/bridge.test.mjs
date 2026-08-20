@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import { createBridge } from "../src/bridge.mjs";
@@ -53,6 +55,33 @@ const event = {
 
 const retryEvent = { ...event, eventId: "evt_retry" };
 
+function metadataMarker(overrides = {}) {
+  const metadata = {
+    source: "feishu-base",
+    eventId: "evt_ready",
+    baseToken: "bas_demo",
+    tableId: "tbl_a",
+    recordId: "rec_1",
+    triggerField: "视频整体进度",
+    triggerValue: "待剪辑",
+    ...overrides,
+  };
+  const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
+  return `<!-- feishu-codex-task:v1:${encoded} -->`;
+}
+
+function lifecycleTask(id, overrides = {}) {
+  return {
+    id,
+    identifier: id.toUpperCase(),
+    version: 1,
+    status: "todo",
+    archivedAt: null,
+    description: metadataMarker(),
+    ...overrides,
+  };
+}
+
 async function stateFilename() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-bridge-durable-"));
   return path.join(directory, "state.json");
@@ -61,6 +90,7 @@ async function stateFilename() {
 function memoryStore() {
   const entries = new Map();
   const clone = (value) => value === undefined ? value : structuredClone(value);
+  const tokenMatches = (record, token) => typeof token === "string" && token === record.lease?.token;
   const newRecord = (value, now) => ({
     schemaVersion: 2,
     eventId: value.eventId,
@@ -122,7 +152,7 @@ function memoryStore() {
     record.deliveryState = "processing";
     record.attempts += 1;
     record.nextAttemptAt = null;
-    record.lease = { ownerId, leaseUntil: now + leaseMs };
+    record.lease = { ownerId, token: randomUUID(), leaseUntil: now + leaseMs };
     record.updatedAt = now;
     return { kind: "claimed", record: clone(record) };
   };
@@ -143,22 +173,25 @@ function memoryStore() {
       entries.set(value.eventId, record);
       return claim(record, ownerId, now, leaseMs);
     },
-    claimNextDue: async ({ ownerId, now, leaseMs }) => {
+    claimNextDue: async ({ ownerId, now, leaseMs, excludeEventIds }) => {
       const due = [...entries.values()]
         .map((value) => normalize(value.eventId, value, now))
         .filter((value) => (value.deliveryState === "pending"
           || value.deliveryState === "retry_wait")
           && value.event !== null
+          && !(excludeEventIds instanceof Set && excludeEventIds.has(value.eventId))
           && (value.nextAttemptAt === null || value.nextAttemptAt <= now))
         .sort((left, right) => left.createdAt - right.createdAt)[0];
       if (!due) return null;
       entries.set(due.eventId, due);
       return claim(due, ownerId, now, leaseMs).record;
     },
-    complete: async (eventId, { ownerId, decision, outcome, now }) => {
+    complete: async (eventId, { ownerId, token, decision, outcome, now }) => {
       const record = entries.get(eventId);
       if (!record || record.deliveryState !== "processing"
-        || record.lease?.ownerId !== ownerId || record.lease.leaseUntil <= now) {
+        || record.lease?.ownerId !== ownerId
+        || record.lease.leaseUntil <= now
+        || !tokenMatches(record, token)) {
         throw new Error(`lease is not owned by ${ownerId}`);
       }
       record.deliveryState = "succeeded";
@@ -169,10 +202,12 @@ function memoryStore() {
       record.updatedAt = now;
       return clone(record);
     },
-    fail: async (eventId, { ownerId, error, nextAttemptAt, deadLetter, now }) => {
+    fail: async (eventId, { ownerId, token, error, nextAttemptAt, deadLetter, now }) => {
       const record = entries.get(eventId);
       if (!record || record.deliveryState !== "processing"
-        || record.lease?.ownerId !== ownerId || record.lease.leaseUntil <= now) {
+        || record.lease?.ownerId !== ownerId
+        || record.lease.leaseUntil <= now
+        || !tokenMatches(record, token)) {
         throw new Error(`lease is not owned by ${ownerId}`);
       }
       const summary = { code: error.code, status: error.status ?? 0, at: error.at ?? now };
@@ -184,10 +219,24 @@ function memoryStore() {
       record.updatedAt = now;
       return clone(record);
     },
-    recoverExpiredLeases: async ({ now }) => {
+    renewLease: async (eventId, { ownerId, token, now, leaseMs }) => {
+      const record = entries.get(eventId);
+      if (!record || record.deliveryState !== "processing"
+        || record.lease?.ownerId !== ownerId
+        || record.lease?.token !== token
+        || record.lease.leaseUntil <= now) {
+        throw new Error(`lease is not owned by ${ownerId}`);
+      }
+      record.lease.leaseUntil = now + leaseMs;
+      record.updatedAt = now;
+      return clone(record);
+    },
+    recoverExpiredLeases: async ({ now, excludeEventIds }) => {
       let count = 0;
       for (const record of entries.values()) {
-        if (record.deliveryState === "processing" && record.lease?.leaseUntil <= now) {
+        if (record.deliveryState === "processing"
+          && !(excludeEventIds instanceof Set && excludeEventIds.has(record.eventId))
+          && record.lease?.leaseUntil <= now) {
           record.deliveryState = "pending";
           record.lease = null;
           record.nextAttemptAt = null;
@@ -207,6 +256,25 @@ function memoryStore() {
         if (record.deliveryState === "dead_letter") stats.deadLetter += 1;
       }
       return stats;
+    },
+  };
+}
+
+function fakeIntervals() {
+  let nextId = 0;
+  const callbacks = new Map();
+  return {
+    callbacks,
+    setInterval(callback) {
+      const id = ++nextId;
+      callbacks.set(id, callback);
+      return id;
+    },
+    clearInterval(id) {
+      callbacks.delete(id);
+    },
+    async fireAll() {
+      for (const callback of callbacks.values()) await callback();
     },
   };
 }
@@ -316,6 +384,140 @@ test("persists ignored events without calling Taskboard", async () => {
     kind: "ignored",
     reason: "new_value_not_trigger",
   });
+});
+
+test("archives matching waiting tasks when a record leaves 待剪辑 and leaves execution tasks alone", async () => {
+  const waiting = lifecycleTask("task_waiting");
+  const running = lifecycleTask("task_running", { status: "in_progress" });
+  const tasks = [waiting, running];
+  const archived = [];
+  let listed = 0;
+  const bridge = createBridge({
+    config,
+    store: memoryStore(),
+    taskboard: {
+      async listTasks(options) {
+        listed += 1;
+        assert.deepEqual(options, { archived: "false" });
+        return tasks.filter((task) => task.archivedAt === null);
+      },
+      async getTask(id) { return tasks.find((task) => task.id === id); },
+      async archiveTask(task) {
+        archived.push(task.id);
+        task.archivedAt = "2026-08-20T00:00:00.000Z";
+        return task;
+      },
+      createTask: assert.fail,
+      ensureProject: assert.fail,
+    },
+  });
+  const left = {
+    ...event,
+    eventId: "evt_left_trigger",
+    beforeValue: "待剪辑",
+    afterValue: "剪辑中",
+    fields: {},
+  };
+  assert.deepEqual(await bridge.handle(left), {
+    kind: "ignored",
+    reason: "left_trigger",
+  });
+  assert.deepEqual(archived, ["task_waiting"]);
+  assert.equal(running.archivedAt, null);
+  assert.equal(listed, 1);
+  assert.deepEqual(await bridge.handle(left), {
+    kind: "ignored",
+    reason: "left_trigger",
+    duplicate: true,
+  });
+  assert.equal(listed, 1);
+});
+
+test("retries a temporary archive failure and completes the leave event", async () => {
+  let now = 0;
+  let available = false;
+  let task = lifecycleTask("task_retry_archive");
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store: memoryStore(),
+    now: () => now,
+    random: () => 0.5,
+    taskboard: {
+      async listTasks() {
+        if (!available) throw unavailable();
+        return task.archivedAt === null ? [task] : [];
+      },
+      async getTask() { return task; },
+      async archiveTask(value) {
+        if (!available) throw unavailable();
+        value.archivedAt = "now";
+        return value;
+      },
+    },
+  });
+  const left = {
+    ...event,
+    eventId: "evt_archive_retry",
+    beforeValue: "待剪辑",
+    afterValue: "剪辑中",
+    fields: {},
+  };
+  assert.deepEqual(await bridge.handle(left), {
+    kind: "pending",
+    deliveryState: "retry_wait",
+    attempts: 1,
+    retryAt: 5,
+  });
+  now = 5;
+  available = true;
+  assert.deepEqual(await bridge.processDue(), {
+    kind: "ignored",
+    reason: "left_trigger",
+  });
+  assert.equal(task.archivedAt, "now");
+});
+
+test("replays partial archival safely without touching already archived tasks", async () => {
+  let now = 0;
+  let failedOnce = false;
+  const first = lifecycleTask("task_partial_1");
+  const second = lifecycleTask("task_partial_2");
+  const tasks = [first, second];
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store: memoryStore(),
+    now: () => now,
+    random: () => 0.5,
+    taskboard: {
+      async listTasks() { return tasks.filter((task) => task.archivedAt === null); },
+      async getTask(id) { return tasks.find((task) => task.id === id); },
+      async archiveTask(value) {
+        if (value.id === second.id && !failedOnce) {
+          failedOnce = true;
+          throw unavailable();
+        }
+        value.archivedAt = "now";
+        return value;
+      },
+    },
+  });
+  const left = {
+    ...event,
+    eventId: "evt_partial_archive",
+    beforeValue: "待剪辑",
+    afterValue: "剪辑中",
+    fields: {},
+  };
+  assert.equal((await bridge.handle(left)).deliveryState, "retry_wait");
+  assert.equal(first.archivedAt, "now");
+  assert.equal(second.archivedAt, null);
+  now = 5;
+  assert.deepEqual(await bridge.processDue(), {
+    kind: "ignored",
+    reason: "left_trigger",
+  });
+  assert.equal(first.archivedAt, "now");
+  assert.equal(second.archivedAt, "now");
 });
 
 test("creates a blocked task in the local project", async () => {
@@ -570,4 +772,465 @@ test("does not create a second task when two Bridge instances share a durable st
   releaseCreate();
   assert.equal((await first).taskIdentifier, "AUTO-SHARED");
   assert.equal(created, 1);
+});
+
+test("serializes an expired same-event delivery across Bridge instances", async () => {
+  const filename = await stateFilename();
+  let releaseCreate;
+  const createReleased = new Promise((resolve) => { releaseCreate = resolve; });
+  let firstCreateEntered;
+  const firstEntered = new Promise((resolve) => { firstCreateEntered = resolve; });
+  let created = 0;
+  const taskboard = {
+    findTaskByEventId: async () => (created > 0
+      ? { id: "task_1", identifier: "AUTO-1" }
+      : null),
+    ensureProject: async () => {},
+    createTask: async () => {
+      created += 1;
+      firstCreateEntered();
+      await createReleased;
+      return { id: `task_${created}`, identifier: `AUTO-${created}` };
+    },
+  };
+  const timersOne = fakeIntervals();
+  const storeOne = new JsonStateStore(filename);
+  const storeTwo = new JsonStateStore(filename);
+  const bridgeOne = createBridge({
+    config: { ...config, delivery: policy },
+    store: storeOne,
+    taskboard,
+    now: () => 0,
+    ownerId: "expired-one",
+    timers: timersOne,
+  });
+  const bridgeTwo = createBridge({
+    config: { ...config, delivery: policy },
+    store: storeTwo,
+    taskboard,
+    now: () => policy.leaseMs + 1,
+    ownerId: "expired-two",
+    timers: fakeIntervals(),
+  });
+
+  const first = bridgeOne.handle({ ...event, eventId: "evt_expired_cross_instance" });
+  await firstEntered;
+  const second = bridgeTwo.handle({ ...event, eventId: "evt_expired_cross_instance" });
+  await Promise.resolve();
+  assert.equal(created, 1);
+
+  releaseCreate();
+  const firstResult = await first;
+  const secondResult = await second;
+  assert.equal(created, 1);
+  const taskResults = [firstResult, secondResult].filter((result) => result.taskIdentifier);
+  assert.equal(taskResults.filter((result) => !result.duplicate).length, 1);
+  assert.equal(taskResults.every((result) => result.taskIdentifier === "AUTO-1"), true);
+  assert.ok([firstResult, secondResult].some((result) => (
+    result.kind === "pending" || result.duplicate === true
+  )));
+});
+
+test("renews a long-running lease before another Bridge can recover it", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const timers = fakeIntervals();
+  let now = 0;
+  let releaseCreate;
+  const createReleased = new Promise((resolve) => { releaseCreate = resolve; });
+  let enteredCreate;
+  const createEntered = new Promise((resolve) => { enteredCreate = resolve; });
+  let created = 0;
+  const taskboard = {
+    findTaskByEventId: async () => null,
+    ensureProject: async () => {},
+    createTask: async () => {
+      created += 1;
+      enteredCreate();
+      await createReleased;
+      return { id: "task_lease", identifier: "AUTO-LEASE" };
+    },
+  };
+  const bridgeOne = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    taskboard,
+    now: () => now,
+    ownerId: "bridge-lease-one",
+    timers,
+  });
+  const first = bridgeOne.handle({ ...event, eventId: "evt_lease_heartbeat" });
+  await createEntered;
+
+  now = Math.floor(policy.leaseMs / 2);
+  await timers.fireAll();
+  const heartbeatRecord = await store.get("evt_lease_heartbeat");
+  const renewedLeaseUntil = heartbeatRecord.lease?.leaseUntil ?? null;
+
+  now = policy.leaseMs + 1;
+
+  const bridgeTwo = createBridge({
+    config: { ...config, delivery: policy },
+    store: new JsonStateStore(filename),
+    taskboard,
+    now: () => now,
+    ownerId: "bridge-lease-two",
+  });
+  const recovered = await bridgeTwo.recover();
+  const due = recovered === 0 ? await bridgeTwo.processDue() : "recovered";
+
+  releaseCreate();
+  const firstResult = await first.catch((error) => error);
+  assert.equal(renewedLeaseUntil, Math.floor(policy.leaseMs / 2) + policy.leaseMs);
+  assert.equal(recovered, 0);
+  assert.equal(due, null);
+  assert.equal(firstResult.taskIdentifier, "AUTO-LEASE");
+  assert.equal(created, 1);
+  assert.equal(timers.callbacks.size, 0);
+});
+
+test("renews an expired but unreclaimed lease with its fencing token", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const timers = fakeIntervals();
+  let now = 0;
+  let releaseFind;
+  const findReleased = new Promise((resolve) => { releaseFind = resolve; });
+  let enteredFind;
+  const findEntered = new Promise((resolve) => { enteredFind = resolve; });
+  let created = 0;
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    ownerId: "late-heartbeat",
+    timers,
+    taskboard: {
+      findTaskByEventId: async () => {
+        enteredFind();
+        await findReleased;
+        return null;
+      },
+      ensureProject: async () => {},
+      createTask: async () => {
+        created += 1;
+        return { id: "task_late_heartbeat", identifier: "AUTO-LATE-HEARTBEAT" };
+      },
+    },
+  });
+
+  const operation = bridge.handle({ ...event, eventId: "evt_late_heartbeat" });
+  await findEntered;
+  now = policy.leaseMs + 1;
+  await timers.fireAll();
+  releaseFind();
+
+  const result = await operation;
+  assert.equal(result.taskIdentifier, "AUTO-LATE-HEARTBEAT");
+  assert.equal(created, 1);
+  assert.equal(timers.callbacks.size, 0);
+});
+
+test("renews a lease that expires while waiting for the event lock", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const timers = fakeIntervals();
+  let now = 0;
+  const originalEventLock = store.withEventLock.bind(store);
+  store.withEventLock = async (eventId, operation) => {
+    now = policy.leaseMs + 1;
+    return originalEventLock(eventId, operation);
+  };
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    ownerId: "event-lock-late-heartbeat",
+    timers,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async () => ({ id: "task_event_lock_late", identifier: "AUTO-EVENT-LOCK-LATE" }),
+    },
+  });
+
+  const result = await bridge.handle({ ...event, eventId: "evt_event_lock_late" });
+  assert.equal(result.taskIdentifier, "AUTO-EVENT-LOCK-LATE");
+  assert.equal(timers.callbacks.size, 0);
+});
+
+test("waits for an in-flight heartbeat renewal before returning", async () => {
+  const store = memoryStore();
+  const timers = fakeIntervals();
+  let releaseRenew;
+  const renewReleased = new Promise((resolve) => { releaseRenew = resolve; });
+  let renewEntered;
+  const renewEnteredPromise = new Promise((resolve) => { renewEntered = resolve; });
+  store.renewLease = async () => {
+    renewEntered();
+    await renewReleased;
+    return { lease: { leaseUntil: 100 } };
+  };
+  const originalComplete = store.complete.bind(store);
+  store.complete = async (...args) => {
+    const result = await originalComplete(...args);
+    void timers.fireAll();
+    await renewEnteredPromise;
+    return result;
+  };
+
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => 0,
+    ownerId: "heartbeat-stop-wait",
+    timers,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async () => ({ id: "task_stop_wait", identifier: "AUTO-STOP-WAIT" }),
+    },
+  });
+
+  const operation = bridge.handle({ ...event, eventId: "evt_heartbeat_stop_wait" });
+  await renewEnteredPromise;
+  const status = await Promise.race([
+    operation.then(() => "settled"),
+    delay(20).then(() => "waiting"),
+  ]);
+  assert.equal(status, "waiting");
+
+  releaseRenew();
+  const result = await operation;
+  assert.equal(result.taskIdentifier, "AUTO-STOP-WAIT");
+  assert.equal(timers.callbacks.size, 0);
+});
+
+test("returns a durable pending result when the heartbeat loses its lease", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const timers = fakeIntervals();
+  let now = 0;
+  let releaseCreate;
+  const createReleased = new Promise((resolve) => { releaseCreate = resolve; });
+  let enteredCreate;
+  const createEntered = new Promise((resolve) => { enteredCreate = resolve; });
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    ownerId: "heartbeat-lost",
+    timers,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async () => {
+        enteredCreate();
+        await createReleased;
+        return { id: "task_lost", identifier: "AUTO-LOST" };
+      },
+    },
+  });
+  const originalRenew = store.renewLease.bind(store);
+  store.renewLease = async () => {
+    throw Object.assign(new Error("lease replaced"), { code: "LEASE_NOT_OWNED" });
+  };
+  const operation = bridge.handle({ ...event, eventId: "evt_heartbeat_lost" });
+  await createEntered;
+  await timers.fireAll();
+  releaseCreate();
+  const result = await operation;
+  assert.equal(result.kind, "pending");
+  assert.equal(result.deliveryState, "processing");
+  assert.equal(timers.callbacks.size, 0);
+  store.renewLease = originalRenew;
+});
+
+test("does not start a Taskboard side effect after a lease expires during renewal", async () => {
+  const store = memoryStore();
+  const timers = fakeIntervals();
+  let now = 0;
+  let releaseFind;
+  const findReleased = new Promise((resolve) => { releaseFind = resolve; });
+  let markFindEntered;
+  const findEntered = new Promise((resolve) => { markFindEntered = resolve; });
+  let releaseRenew;
+  const renewReleased = new Promise((resolve) => { releaseRenew = resolve; });
+  let markRenewEntered;
+  const renewEntered = new Promise((resolve) => { markRenewEntered = resolve; });
+  let created = 0;
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    ownerId: "heartbeat-expired-before-side-effect",
+    timers,
+    taskboard: {
+      findTaskByEventId: async () => {
+        markFindEntered();
+        await findReleased;
+        return null;
+      },
+      ensureProject: async () => {},
+      createTask: async () => {
+        created += 1;
+        return { id: "task_expired", identifier: "AUTO-EXPIRED" };
+      },
+    },
+  });
+  const originalRenew = store.renewLease.bind(store);
+  store.renewLease = async (...args) => {
+    markRenewEntered();
+    await renewReleased;
+    throw Object.assign(new Error("renewal remained fenced"), { code: "LEASE_NOT_OWNED" });
+  };
+
+  const operation = bridge.handle({ ...event, eventId: "evt_expired_before_side_effect" });
+  await findEntered;
+  const timerRun = timers.fireAll();
+  await renewEntered;
+  now = policy.leaseMs + 1;
+  releaseFind();
+  releaseRenew();
+  await timerRun;
+  const result = await operation;
+
+  assert.equal(created, 0);
+  assert.equal(result.kind, "pending");
+  assert.equal(result.deliveryState, "processing");
+  store.renewLease = originalRenew;
+});
+
+test("persists event-lock timeouts for bounded compensation", async () => {
+  for (const [index, code] of ["STATE_LOCK_TIMEOUT", "EVENT_LOCK_TIMEOUT"].entries()) {
+    let now = 0;
+    const store = memoryStore();
+    store.withEventLock = async () => {
+      throw Object.assign(new Error("event lock busy"), { code });
+    };
+    const bridge = createBridge({
+      config: { ...config, delivery: policy },
+      store,
+      now: () => now,
+      random: () => 0.5,
+      ownerId: `event-lock-timeout-${index}`,
+      taskboard: {
+        ensureProject: assert.fail,
+        createTask: assert.fail,
+      },
+    });
+    assert.deepEqual(await bridge.handle({ ...event, eventId: `evt_event_lock_timeout_${index}` }), {
+      kind: "pending",
+      deliveryState: "retry_wait",
+      attempts: 1,
+      retryAt: 5,
+    });
+    now = 5;
+    assert.deepEqual(await bridge.processDue(), {
+      kind: "dead_letter",
+      deliveryState: "dead_letter",
+      attempts: 2,
+      errorCode: code,
+    });
+  }
+});
+
+test("treats transient heartbeat renewal errors as bounded delivery failures", async () => {
+  let now = 0;
+  const timers = fakeIntervals();
+  const store = memoryStore();
+  store.renewLease = async () => {
+    throw Object.assign(new Error("state lock busy"), { code: "STATE_LOCK_TIMEOUT" });
+  };
+  let releaseFind;
+  const findReleased = new Promise((resolve) => { releaseFind = resolve; });
+  let enteredFind;
+  const findEntered = new Promise((resolve) => { enteredFind = resolve; });
+  let ensured = 0;
+  let created = 0;
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    timers,
+    random: () => 0.5,
+    ownerId: "heartbeat-timeout",
+    taskboard: {
+      findTaskByEventId: async () => {
+        enteredFind();
+        await findReleased;
+        return null;
+      },
+      ensureProject: async () => { ensured += 1; },
+      createTask: async () => {
+        created += 1;
+        return { id: "unexpected", identifier: "UNEXPECTED" };
+      },
+    },
+  });
+  const operation = bridge.handle({ ...event, eventId: "evt_heartbeat_timeout" });
+  await findEntered;
+  assert.equal(timers.callbacks.size, 1);
+  await timers.fireAll();
+  releaseFind();
+  assert.deepEqual(await operation, {
+    kind: "pending",
+    deliveryState: "retry_wait",
+    attempts: 1,
+    retryAt: 5,
+  });
+  assert.equal(ensured, 0);
+  assert.equal(created, 0);
+});
+
+test("tracks due delivery so same-Bridge replay and recovery cannot reclaim it", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  let now = 0;
+  const claim = await store.claimEvent({ ...event, eventId: "evt_due_active" }, {
+    ownerId: "seed",
+    now,
+    leaseMs: policy.leaseMs,
+  });
+  await store.fail("evt_due_active", {
+    ownerId: "seed",
+    token: claim.record.lease.token,
+    error: { code: "TASKBOARD_UNAVAILABLE" },
+    nextAttemptAt: 1,
+    deadLetter: false,
+    now,
+  });
+  now = 1;
+  const timers = fakeIntervals();
+  let releaseCreate;
+  const createReleased = new Promise((resolve) => { releaseCreate = resolve; });
+  let enteredCreate;
+  const createEntered = new Promise((resolve) => { enteredCreate = resolve; });
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    ownerId: "due-owner",
+    timers,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async () => {
+        enteredCreate();
+        await createReleased;
+        return { id: "task_due", identifier: "AUTO-DUE" };
+      },
+    },
+  });
+  const due = bridge.processDue();
+  await enteredCreate;
+  const replay = await bridge.handle({ ...event, eventId: "evt_due_active" });
+  assert.deepEqual(replay, {
+    kind: "pending",
+    deliveryState: "processing",
+    attempts: 2,
+  });
+  assert.equal(await bridge.recover(), 0);
+  releaseCreate();
+  assert.equal((await due).taskIdentifier, "AUTO-DUE");
 });

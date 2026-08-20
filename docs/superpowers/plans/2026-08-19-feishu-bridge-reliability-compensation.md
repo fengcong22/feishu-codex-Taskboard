@@ -6,7 +6,7 @@
 
 **Architecture:** Persist a versioned delivery record for every normalized event, atomically lease it before processing, and retry only classified temporary delivery failures through a single compensation worker. Retain the official Feishu SDK's built-in reconnect behavior rather than adding a competing reconnect loop; expose its lifecycle as `sdk_managed` because this SDK version has no public connection-event or dispose API.
 
-**Tech Stack:** Node.js >= 22.5 ESM, built-in `node:test`, JSON state file with atomic rename and directory locks, PowerShell 5-compatible operational scripts, `@larksuiteoapi/node-sdk@1.36.x`.
+**Tech Stack:** Node.js >= 22.5 ESM, built-in `node:test`, JSON state file with atomic rename and an OS-managed local IPC lock, PowerShell 5-compatible operational scripts, `@larksuiteoapi/node-sdk@1.36.x`.
 
 ## Global Constraints
 
@@ -28,6 +28,7 @@
 | --- | --- |
 | `src/retry-policy.mjs` | Pure defaults, retryable-error classification, exponential backoff, and safe error summaries. |
 | `src/state-store.mjs` | Versioned delivery records, legacy migration, atomic claim/lease transitions, due-record selection, and queue statistics. |
+| `src/state-lock.mjs` | OS-managed per-state-file local IPC lock; process termination releases the lock without stale-directory takeover. |
 | `src/bridge.mjs` | One delivery path shared by new events and recovered events; translates errors into durable delivery states. |
 | `src/compensation-worker.mjs` | One serial poller that recovers expired leases and drains due records without overlapping ticks. |
 | `src/feishu-ws.mjs` | Existing normalization queue plus explicit SDK auto-reconnect option and truthful listener activity health. |
@@ -50,7 +51,7 @@ The persisted v2 record uses millisecond Unix timestamps for deterministic compa
   decision: null | "ready" | "blocked" | "ignored",
   attempts: 0,
   nextAttemptAt: null,
-  lease: null | { ownerId: "bridge-instance-id", leaseUntil: 0 },
+  lease: null | { ownerId: "bridge-instance-id", token: "fencing-token", leaseUntil: 0 },
   lastError: null | { code: "TASKBOARD_UNAVAILABLE", status: 0, at: 0 },
   failureHistory: [],
   outcome: null | { kind: "ready" | "blocked" | "ignored", taskId?: "...", taskIdentifier?: "..." },
@@ -239,16 +240,17 @@ git commit -m "feat: add bridge delivery retry policy"
 store.claimEvent(event, { ownerId, now, leaseMs })
 // => { kind: "claimed", record } | { kind: "terminal", record } | { kind: "deferred", record }
 
-store.claimNextDue({ ownerId, now, leaseMs })
+store.claimNextDue({ ownerId, now, leaseMs, excludeEventIds? })
 // => record | null
 
-store.complete(eventId, { ownerId, decision, outcome, now })
-store.fail(eventId, { ownerId, error, nextAttemptAt, deadLetter, now })
-store.recoverExpiredLeases({ now })
+store.complete(eventId, { ownerId, token, decision, outcome, now })
+store.fail(eventId, { ownerId, token, error, nextAttemptAt, deadLetter, now })
+store.renewLease(eventId, { ownerId, token, now, leaseMs })
+store.recoverExpiredLeases({ now, excludeEventIds? })
 store.getQueueStats()
 ```
 
-- `complete()` and `fail()` reject an owner mismatch or expired lease instead of overwriting another worker's record.
+- Each claim carries a random fencing token; `complete()`, `fail()` and `renewLease()` require the matching owner and token, and terminal writes reject expired leases instead of overwriting another worker's record.
 
 - [ ] **Step 1: Write the failing state-transition tests.**
 
@@ -300,7 +302,7 @@ Expected: FAIL because `claimEvent` and the other v2 transition methods do not e
 
 - [ ] **Step 3: Implement record normalization and a single locked mutation primitive.**
 
-Keep the current lock directory, stale-lock recovery, atomic temporary-file rename, and `0600` file mode. Replace `#write(eventId, outcome, overwrite)` with a `#mutate(operation)` helper that reads, normalizes, mutates, and writes the entire map while holding the file lock.
+Use an OS-managed local IPC lock keyed by the canonical absolute state-file path, plus the existing atomic temporary-file rename and `0600` file mode. Process termination must release the lock without PID-based stale takeover. The configured state path must be a stable regular file path: reject the state file itself when it is a symbolic link or hard-link/multi-link alias, and do not replace the configured path while the service is running. The lock covers only processes on the same Windows/Linux host. Replace `#write(eventId, outcome, overwrite)` with a `#mutate(operation)` helper that reads, normalizes, mutates, and writes the entire map while holding the file lock.
 
 Use these exact helpers and record construction rules:
 

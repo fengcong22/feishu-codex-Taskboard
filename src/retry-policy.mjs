@@ -6,6 +6,58 @@ export const DEFAULT_DELIVERY_POLICY = Object.freeze({
   pollIntervalMs: 1_000,
 });
 
+const SAFE_DELIVERY_ERROR_CODES = new Map([
+  "BODY_TOO_LARGE",
+  "BRIDGE_FAILURE",
+  "DELIVERY_FAILED",
+  "EVENT_RECORD_ID_MISMATCH",
+  "EVENT_RECORD_INVALID",
+  "EVENT_LOCK_TIMEOUT",
+  "EVENT_SNAPSHOT_MISSING",
+  "FEISHU_EVENT_HANDLER_FAILED",
+  "FEISHU_LISTENER_START_FAILED",
+  "FEISHU_RECORD_LOOKUP_FAILED",
+  "FEISHU_SDK_MISSING",
+  "FEISHU_TITLE_LOOKUP_FAILED",
+  "FEISHU_TITLE_LOOKUP_TIMEOUT",
+  "INTERNAL_ERROR",
+  "INVALID_ACTOR",
+  "INVALID_BODY",
+  "INVALID_EVENT",
+  "INVALID_FIELD",
+  "INVALID_HOST",
+  "INVALID_JSON",
+  "INVALID_ORIGIN",
+  "INVALID_PATH",
+  "INVALID_QUERY_PARAMETER",
+  "LEGACY_EVENT_SNAPSHOT_MISSING",
+  "LOCAL_ONLY",
+  "METHOD_NOT_ALLOWED",
+  "NOT_FOUND",
+  "PROCESSING_EVENT_SNAPSHOT_MISSING",
+  "PROJECT_EXISTS",
+  "PROJECT_NOT_FOUND",
+  "STATE_LOCK_TARGET_CHANGED",
+  "STATE_LOCK_TARGET_UNSUPPORTED",
+  "STATE_LOCK_TIMEOUT",
+  "STATE_LOCK_UNSUPPORTED_PLATFORM",
+  "STATE_FILE_INVALID",
+  "TASKBOARD_INVALID_RESPONSE",
+  "TASKBOARD_REQUEST_FAILED",
+  "TASKBOARD_UNAVAILABLE",
+  "TASK_NOT_FOUND",
+  "UNKNOWN_FIELD",
+  "UNKNOWN_QUERY_PARAMETER",
+  "UNSUPPORTED_MEDIA_TYPE",
+  "VERSION_CONFLICT",
+].map((code) => [code, code]));
+
+export function safeDeliveryErrorCode(value, fallback = "DELIVERY_FAILED") {
+  const safeFallback = SAFE_DELIVERY_ERROR_CODES.get(fallback) ?? "DELIVERY_FAILED";
+  if (typeof value !== "string") return safeFallback;
+  return SAFE_DELIVERY_ERROR_CODES.get(value.trim()) ?? safeFallback;
+}
+
 function positiveInteger(value, name, minimum = 1) {
   if (!Number.isInteger(value) || value < minimum) {
     throw new Error(`${name} must be an integer >= ${minimum}`);
@@ -55,13 +107,16 @@ export function validateDeliveryPolicy(input) {
 
 export function classifyDeliveryError(error) {
   const status = Number.isInteger(error?.status) ? error.status : 0;
-  const code = typeof error?.code === "string" && error.code
-    ? error.code
-    : "DELIVERY_FAILED";
+  const code = safeDeliveryErrorCode(error?.code);
   return {
     code,
     status,
-    retryable: code === "TASKBOARD_UNAVAILABLE" || status === 429 || (status >= 500 && status < 600),
+    retryable: code === "TASKBOARD_UNAVAILABLE"
+      || code === "EVENT_LOCK_TIMEOUT"
+      || code === "STATE_LOCK_TIMEOUT"
+      || status === 408
+      || status === 429
+      || (status >= 500 && status < 600),
   };
 }
 

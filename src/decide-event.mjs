@@ -36,10 +36,21 @@ export function decideRecordChange(config, event) {
   if (!triggerMatches) {
     return { kind: "ignored", reason: "unrelated_field" };
   }
-  if (displayValue(event.afterValue) !== table.triggerValue) {
+  const before = displayValue(event.beforeValue);
+  const after = displayValue(event.afterValue);
+  if (before === table.triggerValue && after !== table.triggerValue) {
+    return {
+      kind: "ignored",
+      reason: "left_trigger",
+      effect: "archive_waiting_tasks",
+      table,
+      event,
+    };
+  }
+  if (after !== table.triggerValue) {
     return { kind: "ignored", reason: "new_value_not_trigger" };
   }
-  if (displayValue(event.beforeValue) === table.triggerValue) {
+  if (before === table.triggerValue) {
     return { kind: "ignored", reason: "already_at_trigger" };
   }
 

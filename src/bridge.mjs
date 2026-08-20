@@ -9,6 +9,7 @@ import {
 } from "./retry-policy.mjs";
 import { logDelivery } from "./observability.mjs";
 import { buildTaskPayload } from "./task-payload.mjs";
+import { archiveWaitingFeishuTasks } from "./task-lifecycle.mjs";
 
 const DEFAULT_TITLE_LOOKUP_TIMEOUT_MS = 5_000;
 
@@ -47,6 +48,16 @@ function publicDeadLetter(record, duplicate = false) {
   };
 }
 
+function leaseLostError() {
+  const error = new Error("delivery lease lost");
+  error.code = "LEASE_LOST";
+  return error;
+}
+
+function isLeaseLost(error) {
+  return error?.code === "LEASE_LOST" || error?.code === "LEASE_NOT_OWNED";
+}
+
 export function createBridge({
   config,
   store,
@@ -57,9 +68,91 @@ export function createBridge({
   random = Math.random,
   ownerId = randomUUID(),
   logger = console,
+  timers = globalThis,
 }) {
   const inFlight = new Map();
   const delivery = config?.delivery ?? DEFAULT_DELIVERY_POLICY;
+
+  function startLeaseHeartbeat(record) {
+    const token = record.lease?.token;
+    const intervalMs = Math.max(1, Math.floor(delivery.leaseMs / 3));
+    let leaseUntil = Number.isFinite(record.lease?.leaseUntil) ? record.lease.leaseUntil : null;
+    let stopped = false;
+    let renewal = null;
+    let lost = null;
+    let renewalError = null;
+
+    function assertActive() {
+      if (lost) throw lost;
+      if (renewalError) throw renewalError;
+    }
+
+    if (typeof store.renewLease !== "function" || !token) {
+      return {
+        assertActive,
+        async ensureActive() {
+          assertActive();
+          if (leaseUntil !== null && leaseUntil <= now()) {
+            lost = leaseLostError();
+            throw lost;
+          }
+        },
+        async stop() {},
+      };
+    }
+
+    async function renew() {
+      if (stopped || lost || renewalError) return;
+      if (renewal) return renewal;
+      renewal = Promise.resolve()
+        .then(() => store.renewLease(record.eventId, {
+          ownerId,
+          token,
+          now: now(),
+          leaseMs: delivery.leaseMs,
+          clock: now,
+        }))
+        .then((renewed) => {
+          const nextLeaseUntil = renewed?.lease?.leaseUntil;
+          leaseUntil = Number.isFinite(nextLeaseUntil)
+            ? nextLeaseUntil
+            : now() + delivery.leaseMs;
+        })
+        .catch((error) => {
+          if (error?.code === "LEASE_NOT_OWNED" || error?.code === "LEASE_LOST") {
+            lost = leaseLostError();
+          } else {
+            renewalError = error;
+          }
+        })
+        .finally(() => {
+          renewal = null;
+        });
+      return renewal;
+    }
+
+    const timer = timers.setInterval(() => renew(), intervalMs);
+    return {
+      assertActive,
+      async ensureActive() {
+        if (renewal) await renewal;
+        assertActive();
+        if (leaseUntil !== null && leaseUntil - now() <= intervalMs) {
+          await renew();
+        }
+        assertActive();
+        if (leaseUntil !== null && leaseUntil <= now()) {
+          lost = leaseLostError();
+          throw lost;
+        }
+      },
+      async stop() {
+        stopped = true;
+        timers.clearInterval(timer);
+        if (renewal) await renewal;
+      },
+    };
+  }
 
   function logRecord(level, record, details = {}) {
     logDelivery(logger, level, {
@@ -73,7 +166,19 @@ export function createBridge({
     });
   }
 
+  async function resultAfterLeaseLoss(record) {
+    if (typeof store.get !== "function") return publicPending(record);
+    const current = await store.get(record.eventId);
+    if (!current) return publicPending(record);
+    if (current.deliveryState === "succeeded") {
+      return { ...current.outcome, duplicate: true };
+    }
+    if (current.deliveryState === "dead_letter") return publicDeadLetter(current);
+    return publicPending(current);
+  }
+
   async function failClaim(record, error) {
+    if (isLeaseLost(error)) return resultAfterLeaseLoss(record);
     const classification = classifyDeliveryError(error);
     const attempts = record.attempts;
     const timestamp = now();
@@ -85,13 +190,21 @@ export function createBridge({
       maxDelayMs: delivery.maxDelayMs,
       random,
     });
-    const stored = await store.fail(record.eventId, {
-      ownerId,
-      error: summarizeDeliveryError(error, timestamp),
-      nextAttemptAt: retryAt,
-      deadLetter,
-      now: timestamp,
-    });
+    let stored;
+    try {
+      stored = await store.fail(record.eventId, {
+        ownerId,
+        token: record.lease?.token,
+        error: summarizeDeliveryError(error, timestamp),
+        nextAttemptAt: retryAt,
+        deadLetter,
+        now: timestamp,
+        clock: now,
+      });
+    } catch (stateError) {
+      if (isLeaseLost(stateError)) return resultAfterLeaseLoss(record);
+      throw stateError;
+    }
     if (deadLetter) {
       logRecord("error", stored, {
         deliveryState: "dead_letter",
@@ -116,15 +229,28 @@ export function createBridge({
       return failClaim(record, error);
     }
 
+    let heartbeat = { assertActive() {}, async stop() {} };
     try {
+      heartbeat = startLeaseHeartbeat(record);
+      await heartbeat.ensureActive();
       const decision = decideRecordChange(config, event);
       if (decision.kind === "ignored") {
+        if (decision.effect === "archive_waiting_tasks") {
+          await archiveWaitingFeishuTasks(
+            taskboard,
+            { event, table: decision.table },
+            { ensureActive: () => heartbeat.ensureActive() },
+          );
+        }
+        await heartbeat.ensureActive();
         const outcome = { kind: "ignored", reason: decision.reason };
         await store.complete(record.eventId, {
           ownerId,
+          token: record.lease?.token,
           decision: decision.kind,
           outcome,
           now: now(),
+          clock: now,
         });
         logRecord("info", record, { deliveryState: "succeeded" });
         return outcome;
@@ -152,18 +278,27 @@ export function createBridge({
         }
       }
 
+      await heartbeat.ensureActive();
       const payload = buildTaskPayload(taskDecision);
+      await heartbeat.ensureActive();
       let task = typeof taskboard.findTaskByEventId === "function"
         ? await taskboard.findTaskByEventId(record.eventId, payload.projectId)
         : null;
+      await heartbeat.ensureActive();
       if (!task && decision.kind === "ready") {
+        await heartbeat.ensureActive();
         await taskboard.ensureProject({
           id: decision.packageConfig.projectId,
           name: decision.packageConfig.projectName,
           workspacePath: decision.packageConfig.workspacePath,
         });
+        await heartbeat.ensureActive();
       }
-      if (!task) task = await taskboard.createTask(payload);
+      if (!task) {
+        await heartbeat.ensureActive();
+        task = await taskboard.createTask(payload);
+      }
+      await heartbeat.ensureActive();
       const outcome = {
         kind: decision.kind,
         ...(decision.reason ? { reason: decision.reason } : {}),
@@ -173,9 +308,11 @@ export function createBridge({
       };
       await store.complete(record.eventId, {
         ownerId,
+        token: record.lease?.token,
         decision: decision.kind,
         outcome,
         now: now(),
+        clock: now,
       });
       logRecord("info", record, {
         deliveryState: "succeeded",
@@ -184,6 +321,8 @@ export function createBridge({
       return outcome;
     } catch (error) {
       return failClaim(record, error);
+    } finally {
+      await heartbeat.stop();
     }
   }
 
@@ -195,7 +334,38 @@ export function createBridge({
       return { ...claim.record.outcome, duplicate: true };
     }
     if (claim.kind === "deferred") return publicPending(claim.record);
-    return deliverClaimedRecord(claim.record);
+    return deliverClaimedRecordWithEventLock(claim.record);
+  }
+
+  async function withEventLock(eventId, operation) {
+    if (typeof store.withEventLock !== "function") return operation();
+    return store.withEventLock(eventId, operation);
+  }
+
+  async function currentLeaseIsOwned(record) {
+    if (typeof store.get !== "function") return true;
+    const current = await store.get(record.eventId);
+    return Boolean(
+      current
+      && current.deliveryState === "processing"
+      && current.lease?.ownerId === ownerId
+      && current.lease?.token === record.lease?.token
+      && Number.isFinite(current.lease?.leaseUntil)
+    );
+  }
+
+  async function deliverClaimedRecordWithEventLock(record) {
+    try {
+      return await withEventLock(record.eventId, async () => {
+        if (!(await currentLeaseIsOwned(record))) return resultAfterLeaseLoss(record);
+        return deliverClaimedRecord(record);
+      });
+    } catch (error) {
+      if (error?.code === "STATE_LOCK_TIMEOUT" || error?.code === "EVENT_LOCK_TIMEOUT") {
+        return failClaim(record, error);
+      }
+      throw error;
+    }
   }
 
   async function processEvent(event) {
@@ -203,21 +373,35 @@ export function createBridge({
       ownerId,
       now: now(),
       leaseMs: delivery.leaseMs,
+      clock: now,
     });
     return handleClaim(claim);
+  }
+
+  function trackDelivery(eventId, operation) {
+    let tracked;
+    tracked = Promise.resolve()
+      .then(operation)
+      .finally(() => {
+        if (inFlight.get(eventId) === tracked) inFlight.delete(eventId);
+      });
+    inFlight.set(eventId, tracked);
+    return tracked;
   }
 
   return {
     handle(event) {
       const active = inFlight.get(event.eventId);
       if (active) return active.then((outcome) => ({ ...outcome, duplicate: true }));
-      const operation = processEvent(event).finally(() => inFlight.delete(event.eventId));
-      inFlight.set(event.eventId, operation);
-      return operation;
+      return trackDelivery(event.eventId, () => processEvent(event));
     },
 
     recover() {
-      return store.recoverExpiredLeases({ now: now() });
+      return store.recoverExpiredLeases({
+        now: now(),
+        clock: now,
+        excludeEventIds: new Set(inFlight.keys()),
+      });
     },
 
     async processDue() {
@@ -225,9 +409,14 @@ export function createBridge({
         ownerId,
         now: now(),
         leaseMs: delivery.leaseMs,
+        clock: now,
+        excludeEventIds: new Set(inFlight.keys()),
       });
       if (!record) return null;
-      return deliverClaimedRecord(record);
+      return trackDelivery(record.eventId, async () => {
+        if (!(await currentLeaseIsOwned(record))) return resultAfterLeaseLoss(record);
+        return deliverClaimedRecordWithEventLock(record);
+      });
     },
 
     getQueueStats() {

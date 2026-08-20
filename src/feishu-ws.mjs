@@ -2,6 +2,7 @@ import {
   BITABLE_RECORD_CHANGED_EVENT,
   normalizeBitableRecordChanged,
 } from "./feishu-event.mjs";
+import { safeDeliveryErrorCode } from "./retry-policy.mjs";
 
 export { BITABLE_RECORD_CHANGED_EVENT } from "./feishu-event.mjs";
 
@@ -24,26 +25,22 @@ function createClientSdk(sdk) {
   return value;
 }
 
-async function stopClient(client) {
+function findStopMethod(client) {
   for (const method of ["stop", "close", "disconnect"]) {
-    if (typeof client?.[method] === "function") {
-      await client[method]();
-      return true;
-    }
+    if (typeof client?.[method] === "function") return method;
   }
-  return false;
+  return null;
 }
 
-function safeErrorCode(error, fallback) {
-  const code = typeof error?.code === "string" ? error.code.trim() : "";
-  // Error codes are surfaced in health and logs, so accept only a bounded,
-  // identifier-like value rather than accidentally exposing an error message.
-  return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/.test(code) ? code : fallback;
+async function stopClient(client, method) {
+  if (!method) return false;
+  await client[method]();
+  return true;
 }
 
 function safeErrorSummary(error, fallback) {
   return {
-    code: safeErrorCode(error, fallback),
+    code: safeDeliveryErrorCode(error?.code, fallback),
     at: Date.now(),
   };
 }
@@ -90,6 +87,7 @@ export function createFeishuWsListener({
   let lastEventAt = null;
   let lastError = null;
   let startPromise = null;
+  let stopRequested = false;
 
   function notifyStatus(status, detail) {
     try {
@@ -100,8 +98,9 @@ export function createFeishuWsListener({
   }
 
   function recordStartFailure(error) {
-    state = "error";
+    if (stopRequested) return;
     lastError = safeErrorSummary(error, "FEISHU_LISTENER_START_FAILED");
+    state = "error";
     notifyStatus(state, lastError);
   }
 
@@ -168,23 +167,29 @@ export function createFeishuWsListener({
       }
       if (result && typeof result.then === "function") {
         startPromise = Promise.resolve(result).then((value) => {
-          state = "sdk_managed";
-          notifyStatus(state);
+          if (!stopRequested) {
+            state = "sdk_managed";
+            notifyStatus(state);
+          }
           return value;
         }, (error) => {
           recordStartFailure(error);
           throw error;
         });
       } else {
-        state = "sdk_managed";
-        notifyStatus(state);
+        if (!stopRequested) {
+          state = "sdk_managed";
+          notifyStatus(state);
+        }
         startPromise = Promise.resolve(result);
       }
       return startPromise;
     },
     async stop() {
+      const stopMethod = findStopMethod(wsClient);
+      if (stopMethod) stopRequested = true;
       await this.drain();
-      const stopped = await stopClient(wsClient);
+      const stopped = await stopClient(wsClient, stopMethod);
       if (stopped) {
         state = "stopped";
         notifyStatus(state);

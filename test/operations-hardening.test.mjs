@@ -6,6 +6,10 @@ import test from "node:test";
 const checkUrl = new URL("../scripts/check-local.ps1", import.meta.url);
 const agentsUrl = new URL("../AGENTS.md", import.meta.url);
 const readmeUrl = new URL("../README.md", import.meta.url);
+const reliabilitySpecUrl = new URL(
+  "../docs/superpowers/specs/2026-08-19-feishu-bridge-reliability-compensation-design.md",
+  import.meta.url,
+);
 const taskboardScreenshotUrl = new URL("../docs/assets/taskboard-kanban-demo.jpg", import.meta.url);
 
 function windowsPath(url) {
@@ -82,8 +86,22 @@ test("README presents the verified bridge capabilities without claiming unsuppor
   assert.match(source, /死信|dead.?letter/i);
   assert.match(source, /SDK.*自动重连/);
   assert.match(source, /sdk_managed/);
+  assert.match(source, /至少一次/);
+  assert.match(source, /原生幂等|exactly.?once/i);
+  assert.match(source, /符号链接.*硬链接|硬链接.*符号链接/s);
   assert.doesNotMatch(source, /不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障/);
   assert.doesNotMatch(source, /打开任务后点击“启动 Codex”/);
+});
+
+test("reliability contract states the Taskboard idempotency boundary", async () => {
+  const [agents, spec] = await Promise.all([
+    readFile(agentsUrl, "utf8"),
+    readFile(reliabilitySpecUrl, "utf8"),
+  ]);
+  assert.match(agents, /至少一次/);
+  assert.match(agents, /原生幂等|exactly.?once/i);
+  assert.match(spec, /至少一次/);
+  assert.match(spec, /不宣称绝对 exactly-once/);
 });
 
 test("README embeds a real Taskboard screenshot labeled as local test data", async () => {

@@ -78,7 +78,7 @@ if ($RequireFeishu -and $listenerState -notin @('sdk_managed')) {
 
 $queue = $bridge.queue
 if ($null -eq $queue) {
-  $queue = [pscustomobject]@{ pending = 0; processing = 0; retryWait = 0; deadLetter = 0 }
+  throw 'Bridge health queue counters are missing.'
 }
 function Get-QueueCount([object]$Queue, [string]$Name) {
   $value = $Queue.$Name

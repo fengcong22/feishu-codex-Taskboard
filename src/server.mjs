@@ -1,6 +1,15 @@
 import { createServer } from "node:http";
 
+import { safeDeliveryErrorCode } from "./retry-policy.mjs";
+
 const BODY_LIMIT = 1_000_000;
+
+function publicFailure(error) {
+  return {
+    code: safeDeliveryErrorCode(error?.code, "BRIDGE_FAILURE"),
+    message: "Bridge request failed",
+  };
+}
 
 function sendJson(response, status, value) {
   const body = JSON.stringify(value);
@@ -61,20 +70,19 @@ export function createBridgeServer({ host, port, configSummary, handleEvent, get
           event = validateEvent(await readJson(request));
         } catch (error) {
           return sendJson(response, 400, {
-            error: { code: "INVALID_EVENT", message: error.message },
+            error: { code: "INVALID_EVENT", message: "Invalid simulated event" },
           });
         }
         const outcome = await handleEvent(event);
-        const status = outcome.duplicate ? 200
-          : outcome.kind === "ready" || outcome.kind === "blocked" ? 201
-            : outcome.kind === "pending" || outcome.kind === "dead_letter" ? 202
-              : 200;
+        const status = outcome.kind === "pending" || outcome.kind === "dead_letter" ? 202
+          : outcome.kind === "ready" || outcome.kind === "blocked" ? (outcome.duplicate ? 200 : 201)
+            : 200;
         return sendJson(response, status, outcome);
       }
       sendJson(response, 404, { error: { code: "NOT_FOUND", message: "Route not found" } });
     } catch (error) {
       sendJson(response, 502, {
-        error: { code: error.code ?? "BRIDGE_FAILURE", message: error.message },
+        error: publicFailure(error),
       });
     }
   });

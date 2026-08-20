@@ -76,6 +76,22 @@ test("rejects incomplete simulated events", async (t) => {
   assert.equal((await response.json()).error.code, "INVALID_EVENT");
 });
 
+test("does not echo malformed JSON content in validation errors", async (t) => {
+  const app = await start(assert.fail);
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: '{"value":secret-token-not-for-client}',
+  });
+  const text = await response.text();
+  assert.equal(response.status, 400);
+  assert.equal(text.includes("secret-token-not-for-client"), false);
+  assert.deepEqual(JSON.parse(text), {
+    error: { code: "INVALID_EVENT", message: "Invalid simulated event" },
+  });
+});
+
 test("returns 202 when a simulated event is durably pending retry", async (t) => {
   const app = await start(async () => ({
     kind: "pending",
@@ -126,4 +142,58 @@ test("returns 202 when a simulated event is durably dead-lettered", async (t) =>
   });
   assert.equal(response.status, 202);
   assert.equal((await response.json()).deliveryState, "dead_letter");
+});
+
+test("returns 202 when a persisted dead letter is replayed", async (t) => {
+  const app = await start(async () => ({
+    kind: "dead_letter",
+    deliveryState: "dead_letter",
+    attempts: 8,
+    errorCode: "TASKBOARD_UNAVAILABLE",
+    duplicate: true,
+  }));
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      eventId: "evt_dead_letter_replay",
+      baseToken: "bas_demo",
+      tableId: "tbl_a",
+      recordId: "rec_1",
+      fieldName: "视频整体进度",
+      beforeValue: "素材齐全",
+      afterValue: "待剪辑",
+      fields: { 自动剪辑项目包: "Auto-cut-copyA" },
+    }),
+  });
+  assert.equal(response.status, 202);
+});
+
+test("sanitizes unexpected simulation failures", async (t) => {
+  const app = await start(async () => {
+    throw Object.assign(new Error("secret-token\nnot-for-client"), {
+      code: "fake-app-secret-do-not-log",
+    });
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      eventId: "evt_failure",
+      baseToken: "bas_demo",
+      tableId: "tbl_a",
+      recordId: "rec_1",
+      fieldName: "视频整体进度",
+      beforeValue: "素材齐全",
+      afterValue: "待剪辑",
+      fields: { 自动剪辑项目包: "Auto-cut-copyA" },
+    }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 502);
+  assert.deepEqual(body, {
+    error: { code: "BRIDGE_FAILURE", message: "Bridge request failed" },
+  });
 });

@@ -126,6 +126,26 @@ test("records a safe callback failure summary without exposing the raw error", a
   assert.equal(JSON.stringify(logs).includes(expected.message), false);
 });
 
+test("maps unknown callback error codes to a listener-owned code", async () => {
+  const expected = Object.assign(new Error("do not expose"), {
+    code: "fake-app-secret-do-not-log",
+  });
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table],
+    sdk: fakeSdk(),
+    logger: { error() {} },
+    handleEvent: async () => { throw expected; },
+  });
+  await listener.start();
+  await assert.rejects(
+    listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT](payload()),
+    expected,
+  );
+  assert.equal(listener.health.lastError.code, "FEISHU_EVENT_HANDLER_FAILED");
+});
+
 test("does not claim stopped when the SDK exposes no public stop method", async () => {
   const sdk = fakeSdk();
   delete sdk.WSClient.prototype.stop;
@@ -140,6 +160,130 @@ test("does not claim stopped when the SDK exposes no public stop method", async 
   await listener.start();
   await listener.stop();
   assert.equal(listener.health.state, "sdk_managed");
+});
+
+test("allows a pending start to finish when the SDK exposes no stop method", async () => {
+  let resolveStart;
+  const sdk = fakeSdk();
+  delete sdk.WSClient.prototype.stop;
+  sdk.WSClient.prototype.start = function start() {
+    return new Promise((resolve) => { resolveStart = resolve; });
+  };
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table],
+    sdk,
+    handleEvent: async () => {},
+  });
+
+  const starting = listener.start();
+  await listener.stop();
+  resolveStart();
+  await starting;
+
+  assert.equal(listener.health.state, "sdk_managed");
+});
+
+test("does not let a pending start overwrite stopped health", async () => {
+  let resolveStart;
+  const sdk = fakeSdk();
+  sdk.WSClient.prototype.start = function start() {
+    this.startedWith = arguments[0];
+    return new Promise((resolve) => { resolveStart = resolve; });
+  };
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table],
+    sdk,
+    handleEvent: async () => {},
+  });
+  const starting = listener.start();
+  const stopping = listener.stop();
+  await stopping;
+  assert.equal(listener.health.state, "stopped");
+  resolveStart();
+  await starting;
+  await stopping;
+  assert.equal(listener.health.state, "stopped");
+});
+
+test("does not publish sdk_managed when start resolves during an in-progress stop", async () => {
+  let resolveStart;
+  let resolveStop;
+  let markStopStarted;
+  const stopStarted = new Promise((resolve) => { markStopStarted = resolve; });
+  const statuses = [];
+  const sdk = fakeSdk();
+  sdk.WSClient.prototype.start = function start() {
+    return new Promise((resolve) => { resolveStart = resolve; });
+  };
+  sdk.WSClient.prototype.stop = function stop() {
+    markStopStarted();
+    return new Promise((resolve) => { resolveStop = resolve; });
+  };
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table],
+    sdk,
+    onStatus: (status) => statuses.push(status),
+    handleEvent: async () => {},
+  });
+
+  const starting = listener.start();
+  const stopping = listener.stop();
+  await stopStarted;
+  resolveStart();
+  await starting;
+
+  assert.notEqual(listener.health.state, "sdk_managed");
+  assert.equal(statuses.includes("sdk_managed"), false);
+
+  resolveStop();
+  await stopping;
+  assert.equal(listener.health.state, "stopped");
+});
+
+test("does not publish an error when start rejects after stop intent", async () => {
+  let rejectStart;
+  let resolveStop;
+  let markStopStarted;
+  const stopStarted = new Promise((resolve) => { markStopStarted = resolve; });
+  const statuses = [];
+  const expected = new Error("late start rejection");
+  const sdk = fakeSdk();
+  sdk.WSClient.prototype.start = function start() {
+    return new Promise((_resolve, reject) => { rejectStart = reject; });
+  };
+  sdk.WSClient.prototype.stop = function stop() {
+    markStopStarted();
+    return new Promise((resolve) => { resolveStop = resolve; });
+  };
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table],
+    sdk,
+    onStatus: (status) => statuses.push(status),
+    handleEvent: async () => {},
+  });
+
+  const starting = listener.start();
+  const rejected = assert.rejects(starting, expected);
+  const stopping = listener.stop();
+  await stopStarted;
+  rejectStart(expected);
+  await rejected;
+
+  assert.notEqual(listener.health.state, "error");
+  assert.equal(listener.health.lastError, null);
+  assert.equal(statuses.includes("error"), false);
+
+  resolveStop();
+  await stopping;
+  assert.equal(listener.health.state, "stopped");
 });
 
 test("registers the bitable event and forwards normalized records through a non-blocking queue", async () => {

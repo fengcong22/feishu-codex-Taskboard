@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildTaskPayload } from "../src/task-payload.mjs";
+import { buildTaskPayload, parseFeishuTaskMetadata } from "../src/task-payload.mjs";
 
 const event = {
   eventId: "evt_1",
@@ -60,6 +60,34 @@ test("metadata marker remains parseable when record context contains HTML delimi
     event: { ...event, recordId: "rec_>_-->", recordTitle: "title > marker" },
   });
   assert.match(payload.description, /feishu-codex-task:v1:[A-Za-z0-9_-]+/);
+});
+
+test("stores the configured trigger field id in task metadata", () => {
+  const payload = buildTaskPayload({
+    kind: "ready",
+    table: { ...table, triggerFieldId: "fld_progress" },
+    packageAlias: "Auto-cut-copyA",
+    packageConfig: {
+      projectId: "auto-cut-copy-a",
+      projectName: "Auto-cut-copyA",
+      workspacePath: "D:\\trusted\\Auto-cut-copyA",
+      prompt: "trusted",
+    },
+    event,
+  });
+  assert.equal(parseFeishuTaskMetadata(payload.description)?.triggerFieldId, "fld_progress");
+});
+
+test("continues to parse existing marker metadata without a trigger field id", () => {
+  const encoded = Buffer.from(JSON.stringify({
+    version: 1,
+    source: "feishu-base",
+    eventId: "evt_existing",
+  }), "utf8").toString("base64url");
+  assert.deepEqual(
+    parseFeishuTaskMetadata(`<!-- feishu-codex-task:v1:${encoded} -->`),
+    { version: 1, source: "feishu-base", eventId: "evt_existing" },
+  );
 });
 
 test("labels a table-level default package without implying that the Base field exists", () => {
