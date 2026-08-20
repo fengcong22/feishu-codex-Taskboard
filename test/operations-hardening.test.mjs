@@ -6,6 +6,10 @@ import test from "node:test";
 const checkUrl = new URL("../scripts/check-local.ps1", import.meta.url);
 const agentsUrl = new URL("../AGENTS.md", import.meta.url);
 const readmeUrl = new URL("../README.md", import.meta.url);
+const reliabilitySpecUrl = new URL(
+  "../docs/superpowers/specs/2026-08-19-feishu-bridge-reliability-compensation-design.md",
+  import.meta.url,
+);
 const taskboardScreenshotUrl = new URL("../docs/assets/taskboard-kanban-demo.jpg", import.meta.url);
 
 function windowsPath(url) {
@@ -21,6 +25,13 @@ test("check script exposes a sanitized, opt-in Feishu health contract", async ()
   assert.match(source, /127\.0\.0\.1:47824\/health/);
   assert.match(source, /Invoke-RestMethod/);
   assert.match(source, /LASTEXITCODE|exit\s+1/i);
+  assert.match(source, /\$bridge\.feishuListener\.state/);
+  assert.match(source, /\$bridge\.queue/);
+  assert.match(source, /sdk_managed/);
+  assert.match(source, /retryWait/);
+  assert.match(source, /deadLetter/);
+  assert.match(source, /public socket|socket-confirmed|物理.*连接|socket/i);
+  assert.doesNotMatch(source, /lastError\.message/);
   assert.doesNotMatch(source, /Get-Content[^\r\n]*\.env\.local/i);
   assert.doesNotMatch(source, /FEISHU_APP_SECRET\s*=/i);
 });
@@ -71,8 +82,26 @@ test("README presents the verified bridge capabilities without claiming unsuppor
   assert.match(source, /完成本地配置后/);
   assert.match(source, /团队提供的匹配测试配置/);
   assert.match(source, /Taskboard 的手动启动与网页展示属于外部 Taskboard 能力/);
-  assert.match(source, /不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障/);
+  assert.match(source, /持久化重试|自动重试/);
+  assert.match(source, /死信|dead.?letter/i);
+  assert.match(source, /SDK.*自动重连/);
+  assert.match(source, /sdk_managed/);
+  assert.match(source, /至少一次/);
+  assert.match(source, /原生幂等|exactly.?once/i);
+  assert.match(source, /符号链接.*硬链接|硬链接.*符号链接/s);
+  assert.doesNotMatch(source, /不提供 SDK 断线后的自动重连或退避、定时补偿或高可用保障/);
   assert.doesNotMatch(source, /打开任务后点击“启动 Codex”/);
+});
+
+test("reliability contract states the Taskboard idempotency boundary", async () => {
+  const [agents, spec] = await Promise.all([
+    readFile(agentsUrl, "utf8"),
+    readFile(reliabilitySpecUrl, "utf8"),
+  ]);
+  assert.match(agents, /至少一次/);
+  assert.match(agents, /原生幂等|exactly.?once/i);
+  assert.match(spec, /至少一次/);
+  assert.match(spec, /不宣称绝对 exactly-once/);
 });
 
 test("README embeds a real Taskboard screenshot labeled as local test data", async () => {

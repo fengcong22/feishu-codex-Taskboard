@@ -1,9 +1,327 @@
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 
-const LOCK_TIMEOUT_MS = 10_000;
-const LOCK_RETRY_MS = 25;
-const LOCK_STALE_MS = 60_000;
+import { safeDeliveryErrorCode } from "./retry-policy.mjs";
+import { withEventLock as withEventIpcLock, withStateLock } from "./state-lock.mjs";
+
+const TERMINAL_STATES = new Set(["succeeded", "dead_letter"]);
+const DELIVERY_STATES = new Set([
+  "pending",
+  "processing",
+  "retry_wait",
+  "succeeded",
+  "dead_letter",
+]);
+const DECISIONS = new Set(["ready", "blocked", "ignored"]);
+const MAX_FAILURE_HISTORY = 10;
+const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
+  "LEGACY_EVENT_SNAPSHOT_MISSING",
+  "EVENT_SNAPSHOT_MISSING",
+  "PROCESSING_EVENT_SNAPSHOT_MISSING",
+]);
+const EVENT_SNAPSHOT_FIELDS = Object.freeze([
+  "eventId",
+  "baseToken",
+  "tableId",
+  "recordId",
+  "recordTitle",
+  "action",
+  "fieldId",
+  "fieldName",
+  "beforeValue",
+  "afterValue",
+  "fields",
+  "fieldValuesById",
+]);
+
+function normalizeEventSnapshot(event) {
+  const snapshot = {};
+  for (const field of EVENT_SNAPSHOT_FIELDS) {
+    if (Object.hasOwn(event, field)) snapshot[field] = structuredClone(event[field]);
+  }
+  return snapshot;
+}
+
+function assertClaimOptions({ ownerId, leaseMs }) {
+  if (typeof ownerId !== "string" || ownerId.trim() === "") {
+    throw new Error("ownerId must be a non-empty string");
+  }
+  if (!Number.isFinite(leaseMs) || !Number.isInteger(leaseMs) || leaseMs <= 0) {
+    throw new Error("leaseMs must be a finite positive integer");
+  }
+}
+
+function assertRetrySchedule(nextAttemptAt, now) {
+  if (!Number.isFinite(nextAttemptAt) || nextAttemptAt <= now) {
+    throw new Error("nextAttemptAt must be a finite timestamp greater than now");
+  }
+}
+
+function newRecord(event, now) {
+  return {
+    schemaVersion: 2,
+    eventId: event.eventId,
+    event: normalizeEventSnapshot(event),
+    deliveryState: "pending",
+    decision: null,
+    attempts: 0,
+    nextAttemptAt: null,
+    lease: null,
+    lastError: null,
+    failureHistory: [],
+    outcome: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function legacyRecord(eventId, value, now) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    const invalid = new Error("STATE_FILE_INVALID: durable state record must be an object");
+    invalid.code = "STATE_FILE_INVALID";
+    throw invalid;
+  }
+  if (value.kind === "pending") {
+    return {
+      schemaVersion: 2,
+      eventId,
+      event: null,
+      deliveryState: "dead_letter",
+      decision: null,
+      attempts: 0,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: { code: "LEGACY_EVENT_SNAPSHOT_MISSING", status: 0, at: now },
+      failureHistory: [],
+      outcome: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+  if (!DECISIONS.has(value.kind)) {
+    const invalid = new Error("STATE_FILE_INVALID: unknown legacy delivery outcome");
+    invalid.code = "STATE_FILE_INVALID";
+    throw invalid;
+  }
+  const outcome = normalizeOutcome(value, value.kind);
+  if (!outcome) {
+    const invalid = new Error("STATE_FILE_INVALID: invalid legacy delivery outcome");
+    invalid.code = "STATE_FILE_INVALID";
+    throw invalid;
+  }
+  return {
+    schemaVersion: 2,
+    eventId,
+    event: null,
+    deliveryState: "succeeded",
+    decision: value?.kind ?? null,
+    attempts: 0,
+    nextAttemptAt: null,
+    lease: null,
+    lastError: null,
+    failureHistory: [],
+    outcome,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function invalidRecord(eventId, value, now, code) {
+  const createdAt = Number.isFinite(value?.createdAt) ? value.createdAt : now;
+  const attempts = Number.isInteger(value?.attempts) && value.attempts >= 0 ? value.attempts : 0;
+  return {
+    schemaVersion: 2,
+    eventId,
+    event: null,
+    deliveryState: "dead_letter",
+    decision: null,
+    attempts,
+    nextAttemptAt: null,
+    lease: null,
+    lastError: { code, status: 0, at: now },
+    failureHistory: [],
+    outcome: null,
+    createdAt,
+    updatedAt: now,
+  };
+}
+
+function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!DECISIONS.has(value.kind) || (decision !== null && value.kind !== decision)) return null;
+  const outcome = { kind: value.kind };
+  for (const field of ["reason", "taskId", "taskIdentifier", "packageAlias"]) {
+    if (!Object.hasOwn(value, field)) continue;
+    if (typeof value[field] !== "string" || value[field].trim() === "") return null;
+    outcome[field] = value[field];
+  }
+  if (value.kind !== "ignored" && !outcome.taskId && !outcome.taskIdentifier) return null;
+  if (requireTaskIdentifier && value.kind !== "ignored" && (!outcome.taskId || !outcome.taskIdentifier)) return null;
+  return outcome;
+}
+
+function normalizeRecord(eventId, value, now) {
+  if (value?.schemaVersion === 2) {
+    const record = structuredClone(value);
+    const snapshotEventId = record.event
+      && typeof record.event === "object"
+      && !Array.isArray(record.event)
+      && typeof record.event.eventId === "string"
+      && record.event.eventId.trim() !== ""
+      ? record.event.eventId
+      : null;
+    if (record.eventId !== eventId || (snapshotEventId !== null && snapshotEventId !== eventId)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_ID_MISMATCH");
+    }
+    if (!DELIVERY_STATES.has(record.deliveryState)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.attempts === undefined) record.attempts = 0;
+    if (!Number.isInteger(record.attempts) || record.attempts < 0) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.createdAt === undefined) record.createdAt = now;
+    if (record.updatedAt === undefined) record.updatedAt = now;
+    if (!Number.isFinite(record.createdAt) || !Number.isFinite(record.updatedAt)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.decision === undefined) record.decision = null;
+    if (record.decision !== null && !DECISIONS.has(record.decision)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.nextAttemptAt === undefined) record.nextAttemptAt = null;
+    if (record.nextAttemptAt !== null && !Number.isFinite(record.nextAttemptAt)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.lease === undefined) record.lease = null;
+    if (record.lease !== null && (typeof record.lease !== "object" || Array.isArray(record.lease))) {
+      record.lease = null;
+    }
+    if (record.lastError === undefined) record.lastError = null;
+    if (record.lastError !== null && (typeof record.lastError !== "object" || Array.isArray(record.lastError))) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.lastError) {
+      record.lastError = summarizeError(record.lastError, now);
+    }
+    if (record.failureHistory === undefined) record.failureHistory = [];
+    if (!Array.isArray(record.failureHistory)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    record.failureHistory = record.failureHistory
+      .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+      .map((entry) => summarizeError(entry, now))
+      .slice(-MAX_FAILURE_HISTORY);
+    if (record.outcome === undefined) record.outcome = null;
+    if (record.deliveryState === "succeeded") {
+      const outcome = normalizeOutcome(record.outcome, record.decision);
+      if (!outcome) return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+      record.outcome = outcome;
+    } else {
+      record.outcome = null;
+    }
+    if (record.deliveryState === "retry_wait" && record.nextAttemptAt === null) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.deliveryState !== "retry_wait") record.nextAttemptAt = null;
+    if (record.deliveryState !== "processing") record.lease = null;
+    if (record.event && typeof record.event === "object" && !Array.isArray(record.event)) {
+      record.event = normalizeEventSnapshot(record.event);
+    } else if (record.event !== null && record.event !== undefined) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (record.event === undefined) record.event = null;
+    if (!hasEventSnapshot(record.event)) {
+      record.event = null;
+      if (record.deliveryState === "pending" || record.deliveryState === "retry_wait") {
+        return invalidRecord(eventId, record, now, "EVENT_SNAPSHOT_MISSING");
+      }
+    }
+    return record;
+  }
+  return legacyRecord(eventId, value, now);
+}
+
+function validLease(record, now) {
+  return (
+    record.deliveryState === "processing"
+    && typeof record.lease?.ownerId === "string"
+    && record.lease.ownerId.trim() !== ""
+    && typeof record.lease?.token === "string"
+    && record.lease.token.trim() !== ""
+    && Number.isFinite(record.lease?.leaseUntil)
+    && record.lease.leaseUntil > now
+  );
+}
+
+function newLease(ownerId, now, leaseMs) {
+  return {
+    ownerId,
+    token: randomUUID(),
+    leaseUntil: now + leaseMs,
+  };
+}
+
+function isExcluded(excludeEventIds, eventId) {
+  if (excludeEventIds instanceof Set) return excludeEventIds.has(eventId);
+  if (Array.isArray(excludeEventIds)) return excludeEventIds.includes(eventId);
+  return false;
+}
+
+function assertEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new Error("event must be an object");
+  }
+  if (typeof event.eventId !== "string" || event.eventId.trim() === "") {
+    throw new Error("event.eventId must be a non-empty string");
+  }
+}
+
+function hasEventSnapshot(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  for (const field of ["eventId", "baseToken", "tableId", "recordId", "fieldName"]) {
+    if (typeof event[field] !== "string" || event[field].trim() === "") return false;
+  }
+  if (!Object.hasOwn(event, "beforeValue") || !Object.hasOwn(event, "afterValue")) return false;
+  return Boolean(event.fields && typeof event.fields === "object" && !Array.isArray(event.fields));
+}
+
+function assertLeaseOwner(record, ownerId, now, token, { allowExpired = false } = {}) {
+  const leaseUntil = record.lease?.leaseUntil;
+  const leaseToken = record.lease?.token;
+  if (
+    record.deliveryState !== "processing"
+    || record.lease?.ownerId !== ownerId
+    || !Number.isFinite(leaseUntil)
+    || (!allowExpired && leaseUntil <= now)
+    || typeof leaseToken !== "string"
+    || leaseToken.trim() === ""
+    || token !== leaseToken
+  ) {
+    const error = new Error(`Cannot update delivery record ${record.eventId}: lease is not owned by ${ownerId}`);
+    error.code = "LEASE_NOT_OWNED";
+    throw error;
+  }
+}
+
+function summarizeError(error, now) {
+  const code = safeDeliveryErrorCode(error?.code);
+  const status = Number.isInteger(error?.status) ? error.status : 0;
+  const at = Number.isFinite(error?.at) ? error.at : now;
+  return { code, status, at };
+}
+
+function stateObject() {
+  return Object.create(null);
+}
 
 export class JsonStateStore {
   #filename;
@@ -13,75 +331,290 @@ export class JsonStateStore {
     this.#filename = filename;
   }
 
-  async #read() {
+  async #read(now = Date.now()) {
+    let data;
     try {
-      const data = JSON.parse(await readFile(this.#filename, "utf8"));
-      if (!data || typeof data !== "object" || Array.isArray(data)) return Object.create(null);
-      const state = Object.create(null);
-      for (const [key, value] of Object.entries(data)) state[key] = value;
-      return state;
+      data = JSON.parse(await readFile(this.#filename, "utf8"));
     } catch (error) {
-      if (error.code === "ENOENT") return Object.create(null);
+      if (error.code === "ENOENT") return stateObject();
       throw error;
     }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      const invalid = new Error("STATE_FILE_INVALID: durable state file must contain an object map");
+      invalid.code = "STATE_FILE_INVALID";
+      throw invalid;
+    }
+    const state = stateObject();
+    for (const [key, value] of Object.entries(data)) {
+      state[key] = normalizeRecord(key, value, now);
+    }
+    return state;
   }
 
   async get(eventId) {
-    const state = await this.#read();
-    return Object.hasOwn(state, eventId) ? state[eventId] : null;
+    return this.#withFileLock(async () => {
+      const state = await this.#read();
+      return Object.hasOwn(state, eventId) ? structuredClone(state[eventId]) : null;
+    });
   }
 
   async #withFileLock(operation) {
-    const lockPath = `${this.#filename}.lock`;
     await mkdir(path.dirname(this.#filename), { recursive: true });
-    const deadline = Date.now() + LOCK_TIMEOUT_MS;
-    while (true) {
+    return withStateLock(this.#filename, operation);
+  }
+
+  async withEventLock(eventId, operation) {
+    if (typeof eventId !== "string" || eventId.trim() === "") {
+      throw new Error("eventId must be a non-empty string");
+    }
+    if (typeof operation !== "function") throw new Error("event lock operation must be a function");
+    await mkdir(path.dirname(this.#filename), { recursive: true });
+    return withEventIpcLock(this.#filename, eventId, operation);
+  }
+
+  async #writeState(state) {
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
+    let temporary = null;
+    let handle = null;
+    for (let attempt = 0; attempt < 3 && !handle; attempt += 1) {
+      temporary = `${this.#filename}.${randomUUID()}.tmp`;
       try {
-        await mkdir(lockPath);
-        break;
+        handle = await open(temporary, "wx", 0o600);
       } catch (error) {
-        if (error.code !== "EEXIST") throw error;
-        try {
-          const lockAge = Date.now() - (await stat(lockPath)).mtimeMs;
-          if (lockAge > LOCK_STALE_MS) {
-            await rm(lockPath, { recursive: true, force: true });
-            continue;
-          }
-        } catch (statError) {
-          if (statError.code !== "ENOENT") throw statError;
-        }
-        if (Date.now() >= deadline) throw new Error(`Timed out acquiring state lock: ${lockPath}`);
-        await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+        if (error?.code !== "EEXIST" || attempt === 2) throw error;
       }
     }
+
     try {
-      return await operation();
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.nlink !== 1) {
+        const error = new Error("STATE_TEMP_UNSUPPORTED: temporary state file must be a single-link regular file");
+        error.code = "STATE_TEMP_UNSUPPORTED";
+        throw error;
+      }
+      await handle.writeFile(serialized, "utf8");
+      await handle.chmod(0o600);
+      await handle.sync();
+      const written = await handle.stat();
+      if (!written.isFile() || written.nlink !== 1) {
+        const error = new Error("STATE_TEMP_UNSUPPORTED: temporary state file changed while writing");
+        error.code = "STATE_TEMP_UNSUPPORTED";
+        throw error;
+      }
+      await handle.close();
+      handle = null;
+      const target = await lstat(temporary);
+      if (!target.isFile() || target.nlink !== 1) {
+        const error = new Error("STATE_TEMP_UNSUPPORTED: temporary state path is not a single-link regular file");
+        error.code = "STATE_TEMP_UNSUPPORTED";
+        throw error;
+      }
+      await rename(temporary, this.#filename);
+      temporary = null;
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      if (handle) await handle.close().catch(() => {});
+      if (temporary) await unlink(temporary).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
     }
   }
 
-  async #write(eventId, outcome, overwrite) {
-    const state = await this.#read();
-    if (!overwrite && Object.hasOwn(state, eventId)) return;
-    state[eventId] = outcome;
-    const temporary = `${this.#filename}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, this.#filename);
-    await chmod(this.#filename, 0o600);
-  }
-
-  async put(eventId, outcome) {
+  async #mutate(operation, now = Date.now(), clock = () => now) {
+    let result;
     this.#writeQueue = this.#writeQueue.catch(() => {}).then(async () => {
-      await this.#withFileLock(() => this.#write(eventId, outcome, false));
+      result = await this.#withFileLock(async () => {
+        const readNow = typeof clock === "function" ? clock() : now;
+        const state = await this.#read(readNow);
+        const currentNow = typeof clock === "function" ? clock() : readNow;
+        const value = await operation(state, currentNow);
+        await this.#writeState(state);
+        return value;
+      });
     });
     await this.#writeQueue;
+    return result;
   }
 
-  async replace(eventId, outcome) {
-    this.#writeQueue = this.#writeQueue.catch(() => {}).then(async () => {
-      await this.#withFileLock(() => this.#write(eventId, outcome, true));
+  async claimEvent(event, { ownerId, now, leaseMs, clock }) {
+    assertEvent(event);
+    assertClaimOptions({ ownerId, leaseMs });
+    return this.#mutate((state, currentNow) => {
+      let record = Object.hasOwn(state, event.eventId) ? state[event.eventId] : null;
+      if (!record) {
+        if (!hasEventSnapshot(event)) throw new Error("event snapshot is incomplete");
+        record = newRecord(event, currentNow);
+        state[event.eventId] = record;
+      } else if (
+        record.deliveryState === "dead_letter"
+        && record.event === null
+        && REHYDRATABLE_SNAPSHOT_ERRORS.has(record.lastError?.code)
+      ) {
+        if (!hasEventSnapshot(event)) return { kind: "terminal", record: structuredClone(record) };
+        record = newRecord(event, currentNow);
+        state[event.eventId] = record;
+      }
+
+      if (record && !hasEventSnapshot(record.event) && !TERMINAL_STATES.has(record.deliveryState)) {
+        // Never replace a snapshot while another worker still owns a valid
+        // lease. Once the lease is absent or expired, a replay carrying the
+        // complete server-normalized event is the only safe way to rehydrate
+        // the malformed record.
+        if (validLease(record, currentNow)) {
+          return { kind: "deferred", record: structuredClone(record) };
+        }
+        if (!hasEventSnapshot(event)) {
+          record = invalidRecord(event.eventId, record, currentNow, "EVENT_SNAPSHOT_MISSING");
+          state[event.eventId] = record;
+          return { kind: "terminal", record: structuredClone(record) };
+        }
+        record.event = normalizeEventSnapshot(event);
+        record.deliveryState = "pending";
+        record.nextAttemptAt = null;
+        record.lease = null;
+        record.updatedAt = currentNow;
+      }
+
+      if (TERMINAL_STATES.has(record.deliveryState)) {
+        return { kind: "terminal", record: structuredClone(record) };
+      }
+      if (validLease(record, currentNow)) {
+        return { kind: "deferred", record: structuredClone(record) };
+      }
+      if (
+        record.deliveryState === "retry_wait"
+        && record.nextAttemptAt !== null
+        && record.nextAttemptAt > currentNow
+      ) {
+        return { kind: "deferred", record: structuredClone(record) };
+      }
+
+      record.deliveryState = "processing";
+      record.attempts += 1;
+      record.nextAttemptAt = null;
+      record.lease = newLease(ownerId, currentNow, leaseMs);
+      record.updatedAt = currentNow;
+      return { kind: "claimed", record: structuredClone(record) };
+    }, now, clock);
+  }
+
+  async claimNextDue({ ownerId, now, leaseMs, excludeEventIds, clock }) {
+    assertClaimOptions({ ownerId, leaseMs });
+    return this.#mutate((state, currentNow) => {
+      const due = Object.values(state)
+        .filter((record) => (
+          (record.deliveryState === "pending" || record.deliveryState === "retry_wait")
+          && hasEventSnapshot(record.event)
+          && !isExcluded(excludeEventIds, record.eventId)
+          && (record.nextAttemptAt === null || record.nextAttemptAt <= currentNow)
+        ))
+        .sort((left, right) => left.createdAt - right.createdAt)[0];
+      if (!due) return null;
+
+      due.deliveryState = "processing";
+      due.attempts += 1;
+      due.nextAttemptAt = null;
+      due.lease = newLease(ownerId, currentNow, leaseMs);
+      due.updatedAt = currentNow;
+      return structuredClone(due);
+    }, now, clock);
+  }
+
+  async complete(eventId, { ownerId, token, decision, outcome, now, clock }) {
+    return this.#mutate((state, currentNow) => {
+      const record = state[eventId];
+      if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
+      assertLeaseOwner(record, ownerId, currentNow, token);
+      const normalizedOutcome = normalizeOutcome(outcome, decision, { requireTaskIdentifier: true });
+      if (!DECISIONS.has(decision) || !normalizedOutcome) {
+        throw new Error("outcome must match decision and contain valid task identifiers");
+      }
+      record.deliveryState = "succeeded";
+      record.decision = decision;
+      record.outcome = normalizedOutcome;
+      record.nextAttemptAt = null;
+      record.lease = null;
+      record.updatedAt = currentNow;
+      return structuredClone(record);
+    }, now, clock);
+  }
+
+  async fail(eventId, { ownerId, token, error, nextAttemptAt, deadLetter, now, clock }) {
+    if (!deadLetter) {
+      const validationNow = Number.isFinite(now) ? now : Date.now();
+      assertRetrySchedule(nextAttemptAt, validationNow);
+    }
+    return this.#mutate((state, currentNow) => {
+      const record = state[eventId];
+      if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
+      assertLeaseOwner(record, ownerId, currentNow, token);
+      const scheduledNextAttemptAt = deadLetter
+        ? null
+        : Math.max(nextAttemptAt, currentNow + 1);
+      if (!deadLetter) assertRetrySchedule(scheduledNextAttemptAt, currentNow);
+      const summary = summarizeError(error, currentNow);
+      record.lastError = summary;
+      record.failureHistory = [...record.failureHistory, summary].slice(-MAX_FAILURE_HISTORY);
+      record.deliveryState = deadLetter ? "dead_letter" : "retry_wait";
+      record.nextAttemptAt = scheduledNextAttemptAt;
+      record.lease = null;
+      record.updatedAt = currentNow;
+      return structuredClone(record);
+    }, now, clock);
+  }
+
+  async renewLease(eventId, { ownerId, token, now, leaseMs, clock }) {
+    assertClaimOptions({ ownerId, leaseMs });
+    return this.#mutate((state, currentNow) => {
+      const record = state[eventId];
+      if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
+      assertLeaseOwner(record, ownerId, currentNow, token, { allowExpired: true });
+      record.lease.leaseUntil = currentNow + leaseMs;
+      record.updatedAt = currentNow;
+      return structuredClone(record);
+    }, now, clock);
+  }
+
+  async recoverExpiredLeases({ now, excludeEventIds, clock }) {
+    return this.#mutate((state, currentNow) => {
+      let recovered = 0;
+      for (const record of Object.values(state)) {
+        if (
+          record.deliveryState === "processing"
+          && !isExcluded(excludeEventIds, record.eventId)
+          && !validLease(record, currentNow)
+        ) {
+          const snapshotValid = hasEventSnapshot(record.event);
+          record.deliveryState = snapshotValid ? "pending" : "dead_letter";
+          if (!snapshotValid) record.event = null;
+          record.lease = null;
+          record.nextAttemptAt = null;
+          if (!snapshotValid) {
+            record.lastError = { code: "PROCESSING_EVENT_SNAPSHOT_MISSING", status: 0, at: currentNow };
+          }
+          record.updatedAt = currentNow;
+          recovered += 1;
+        }
+      }
+      return recovered;
+    }, now, clock);
+  }
+
+  async getQueueStats() {
+    return this.#withFileLock(async () => {
+      const state = await this.#read();
+      const stats = {
+        pending: 0,
+        processing: 0,
+        retryWait: 0,
+        deadLetter: 0,
+      };
+      for (const record of Object.values(state)) {
+        if (record.deliveryState === "pending") stats.pending += 1;
+        else if (record.deliveryState === "processing") stats.processing += 1;
+        else if (record.deliveryState === "retry_wait") stats.retryWait += 1;
+        else if (record.deliveryState === "dead_letter") stats.deadLetter += 1;
+      }
+      return stats;
     });
-    await this.#writeQueue;
   }
 }

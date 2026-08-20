@@ -35,6 +35,13 @@ function validConfig() {
 
 test("accepts a loopback, per-table, alias-only configuration", () => {
   const result = validateConfig(validConfig());
+  assert.deepEqual(result.delivery, {
+    maxAttempts: 8,
+    initialDelayMs: 5_000,
+    maxDelayMs: 300_000,
+    leaseMs: 30_000,
+    pollIntervalMs: 1_000,
+  });
   assert.equal(result.tables[0].triggerValue, "待剪辑");
   assert.equal(result.tables[0].titleField, "视频名称");
   assert.equal(result.tables[0].titleFieldId, "fld_title");
@@ -42,6 +49,37 @@ test("accepts a loopback, per-table, alias-only configuration", () => {
   assert.equal(result.tables[0].fallbackTitleFieldId, "fld_collection");
   assert.equal(result.packages["Auto-cut-copyA"].projectId, "auto-cut-copy-a");
   assert.equal(result.packages["Auto-cut-copyA"].prompt, "执行安全的演示任务。");
+});
+
+test("accepts a valid delivery policy override", () => {
+  const input = validConfig();
+  input.delivery = {
+    maxAttempts: 3,
+    initialDelayMs: 200,
+    maxDelayMs: 2_000,
+    leaseMs: 1_500,
+    pollIntervalMs: 250,
+    ignored: "not returned",
+  };
+  assert.deepEqual(validateConfig(input).delivery, {
+    maxAttempts: 3,
+    initialDelayMs: 200,
+    maxDelayMs: 2_000,
+    leaseMs: 1_500,
+    pollIntervalMs: 250,
+  });
+});
+
+test("rejects a delivery policy poll interval below 100 milliseconds", () => {
+  const input = validConfig();
+  input.delivery = { pollIntervalMs: 99 };
+  assert.throws(() => validateConfig(input), /delivery\.pollIntervalMs must be an integer >= 100/);
+});
+
+test("rejects delivery policies whose maximum delay is below the initial delay", () => {
+  const input = validConfig();
+  input.delivery = { initialDelayMs: 2_000, maxDelayMs: 1_000 };
+  assert.throws(() => validateConfig(input), /delivery\.maxDelayMs must be >= delivery\.initialDelayMs/);
 });
 
 test("accepts a real table with a field-id trigger and a table-level default package", () => {

@@ -105,6 +105,25 @@ test("matches a configured trigger field id even when the display name is absent
   assert.equal(result.kind, "ready");
 });
 
+test("marks a transition away from 待剪辑 for waiting-task archival without a package alias", () => {
+  const result = decideRecordChange(config, event({
+    beforeValue: "待剪辑",
+    afterValue: "剪辑中",
+    fields: {},
+  }));
+  assert.deepEqual(result, {
+    kind: "ignored",
+    reason: "left_trigger",
+    effect: "archive_waiting_tasks",
+    table: config.tables[0],
+    event: event({
+      beforeValue: "待剪辑",
+      afterValue: "剪辑中",
+      fields: {},
+    }),
+  });
+});
+
 test("uses each table's own trigger and package fields", () => {
   const result = decideRecordChange(config, event({
     tableId: "tbl_b",

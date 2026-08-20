@@ -2,7 +2,7 @@
 
 ## 固定数据流
 
-生产流程固定为：飞书多维表格发生变化 → 飞书官方 SDK 长连接接收事件 → Bridge 按表和字段规则筛选、标准化、去重 → Taskboard 创建手动任务。
+生产流程固定为：飞书多维表格发生变化 → 飞书官方 SDK 长连接接收事件 → Bridge 按表和字段规则筛选、标准化、去重 → Taskboard 创建或归档受控的手动任务。
 
 Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LAN 或公网监听。当前流程不会自动启动 Codex、回写飞书记录或处理真实视频。
 
@@ -32,16 +32,24 @@ npm test
 ## 事件不变量
 
 - 只有从其他值变化到 `待剪辑` 才创建任务。
-- 同一事件按 `event_id` 幂等处理；重放事件不得创建第二个任务。
-- Taskboard 暂时不可用时保留 pending 状态，恢复后允许安全重试。
+- 从 `待剪辑` 变为其他值时，只归档同一 Base、表、记录和触发字段流程下仍为 Taskboard `todo` 的任务；`in_progress`、`in_review`、`done` 或其他非 `todo` 状态不得被 Bridge 自动归档或中止。
+- 当前不启用“飞书字段状态 → Taskboard 各流程列”的通用映射；Taskboard 的处理中等执行状态由 Taskboard/Codex 自己维护。
+- 同一事件按 `event_id` 幂等处理：已持久化成功状态或同机有效租约下的正常重放不得创建第二个任务。整体投递语义是至少一次；Taskboard 没有原生原子幂等键时，不得宣称绝对 exactly-once。
+- Taskboard 暂时不可用时必须持久化 `retry_wait`/`pending` 状态，按有限退避安全重试；Bridge 重启时恢复过期租约，超过上限的事件保留为 `dead_letter`，不得静默丢弃。
 - 未知或缺失项目包别名必须阻断执行，不得把单元格内容当作路径或命令。
 
 ## 故障排查
 
 1. 先运行 `.\scripts\check-local.ps1`，再根据输出查看 `.runtime\logs\bridge.stdout.log` 和 `taskboard.stdout.log`。
-2. 真实事件需要运行 `.\scripts\check-local.ps1 -RequireFeishu`，监听器必须显示 `connected`。
+2. 真实事件需要运行 `.\scripts\check-local.ps1 -RequireFeishu`，监听器必须显示 `sdk_managed`。这只证明官方 SDK 已接管长连接；SDK 没有公开物理 socket 或连接回调，必须用指定测试表事件完成端到端验证。
 3. 修改配置后先停止并重新启动服务，再用模拟事件验证；不要直接删除状态文件来“修复”重复任务。
 4. 网络/DNS 重试持续发生时，记录时间和日志后再重启服务；不要在飞书表格中反复改动生产记录做测试。
+
+状态文件不是合法对象映射时 Bridge 必须 fail-closed；不要用空文件或手工改写内容覆盖它。`stateFile` 必须是稳定的普通文件路径，不支持状态文件本身的符号链接、硬链接或多链接别名，也不要在运行中替换路径。状态文件的读写（包括健康队列统计）都经过同一校验和本机互斥锁；写入使用原子替换，进程间互斥由本机 Windows/Linux 的操作系统锁托管，进程崩溃后锁由系统释放；不要手工删除锁或状态文件来“修复”重复任务。Taskboard 成功响应结构异常会进入受控重试，HTTP 错误和日志只允许使用安全错误码。
+
+生命周期归档按“同一记录的全部匹配流程任务”筛选；如果离开事件延迟到一次快速“离开待剪辑 → 再次进入待剪辑”之后，旧事件可能把新一轮仍为 `todo` 的任务一并归档。这是当前至少一次事件模型下的已知边界，后续如需严格按轮次隔离再增加记录版本/事件顺序约束。
+
+健康接口 `/health` 返回脱敏的监听器对象（`state`、`lastEventAt`、`lastError`）和队列计数（`pending`、`processing`、`retryWait`、`deadLetter`）。模拟事件在已持久化的 `retry_wait` 或 `dead_letter` 结果下返回 HTTP 202，表示 Bridge 已安全接收并记录，不能据此要求飞书重复投递。
 
 ## 变更规则
 

@@ -17,6 +17,7 @@ function metadata(decision) {
     tableId: decision.event.tableId,
     recordId: decision.event.recordId,
     triggerField: decision.table.triggerField,
+    ...(decision.table.triggerFieldId ? { triggerFieldId: decision.table.triggerFieldId } : {}),
     triggerValue: decision.table.triggerValue,
     mode: decision.table.mode,
     ...(decision.kind === "ready" ? { packageAlias: decision.packageAlias } : {}),

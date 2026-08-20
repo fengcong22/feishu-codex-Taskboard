@@ -2,6 +2,7 @@ import {
   BITABLE_RECORD_CHANGED_EVENT,
   normalizeBitableRecordChanged,
 } from "./feishu-event.mjs";
+import { safeDeliveryErrorCode } from "./retry-policy.mjs";
 
 export { BITABLE_RECORD_CHANGED_EVENT } from "./feishu-event.mjs";
 
@@ -24,13 +25,24 @@ function createClientSdk(sdk) {
   return value;
 }
 
-async function stopClient(client) {
+function findStopMethod(client) {
   for (const method of ["stop", "close", "disconnect"]) {
-    if (typeof client?.[method] === "function") {
-      await client[method]();
-      return;
-    }
+    if (typeof client?.[method] === "function") return method;
   }
+  return null;
+}
+
+async function stopClient(client, method) {
+  if (!method) return false;
+  await client[method]();
+  return true;
+}
+
+function safeErrorSummary(error, fallback) {
+  return {
+    code: safeDeliveryErrorCode(error?.code, fallback),
+    at: Date.now(),
+  };
 }
 
 /** Load the official SDK only when the real listener is enabled. */
@@ -67,7 +79,31 @@ export function createFeishuWsListener({
   const wsClient = new sdkModule.WSClient({
     appId: normalizedAppId,
     appSecret: normalizedSecret,
+    autoReconnect: true,
   });
+
+  let queue = Promise.resolve();
+  let state = "idle";
+  let lastEventAt = null;
+  let lastError = null;
+  let startPromise = null;
+  let stopRequested = false;
+
+  function notifyStatus(status, detail) {
+    try {
+      onStatus(status, detail);
+    } catch {
+      // Status observers are diagnostics only and must not break event delivery.
+    }
+  }
+
+  function recordStartFailure(error) {
+    if (stopRequested) return;
+    lastError = safeErrorSummary(error, "FEISHU_LISTENER_START_FAILED");
+    state = "error";
+    notifyStatus(state, lastError);
+  }
+
   const eventDispatcher = new sdkModule.EventDispatcher({}).register({
     [BITABLE_RECORD_CHANGED_EVENT]: (payload) => {
       const source = sourceEvent(payload) ?? {};
@@ -87,20 +123,23 @@ export function createFeishuWsListener({
         : tokenTables.length === 1 ? tokenTables : [];
       const events = matchingTables.flatMap((table) => normalizeBitableRecordChanged(payload, table));
       if (events.length === 0) return Promise.resolve();
+      lastEventAt = Date.now();
       const processing = queue.then(async () => {
         for (const event of events) await handleEvent(event);
       });
       queue = processing.catch((error) => {
-        logger.error?.("Feishu event handling failed:", error);
-        onStatus("error", error);
+        const summary = safeErrorSummary(error, "FEISHU_EVENT_HANDLER_FAILED");
+        lastError = summary;
+        try {
+          logger.error?.(`Feishu event handling failed: ${summary.code}`);
+        } catch {
+          // Logging must not turn a handled callback failure into a stuck queue.
+        }
+        notifyStatus("error", summary);
       });
       return processing;
     },
   });
-
-  let queue = Promise.resolve();
-  let state = "idle";
-  let startPromise = null;
 
   return {
     wsClient,
@@ -108,40 +147,53 @@ export function createFeishuWsListener({
     get state() {
       return state;
     },
+    get health() {
+      return {
+        state,
+        lastEventAt,
+        lastError: lastError ? { ...lastError } : null,
+      };
+    },
     start() {
       if (startPromise) return startPromise;
       state = "starting";
-      onStatus(state);
+      notifyStatus(state);
       let result;
       try {
         result = wsClient.start({ eventDispatcher });
       } catch (error) {
-        state = "error";
-        onStatus(state, error);
+        recordStartFailure(error);
         throw error;
       }
       if (result && typeof result.then === "function") {
         startPromise = Promise.resolve(result).then((value) => {
-          state = "connected";
-          onStatus(state);
+          if (!stopRequested) {
+            state = "sdk_managed";
+            notifyStatus(state);
+          }
           return value;
         }, (error) => {
-          state = "error";
-          onStatus(state, error);
+          recordStartFailure(error);
           throw error;
         });
       } else {
-        state = "connected";
-        onStatus(state);
+        if (!stopRequested) {
+          state = "sdk_managed";
+          notifyStatus(state);
+        }
         startPromise = Promise.resolve(result);
       }
       return startPromise;
     },
     async stop() {
+      const stopMethod = findStopMethod(wsClient);
+      if (stopMethod) stopRequested = true;
       await this.drain();
-      await stopClient(wsClient);
-      state = "stopped";
-      onStatus(state);
+      const stopped = await stopClient(wsClient, stopMethod);
+      if (stopped) {
+        state = "stopped";
+        notifyStatus(state);
+      }
     },
     drain() {
       return queue;
