@@ -75,6 +75,18 @@ npm install
 
 任务卡片标题按表配置读取当前记录：优先使用 `titleField`/`titleFieldId` 指定的 `视频名称`，为空时使用 `fallbackTitleField`/`fallbackTitleFieldId` 指定的 `集合文档`，两者都为空时回退到飞书记录 ID。标题读取失败不会阻止建任务，记录 ID 仍始终保留在任务描述中。
 
+### Windows 双击入口
+
+仓库根目录提供了可以在资源管理器中直接双击的批处理文件，不需要先打开 PowerShell：
+
+| 文件 | 用途 |
+| --- | --- |
+| `启动-Taskboard.bat` | 启动本地 Taskboard、Bridge 和飞书长连接，并打开 Taskboard 页面。 |
+| `检查-Taskboard.bat` | 检查 Node.js、配置、Taskboard、Bridge、飞书长连接和队列状态。 |
+| `停止-Taskboard.bat` | 停止本地 Taskboard 和 Bridge。 |
+
+这些文件使用自身所在目录定位仓库，因此可以从资源管理器直接双击；它们仍复用 `scripts` 下的正式脚本，不会改变 `127.0.0.1` 监听边界。`启动-Taskboard.bat` 默认带 `-EnableFeishu`，用于真实多维表格事件；`检查-Taskboard.bat` 会要求监听器处于 `sdk_managed`。首次启动前仍需完成本地配置并安装 Node.js、Codex 和外部 Taskboard 依赖，不要把凭据写入批处理文件。
+
 ### 任务生命周期边界
 
 - 其他值 → `待剪辑`：创建一张新的“等待认领”任务。
