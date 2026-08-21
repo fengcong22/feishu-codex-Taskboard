@@ -13,12 +13,15 @@ $bridgeData = Join-Path $runtime 'bridge'
 $config = Join-Path $root 'config\bridge.local.json'
 $taskboardPidFile = Join-Path $runtime 'taskboard.pid'
 $bridgePidFile = Join-Path $runtime 'bridge.pid'
+$taskboardIdentityFile = Join-Path $runtime 'taskboard.process.json'
+$bridgeIdentityFile = Join-Path $runtime 'bridge.process.json'
 $bridgeModeFile = Join-Path $runtime 'bridge.feishu-mode'
 $taskboardStdout = Join-Path $logs 'taskboard.stdout.log'
 $taskboardStderr = Join-Path $logs 'taskboard.stderr.log'
 $bridgeStdout = Join-Path $logs 'bridge.stdout.log'
 $bridgeStderr = Join-Path $logs 'bridge.stderr.log'
 $launcher = Join-Path $root 'scripts\detached-launcher.mjs'
+. (Join-Path $root 'scripts\process-identity.ps1')
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 $node = if ($nodeCommand) { $nodeCommand.Source } else { 'C:\Program Files\nodejs\node.exe' }
 $codexCommand = Get-Command codex.exe -ErrorAction SilentlyContinue
@@ -47,93 +50,45 @@ if ([string]::IsNullOrWhiteSpace($codexExecutable) -or -not (Test-Path -LiteralP
   throw 'Codex executable was not found. Install the Codex desktop app or set CODEX_EXECUTABLE explicitly.'
 }
 
-function Test-ListeningPortOwner([int]$Port, [int]$ProcessId) {
-  try {
-    $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
-    foreach ($connection in $connections) {
-      if ([int]$connection.OwningProcess -eq $ProcessId) { return $true }
-    }
-    return $false
-  } catch {
-    try {
-      $lines = @(netstat.exe -ano -p tcp 2>$null)
-      foreach ($line in $lines) {
-        $parts = ($line -split '\s+') | Where-Object { $_ -ne '' }
-        if ($parts.Count -lt 5 -or $parts[0] -ne 'TCP' -or $parts[3] -ne 'LISTENING') { continue }
-        if ($parts[1] -match ':(\d+)$' -and [int]$Matches[1] -eq $Port -and [int]$parts[4] -eq $ProcessId) {
-          return $true
-        }
-      }
-    } catch {}
-    return $false
-  }
-}
-
-function Test-Ready([string]$Url, [int]$ExpectedPid = 0, [int]$Port = 0, [string]$ExpectedScript = $null) {
+function Test-Ready(
+  [string]$Url,
+  [int]$ExpectedPid = 0,
+  [int]$Port = 0,
+  [string]$ExpectedScript = $null,
+  [string]$ExpectedExecutable = $null,
+  [object]$ExpectedIdentity = $null
+) {
   if ($ExpectedPid -gt 0) {
-    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ExpectedPid" -ErrorAction SilentlyContinue
-    if (-not $process -or ($ExpectedScript -and -not (Test-NodeScriptProcess $process $ExpectedScript))) { return $false }
-    if ($Port -gt 0 -and -not (Test-ListeningPortOwner $Port $ExpectedPid)) { return $false }
+    if (-not (Test-ExpectedNodeProcess $ExpectedPid $ExpectedScript $ExpectedExecutable $ExpectedIdentity $Port)) { return $false }
   }
-  try { return (Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { return $false }
+  try {
+    if ((Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 2).StatusCode -ne 200) { return $false }
+  } catch { return $false }
+  if ($ExpectedPid -le 0) { return $true }
+  return (Test-ExpectedNodeProcess $ExpectedPid $ExpectedScript $ExpectedExecutable $ExpectedIdentity $Port)
 }
 
-function Wait-Ready([string]$Name, [string]$Url, [int]$ExpectedPid, [int]$Port, [string]$ExpectedScript) {
+function Wait-Ready(
+  [string]$Name,
+  [string]$Url,
+  [int]$ExpectedPid,
+  [int]$Port,
+  [string]$ExpectedScript,
+  [string]$ExpectedExecutable,
+  [object]$ExpectedIdentity
+) {
   $deadline = (Get-Date).AddSeconds(15)
   do {
-    if (Test-Ready $Url $ExpectedPid $Port $ExpectedScript) { return }
+    if (Test-Ready $Url $ExpectedPid $Port $ExpectedScript $ExpectedExecutable $ExpectedIdentity) { return }
     Start-Sleep -Milliseconds 250
   } while ((Get-Date) -lt $deadline)
   throw "$Name is not ready"
 }
 
-$startedNodes = @{}
+$startedNodes = New-Object System.Collections.ArrayList
 
-function Test-NodeScriptProcess([object]$Process, [string]$Script) {
-  if (-not $Process -or [string]::IsNullOrWhiteSpace($Process.CommandLine)) { return $false }
-  $executable = [string]$Process.ExecutablePath
-  if ([string]::IsNullOrWhiteSpace($executable)) { return $false }
-  try {
-    if ([System.IO.Path]::GetFileName($executable) -notmatch '(?i)^node(?:\.exe)?$') { return $false }
-  } catch {
-    return $false
-  }
-  $commandLine = ($Process.CommandLine -replace '/', '\')
-  $normalizedExecutable = ($executable -replace '/', '\')
-  $expected = ($Script -replace '/', '\')
-  $executableIndex = $commandLine.IndexOf($normalizedExecutable, [System.StringComparison]::OrdinalIgnoreCase)
-  if ($executableIndex -lt 0) {
-    return $false
-  }
-  $argumentStart = $executableIndex + $normalizedExecutable.Length
-  if ($argumentStart -lt $commandLine.Length -and $commandLine[$argumentStart] -eq '"') {
-    $argumentStart++
-  }
-  $arguments = $commandLine.Substring($argumentStart).TrimStart()
-  if ([string]::IsNullOrWhiteSpace($arguments)) { return $false }
-  if ($arguments.StartsWith('"')) {
-    $closingQuote = $arguments.IndexOf('"', 1)
-    if ($closingQuote -lt 0) { return $false }
-    $firstArgument = $arguments.Substring(1, $closingQuote - 1)
-  } else {
-    $separator = $arguments.IndexOf(' ')
-    $firstArgument = if ($separator -lt 0) { $arguments } else { $arguments.Substring(0, $separator) }
-  }
-  return [string]::Equals($firstArgument, $expected, [System.StringComparison]::OrdinalIgnoreCase)
-}
-
-function Stop-ValidatedNode([object]$Process, [string]$Script) {
-  if (-not $Process) { return }
-  if (-not (Test-NodeScriptProcess $Process $Script)) {
-    throw "Refusing to stop PID $($Process.ProcessId): command line did not match $Script"
-  }
-  & taskkill.exe /PID $Process.ProcessId /T /F | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "Could not stop PID $($Process.ProcessId)" }
-}
-
-function Test-ModeMatch([string]$ModeFile, [string]$RequestedMode) {
-  if ([string]::IsNullOrWhiteSpace($ModeFile) -or -not (Test-Path -LiteralPath $ModeFile)) { return $false }
-  return ((Get-Content -LiteralPath $ModeFile -Raw).Trim() -eq $RequestedMode)
+function Stop-ValidatedNode([object]$Process, [string]$Script, [object]$ExpectedIdentity, [string]$ExpectedExecutable) {
+  Stop-IdentityVerifiedNodeProcess $Process $Script $ExpectedIdentity $ExpectedExecutable | Out-Null
 }
 
 function Get-FeishuListenerState {
@@ -151,32 +106,75 @@ function Get-ExpectedListenerState([string]$RequestedMode) {
   return 'disabled'
 }
 
-function Get-ProcessCreationTicks([object]$Process) {
-  try { return ([DateTime]$Process.CreationDate).ToUniversalTime().Ticks } catch { return $null }
-}
-
 function Test-StartedNodeIdentity([object]$Process, [hashtable]$Entry) {
+  if ($null -eq $Entry.CreationDate) { return $false }
   $currentCreation = Get-ProcessCreationTicks $Process
   if ($null -eq $currentCreation) { return $false }
-  if ($null -ne $Entry.CreationDate) { return $currentCreation -eq $Entry.CreationDate }
-  if ($null -ne $Entry.StartedAt) { return $currentCreation -ge $Entry.StartedAt }
-  return $false
+  return $currentCreation -eq $Entry.CreationDate
 }
 
-function Remove-StartedMarkers([hashtable]$Entry, [int]$ProcessId) {
-  if (-not (Test-Path -LiteralPath $Entry.PidFile)) { return }
-  try {
-    $markerPid = (Get-Content -LiteralPath $Entry.PidFile -Raw).Trim()
-    if ($markerPid -ne "$ProcessId") { return }
-    Remove-Item -LiteralPath $Entry.PidFile -Force -ErrorAction SilentlyContinue
-    if (-not [string]::IsNullOrWhiteSpace($Entry.ModeFile)) {
-      Remove-Item -LiteralPath $Entry.ModeFile -Force -ErrorAction SilentlyContinue
+function Set-ProcessMarkers(
+  [string]$PidFile,
+  [string]$IdentityFile,
+  [object]$Process,
+  [string]$ModeFile = $null,
+  [string]$RequestedMode = $null,
+  [object]$ExpectedPidSnapshot = $null,
+  [object]$ExpectedIdentitySnapshot = $null,
+  [object]$ExpectedModeSnapshot = $null
+) {
+  if ($null -ne $ExpectedPidSnapshot -or $null -ne $ExpectedIdentitySnapshot -or $null -ne $ExpectedModeSnapshot) {
+    if (-not (Test-ProcessMarkerFileSnapshot $PidFile $ExpectedPidSnapshot) -or
+      -not (Test-ProcessMarkerFileSnapshot $IdentityFile $ExpectedIdentitySnapshot) -or
+      (-not [string]::IsNullOrWhiteSpace($ModeFile) -and
+        -not (Test-ProcessMarkerFileSnapshot $ModeFile $ExpectedModeSnapshot))) {
+      throw 'Process markers changed before ownership could be persisted.'
     }
-  } catch {}
+  }
+  Set-Content -LiteralPath $PidFile -Value $Process.ProcessId -NoNewline
+  Write-PersistedProcessIdentity $IdentityFile $Process
+  if (-not [string]::IsNullOrWhiteSpace($ModeFile)) {
+    Set-Content -LiteralPath $ModeFile -Value $RequestedMode -NoNewline
+  }
+}
+
+function Remove-ProcessMarkerFilesIfUnchanged(
+  [string]$PidFile,
+  [string]$IdentityFile,
+  [string]$ModeFile,
+  [object]$PidSnapshot,
+  [object]$IdentitySnapshot,
+  [object]$ModeSnapshot
+) {
+  if (-not (Test-ProcessMarkerFileSnapshot $PidFile $PidSnapshot) -or
+    -not (Test-ProcessMarkerFileSnapshot $IdentityFile $IdentitySnapshot)) {
+    return $false
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ModeFile) -and
+    -not (Test-ProcessMarkerFileSnapshot $ModeFile $ModeSnapshot)) {
+    return $false
+  }
+  try {
+    Remove-Item -LiteralPath $PidFile -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $IdentityFile -Force -ErrorAction Stop
+    if (-not [string]::IsNullOrWhiteSpace($ModeFile)) {
+      Remove-Item -LiteralPath $ModeFile -Force -ErrorAction Stop
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Remove-StartedMarkers([hashtable]$Entry, [object]$ExpectedIdentity) {
+  $additionalFiles = if ([string]::IsNullOrWhiteSpace($Entry.ModeFile)) { @() } else { @($Entry.ModeFile) }
+  $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($Entry.ModeSnapshot) }
+  Remove-PersistedProcessMarkersIfMatch $Entry.PidFile $Entry.IdentityFile $ExpectedIdentity $additionalFiles $additionalSnapshots | Out-Null
 }
 
 function Start-LocalNode(
   [string]$PidFile,
+  [string]$IdentityFile,
   [string]$Script,
   [string]$StdoutFile,
   [string]$StderrFile,
@@ -186,46 +184,137 @@ function Start-LocalNode(
   [int]$Port = 0
 ) {
   $tracksMode = -not [string]::IsNullOrWhiteSpace($ModeFile)
-  if (Test-Path $PidFile) {
-    $oldPid = [int](Get-Content $PidFile -Raw)
-    $old = Get-CimInstance Win32_Process -Filter "ProcessId=$oldPid" -ErrorAction SilentlyContinue
-    if ($old -and (Test-NodeScriptProcess $old $Script)) {
-      if (-not $tracksMode) {
-        if ($Port -le 0 -or (Test-ListeningPortOwner $Port $oldPid)) { return $oldPid }
-      } else {
-        if (Test-ModeMatch $ModeFile $RequestedMode) {
-          $expectedState = Get-ExpectedListenerState $RequestedMode
-          if ((Get-FeishuListenerState) -eq $expectedState -and
-            ($Port -le 0 -or (Test-ListeningPortOwner $Port $oldPid))) { return $oldPid }
+  [int]$blockedPid = 0
+  $pidMarkerSnapshot = Get-ProcessMarkerFileSnapshot $PidFile
+  $identityMarkerSnapshot = Get-ProcessMarkerFileSnapshot $IdentityFile
+  $modeMarkerSnapshot = if ($tracksMode) { Get-ProcessMarkerFileSnapshot $ModeFile } else { $null }
+  if (Test-Path -LiteralPath $PidFile) {
+    $oldPid = Read-PersistedProcessId $PidFile
+    if ($null -eq $oldPid) {
+      Write-Warning "Ignoring malformed PID marker $PidFile."
+      if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot)) {
+        throw "Could not safely clear malformed process markers for $PidFile; leaving them unchanged."
+      }
+    } else {
+      $oldQuery = Get-ProcessQueryResult $oldPid
+      if (-not $oldQuery.Succeeded) {
+        throw "Could not query persisted PID $oldPid; leaving its process and markers unchanged. ($($oldQuery.Error))"
+      }
+      $old = $oldQuery.Process
+      $identityFilePresent = Test-Path -LiteralPath $IdentityFile
+      $persistedIdentity = Read-PersistedProcessIdentity $IdentityFile
+      if (-not $old) {
+        if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot)) {
+          throw "Could not safely clear stale process markers for PID $oldPid; leaving them unchanged."
         }
-        Stop-ValidatedNode $old $Script
+      } else {
+        $scriptMatches = Test-NodeScriptProcess $old $Script $node
+        $portMatches = $Port -le 0 -or (Test-ListeningPortOwner $Port $oldPid)
+        $identityMatches = $persistedIdentity -and (Test-PersistedProcessIdentity $old $persistedIdentity)
+
+        if ($identityMatches -and $scriptMatches) {
+          if (-not $tracksMode) {
+            if ($portMatches) { return $oldPid }
+            Stop-ValidatedNode $old $Script $persistedIdentity $node
+            if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity)) {
+              throw "Stopped PID $oldPid, but its ownership markers changed before cleanup."
+            }
+          } else {
+            $expectedState = Get-ExpectedListenerState $RequestedMode
+            if ($portMatches -and (Get-FeishuListenerState) -eq $expectedState) {
+              if (-not (Test-ExpectedNodeProcess $oldPid $Script $node $persistedIdentity $Port) -or
+                -not (Test-ProcessMarkerFileSnapshot $PidFile $pidMarkerSnapshot) -or
+                -not (Test-ProcessMarkerFileSnapshot $IdentityFile $identityMarkerSnapshot) -or
+                -not (Test-ProcessMarkerFileSnapshot $ModeFile $modeMarkerSnapshot)) {
+                throw "Bridge PID $oldPid or its ownership markers changed during mode validation."
+              }
+              Set-Content -LiteralPath $ModeFile -Value $RequestedMode -NoNewline
+              return $oldPid
+            }
+            Stop-ValidatedNode $old $Script $persistedIdentity $node
+            $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
+            $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeMarkerSnapshot) }
+            if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
+              throw "Stopped Bridge PID $oldPid, but its ownership markers changed before cleanup."
+            }
+          }
+        } elseif (-not $identityFilePresent -and $scriptMatches -and $portMatches) {
+          # A legacy PID-only marker is adopted only after script, port, and mode health checks.
+          if (-not $tracksMode) {
+            if (Test-Ready 'http://127.0.0.1:47823/api/meta' $oldPid $Port $Script $node) {
+              $verifiedOld = Get-VerifiedCurrentNodeProcess $old $Script $Port $node
+              if ($verifiedOld) {
+                Set-ProcessMarkers $PidFile $IdentityFile $verifiedOld $null $null $pidMarkerSnapshot $identityMarkerSnapshot $null
+                return $verifiedOld.ProcessId
+              }
+            }
+            Write-Warning "Could not verify the health and identity of legacy process $oldPid; leaving it running."
+            $blockedPid = $oldPid
+            if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot)) {
+              throw "Could not safely clear legacy process markers for PID $oldPid; leaving them unchanged."
+            }
+          } else {
+            $expectedState = Get-ExpectedListenerState $RequestedMode
+            $listenerState = Get-FeishuListenerState
+            if ($listenerState -eq $expectedState) {
+              $verifiedOld = Get-VerifiedCurrentNodeProcess $old $Script $Port $node
+              if ($verifiedOld) {
+                Set-ProcessMarkers $PidFile $IdentityFile $verifiedOld $ModeFile $RequestedMode $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot
+                return $verifiedOld.ProcessId
+              }
+            }
+            Write-Warning "Could not verify the mode and identity of legacy process $oldPid; leaving it running."
+            $blockedPid = $oldPid
+            if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot)) {
+              throw "Could not safely clear legacy process markers for PID $oldPid; leaving them unchanged."
+            }
+          }
+        } else {
+          Write-Warning "Could not verify persisted identity for process $oldPid; leaving it running."
+          if ($scriptMatches -and $portMatches) { $blockedPid = $oldPid }
+          if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot)) {
+            throw "Could not safely clear process markers for PID $oldPid; leaving them unchanged."
+          }
+        }
       }
     }
-    Remove-Item -LiteralPath $PidFile -Force
-    if ($tracksMode) { Remove-Item -LiteralPath $ModeFile -Force -ErrorAction SilentlyContinue }
   }
+
+  $pidMarkerSnapshot = Get-ProcessMarkerFileSnapshot $PidFile
+  $identityMarkerSnapshot = Get-ProcessMarkerFileSnapshot $IdentityFile
+  $modeMarkerSnapshot = if ($tracksMode) { Get-ProcessMarkerFileSnapshot $ModeFile } else { $null }
+
   $existing = Get-CimInstance Win32_Process |
     Where-Object {
-      (Test-NodeScriptProcess $_ $Script) -and
+      (Test-NodeScriptProcess $_ $Script $node) -and
       ($Port -le 0 -or (Test-ListeningPortOwner $Port $_.ProcessId))
     } |
     Sort-Object CreationDate -Descending |
     Select-Object -First 1
   if ($existing) {
+    if ($blockedPid -gt 0 -and [int]$existing.ProcessId -eq $blockedPid) {
+      throw "An unverified process is already using port $Port (PID $blockedPid); it was left running. Stop it manually before starting another instance."
+    }
     if (-not $tracksMode) {
-      Set-Content -LiteralPath $PidFile -Value $existing.ProcessId -NoNewline
-      return $existing.ProcessId
+      if (-not (Test-Ready 'http://127.0.0.1:47823/api/meta' $existing.ProcessId $Port $Script $node)) {
+        throw "An unmarked Taskboard process is using port $Port but its health endpoint is not ready (PID $($existing.ProcessId))."
+      }
+      $verifiedExisting = Get-VerifiedCurrentNodeProcess $existing $Script $Port $node
+      if (-not $verifiedExisting) {
+        throw "The unmarked Taskboard process changed after its health check; it was not adopted."
+      }
+      Set-ProcessMarkers $PidFile $IdentityFile $verifiedExisting $null $null $pidMarkerSnapshot $identityMarkerSnapshot $null
+      return $verifiedExisting.ProcessId
     }
     $existingState = Get-FeishuListenerState
     $expectedState = Get-ExpectedListenerState $RequestedMode
-    if (Test-ModeMatch $ModeFile $RequestedMode -and $existingState -eq $expectedState) {
-      Set-Content -LiteralPath $PidFile -Value $existing.ProcessId -NoNewline
-      return $existing.ProcessId
-    }
     if ($existingState -eq $expectedState) {
-      Set-Content -LiteralPath $PidFile -Value $existing.ProcessId -NoNewline
-      Set-Content -LiteralPath $ModeFile -Value $RequestedMode -NoNewline
-      return $existing.ProcessId
+      $verifiedExisting = Get-VerifiedCurrentNodeProcess $existing $Script $Port $node
+      if (-not $verifiedExisting) {
+        throw "The unmarked Feishu Bridge process changed after its health check; it was not adopted."
+      }
+      Set-ProcessMarkers $PidFile $IdentityFile $verifiedExisting $ModeFile $RequestedMode $pidMarkerSnapshot $identityMarkerSnapshot $modeMarkerSnapshot
+      return $verifiedExisting.ProcessId
     }
     throw "A Feishu Bridge process is already running without a matching runtime ownership marker (state: $existingState). Stop it before starting a different mode."
   }
@@ -240,7 +329,6 @@ function Start-LocalNode(
   foreach ($entry in $Environment.GetEnumerator()) {
     $arguments += @('--env', "$($entry.Key)=$($entry.Value)")
   }
-  $launchStartedAt = ([DateTime]::UtcNow).Ticks
   $launcherOutput = @(& $node @arguments)
   $launcherExitCode = $LASTEXITCODE
   $launchedPid = $null
@@ -251,21 +339,21 @@ function Start-LocalNode(
     }
   }
   if ($null -eq $launchedPid -and (Test-Path -LiteralPath $PidFile)) {
-    try {
-      $pidFromFile = 0
-      if ([int]::TryParse((Get-Content -LiteralPath $PidFile -Raw).Trim(), [ref]$pidFromFile) -and $pidFromFile -gt 0) {
-        $launchedPid = $pidFromFile
-      }
-    } catch {}
+    $launchedPid = Read-PersistedProcessId $PidFile
   }
+  $startedEntry = $null
   if ($null -ne $launchedPid) {
-    $startedNodes[$launchedPid] = @{
+    $startedEntry = @{
+      Pid = [int]$launchedPid
       Script = $Script
       PidFile = $PidFile
+      IdentityFile = $IdentityFile
       ModeFile = $ModeFile
-      StartedAt = $launchStartedAt
+      Node = $node
       CreationDate = $null
+      ModeSnapshot = $null
     }
+    $startedNodes.Add($startedEntry) | Out-Null
   }
   if ($launcherExitCode -ne 0) { throw "Could not start process for $Script" }
   if ($null -eq $launchedPid) { throw "Detached launcher did not return a PID for $Script" }
@@ -273,12 +361,17 @@ function Start-LocalNode(
   do {
     $candidate = Get-CimInstance Win32_Process -Filter "ProcessId=$launchedPid" -ErrorAction SilentlyContinue
     if ($candidate) {
-      if (-not (Test-NodeScriptProcess $candidate $Script)) {
+      if (-not (Test-NodeScriptProcess $candidate $Script $node)) {
         throw "Detached launcher PID $launchedPid does not match $Script"
       }
-      $startedNodes[$launchedPid].CreationDate = Get-ProcessCreationTicks $candidate
-      Set-Content -LiteralPath $PidFile -Value $launchedPid -NoNewline
-      if ($tracksMode) { Set-Content -LiteralPath $ModeFile -Value $RequestedMode -NoNewline }
+      $creationTicks = Get-ProcessCreationTicks $candidate
+      if ($null -eq $creationTicks) { throw "Could not read creation time for PID $launchedPid" }
+      $startedEntry.CreationDate = $creationTicks
+      $launchPidSnapshot = Get-ProcessMarkerFileSnapshot $PidFile
+      $launchIdentitySnapshot = Get-ProcessMarkerFileSnapshot $IdentityFile
+      $launchModeSnapshot = if ($tracksMode) { Get-ProcessMarkerFileSnapshot $ModeFile } else { $null }
+      Set-ProcessMarkers $PidFile $IdentityFile $candidate $ModeFile $RequestedMode $launchPidSnapshot $launchIdentitySnapshot $launchModeSnapshot
+      if ($tracksMode) { $startedEntry.ModeSnapshot = Get-ProcessMarkerFileSnapshot $ModeFile }
       return $launchedPid
     }
     Start-Sleep -Milliseconds 250
@@ -287,41 +380,64 @@ function Start-LocalNode(
 }
 
 function Stop-StartedNodes {
-  foreach ($entry in @($startedNodes.GetEnumerator())) {
-    $node = Get-CimInstance Win32_Process -Filter "ProcessId=$($entry.Key)" -ErrorAction SilentlyContinue
+  foreach ($entry in @($startedNodes)) {
+    [int]$startedPid = $entry.Pid
+    $nodeQuery = Get-ProcessQueryResult $startedPid
     $removeMarkers = $true
+    $expectedIdentity = $null
+    if (-not $nodeQuery.Succeeded) {
+      Write-Warning "Could not query started process $startedPid; leaving it and its markers unchanged. ($($nodeQuery.Error))"
+      continue
+    }
+    $node = $nodeQuery.Process
     if ($node) {
-      if (-not (Test-StartedNodeIdentity $node $entry.Value)) {
-        Write-Warning "Could not verify identity of started process $($entry.Key); leaving it running."
-        $removeMarkers = $false
+      if (-not (Test-StartedNodeIdentity $node $entry)) {
+        Write-Warning "Could not verify identity of started process $startedPid; leaving the current PID owner running."
       } else {
         try {
-          Stop-ValidatedNode $node $entry.Value.Script
+          $expectedIdentity = New-PersistedProcessIdentity $node
+          if ($null -eq $expectedIdentity) { throw 'Could not read the started process identity.' }
+          Stop-ValidatedNode $node $entry.Script $expectedIdentity $entry.Node
         } catch {
-          Write-Warning "Could not clean up started process $($entry.Key)."
+          Write-Warning "Could not clean up started process $startedPid."
           $removeMarkers = $false
         }
       }
     }
     if ($removeMarkers) {
-      Remove-StartedMarkers $entry.Value ([int]$entry.Key)
+      if ($null -eq $expectedIdentity -and $null -ne $entry.CreationDate) {
+        $expectedIdentity = [pscustomobject]@{
+          Version = 1
+          Pid = $startedPid
+          CreationTicks = [long]$entry.CreationDate
+        }
+      }
+      if ($expectedIdentity) {
+        try {
+          Remove-StartedMarkers $entry $expectedIdentity
+        } catch {
+          Write-Warning "Could not remove markers for started process $startedPid; continuing cleanup."
+        }
+      }
     }
   }
 }
 
-function Wait-FeishuReady([int]$BridgePid, [string]$BridgeScript) {
+function Wait-FeishuReady(
+  [int]$BridgePid,
+  [string]$BridgeScript,
+  [string]$ExpectedExecutable,
+  [object]$ExpectedIdentity
+) {
   $deadline = (Get-Date).AddSeconds(30)
   $lastState = 'unavailable'
   do {
-    $bridgeProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$BridgePid" -ErrorAction SilentlyContinue
-    if (-not $bridgeProcess) {
+    if (-not (Test-ExpectedNodeProcess $BridgePid $BridgeScript $ExpectedExecutable $ExpectedIdentity 47824)) {
+      $bridgeProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$BridgePid" -ErrorAction SilentlyContinue
+      if (-not $bridgeProcess) {
       throw 'Feishu Bridge exited before the SDK-managed listener became ready. Check .runtime\logs\bridge.stderr.log.'
-    }
-    if (-not (Test-NodeScriptProcess $bridgeProcess $BridgeScript)) {
+      }
       throw 'Feishu Bridge PID no longer matches the expected process. Check .runtime\logs\bridge.stderr.log.'
-    }
-    if (-not (Test-ListeningPortOwner 47824 $BridgePid)) {
-      throw 'Feishu Bridge PID does not own the health endpoint port. Check .runtime\logs\bridge.stderr.log.'
     }
     try {
       $health = Invoke-RestMethod -Method Get -Uri 'http://127.0.0.1:47824/health' -TimeoutSec 2
@@ -333,7 +449,10 @@ function Wait-FeishuReady([int]$BridgePid, [string]$BridgeScript) {
     } catch {
       $lastState = 'unavailable'
     }
-    if ($lastState -eq 'sdk_managed') { return }
+    if ($lastState -eq 'sdk_managed') {
+      if (Test-ExpectedNodeProcess $BridgePid $BridgeScript $ExpectedExecutable $ExpectedIdentity 47824) { return }
+      throw 'Feishu Bridge process changed after the health response. Check .runtime\logs\bridge.stderr.log.'
+    }
     if ($lastState -eq 'error') {
       throw 'Feishu listener failed to start. Check .runtime\logs\bridge.stderr.log.'
     }
@@ -342,7 +461,7 @@ function Wait-FeishuReady([int]$BridgePid, [string]$BridgeScript) {
   throw "Feishu listener did not become SDK-managed within 30 seconds (state: $lastState). Check .runtime\logs\bridge.stderr.log."
 }
 
-$startupMutex = New-Object System.Threading.Mutex($false, 'Local\CodexFeishuTaskboardStartup')
+$startupMutex = New-Object System.Threading.Mutex($false, 'Local\CodexFeishuTaskboardLifecycle')
 $startupMutexAcquired = $false
 try {
   try {
@@ -353,14 +472,16 @@ try {
   if (-not $startupMutexAcquired) { throw 'Another Taskboard startup is already in progress.' }
 
   $taskboardScript = Join-Path $taskboardRoot 'server\index.mjs'
-  $taskboardPid = Start-LocalNode $taskboardPidFile $taskboardScript $taskboardStdout $taskboardStderr @{
+  $taskboardPid = Start-LocalNode $taskboardPidFile $taskboardIdentityFile $taskboardScript $taskboardStdout $taskboardStderr @{
     CODEX_TASKBOARD_HOST = '127.0.0.1'
     CODEX_TASKBOARD_PORT = '47823'
     CODEX_TASKBOARD_DATA_DIR = $taskboardData
     CODEX_EXECUTABLE = $codexExecutable
     CODEX_FEISHU_PACKAGES_PATH = $config
   } $null $null 47823
-  Wait-Ready 'Taskboard' 'http://127.0.0.1:47823/api/meta' $taskboardPid 47823 $taskboardScript
+  $taskboardIdentity = Read-PersistedProcessIdentity $taskboardIdentityFile
+  if (-not $taskboardIdentity) { throw 'Taskboard process identity marker is missing or invalid after startup.' }
+  Wait-Ready 'Taskboard' 'http://127.0.0.1:47823/api/meta' $taskboardPid 47823 $taskboardScript $node $taskboardIdentity
 
   $bridgeScript = Join-Path $root 'src\index.mjs'
   $bridgeMode = if ($EnableFeishu) { 'enabled' } else { 'disabled' }
@@ -370,9 +491,11 @@ try {
   if ($EnableFeishu) {
     $bridgeEnvironment.FEISHU_LISTENER_ENABLED = '1'
   }
-  $bridgePid = Start-LocalNode $bridgePidFile $bridgeScript $bridgeStdout $bridgeStderr $bridgeEnvironment $bridgeModeFile $bridgeMode 47824
-  Wait-Ready 'Feishu Bridge' 'http://127.0.0.1:47824/health' $bridgePid 47824 $bridgeScript
-  if ($EnableFeishu) { Wait-FeishuReady $bridgePid $bridgeScript }
+  $bridgePid = Start-LocalNode $bridgePidFile $bridgeIdentityFile $bridgeScript $bridgeStdout $bridgeStderr $bridgeEnvironment $bridgeModeFile $bridgeMode 47824
+  $bridgeIdentity = Read-PersistedProcessIdentity $bridgeIdentityFile
+  if (-not $bridgeIdentity) { throw 'Bridge process identity marker is missing or invalid after startup.' }
+  Wait-Ready 'Feishu Bridge' 'http://127.0.0.1:47824/health' $bridgePid 47824 $bridgeScript $node $bridgeIdentity
+  if ($EnableFeishu) { Wait-FeishuReady $bridgePid $bridgeScript $node $bridgeIdentity }
 
   Write-Host "Taskboard started: http://127.0.0.1:47823 (PID $taskboardPid)"
   Write-Host "Feishu Bridge started: http://127.0.0.1:47824 (PID $bridgePid)"

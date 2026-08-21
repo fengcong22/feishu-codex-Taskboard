@@ -4,15 +4,17 @@
 
 **Goal:** Prevent stale PID reuse from causing the Taskboard launchers to stop the wrong same-script Node process.
 
-**Architecture:** Preserve the existing PID files and add JSON identity sidecars containing the PID and Windows process creation ticks. Centralized PowerShell helpers will write, read, compare, adopt, and remove markers consistently in the start and stop paths.
+**Architecture:** Preserve the existing PID files and add versioned JSON identity sidecars containing the PID and Windows process creation ticks as a decimal string. Centralized PowerShell helpers will write, read, compare, adopt, and remove markers consistently in the start and stop paths.
 
 **Tech Stack:** Windows PowerShell 5.1, CIM `Win32_Process`, Node.js built-in test runner.
 
 ## Global Constraints
 
-- Both services remain bound to `127.0.0.1` on ports `47823` and `47824`.
+- Both services remain bound exactly to IPv4 `127.0.0.1` on ports `47823` and
+  `47824`; wildcard and IPv6 listeners are not accepted as owned services.
 - Runtime identity files remain under the Git-ignored `.runtime` directory.
 - Legacy PID-only markers never authorize terminating a process.
+- Only startup may migrate a healthy legacy process; stop remains fail-closed.
 - Event routing and Feishu credential handling remain unchanged.
 
 ---
@@ -20,6 +22,7 @@
 ### Task 1: Lock destructive actions to persisted process identity
 
 **Files:**
+- Create: `scripts/process-identity.ps1`
 - Modify: `test/startup-scripts.test.mjs`
 - Modify: `scripts/start-local.ps1`
 - Modify: `scripts/stop-local.ps1`
@@ -32,8 +35,11 @@
 - [ ] **Step 1: Write failing source-contract regression tests**
 
 Add assertions that both scripts reference identity sidecars, persist creation
-ticks, compare them before `taskkill.exe`, and explicitly handle legacy
-PID-only adoption without using it as destructive authorization.
+ticks, compare them before identity-bound native termination, and explicitly
+handle legacy PID-only adoption without using it as destructive authorization.
+Cover missing cleanup identity, wildcard listeners, post-health PID reuse,
+readiness identity reuse, marker rewrites, non-leaf marker paths, and nonzero
+stop results for live targets that cannot be verified.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
@@ -46,9 +52,12 @@ sidecars or require their creation time before stopping a process.
 
 In both PowerShell scripts, serialize a small JSON object with the exact PID and
 UTC creation ticks. Parse it fail-closed. Compare both fields with the current
-CIM process before any persisted-marker stop. Adopt a legacy marker only after
-exact script and expected listening-port ownership checks; otherwise remove
-stale marker files without stopping the process.
+CIM process before any persisted-marker stop, and require the exact Node
+executable selected by the launcher. Adopt a legacy marker only after
+exact script, endpoint or mode health, and exclusive IPv4 loopback ownership
+checks, followed by a same-instance CIM re-query. Remove an invalid marker only
+when its identity-file snapshot is unchanged, and return nonzero after checking
+all targets when a live process must be left running.
 
 - [ ] **Step 4: Document the behavior**
 
