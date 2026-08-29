@@ -1,16 +1,81 @@
 param(
-  [switch]$EnableFeishu
+  [switch]$EnableFeishu,
+  [string]$TaskboardRoot = $null
 )
 
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$taskboardRoot = if ($env:CODEX_TASKBOARD_ROOT) { (Resolve-Path $env:CODEX_TASKBOARD_ROOT).Path } else { 'D:\codex\dashi-taskboard' }
+
+$taskboardDefaultCandidates = @(
+  (Join-Path (Split-Path -Parent $root) 'worktrees\dashi-taskboard-autocut-workflow'),
+  (Join-Path (Split-Path -Parent $root) 'dashi-taskboard'),
+  'D:\codex\dashi-taskboard'
+)
+
+function Resolve-TaskboardRoot(
+  [string]$ExplicitRoot = $null,
+  [string[]]$DefaultCandidates = $null
+) {
+  $hasExplicitOverride = -not [string]::IsNullOrWhiteSpace($ExplicitRoot)
+  $hasEnvironmentOverride = -not [string]::IsNullOrWhiteSpace($env:CODEX_TASKBOARD_ROOT)
+  $candidates = if ($hasExplicitOverride) {
+    @($ExplicitRoot)
+  } elseif ($hasEnvironmentOverride) {
+    @($env:CODEX_TASKBOARD_ROOT)
+  } elseif ($null -ne $DefaultCandidates -and $DefaultCandidates.Count -gt 0) {
+    @($DefaultCandidates)
+  } else {
+    @($taskboardDefaultCandidates)
+  }
+  $checked = New-Object System.Collections.ArrayList
+  foreach ($candidate in $candidates) {
+    $requestedRoot = [string]$candidate
+    if ([string]::IsNullOrWhiteSpace($requestedRoot)) { continue }
+    if (-not [System.IO.Path]::IsPathRooted($requestedRoot)) {
+      if ($hasExplicitOverride -or $hasEnvironmentOverride) {
+        throw "Taskboard root must be an absolute path: $requestedRoot"
+      }
+      [void]$checked.Add("$requestedRoot (not absolute)")
+      continue
+    }
+    try {
+      $resolvedRoot = (Resolve-Path -LiteralPath $requestedRoot -ErrorAction Stop).Path
+    } catch {
+      [void]$checked.Add("$requestedRoot (not found)")
+      continue
+    }
+    $serverEntry = Join-Path $resolvedRoot 'server\index.mjs'
+    $webEntry = Join-Path $resolvedRoot 'dist\web\index.html'
+    if ((Test-Path -LiteralPath $serverEntry -PathType Leaf) -and
+      (Test-Path -LiteralPath $webEntry -PathType Leaf)) {
+      return $resolvedRoot
+    }
+    if ($hasExplicitOverride -or $hasEnvironmentOverride) {
+      throw "Taskboard root is incomplete: $resolvedRoot. Expected server\index.mjs and dist\web\index.html."
+    }
+    [void]$checked.Add("$resolvedRoot (missing server\index.mjs or dist\web\index.html)")
+  }
+  if ($checked.Count -gt 0) {
+    throw "No complete Taskboard checkout was found. Checked: $($checked -join '; '). Set -TaskboardRoot or CODEX_TASKBOARD_ROOT to a Taskboard checkout."
+  }
+  throw 'No Taskboard root candidates were configured. Set -TaskboardRoot or CODEX_TASKBOARD_ROOT.'
+}
+
+$taskboardRoot = Resolve-TaskboardRoot $TaskboardRoot $taskboardDefaultCandidates
 $runtime = Join-Path $root '.runtime'
 $logs = Join-Path $runtime 'logs'
 $taskboardData = Join-Path $runtime 'taskboard'
 $bridgeData = Join-Path $runtime 'bridge'
 $config = Join-Path $root 'config\bridge.local.json'
+$packageRegistry = if ([string]::IsNullOrWhiteSpace($env:CODEX_FEISHU_PACKAGES_PATH)) {
+  Join-Path $root 'config\taskboard-feishu-packages.json'
+} else {
+  $env:CODEX_FEISHU_PACKAGES_PATH
+}
+if (-not [System.IO.Path]::IsPathRooted($packageRegistry)) {
+  throw "CODEX_FEISHU_PACKAGES_PATH must be an absolute path: $packageRegistry"
+}
 $taskboardPidFile = Join-Path $runtime 'taskboard.pid'
 $bridgePidFile = Join-Path $runtime 'bridge.pid'
 $taskboardIdentityFile = Join-Path $runtime 'taskboard.process.json'
@@ -45,6 +110,14 @@ foreach ($directory in @($runtime, $logs, $taskboardData, $bridgeData)) {
 if (-not (Test-Path $config)) {
   Copy-Item (Join-Path $root 'config\bridge.example.json') $config
   Write-Host "Created local config: $config"
+}
+if (Test-Path -LiteralPath $packageRegistry -PathType Container) {
+  throw "Auto-Cut package registry path is not a regular file: $packageRegistry"
+}
+if (-not (Test-Path -LiteralPath $packageRegistry -PathType Leaf)) {
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $packageRegistry) | Out-Null
+  Copy-Item (Join-Path $root 'config\autocut-packages.example.json') $packageRegistry
+  Write-Host "Created package registry: $packageRegistry"
 }
 if ([string]::IsNullOrWhiteSpace($codexExecutable) -or -not (Test-Path -LiteralPath $codexExecutable -PathType Leaf)) {
   throw 'Codex executable was not found. Install the Codex desktop app or set CODEX_EXECUTABLE explicitly.'
@@ -471,13 +544,19 @@ try {
   }
   if (-not $startupMutexAcquired) { throw 'Another Taskboard startup is already in progress.' }
 
+  $taskboardBridgeSecret = [string]$env:CODEX_FEISHU_BRIDGE_SECRET
+  if ([string]::IsNullOrWhiteSpace($taskboardBridgeSecret)) {
+    $taskboardBridgeSecret = ((New-Guid).Guid.Replace('-', '') + (New-Guid).Guid.Replace('-', ''))
+  }
+
   $taskboardScript = Join-Path $taskboardRoot 'server\index.mjs'
   $taskboardPid = Start-LocalNode $taskboardPidFile $taskboardIdentityFile $taskboardScript $taskboardStdout $taskboardStderr @{
     CODEX_TASKBOARD_HOST = '127.0.0.1'
     CODEX_TASKBOARD_PORT = '47823'
     CODEX_TASKBOARD_DATA_DIR = $taskboardData
     CODEX_EXECUTABLE = $codexExecutable
-    CODEX_FEISHU_PACKAGES_PATH = $config
+    CODEX_FEISHU_PACKAGES_PATH = $packageRegistry
+    CODEX_FEISHU_BRIDGE_SECRET = $taskboardBridgeSecret
   } $null $null 47823
   $taskboardIdentity = Read-PersistedProcessIdentity $taskboardIdentityFile
   if (-not $taskboardIdentity) { throw 'Taskboard process identity marker is missing or invalid after startup.' }
@@ -487,6 +566,8 @@ try {
   $bridgeMode = if ($EnableFeishu) { 'enabled' } else { 'disabled' }
   $bridgeEnvironment = @{
     BRIDGE_CONFIG = $config
+    CODEX_FEISHU_PACKAGES_PATH = $packageRegistry
+    CODEX_FEISHU_BRIDGE_SECRET = $taskboardBridgeSecret
   }
   if ($EnableFeishu) {
     $bridgeEnvironment.FEISHU_LISTENER_ENABLED = '1'
@@ -497,6 +578,7 @@ try {
   Wait-Ready 'Feishu Bridge' 'http://127.0.0.1:47824/health' $bridgePid 47824 $bridgeScript $node $bridgeIdentity
   if ($EnableFeishu) { Wait-FeishuReady $bridgePid $bridgeScript $node $bridgeIdentity }
 
+  Write-Host "Taskboard root: $taskboardRoot"
   Write-Host "Taskboard started: http://127.0.0.1:47823 (PID $taskboardPid)"
   Write-Host "Feishu Bridge started: http://127.0.0.1:47824 (PID $bridgePid)"
   if ($EnableFeishu) { Write-Host 'Feishu WebSocket listener is SDK-managed.' }

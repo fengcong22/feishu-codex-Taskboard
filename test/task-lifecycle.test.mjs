@@ -151,6 +151,28 @@ test("archives only matching todo tasks and fences every Taskboard call", async 
   assert.equal(fences, 6);
 });
 
+test("uses provenance-only Feishu list and archive methods when available", async () => {
+  const candidate = task({ id: "task_provenance" });
+  const calls = [];
+  const taskboard = {
+    async listFeishuWaitingTasks(scope) { calls.push(["list-feishu", scope]); return [candidate]; },
+    async getTask() { calls.push(["get", candidate.id]); return candidate; },
+    async archiveFeishuTask(value) { calls.push(["archive-feishu", value.id, value.version]); return { ...value, archivedAt: "now" }; },
+    listTasks: assert.fail,
+    archiveTask: assert.fail,
+  };
+  const result = await (await import("../src/task-lifecycle.mjs")).archiveWaitingFeishuTasks(
+    taskboard,
+    { event, table },
+  );
+  assert.deepEqual(result, { archivedCount: 1 });
+  assert.deepEqual(calls, [
+    ["list-feishu", { event, table }],
+    ["get", "task_provenance"],
+    ["archive-feishu", "task_provenance", 4],
+  ]);
+});
+
 test("skips a task that enters execution after a version conflict", async () => {
   const candidate = task({ id: "task_racing" });
   let reads = 0;
@@ -240,6 +262,24 @@ test("treats an archive-time TASK_NOT_FOUND as an already absent task", async ()
     await (await import("../src/task-lifecycle.mjs")).archiveWaitingFeishuTasks(taskboard, { event, table }),
     { archivedCount: 0 },
   );
+});
+
+test("treats an archive-time TASK_NOT_WAITING as a benign execution race", async () => {
+  const candidate = task({ id: "task_started_while_archiving" });
+  let archiveCalls = 0;
+  const taskboard = {
+    async listTasks() { return [candidate]; },
+    async getTask() { return candidate; },
+    async archiveTask() {
+      archiveCalls += 1;
+      throw Object.assign(new Error("already started"), { code: "TASK_NOT_WAITING", status: 409 });
+    },
+  };
+  assert.deepEqual(
+    await (await import("../src/task-lifecycle.mjs")).archiveWaitingFeishuTasks(taskboard, { event, table }),
+    { archivedCount: 0 },
+  );
+  assert.equal(archiveCalls, 1);
 });
 
 test("uses HTTP status fallbacks when Taskboard omits a structured error code", async () => {

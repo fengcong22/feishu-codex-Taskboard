@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { decideRecordChange } from "./decide-event.mjs";
 import {
@@ -58,8 +58,131 @@ function isLeaseLost(error) {
   return error?.code === "LEASE_LOST" || error?.code === "LEASE_NOT_OWNED";
 }
 
+const DECISION_SNAPSHOT_VERSION = 1;
+
+function packageConfigFingerprint(packageConfig) {
+  if (!packageConfig || typeof packageConfig !== "object") return undefined;
+  const canonical = JSON.stringify({
+    projectId: packageConfig.projectId ?? null,
+    projectName: packageConfig.projectName ?? null,
+    workspacePath: packageConfig.workspacePath ?? null,
+    prompt: packageConfig.prompt ?? null,
+  });
+  return createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
+function snapshotAction(decision) {
+  if (decision?.kind === "ready" || decision?.kind === "blocked") return "create";
+  if (decision?.kind === "ignored" && decision?.effect === "archive_waiting_tasks") return "archive";
+  return null;
+}
+
+function optionalSnapshotString(value) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+function buildDecisionSnapshot(decision) {
+  const action = snapshotAction(decision);
+  if (!action || !decision?.event || !decision?.table) return null;
+  const tableSource = decision.table;
+  const table = {
+    baseToken: optionalSnapshotString(tableSource.baseToken) ?? decision.event.baseToken,
+    tableId: optionalSnapshotString(tableSource.tableId) ?? decision.event.tableId,
+    subjectKey: optionalSnapshotString(decision.subjectKey ?? tableSource.subjectKey),
+    name: optionalSnapshotString(tableSource.name) ?? decision.event.tableId,
+    mode: optionalSnapshotString(decision.executionMode ?? tableSource.executionMode ?? tableSource.mode),
+    executionMode: optionalSnapshotString(decision.executionMode ?? tableSource.executionMode ?? tableSource.mode),
+    uploadMode: optionalSnapshotString(decision.uploadMode ?? tableSource.uploadMode),
+    concurrencyGroup: optionalSnapshotString(decision.concurrencyGroup ?? tableSource.concurrencyGroup),
+    triggerField: optionalSnapshotString(tableSource.triggerField) ?? decision.event.fieldName,
+    triggerFieldId: optionalSnapshotString(tableSource.triggerFieldId),
+    triggerValue: optionalSnapshotString(tableSource.triggerValue),
+  };
+  const configVersion = decision.configVersion ?? tableSource.configVersion;
+  if (Number.isSafeInteger(configVersion) && configVersion > 0) table.configVersion = configVersion;
+  const maxConcurrent = decision.maxConcurrent ?? tableSource.maxConcurrent;
+  if (Number.isSafeInteger(maxConcurrent) && maxConcurrent > 0) table.maxConcurrent = maxConcurrent;
+  const resourceGroups = decision.resourceGroups ?? tableSource.resourceGroups;
+  if (Array.isArray(resourceGroups)) table.resourceGroups = [...resourceGroups];
+
+  const snapshot = {
+    version: DECISION_SNAPSHOT_VERSION,
+    action,
+    kind: decision.kind,
+    table,
+  };
+  for (const field of ["reason", "effect"]) {
+    const value = optionalSnapshotString(decision[field]);
+    if (value !== undefined) snapshot[field] = value;
+  }
+  const packageAlias = optionalSnapshotString(decision.packageAlias);
+  const packageSource = optionalSnapshotString(decision.packageSource);
+  const packageProjectId = optionalSnapshotString(decision.packageConfig?.projectId);
+  const packageFingerprint = packageConfigFingerprint(decision.packageConfig);
+  if (packageAlias !== undefined) snapshot.packageAlias = packageAlias;
+  if (packageSource !== undefined) snapshot.packageSource = packageSource;
+  if (packageProjectId !== undefined) snapshot.packageProjectId = packageProjectId;
+  if (packageFingerprint !== undefined) snapshot.packageConfigFingerprint = packageFingerprint;
+  return snapshot;
+}
+
+function snapshotPackageUnavailable() {
+  const error = new Error("decision snapshot package is no longer available");
+  error.code = "DECISION_SNAPSHOT_PACKAGE_UNAVAILABLE";
+  error.status = 0;
+  return error;
+}
+
+function decisionFromSnapshot(record, snapshot, runtimeConfig) {
+  const table = {
+    ...snapshot.table,
+    // A frozen decision must never consult a later record field/default.
+    packageField: null,
+    packageFieldId: null,
+    defaultPackageAlias: snapshot.packageAlias ?? null,
+  };
+  const decision = {
+    kind: snapshot.kind,
+    table,
+    event: record.event,
+    ...(snapshot.reason ? { reason: snapshot.reason } : {}),
+    ...(snapshot.effect ? { effect: snapshot.effect } : {}),
+    ...(snapshot.subjectKey ? { subjectKey: snapshot.subjectKey } : {}),
+    ...(snapshot.table.subjectKey ? { subjectKey: snapshot.table.subjectKey } : {}),
+    ...(snapshot.table.configVersion ? { configVersion: snapshot.table.configVersion } : {}),
+    ...(snapshot.table.executionMode ? { executionMode: snapshot.table.executionMode } : {}),
+    ...(snapshot.table.uploadMode ? { uploadMode: snapshot.table.uploadMode } : {}),
+    ...(snapshot.table.concurrencyGroup ? { concurrencyGroup: snapshot.table.concurrencyGroup } : {}),
+    ...(snapshot.table.maxConcurrent ? { maxConcurrent: snapshot.table.maxConcurrent } : {}),
+    ...(snapshot.table.resourceGroups ? { resourceGroups: [...snapshot.table.resourceGroups] } : {}),
+    ...(snapshot.packageAlias ? { packageAlias: snapshot.packageAlias } : {}),
+    ...(snapshot.packageSource ? { packageSource: snapshot.packageSource } : {}),
+  };
+  if (snapshot.kind === "ready") {
+    const packages = runtimeConfig?.packages
+      && typeof runtimeConfig.packages === "object"
+      && !Array.isArray(runtimeConfig.packages)
+      ? runtimeConfig.packages
+      : null;
+    const packageConfig = packages
+      && Object.hasOwn(packages, snapshot.packageAlias)
+      ? packages[snapshot.packageAlias]
+      : undefined;
+    if (!packageConfig || packageConfig.projectId !== snapshot.packageProjectId
+      || (snapshot.packageConfigFingerprint !== undefined
+        && packageConfigFingerprint(packageConfig) !== snapshot.packageConfigFingerprint)) {
+      throw snapshotPackageUnavailable();
+    }
+    decision.packageConfig = packageConfig;
+  }
+  return decision;
+}
+
 export function createBridge({
   config,
+  packageCatalog = null,
+  getPackageCatalog,
+  getConfig,
   store,
   taskboard,
   resolveRecordTitle,
@@ -71,7 +194,25 @@ export function createBridge({
   timers = globalThis,
 }) {
   const inFlight = new Map();
+  const localDecisionSnapshots = new Map();
   const delivery = config?.delivery ?? DEFAULT_DELIVERY_POLICY;
+  async function withPackageCatalog(runtimeConfig) {
+    let packages;
+    if (typeof getPackageCatalog === "function") {
+      packages = await getPackageCatalog();
+    } else {
+      packages = packageCatalog ?? runtimeConfig?.packages ?? config?.packages;
+    }
+    return {
+      ...(runtimeConfig ?? {}),
+      packages: packages ?? Object.create(null),
+    };
+  }
+  // The production configuration is normalized by config.mjs and never
+  // carries this test-only compatibility flag.  Without the dedicated
+  // Taskboard provenance route, fail closed instead of creating an ordinary
+  // task that could later be mistaken for an Auto-Cut task.
+  const allowLegacyTaskCreation = config?.allowLegacyTaskCreation === true;
 
   function startLeaseHeartbeat(record) {
     const token = record.lease?.token;
@@ -166,6 +307,28 @@ export function createBridge({
     });
   }
 
+  async function persistDecisionSnapshot(record, decision, heartbeat) {
+    const snapshot = buildDecisionSnapshot(decision);
+    if (!snapshot) return null;
+    await heartbeat.ensureActive();
+    if (typeof store.saveDecisionSnapshot === "function") {
+      const saved = await store.saveDecisionSnapshot(record.eventId, {
+        ownerId,
+        token: record.lease?.token,
+        snapshot,
+        now: now(),
+        clock: now,
+      });
+      localDecisionSnapshots.set(record.eventId, saved.decisionSnapshot ?? snapshot);
+      return saved.decisionSnapshot ?? snapshot;
+    }
+    // Historical in-memory test stores do not expose the durable method. Keep
+    // a process-local copy so retries in that compatibility path are still
+    // stable; production always uses JsonStateStore above.
+    localDecisionSnapshots.set(record.eventId, snapshot);
+    return snapshot;
+  }
+
   async function resultAfterLeaseLoss(record) {
     if (typeof store.get !== "function") return publicPending(record);
     const current = await store.get(record.eventId);
@@ -233,7 +396,34 @@ export function createBridge({
     try {
       heartbeat = startLeaseHeartbeat(record);
       await heartbeat.ensureActive();
-      const decision = decideRecordChange(config, event);
+      const persistedSnapshot = record.decisionSnapshot
+        ?? localDecisionSnapshots.get(record.eventId)
+        ?? null;
+      let runtimeConfig = await withPackageCatalog(config);
+      let decision;
+      if (persistedSnapshot) {
+        // A retry must use the first side-effect decision. The current config
+        // is consulted only to resolve the trusted executable package by its
+        // frozen alias/project id; all subject routing and UI metadata come
+        // from the persisted, non-executable snapshot.
+        if (persistedSnapshot.kind === "ready") {
+          runtimeConfig = await withPackageCatalog(typeof getConfig === "function"
+            ? await getConfig()
+            : config);
+        }
+        decision = decisionFromSnapshot(record, persistedSnapshot, runtimeConfig);
+      } else {
+        // New events read the active catalog once. A draft/disabled subject can
+        // stop receiving new events without restarting the Bridge, while the
+        // claimed event remains protected by its lease.
+        runtimeConfig = await withPackageCatalog(typeof getConfig === "function"
+          ? await getConfig()
+          : config);
+        decision = decideRecordChange(runtimeConfig, event);
+        // Persist before any archive/find/create call. This also safely
+        // migrates older v2 retry records that predate decision snapshots.
+        if (snapshotAction(decision)) await persistDecisionSnapshot(record, decision, heartbeat);
+      }
       if (decision.kind === "ignored") {
         if (decision.effect === "archive_waiting_tasks") {
           await archiveWaitingFeishuTasks(
@@ -252,6 +442,7 @@ export function createBridge({
           now: now(),
           clock: now,
         });
+        localDecisionSnapshots.delete(record.eventId);
         logRecord("info", record, { deliveryState: "succeeded" });
         return outcome;
       }
@@ -288,15 +479,26 @@ export function createBridge({
       if (!task && decision.kind === "ready") {
         await heartbeat.ensureActive();
         await taskboard.ensureProject({
-          id: decision.packageConfig.projectId,
-          name: decision.packageConfig.projectName,
+          id: payload.projectId,
+          name: decision.table.name,
           workspacePath: decision.packageConfig.workspacePath,
         });
         await heartbeat.ensureActive();
       }
       if (!task) {
         await heartbeat.ensureActive();
-        task = await taskboard.createTask(payload);
+        if (typeof taskboard.createFeishuTask === "function") {
+          task = await taskboard.createFeishuTask(payload);
+        } else if (allowLegacyTaskCreation && typeof taskboard.createTask === "function") {
+          // Kept only for historical unit fixtures.  The real Bridge cannot
+          // reach this branch because validateConfig() drops the flag.
+          task = await taskboard.createTask(payload);
+        } else {
+          const error = new Error("Taskboard Feishu provenance route is unavailable");
+          error.code = "TASKBOARD_PROVENANCE_ROUTE_UNAVAILABLE";
+          error.status = 503;
+          throw error;
+        }
       }
       await heartbeat.ensureActive();
       const outcome = {
@@ -314,6 +516,7 @@ export function createBridge({
         now: now(),
         clock: now,
       });
+      localDecisionSnapshots.delete(record.eventId);
       logRecord("info", record, {
         deliveryState: "succeeded",
         taskIdentifier: task.identifier,

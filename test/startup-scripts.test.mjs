@@ -37,11 +37,122 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /Test-Path -LiteralPath \$candidate/);
   assert.match(source, /CODEX_EXECUTABLE/);
   assert.match(source, /CODEX_FEISHU_PACKAGES_PATH/);
-  assert.match(source, /CODEX_FEISHU_PACKAGES_PATH\s*=\s*\$config/);
+  assert.match(source, /CODEX_FEISHU_PACKAGES_PATH\s*=\s*\$packageRegistry/);
+  assert.match(source, /packageRegistry/);
+  assert.match(source, /autocut-packages\.example\.json/);
+  assert.match(source, /CODEX_FEISHU_BRIDGE_SECRET/);
+  assert.match(source, /New-Guid/);
   assert.match(source, /CODEX_TASKBOARD_ROOT/);
+  assert.match(source, /\[string\]\$TaskboardRoot/);
+  assert.match(source, /worktrees\\dashi-taskboard-autocut-workflow/);
+  assert.match(source, /Resolve-TaskboardRoot/);
+  assert.match(source, /dist\\web\\index\.html/);
   assert.match(source, /\/health/);
   assert.match(source, /EnableFeishu/);
   assert.match(source, /FEISHU_LISTENER_ENABLED/);
+});
+
+test("startup resolves an explicit complete Taskboard root before the environment override", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-taskboard-root-resolution-"));
+  const explicitRoot = join(directory, "explicit");
+  const environmentRoot = join(directory, "environment");
+  const helper = fileURLToPath(files.start);
+  try {
+    await Promise.all([
+      mkdir(join(explicitRoot, "server"), { recursive: true }),
+      mkdir(join(explicitRoot, "dist", "web"), { recursive: true }),
+      mkdir(join(environmentRoot, "server"), { recursive: true }),
+      mkdir(join(environmentRoot, "dist", "web"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(join(explicitRoot, "server", "index.mjs"), "", "utf8"),
+      writeFile(join(explicitRoot, "dist", "web", "index.html"), "", "utf8"),
+      writeFile(join(environmentRoot, "server", "index.mjs"), "", "utf8"),
+      writeFile(join(environmentRoot, "dist", "web", "index.html"), "", "utf8"),
+    ]);
+    const command = [
+      `$env:CODEX_TASKBOARD_ROOT = ${powershellLiteral(environmentRoot)}`,
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-TaskboardRoot' }, $true)",
+      "if (-not $definition) { throw 'Resolve-TaskboardRoot is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      `if ((Resolve-TaskboardRoot ${powershellLiteral(explicitRoot)}) -ne ${powershellLiteral(explicitRoot)}) { throw 'explicit Taskboard root did not win' }`,
+      `if ((Resolve-TaskboardRoot $null) -ne ${powershellLiteral(environmentRoot)}) { throw 'environment Taskboard root was not used' }`,
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup rejects a Taskboard root without server and built web entrypoints", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-taskboard-root-invalid-"));
+  const helper = fileURLToPath(files.start);
+  try {
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-TaskboardRoot' }, $true)",
+      "Invoke-Expression $definition.Extent.Text",
+      `$result = try { Resolve-TaskboardRoot ${powershellLiteral(directory)}; 'accepted' } catch { $_.ToString() }`,
+      "if ($result -eq 'accepted' -or $result -notmatch 'Taskboard root is incomplete') { throw \"unexpected root validation result: $result\" }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup prefers the first complete default Taskboard candidate and falls back safely", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-taskboard-default-candidates-"));
+  const preferredRoot = join(directory, "preferred");
+  const fallbackRoot = join(directory, "fallback");
+  const incompleteRoot = join(directory, "incomplete");
+  const helper = fileURLToPath(files.start);
+  try {
+    await Promise.all([
+      mkdir(join(preferredRoot, "server"), { recursive: true }),
+      mkdir(join(preferredRoot, "dist", "web"), { recursive: true }),
+      mkdir(join(fallbackRoot, "server"), { recursive: true }),
+      mkdir(join(fallbackRoot, "dist", "web"), { recursive: true }),
+      mkdir(join(incompleteRoot, "server"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(join(preferredRoot, "server", "index.mjs"), "", "utf8"),
+      writeFile(join(preferredRoot, "dist", "web", "index.html"), "", "utf8"),
+      writeFile(join(fallbackRoot, "server", "index.mjs"), "", "utf8"),
+      writeFile(join(fallbackRoot, "dist", "web", "index.html"), "", "utf8"),
+      writeFile(join(incompleteRoot, "server", "index.mjs"), "", "utf8"),
+    ]);
+    const command = [
+      "$env:CODEX_TASKBOARD_ROOT = $null",
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-TaskboardRoot' }, $true)",
+      "Invoke-Expression $definition.Extent.Text",
+      `if ((Resolve-TaskboardRoot $null @(${powershellLiteral(preferredRoot)}, ${powershellLiteral(fallbackRoot)})) -ne ${powershellLiteral(preferredRoot)}) { throw 'first default candidate was not preferred' }`,
+      `if ((Resolve-TaskboardRoot $null @(${powershellLiteral(incompleteRoot)}, ${powershellLiteral(fallbackRoot)})) -ne ${powershellLiteral(fallbackRoot)}) { throw 'incomplete default candidate did not fall back' }`,
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("bridge startup tracks listener mode and only replaces an owned mismatched process", async () => {
@@ -1171,6 +1282,7 @@ test("simulation sends a deterministic transition to 待剪辑", async () => {
   assert.match(source, /\\u5f85\\u526a\\u8f91/);
   assert.match(source, /Auto-cut-copyA/);
   assert.match(source, /api\/simulate\/record-changed/);
+  assert.match(source, /x-feishu-bridge-client['"]?\s*=\s*['"]local-operator/i);
 });
 
 test("Windows PowerShell 5 can parse every PowerShell startup script", () => {

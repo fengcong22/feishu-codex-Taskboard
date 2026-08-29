@@ -28,13 +28,5 @@
       "packageFieldId": null,
       "defaultPackageAlias": "Auto-cut-copyA"
     }
-  ],
-  "packages": {
-    "Auto-cut-copyA": {
-      "projectId": "auto-cut-copy-a",
-      "projectName": "Auto-cut-copyA",
-      "workspacePath": "D:\\codex\\codex-feishu\\examples\\harmless-auto-cut",
-      "prompt": "阅读 AGENTS.md，完成其中描述的无害演示任务。不要处理真实视频、上传文件或访问工作区外的路径。"
-    }
-  }
+  ]
 }

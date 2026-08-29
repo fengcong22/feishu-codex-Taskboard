@@ -20,6 +20,54 @@ async function fixture(handler) {
   };
 }
 
+function fullFeishuMetadata(overrides = {}) {
+  return {
+    version: 1,
+    source: "feishu-base",
+    eventId: "evt_bridge",
+    baseToken: "bas_bridge",
+    tableId: "tbl_bridge",
+    recordId: "rec_bridge",
+    triggerField: "进度",
+    triggerFieldId: "fld_progress",
+    triggerValue: "待剪辑",
+    mode: "automatic",
+    subjectKey: "bas_bridge:tbl_bridge",
+    configVersion: 9,
+    executionMode: "automatic",
+    uploadMode: "automatic",
+    concurrencyGroup: "primary-editor",
+    maxConcurrent: 3,
+    resourceGroups: ["jianying-desktop", "gpu"],
+    packageAlias: "Auto-cut-copyA",
+    packageSource: "table-default",
+    ...overrides,
+  };
+}
+
+function feishuCreatePayload(metadata) {
+  const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
+  return {
+    projectId: "auto-a",
+    title: "待剪辑",
+    description: `<!-- feishu-codex-task:v1:${encoded} -->`,
+    status: "todo",
+    priority: "high",
+    labels: ["feishu"],
+  };
+}
+
+function feishuCreateResponse(feishuOrigin, suffix = "trusted") {
+  return { task: {
+    id: `task_${suffix}`,
+    identifier: `AUTO-${suffix}`,
+    version: 1,
+    status: "todo",
+    archivedAt: null,
+    feishuOrigin,
+  } };
+}
+
 test("creates a project and a task with exact JSON bodies", async (t) => {
   const calls = [];
   const app = await fixture(async (request, response) => {
@@ -40,6 +88,114 @@ test("creates a project and a task with exact JSON bodies", async (t) => {
     { method: "POST", url: "/api/projects", body: { id: "auto-a", name: "Auto A", workspacePath: "D:\\AutoA" } },
     { method: "POST", url: "/api/tasks", body: { projectId: "auto-a", title: "待剪辑" } },
   ]);
+});
+
+test("creates Feishu tasks through the Bridge-only provenance route", async (t) => {
+  const calls = [];
+  const metadata = fullFeishuMetadata();
+  const payload = feishuCreatePayload(metadata);
+  const bridgeSecret = "fixture-feishu-bridge-secret-2026";
+  const app = await fixture(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    calls.push({
+      method: request.method,
+      url: request.url,
+      client: request.headers["x-taskboard-client"],
+      secret: request.headers["x-feishu-bridge-secret"],
+      body: body ? JSON.parse(body) : null,
+    });
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify(feishuCreateResponse(metadata, "feishu")));
+  });
+  t.after(app.close);
+  const task = await new TaskboardClient(app.url, { bridgeSecret }).createFeishuTask(payload);
+  assert.equal(task.id, "task_feishu");
+  assert.deepEqual(calls, [{
+    method: "POST",
+    url: "/api/local/feishu/tasks",
+    client: "feishu-bridge",
+    secret: bridgeSecret,
+    body: payload,
+  }]);
+});
+
+test("rejects successful Feishu creates whose provenance differs from the request marker", async (t) => {
+  const metadata = fullFeishuMetadata();
+  const payload = feishuCreatePayload(metadata);
+  let responseOrigin = metadata;
+  let responseNumber = 0;
+  const app = await fixture((_request, response) => {
+    responseNumber += 1;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify(feishuCreateResponse(responseOrigin, responseNumber)));
+  });
+  t.after(app.close);
+  const client = new TaskboardClient(app.url);
+  const mismatches = [
+    ["eventId", "evt_other"],
+    ["baseToken", "bas_other"],
+    ["tableId", "tbl_other"],
+    ["recordId", "rec_other"],
+    ["triggerField", "其他进度"],
+    ["triggerFieldId", "fld_other"],
+    ["triggerValue", "已剪辑"],
+    ["mode", "manual"],
+    ["subjectKey", "bas_other:tbl_other"],
+    ["configVersion", 10],
+    ["executionMode", "manual"],
+    ["uploadMode", "manual"],
+    ["packageAlias", "Auto-cut-copyB"],
+    ["packageSource", "record-field"],
+    ["concurrencyGroup", "secondary-editor"],
+    ["maxConcurrent", 2],
+    ["resourceGroups", ["gpu"]],
+  ];
+
+  for (const [field, value] of mismatches) {
+    await t.test(field, async () => {
+      responseOrigin = fullFeishuMetadata({ [field]: value });
+      await assert.rejects(() => client.createFeishuTask(payload), invalidResponse);
+    });
+  }
+
+  await t.test("missing snapshot field", async () => {
+    responseOrigin = fullFeishuMetadata();
+    delete responseOrigin.executionMode;
+    await assert.rejects(() => client.createFeishuTask(payload), invalidResponse);
+  });
+});
+
+test("rejects a Feishu create response without server-owned provenance", async (t) => {
+  const app = await fixture((_request, response) => {
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({ task: { id: "task_untrusted", identifier: "AUTO-3" } }));
+  });
+  t.after(app.close);
+  const metadata = {
+    version: 1,
+    source: "feishu-base",
+    eventId: "evt_untrusted_response",
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    recordId: "rec_demo",
+    triggerField: "进度",
+    triggerValue: "待剪辑",
+    mode: "manual",
+    packageAlias: "Auto-cut-copyA",
+  };
+  const encoded = Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url");
+  await assert.rejects(
+    () => new TaskboardClient(app.url).createFeishuTask({
+      projectId: "auto-a",
+      title: "待剪辑",
+      description: `<!-- feishu-codex-task:v1:${encoded} -->`,
+      status: "todo",
+      priority: "high",
+      labels: ["feishu"],
+    }),
+    (error) => error?.code === "TASKBOARD_INVALID_RESPONSE",
+  );
 });
 
 test("treats PROJECT_EXISTS as a successful ensure", async (t) => {
@@ -130,35 +286,162 @@ test("rejects successful task responses without non-empty ids", async (t) => {
 });
 
 test("finds an existing Feishu task by its server-owned event metadata", async (t) => {
-  const encoded = Buffer.from(JSON.stringify({ source: "feishu-base", eventId: "evt_1" }), "utf8")
-    .toString("base64url");
   const calls = [];
   const app = await fixture((request, response) => {
     calls.push({ method: request.method, url: request.url });
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ tasks: [
-      { id: "task_other", description: "unrelated" },
-      { id: "task_existing", identifier: "AUTO-7", description: `<!-- feishu-codex-task:v1:${encoded} -->` },
-    ] }));
+    response.end(JSON.stringify({ task: {
+      id: "task_existing",
+      identifier: "AUTO-7",
+      version: 4,
+      status: "todo",
+      archivedAt: null,
+      feishuOrigin: {
+        version: 1,
+        source: "feishu-base",
+        eventId: "evt_1",
+        baseToken: "bas_demo",
+        tableId: "tbl_demo",
+        recordId: "rec_demo",
+      },
+    } }));
   });
   t.after(app.close);
   const task = await new TaskboardClient(app.url).findTaskByEventId("evt_1", "auto-a");
   assert.equal(task.identifier, "AUTO-7");
-  assert.deepEqual(calls, [{ method: "GET", url: "/api/tasks?projectId=auto-a&archived=all" }]);
+  assert.deepEqual(calls, [{ method: "GET", url: "/api/local/feishu/tasks?eventId=evt_1&projectId=auto-a&archived=all" }]);
 });
 
-test("rejects a metadata-matching task without valid ids", async (t) => {
-  const encoded = Buffer.from(JSON.stringify({ source: "feishu-base", eventId: "evt_1" }), "utf8")
-    .toString("base64url");
+test("sends the Bridge provenance header for Feishu queries", async (t) => {
+  const calls = [];
+  const app = await fixture((request, response) => {
+    calls.push({
+      method: request.method,
+      url: request.url,
+      client: request.headers["x-taskboard-client"],
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ task: null }));
+  });
+  t.after(app.close);
+  assert.equal(await new TaskboardClient(app.url).findTaskByEventId("evt_header", "auto-a"), null);
+  assert.deepEqual(calls, [{
+    method: "GET",
+    url: "/api/local/feishu/tasks?eventId=evt_header&projectId=auto-a&archived=all",
+    client: "feishu-bridge",
+  }]);
+});
+
+test("lists waiting Feishu tasks through a server-owned provenance query", async (t) => {
+  const calls = [];
+  const app = await fixture((request, response) => {
+    calls.push({
+      method: request.method,
+      url: request.url,
+      client: request.headers["x-taskboard-client"],
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ tasks: [] }));
+  });
+  t.after(app.close);
+  const client = new TaskboardClient(app.url);
+  const tasks = await client.listFeishuWaitingTasks({
+    projectId: "auto-a",
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    recordId: "rec_demo",
+    triggerFieldId: "fld_progress",
+    triggerValue: "待剪辑",
+  });
+  assert.deepEqual(tasks, []);
+  assert.deepEqual(calls, [{
+    method: "GET",
+    url: "/api/local/feishu/tasks?projectId=auto-a&baseToken=bas_demo&tableId=tbl_demo&recordId=rec_demo&triggerFieldId=fld_progress&triggerValue=%E5%BE%85%E5%89%AA%E8%BE%91&status=todo&archived=false",
+    client: "feishu-bridge",
+  }]);
+});
+
+test("archives Feishu tasks through the provenance-only archive route", async (t) => {
+  const calls = [];
+  const app = await fixture(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    calls.push({
+      method: request.method,
+      url: request.url,
+      client: request.headers["x-taskboard-client"],
+      body: body ? JSON.parse(body) : null,
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ task: {
+      id: "task_1",
+      identifier: "AUTO-1",
+      version: 5,
+      status: "todo",
+      archivedAt: "2026-08-20T00:00:00.000Z",
+      feishuOrigin: {
+        version: 1,
+        source: "feishu-base",
+        eventId: "evt_1",
+        baseToken: "bas_demo",
+        tableId: "tbl_demo",
+        recordId: "rec_demo",
+      },
+    } }));
+  });
+  t.after(app.close);
+  const client = new TaskboardClient(app.url);
+  const archived = await client.archiveFeishuTask({
+    id: "task_1",
+    identifier: "AUTO-1",
+    version: 4,
+    status: "todo",
+    archivedAt: null,
+  });
+  assert.equal(archived.archivedAt, "2026-08-20T00:00:00.000Z");
+  assert.deepEqual(calls, [{
+    method: "POST",
+    url: "/api/local/feishu/tasks/task_1/archive",
+    client: "feishu-bridge",
+    body: { version: 4 },
+  }]);
+});
+
+test("rejects a provenance query response without server-owned origin", async (t) => {
   const app = await fixture((_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({
-      tasks: [{ id: "task_existing", identifier: " ", description: `<!-- feishu-codex-task:v1:${encoded} -->` }],
-    }));
+    response.end(JSON.stringify({ task: {
+      id: "task_existing",
+      identifier: "AUTO-7",
+      version: 4,
+      status: "todo",
+      archivedAt: null,
+    } }));
   });
   t.after(app.close);
   await assert.rejects(
     () => new TaskboardClient(app.url).findTaskByEventId("evt_1", "auto-a"),
+    invalidResponse,
+  );
+});
+
+test("rejects malformed Feishu query and archive inputs", async (t) => {
+  const app = await fixture((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ tasks: [] }));
+  });
+  t.after(app.close);
+  const client = new TaskboardClient(app.url);
+  await assert.rejects(
+    () => client.findTaskByEventId(" ", "auto-a"),
+    invalidResponse,
+  );
+  await assert.rejects(
+    () => client.listFeishuWaitingTasks({ baseToken: "bas_demo", tableId: "tbl_demo", recordId: "rec_demo", triggerValue: "待剪辑" }),
+    invalidResponse,
+  );
+  await assert.rejects(
+    () => client.archiveFeishuTask({ id: "task_1", identifier: "AUTO-1", version: 4 }),
     invalidResponse,
   );
 });
@@ -281,6 +564,7 @@ test("preserves task-not-found and version-conflict error codes", async (t) => {
   const responses = [
     { status: 404, body: { error: { code: "TASK_NOT_FOUND", message: "missing" } } },
     { status: 409, body: { error: { code: "VERSION_CONFLICT", message: "stale" } } },
+    { status: 409, body: { error: { code: "TASK_NOT_WAITING", message: "already started" } } },
   ];
   const app = await fixture((_request, response) => {
     const next = responses.shift();
@@ -296,5 +580,9 @@ test("preserves task-not-found and version-conflict error codes", async (t) => {
   await assert.rejects(
     () => client.archiveTask({ id: "task_1", identifier: "AUTO-1", version: 4 }),
     (error) => error instanceof TaskboardError && error.code === "VERSION_CONFLICT" && error.status === 409,
+  );
+  await assert.rejects(
+    () => client.archiveTask({ id: "task_1", identifier: "AUTO-1", version: 4 }),
+    (error) => error instanceof TaskboardError && error.code === "TASK_NOT_WAITING" && error.status === 409,
   );
 });

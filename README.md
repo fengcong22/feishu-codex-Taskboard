@@ -2,7 +2,7 @@
 
 > 将飞书多维表格的状态变化，安全地转换为可追踪的 Taskboard 任务。
 
-这是一个仅在本机运行的自动化桥接服务：当飞书多维表格中的记录进入 `待剪辑`，本地 Bridge 会通过飞书官方 SDK 接收事件、校验和整理数据，并在 Taskboard 创建一张手动待办任务；记录离开 `待剪辑` 时，会只归档同一记录仍在“等待认领”（`todo`）的匹配任务。投递采用“至少一次处理 + 创建前元数据查找”，记录会持久化，临时故障可以有限重试并在重启后恢复；Bridge 不宣称绝对 exactly-once，因为当前 Taskboard 没有原生幂等键。Bridge 不会自动启动或停止 Codex，执行中的任务由使用者和所接入的 Taskboard 决定。
+这是一个仅在本机运行的自动化桥接服务：当飞书多维表格中的记录进入配置的可开始值，本地 Bridge 会通过飞书官方 SDK 接收事件、校验和整理数据，并在 Taskboard 创建一张受控任务；记录离开可开始值时，会只归档同一记录仍在“等待认领”（`todo`）的匹配任务。投递采用“至少一次处理 + 创建前元数据查找”，记录会持久化，临时故障可以有限重试并在重启后恢复；Bridge 不宣称绝对 exactly-once，因为当前 Taskboard 没有原生幂等键。Bridge 不会自动启动或停止 Codex；Taskboard 的自动执行需通过本机策略显式开启，默认关闭。
 
 ## 数据流
 
@@ -16,6 +16,10 @@ flowchart LR
 
 所有服务只监听 `127.0.0.1`；飞书单元格不能传入本地路径、命令或提示词。
 
+飞书任务的描述标记只用于展示和事件去重。真正允许启动 Auto-Cut 的任务来源会由 Taskboard 在本机专用接口中单独登记；普通任务即使复制描述标记和 `feishu` 标签，也不会获得执行资格。Bridge 与 Taskboard 需要同时使用支持该接口的版本；如果专用接口不可用，Bridge 会把事件保留在受控重试队列中，不会退回普通任务创建。
+
+每个 Base/子表的 Taskboard 隔离项目 ID 固定为 `feishu-` 加上 `sha256(baseToken:tableId)` 的前 16 个十六进制字符；Bridge 和 Taskboard 必须保持这一规则一致。旧项目 ID 不会自动改写，新投递统一使用 16 位规则。
+
 ## 当前已支持
 
 | 能力 | 说明 |
@@ -24,10 +28,12 @@ flowchart LR
 | 安全路由 | 按 Base、表、字段、状态值和项目包别名筛选事件。 |
 | 幂等去重 | 已持久化成功的同一 `event_id` 重放会返回 `duplicate`，正常重放不会再次创建；整体投递语义仍是至少一次。 |
 | 任务标题回退 | 优先读取“视频名称”，其次“集合文档”，失败时回退到飞书记录 ID。 |
-| Taskboard 集成 | 创建待办；记录离开 `待剪辑` 时只归档匹配的 `todo` 任务，不改动处理中或已完成任务；Bridge 不启动 Codex。 |
+| Taskboard 集成 | 通过本机 Bridge 专用来源登记接口创建待办；记录离开可开始值时只归档匹配的 `todo` 任务，不改动处理中或已完成任务；Bridge 不启动 Codex。Taskboard 自动执行策略默认关闭。 |
 | 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
 | 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
 | 状态文件保护 | 损坏的状态文件、无效租约或不完整快照会安全停留在可诊断状态；读写（包括健康队列统计）使用同一稳定路径校验和操作系统本机互斥锁，写入使用原子替换，崩溃后可安全恢复。状态文件必须是稳定的普通文件，不接受符号链接或硬链接别名。 |
+| Base 元数据预览 | `POST /api/feishu/base-preview` 在本机配置飞书凭据后，可按 Base 链接只读读取 Base、子表、字段和单选项元数据；即使长连接监听关闭，预览仍可使用，且不会启用子表或接收事件。 |
+| 工作流共享配置 | `GET /api/feishu/workflow/share/export` 导出脱敏配置；`POST /api/feishu/workflow/share/import` 的 `dryRun` 会在不写入配置的前提下校验实时 Base/子表/字段，并报告本机缺失的包别名、工作区、ZIP 获取和上传路径绑定。导入只创建草稿，不自动启用子表；共享内容和诊断不会回显绝对路径、来源 URL、凭据或 SDK 原始错误。 |
 | SDK-managed 监听 | 显式启用官方 SDK 自动重连；健康状态使用 `sdk_managed`，不伪造物理连接确认。 |
 | 健康检查 | 一条命令检查 Node、配置、Taskboard、Bridge、监听器状态和 pending/retry/dead-letter 队列计数。 |
 
@@ -39,11 +45,14 @@ flowchart LR
 
 ## 本地配置详情
 
-首次运行时，`start-local.ps1` 会从 `config/bridge.example.json` 生成被 Git 忽略的 `config/bridge.local.json`。示例文件包含占位符，不能直接用于真实飞书或模拟建任务；请先在本机填写测试 Base、表、字段 ID 和项目包配置。
+首次运行时，`start-local.ps1` 会从 `config/bridge.example.json` 生成被 Git 忽略的 `config/bridge.local.json`，并从 `config/autocut-packages.example.json` 生成独立的 `config/taskboard-feishu-packages.json`。两个文件只在目标不存在时创建，不会覆盖已有配置。示例文件包含占位符，不能直接用于真实飞书或模拟建任务；请先在本机填写测试 Base、表、字段 ID，并在 Auto-Cut 包 registry 中配置包。
 
 - `tables` 只登记允许接收事件的 Base、表、触发字段、状态值和标题字段。
-- `packages` 只登记受控的项目包别名，以及固定的 `projectId`、绝对 `workspacePath` 和提示词；飞书单元格只能选择别名，不能传路径、命令或提示词。
-- 本地 Taskboard 是外部依赖，且需要它自己的依赖和可用的 Codex 可执行文件。启动脚本默认在 `D:\codex\dashi-taskboard` 查找它；若安装在别处，请在启动前设置 `$env:CODEX_TASKBOARD_ROOT` 为该目录的绝对路径。
+- Auto-Cut 包 registry（默认 `config/taskboard-feishu-packages.json`，可由 `CODEX_FEISHU_PACKAGES_PATH` 覆盖）只登记受控的项目包别名，以及固定的 `projectId`、绝对 `workspacePath` 和提示词。只有 `state` 为 `enabled` 的包会被 Bridge 接收；草稿/禁用包仍可由 Taskboard 保存，但不会路由新事件。飞书单元格只能选择别名，不能传路径、命令或提示词。
+- Bridge 到 Taskboard 的任务登记还需要本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。`start-local.ps1` 会在未设置时为本次启动生成随机值，并同时注入两个服务；如果单独启动 Bridge/Taskboard，请在 `.env.local` 中配置同一个随机值。该值不会写入配置导出、任务描述或日志。
+- Taskboard 导入 Base 时调用本机 Bridge 的 `POST /api/feishu/base-preview`。请求体中的 `url` 可使用直接 `/base/{base_token}[?table=<table_id>]` 链接，也可使用知识库中的 `/wiki/{wiki_token}[?table=<table_id>]` 链接；Wiki 链接会先通过飞书官方 SDK 确认节点类型为 `bitable`，再使用返回的真实 Base token，绝不把 Wiki token 直接当作 Base token。当前只支持没有嵌入账号信息的标准 `https://*.feishu.cn` 链接；接口只读取 Wiki 节点及 Base/子表/字段元数据，不读取记录、不写入飞书；`/base/workspace/{token}` 仍不支持。只要 `.env.local` 中配置了完整的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，即使 `FEISHU_LISTENER_ENABLED` 未开启也可以预览；Wiki 链接还要求该飞书应用具有 Wiki 节点只读权限并能访问对应节点。预览不会构造或启动 WebSocket 监听器，且 SDK 原始错误日志会被抑制。凭据或权限缺失时接口返回受控的脱敏错误，不回显链接、凭据或 SDK 原文。
+- Bridge 的工作流同步、共享配置导入和模拟事件写接口会校验 loopback `Host`；`Origin` 可以缺失，但出现时也必须指向 loopback。请求必须使用 `application/json`；同步请求携带 `x-feishu-bridge-client: taskboard`，导入和模拟请求携带 `x-feishu-bridge-client: local-operator`，`simulate-ready.ps1` 已固定发送后一个值。跨站页面、普通表单和缺少专用 header 的本机请求不能写入工作流配置或注入模拟事件。工作流生命周期同步使用期望版本比较交换；如果 Taskboard 因本地提交失败而重放一份版本、生命周期和脱敏配置完全相同的请求，Bridge 会直接返回已保存结果且不重写配置；同版本但内容不同的请求仍返回版本冲突。
+- 本地 Taskboard 是外部依赖，且需要它自己的依赖和可用的 Codex 可执行文件。启动脚本会先尝试相对当前 Bridge 的 `..\worktrees\dashi-taskboard-autocut-workflow`，再回退到旧的 `D:\codex\dashi-taskboard`；显式传入 `-TaskboardRoot <绝对路径>` 优先级最高，其次是 `$env:CODEX_TASKBOARD_ROOT`。启动前会校验所选检出同时包含 `server\index.mjs` 与已构建的 `dist\web\index.html`，并把同一个包 registry 路径注入两个服务；停止脚本会解析现有目录，并继续用进程身份与脚本命令行校验避免匹配错误进程。
 
 不要提交 `config/bridge.local.json`、`.env.local` 或 `.runtime/`。默认示例工作区为 `examples/harmless-auto-cut`；确认测试流程稳定后，再将项目包的 `workspacePath` 和 `prompt` 调整为团队批准的真实值。
 
@@ -55,6 +64,12 @@ flowchart LR
 Set-Location D:\codex\codex-feishu
 npm install
 .\scripts\start-local.ps1
+```
+
+需要运行指定的 Taskboard 工作树时，直接传入绝对路径：
+
+```powershell
+.\scripts\start-local.ps1 -TaskboardRoot D:\codex\worktrees\dashi-taskboard-autocut-workflow
 ```
 
 浏览器会打开 Taskboard：<http://127.0.0.1:47823>。
@@ -162,5 +177,5 @@ npm install
 - 不提供多实例高可用（HA）；补偿 worker 在单个 Bridge 进程内串行运行。
 - 投递语义是至少一次；同机状态锁只封闭并发窗口。当前 Taskboard 没有原生幂等键，若 POST 已成功但 Bridge 在状态提交前崩溃，仍存在极端重复创建风险，需通过事件元数据核对。
 - `stateFile` 必须保持稳定的普通文件路径；不支持状态文件本身的符号链接、硬链接或多链接别名，也不要在运行中替换状态文件路径。锁只覆盖本机 Windows/Linux 进程。
-- Taskboard 返回无法识别的成功响应时会按临时故障重试；Bridge 的异常 HTTP 响应只返回安全错误码，不回显原始消息。
+- Taskboard 返回无法识别的成功响应，或服务端登记的 provenance 与 Bridge 发送的 marker 快照任一受控字段不一致时，会按临时故障重试；Bridge 的异常 HTTP 响应只返回安全错误码，不回显原始消息。
 - 不处理真实视频，也不提供自动配音、自动剪辑或视频导出能力。

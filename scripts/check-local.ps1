@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $config = if ($env:BRIDGE_CONFIG) { $env:BRIDGE_CONFIG } else { Join-Path $root 'config\bridge.local.json' }
+$packageRegistry = if ($env:CODEX_FEISHU_PACKAGES_PATH) { $env:CODEX_FEISHU_PACKAGES_PATH } else { Join-Path $root 'config\taskboard-feishu-packages.json' }
 $taskboardUrl = 'http://127.0.0.1:47823/api/meta'
 $bridgeUrl = 'http://127.0.0.1:47824/health'
 
@@ -27,16 +28,21 @@ if ($nodeMajor -lt 22 -or ($nodeMajor -eq 22 -and $nodeMinor -lt 5)) {
 if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
   throw 'Local config is missing. Create config/bridge.local.json from config/bridge.example.json.'
 }
+if (-not (Test-Path -LiteralPath $packageRegistry -PathType Leaf)) {
+  throw 'Auto-Cut package registry is missing. Create config/taskboard-feishu-packages.json from config/autocut-packages.example.json.'
+}
 
 $validationCode = @'
 import { loadConfig } from './src/config.mjs';
+import { loadPackageRegistry } from './src/package-config.mjs';
 const config = await loadConfig(process.argv[1]);
-console.log(JSON.stringify({ tables: config.tables.length, packages: Object.keys(config.packages).length }));
+const packages = await loadPackageRegistry(process.argv[2]);
+console.log(JSON.stringify({ tables: config.tables.length, packages: Object.keys(packages).length }));
 '@
 $configSummaryOutput = $null
 Push-Location $root
 try {
-  $configSummaryOutput = & $node --input-type=module -e $validationCode $config 2>&1
+  $configSummaryOutput = & $node --input-type=module -e $validationCode $config $packageRegistry 2>&1
   $configExitCode = $LASTEXITCODE
 } finally {
   Pop-Location

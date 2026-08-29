@@ -1,15 +1,45 @@
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
 import test from "node:test";
 
 import { createBridgeServer } from "../src/server.mjs";
 
-async function start(handler, getHealth) {
+const TASKBOARD_WRITE_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "x-feishu-bridge-client": "taskboard",
+};
+const SIMULATION_WRITE_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "x-feishu-bridge-client": "local-operator",
+};
+
+async function postWithRawHeaders(url, headers, body) {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      method: "POST",
+      headers,
+    }, (response) => {
+      response.resume();
+      response.once("end", () => resolve({ status: response.statusCode }));
+    });
+    request.once("error", reject);
+    request.end(body);
+  });
+}
+
+async function start(handler, getHealth, baseMetadataReader, workflowStore) {
   const app = createBridgeServer({
     host: "127.0.0.1",
     port: 0,
     configSummary: { tables: 1, packages: 1 },
     handleEvent: handler,
     getHealth,
+    baseMetadataReader,
+    workflowStore,
   });
   const address = await app.listen();
   return {
@@ -17,6 +47,226 @@ async function start(handler, getHealth) {
     close: app.close,
   };
 }
+
+test("previews a Feishu Base through the injected read-only metadata reader", async (t) => {
+  let received;
+  const app = await start(assert.fail, undefined, {
+    preview: async (url) => {
+      received = url;
+      return {
+        baseToken: "bas_demo",
+        baseName: "课程库",
+        tables: [],
+      };
+    },
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.feishu.cn/base/bas_demo" }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(received, "https://example.feishu.cn/base/bas_demo");
+  assert.deepEqual(await response.json(), {
+    baseToken: "bas_demo",
+    baseName: "课程库",
+    tables: [],
+  });
+});
+
+test("passes a Wiki Base link to the injected read-only metadata reader", async (t) => {
+  let received;
+  const app = await start(assert.fail, undefined, {
+    preview: async (url) => {
+      received = url;
+      return { baseToken: "bas_demo", baseName: "课程库", tables: [] };
+    },
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      url: "https://example.feishu.cn/wiki/wik_demo?table=tbl_chinese",
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(received, "https://example.feishu.cn/wiki/wik_demo?table=tbl_chinese");
+  assert.equal((await response.json()).baseToken, "bas_demo");
+});
+
+test("rejects an invalid Base preview request without echoing the URL", async (t) => {
+  const app = await start(assert.fail, undefined, { preview: assert.fail });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.feishu.cn/docx/docx_secret" }),
+  });
+  assert.equal(response.status, 400);
+  const text = await response.text();
+  assert.equal(text.includes("docx_secret"), false);
+  assert.deepEqual(JSON.parse(text), {
+    error: { code: "INVALID_BASE_LINK", message: "Invalid Base link" },
+  });
+});
+
+test("returns a controlled client error when a Wiki node is not a Base", async (t) => {
+  const error = Object.assign(new Error("private Wiki node details"), {
+    code: "FEISHU_WIKI_NOT_BASE",
+    status: 400,
+  });
+  const app = await start(assert.fail, undefined, {
+    preview: async () => { throw error; },
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.feishu.cn/wiki/wik_doc" }),
+  });
+  assert.equal(response.status, 400);
+  const text = await response.text();
+  assert.equal(text.includes("private Wiki node details"), false);
+  assert.deepEqual(JSON.parse(text), {
+    error: { code: "FEISHU_WIKI_NOT_BASE", message: "Bridge request failed" },
+  });
+});
+
+test("sanitizes Base metadata SDK failures", async (t) => {
+  const error = Object.assign(new Error("secret app token"), {
+    code: "FEISHU_METADATA_READ_FAILED",
+  });
+  const app = await start(assert.fail, undefined, {
+    preview: async () => { throw error; },
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.feishu.cn/base/bas_demo" }),
+  });
+  assert.equal(response.status, 502);
+  const text = await response.text();
+  assert.equal(text.includes("secret app token"), false);
+  assert.deepEqual(JSON.parse(text), {
+    error: { code: "FEISHU_METADATA_READ_FAILED", message: "Bridge request failed" },
+  });
+});
+
+test("preserves the safe code for a missing selected Base table", async (t) => {
+  const error = Object.assign(new Error("private table token"), {
+    code: "FEISHU_TABLE_NOT_FOUND",
+  });
+  const app = await start(assert.fail, undefined, {
+    preview: async () => { throw error; },
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://example.feishu.cn/base/bas_demo?table=tbl_missing" }),
+  });
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "FEISHU_TABLE_NOT_FOUND", message: "Bridge request failed" },
+  });
+});
+
+test("syncs an enabled workflow subject through the loopback Bridge store", async (t) => {
+  let received;
+  const app = await start(assert.fail, undefined, undefined, {
+    syncSubject: async (subject, options) => {
+      received = { subject, options };
+      return { ...subject, lifecycle: options.lifecycle };
+    },
+  });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+    method: "POST",
+    headers: { ...TASKBOARD_WRITE_HEADERS, origin: "http://127.0.0.1:47823" },
+    body: JSON.stringify({
+      lifecycle: "enabled",
+      expectedVersion: 1,
+      subject: { subjectKey: "bas_sync:tbl_sync", tableId: "tbl_sync" },
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(received.options.lifecycle, "enabled");
+  assert.equal(received.options.expectedVersion, 1);
+  assert.equal((await response.json()).subject.lifecycle, "enabled");
+});
+
+test("rejects non-loopback Host and Origin values before workflow sync", async (t) => {
+  let calls = 0;
+  const app = await start(assert.fail, undefined, undefined, {
+    syncSubject: async (subject) => {
+      calls += 1;
+      return subject;
+    },
+  });
+  t.after(app.close);
+  const body = JSON.stringify({
+    lifecycle: "enabled",
+    subject: { subjectKey: "bas_sync:tbl_sync", tableId: "tbl_sync" },
+  });
+
+  const invalidHost = await postWithRawHeaders(
+    `${app.url}/api/feishu/workflow/sync`,
+    { ...TASKBOARD_WRITE_HEADERS, host: "attacker.example" },
+    body,
+  );
+  const crossSiteOrigin = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+    method: "POST",
+    headers: {
+      ...TASKBOARD_WRITE_HEADERS,
+      "content-type": "text/plain",
+      origin: "https://attacker.example",
+    },
+    body,
+  });
+
+  assert.equal(invalidHost.status, 403);
+  assert.equal(crossSiteOrigin.status, 403);
+  assert.equal(calls, 0);
+});
+
+test("requires JSON and the Taskboard client header for workflow sync", async (t) => {
+  let calls = 0;
+  const app = await start(assert.fail, undefined, undefined, {
+    syncSubject: async (subject) => {
+      calls += 1;
+      return subject;
+    },
+  });
+  t.after(app.close);
+  const body = JSON.stringify({
+    lifecycle: "enabled",
+    subject: { subjectKey: "bas_sync:tbl_sync", tableId: "tbl_sync" },
+  });
+
+  const nonJson = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+    method: "POST",
+    headers: { "x-feishu-bridge-client": "taskboard" },
+    body,
+  });
+  const missingClient = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+  const wrongClient = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+    method: "POST",
+    headers: SIMULATION_WRITE_HEADERS,
+    body,
+  });
+
+  assert.equal(nonJson.status, 415);
+  assert.equal(missingClient.status, 403);
+  assert.equal(wrongClient.status, 403);
+  assert.equal(calls, 0);
+});
 
 test("serves health and configuration summary", async (t) => {
   const app = await start(assert.fail);
@@ -48,7 +298,7 @@ test("validates and handles a simulated event", async (t) => {
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { ...SIMULATION_WRITE_HEADERS, origin: "http://localhost:47823" },
     body: JSON.stringify({
       eventId: "evt_1",
       baseToken: "bas_demo",
@@ -64,12 +314,90 @@ test("validates and handles a simulated event", async (t) => {
   assert.equal(received.eventId, "evt_1");
 });
 
+test("rejects non-loopback Host and Origin values before simulation", async (t) => {
+  let calls = 0;
+  const app = await start(async () => {
+    calls += 1;
+    return { kind: "ignored" };
+  });
+  t.after(app.close);
+  const body = JSON.stringify({
+    eventId: "evt_cross_site",
+    baseToken: "bas_demo",
+    tableId: "tbl_a",
+    recordId: "rec_1",
+    fieldName: "视频整体进度",
+    beforeValue: "素材齐全",
+    afterValue: "待剪辑",
+    fields: {},
+  });
+
+  const invalidHost = await postWithRawHeaders(
+    `${app.url}/api/simulate/record-changed`,
+    { ...SIMULATION_WRITE_HEADERS, host: "attacker.example" },
+    body,
+  );
+  const crossSiteOrigin = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: {
+      ...SIMULATION_WRITE_HEADERS,
+      "content-type": "text/plain",
+      origin: "https://attacker.example",
+    },
+    body,
+  });
+
+  assert.equal(invalidHost.status, 403);
+  assert.equal(crossSiteOrigin.status, 403);
+  assert.equal(calls, 0);
+});
+
+test("requires JSON and the local operator header for simulation", async (t) => {
+  let calls = 0;
+  const app = await start(async () => {
+    calls += 1;
+    return { kind: "ignored" };
+  });
+  t.after(app.close);
+  const body = JSON.stringify({
+    eventId: "evt_local_gate",
+    baseToken: "bas_demo",
+    tableId: "tbl_a",
+    recordId: "rec_1",
+    fieldName: "视频整体进度",
+    beforeValue: "素材齐全",
+    afterValue: "待剪辑",
+    fields: {},
+  });
+
+  const nonJson = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: { "x-feishu-bridge-client": "local-operator" },
+    body,
+  });
+  const missingClient = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+  const wrongClient = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: TASKBOARD_WRITE_HEADERS,
+    body,
+  });
+
+  assert.equal(nonJson.status, 415);
+  assert.equal(missingClient.status, 403);
+  assert.equal(wrongClient.status, 403);
+  assert.equal(calls, 0);
+});
+
 test("rejects incomplete simulated events", async (t) => {
   const app = await start(assert.fail);
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({ eventId: "evt_1" }),
   });
   assert.equal(response.status, 400);
@@ -81,7 +409,7 @@ test("does not echo malformed JSON content in validation errors", async (t) => {
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: SIMULATION_WRITE_HEADERS,
     body: '{"value":secret-token-not-for-client}',
   });
   const text = await response.text();
@@ -102,7 +430,7 @@ test("returns 202 when a simulated event is durably pending retry", async (t) =>
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
       eventId: "evt_retry",
       baseToken: "bas_demo",
@@ -128,7 +456,7 @@ test("returns 202 when a simulated event is durably dead-lettered", async (t) =>
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
       eventId: "evt_dead_letter",
       baseToken: "bas_demo",
@@ -155,7 +483,7 @@ test("returns 202 when a persisted dead letter is replayed", async (t) => {
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
       eventId: "evt_dead_letter_replay",
       baseToken: "bas_demo",
@@ -179,7 +507,7 @@ test("sanitizes unexpected simulation failures", async (t) => {
   t.after(app.close);
   const response = await fetch(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
       eventId: "evt_failure",
       baseToken: "bas_demo",

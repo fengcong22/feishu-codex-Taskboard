@@ -161,6 +161,131 @@ test("blocks an unknown package alias instead of treating it as a path", () => {
   assert.equal(result.packageConfig, undefined);
 });
 
+test("matches the stable Base and table identity, even when table ids or names repeat", () => {
+  const multiBase = {
+    packages: config.packages,
+    tables: [
+      { ...config.tables[0], baseToken: "bas_a", name: "同名学科", defaultPackageAlias: "Auto-cut-copyA" },
+      { ...config.tables[0], baseToken: "bas_b", name: "同名学科", defaultPackageAlias: "Auto-cut-math" },
+    ],
+  };
+  const resultA = decideRecordChange(multiBase, event({
+    baseToken: "bas_a",
+    fields: {},
+  }));
+  const resultB = decideRecordChange(multiBase, event({
+    baseToken: "bas_b",
+    fields: {},
+  }));
+  assert.equal(resultA.kind, "ready");
+  assert.equal(resultA.table.baseToken, "bas_a");
+  assert.equal(resultA.packageAlias, "Auto-cut-copyA");
+  assert.equal(resultB.kind, "ready");
+  assert.equal(resultB.table.baseToken, "bas_b");
+  assert.equal(resultB.packageAlias, "Auto-cut-math");
+  assert.notEqual(resultA.subjectKey, resultB.subjectKey);
+});
+
+test("routes an enabled workflow subject with a custom start value and ignores drafts or disabled subjects", () => {
+  const subject = {
+    baseToken: "bas_workflow",
+    tableId: "tbl_subject",
+    tableName: "小学语文",
+    displayEnabled: true,
+    lifecycle: "enabled",
+    configVersion: 4,
+    trigger: { fieldId: "fld_progress", fieldName: "制作进度", startValue: "待制作", optionId: null },
+    title: { fieldId: "fld_title", fieldName: "脚本名称" },
+    execution: { mode: "automatic", concurrencyGroup: "subject", maxConcurrent: 2, resourceGroups: ["jianying-desktop", "gpu"] },
+    packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-copyA", subjectCodeFieldId: null, branchMap: null },
+    upload: { enqueueMode: "automatic", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+  };
+  const workflowConfig = {
+    schemaVersion: 1,
+    configVersion: 4,
+    bases: [{ baseToken: "bas_workflow", baseName: "学科 Base", sourceUrlLabel: null, metadataRefreshedAt: null, subjects: [subject] }],
+  };
+  const runtime = { workflow: workflowConfig, packages: config.packages };
+  const ready = decideRecordChange(runtime, {
+    ...event(),
+    baseToken: "bas_workflow",
+    tableId: "tbl_subject",
+    fieldId: "fld_progress",
+    fieldName: "制作进度",
+    beforeValue: "脚本完成",
+    afterValue: "待制作",
+    fields: {},
+  });
+  assert.equal(ready.kind, "ready");
+  assert.equal(ready.subjectKey, "bas_workflow:tbl_subject");
+  assert.equal(ready.configVersion, 4);
+  assert.equal(ready.table.triggerValue, "待制作");
+  assert.equal(ready.table.mode, "automatic");
+  assert.equal(ready.uploadMode, "automatic");
+  assert.equal(ready.concurrencyGroup, "subject");
+  assert.equal(ready.maxConcurrent, 2);
+  assert.deepEqual(ready.resourceGroups, ["jianying-desktop", "gpu"]);
+
+  for (const lifecycle of ["draft", "disabled"]) {
+    const ignored = decideRecordChange({
+      workflow: { ...workflowConfig, bases: [{ ...workflowConfig.bases[0], subjects: [{ ...subject, lifecycle }] }] },
+      packages: config.packages,
+    }, {
+      ...event(),
+      baseToken: "bas_workflow",
+      tableId: "tbl_subject",
+      fieldId: "fld_progress",
+      fieldName: "制作进度",
+      beforeValue: "脚本完成",
+      afterValue: "待制作",
+      fields: {},
+    });
+    assert.deepEqual(ignored, { kind: "ignored", reason: "unknown_table" });
+  }
+});
+
+test("keeps the previous enabled snapshot live while a subject is edited as a draft", () => {
+  const active = {
+    baseToken: "bas_snapshot",
+    tableId: "tbl_snapshot",
+    tableName: "快照学科",
+    lifecycle: "enabled",
+    configVersion: 7,
+    trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待剪辑", optionId: null },
+    title: { fieldId: null, fieldName: null },
+    execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+    packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-copyA", subjectCodeFieldId: null, branchMap: null },
+    upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+  };
+  const draft = {
+    ...active,
+    lifecycle: "draft",
+    configVersion: 8,
+    trigger: { ...active.trigger, startValue: "待制作" },
+    activeSnapshot: active,
+  };
+  const result = decideRecordChange({
+    workflow: {
+      schemaVersion: 1,
+      configVersion: 8,
+      bases: [{ baseToken: "bas_snapshot", baseName: "Base", subjects: [draft] }],
+    },
+    packages: config.packages,
+  }, {
+    ...event(),
+    baseToken: "bas_snapshot",
+    tableId: "tbl_snapshot",
+    fieldId: "fld_status",
+    fieldName: "进度",
+    beforeValue: "素材齐全",
+    afterValue: "待剪辑",
+    fields: {},
+  });
+  assert.equal(result.kind, "ready");
+  assert.equal(result.table.triggerValue, "待剪辑");
+  assert.equal(result.configVersion, 7);
+});
+
 test("blocks package aliases inherited from the package map prototype", () => {
   const result = decideRecordChange(config, event({
     fields: { 自动剪辑项目包: "toString" },

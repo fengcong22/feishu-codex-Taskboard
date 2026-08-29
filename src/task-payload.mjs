@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+
+const SUBJECT_PROJECT_HASH_LENGTH = 16;
+
 const BLOCKED_REASON_LABELS = {
   missing_package_alias: "记录没有选择自动剪辑项目包",
   unknown_package_alias: "记录选择了未配置的自动剪辑项目包",
@@ -8,7 +12,30 @@ function text(value) {
   return String(value);
 }
 
+/**
+ * Project identity belongs to the configured Base/subject, not to whichever
+ * Auto-Cut package happens to be selected for the subject.  Hashing keeps
+ * tokens out of URLs and project labels while preserving deterministic
+ * isolation between two Bases that use the same table id.
+ */
+export function projectIdForSubject(value, fallback = "local") {
+  if (typeof value !== "string" || value.trim() === "") return fallback;
+  // Keep this in lockstep with Taskboard's subjectProjectId() helper.  The
+  // subject project is the Base/table isolation boundary; package project IDs
+  // are only used to resolve the trusted Auto-Cut workspace.
+  const digest = createHash("sha256")
+    .update(value.trim(), "utf8")
+    .digest("hex")
+    .slice(0, SUBJECT_PROJECT_HASH_LENGTH);
+  return `feishu-${digest}`;
+}
+
 function metadata(decision) {
+  const executionMode = decision.executionMode ?? decision.table.executionMode ?? decision.table.mode;
+  const uploadMode = decision.uploadMode ?? decision.table.uploadMode ?? decision.table.upload?.enqueueMode;
+  const concurrencyGroup = decision.concurrencyGroup ?? decision.table.concurrencyGroup ?? decision.table.execution?.concurrencyGroup;
+  const maxConcurrent = decision.maxConcurrent ?? decision.table.maxConcurrent ?? decision.table.execution?.maxConcurrent;
+  const resourceGroups = decision.resourceGroups ?? decision.table.resourceGroups ?? decision.table.execution?.resourceGroups;
   return {
     version: 1,
     source: "feishu-base",
@@ -20,7 +47,14 @@ function metadata(decision) {
     ...(decision.table.triggerFieldId ? { triggerFieldId: decision.table.triggerFieldId } : {}),
     triggerValue: decision.table.triggerValue,
     mode: decision.table.mode,
-    ...(decision.kind === "ready" ? { packageAlias: decision.packageAlias } : {}),
+    subjectKey: decision.subjectKey ?? `${decision.event.baseToken}:${decision.event.tableId}`,
+    ...(Number.isInteger(decision.configVersion) ? { configVersion: decision.configVersion } : {}),
+    ...(executionMode ? { executionMode } : {}),
+    ...(uploadMode ? { uploadMode } : {}),
+    ...(typeof concurrencyGroup === "string" && concurrencyGroup ? { concurrencyGroup } : {}),
+    ...(Number.isSafeInteger(maxConcurrent) && maxConcurrent > 0 ? { maxConcurrent } : {}),
+    ...(Array.isArray(resourceGroups) ? { resourceGroups: [...resourceGroups] } : {}),
+    ...(decision.packageAlias ? { packageAlias: decision.packageAlias } : {}),
     ...(decision.kind === "ready" && decision.packageSource
       ? { packageSource: decision.packageSource }
       : {}),
@@ -52,7 +86,7 @@ export function buildTaskPayload(decision) {
   if (decision.kind === "blocked") {
     const reason = BLOCKED_REASON_LABELS[decision.reason] ?? decision.reason;
     return {
-      projectId: "local",
+      projectId: projectIdForSubject(decision.subjectKey, "local"),
       title,
       description: [
         `飞书多维表格「${decision.table.name}」产生了一条待处理记录，但暂时无法启动。`,
@@ -75,7 +109,7 @@ export function buildTaskPayload(decision) {
     ? `本表默认项目包：${decision.packageAlias}`
     : `自动剪辑项目包：${decision.packageAlias}`;
   return {
-    projectId: decision.packageConfig.projectId,
+    projectId: projectIdForSubject(decision.subjectKey, decision.packageConfig.projectId),
     title,
     description: [
       `飞书多维表格「${decision.table.name}」中的记录已进入待剪辑状态。`,

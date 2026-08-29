@@ -1,8 +1,73 @@
+param(
+  [string]$TaskboardRoot = $null
+)
+
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
+$taskboardDefaultCandidates = @(
+  (Join-Path (Split-Path -Parent $root) 'worktrees\dashi-taskboard-autocut-workflow'),
+  (Join-Path (Split-Path -Parent $root) 'dashi-taskboard'),
+  'D:\codex\dashi-taskboard'
+)
+
+function Resolve-TaskboardRoot(
+  [string]$ExplicitRoot = $null,
+  [string[]]$DefaultCandidates = $null
+) {
+  $hasExplicitOverride = -not [string]::IsNullOrWhiteSpace($ExplicitRoot)
+  $hasEnvironmentOverride = -not [string]::IsNullOrWhiteSpace($env:CODEX_TASKBOARD_ROOT)
+  $candidates = if ($hasExplicitOverride) {
+    @($ExplicitRoot)
+  } elseif ($hasEnvironmentOverride) {
+    @($env:CODEX_TASKBOARD_ROOT)
+  } elseif ($null -ne $DefaultCandidates -and $DefaultCandidates.Count -gt 0) {
+    @($DefaultCandidates)
+  } else {
+    @($taskboardDefaultCandidates)
+  }
+  $checked = New-Object System.Collections.ArrayList
+  $firstExistingDirectory = $null
+  foreach ($candidate in $candidates) {
+    $requestedRoot = [string]$candidate
+    if ([string]::IsNullOrWhiteSpace($requestedRoot)) { continue }
+    if (-not [System.IO.Path]::IsPathRooted($requestedRoot)) {
+      if ($hasExplicitOverride -or $hasEnvironmentOverride) {
+        throw "Taskboard root must be an absolute path: $requestedRoot"
+      }
+      [void]$checked.Add("$requestedRoot (not absolute)")
+      continue
+    }
+    try {
+      $resolvedRoot = (Resolve-Path -LiteralPath $requestedRoot -ErrorAction Stop).Path
+    } catch {
+      [void]$checked.Add("$requestedRoot (not found)")
+      continue
+    }
+    if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) {
+      [void]$checked.Add("$resolvedRoot (not a directory)")
+      continue
+    }
+    if ($hasExplicitOverride -or $hasEnvironmentOverride) {
+      return $resolvedRoot
+    }
+    if ($null -eq $firstExistingDirectory) {
+      $firstExistingDirectory = $resolvedRoot
+    }
+    if (Test-Path -LiteralPath (Join-Path $resolvedRoot 'server\index.mjs') -PathType Leaf) {
+      return $resolvedRoot
+    }
+    [void]$checked.Add("$resolvedRoot (missing server\index.mjs)")
+  }
+  if ($null -ne $firstExistingDirectory) {
+    return $firstExistingDirectory
+  }
+  throw "No Taskboard checkout was found. Checked: $($checked -join '; '). Set -TaskboardRoot or CODEX_TASKBOARD_ROOT to a Taskboard checkout."
+}
+
 $runtime = Join-Path $root '.runtime'
-$taskboardRoot = if ($env:CODEX_TASKBOARD_ROOT) { (Resolve-Path $env:CODEX_TASKBOARD_ROOT).Path } else { 'D:\codex\dashi-taskboard' }
+$taskboardRoot = Resolve-TaskboardRoot $TaskboardRoot $taskboardDefaultCandidates
 . (Join-Path $root 'scripts\process-identity.ps1')
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 $node = if ($nodeCommand) { $nodeCommand.Source } else { 'C:\Program Files\nodejs\node.exe' }

@@ -2,9 +2,10 @@
 
 ## 固定数据流
 
-生产流程固定为：飞书多维表格发生变化 → 飞书官方 SDK 长连接接收事件 → Bridge 按表和字段规则筛选、标准化、去重 → Taskboard 创建或归档受控的手动任务。
+生产流程固定为：飞书多维表格发生变化 → 飞书官方 SDK 长连接接收事件 → Bridge 按表和字段规则筛选、标准化、去重 → Taskboard 创建或归档受控任务。
+Bridge 创建的飞书任务必须通过 Taskboard 的本机专用来源登记接口，并携带由启动脚本注入的 `CODEX_FEISHU_BRIDGE_SECRET`；普通任务描述中的标记或标签不能获得 Auto-Cut 执行资格。
 
-Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LAN 或公网监听。当前流程不会自动启动 Codex、回写飞书记录或处理真实视频。
+Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LAN 或公网监听。Bridge 永不启动 Codex；Taskboard 只有在 `CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION` 显式开启时，才可自动执行由 Bridge 专用接口登记、活动配置快照为 `automatic` 且项目包别名已在本机白名单中的任务。该开关默认关闭，普通任务、伪造描述标记或标签不得获得自动执行资格。当前流程不会回写飞书记录。
 
 ## 标准命令
 
@@ -24,10 +25,12 @@ npm test
 
 ## 配置和安全边界
 
-- 真实配置只放在被 Git 忽略的 `config/bridge.local.json`；示例结构维护在 `config/bridge.example.json`。
+- 真实 Bridge 配置只放在被 Git 忽略的 `config/bridge.local.json`；示例结构维护在 `config/bridge.example.json`。Auto-Cut 包定义单独放在被 Git 忽略的 `config/taskboard-feishu-packages.json`，示例结构维护在 `config/autocut-packages.example.json`。
 - `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 只放在 `.env.local` 或团队批准的密钥管理工具中，不写入飞书单元格、日志、任务描述或 Git。
+- `CODEX_FEISHU_BRIDGE_SECRET` 只用于本机 Bridge/Taskboard 互认，放在 `.env.local` 或由 `start-local.ps1` 临时生成；不要写入飞书单元格、日志、任务描述、共享配置或 Git。
 - 飞书单元格只能提供受控字段值和项目包别名；不能提供工作区路径、shell 命令、Codex 参数或 prompt。
 - Bridge 只解析配置白名单中的项目包别名，并使用配置中的绝对工作区路径和固定 prompt。
+- `CODEX_FEISHU_PACKAGES_PATH` 可覆盖默认包 registry 路径；启动脚本会在目标不存在时复制示例，但不会覆盖已有 registry。Taskboard 和 Bridge 必须使用同一路径，registry 中只有 `enabled` 包会进入 Bridge 白名单。
 
 ## 事件不变量
 

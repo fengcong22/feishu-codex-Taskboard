@@ -10,6 +10,10 @@ import { createBridge } from "../src/bridge.mjs";
 import { JsonStateStore } from "../src/state-store.mjs";
 
 const config = {
+  // Legacy generic task creation is enabled only for these historical unit
+  // fixtures.  Production config is normalized by validateConfig(), which
+  // drops this test-only escape hatch and therefore fails closed.
+  allowLegacyTaskCreation: true,
   tables: [{
     tableId: "tbl_a",
     name: "语文项目",
@@ -300,6 +304,108 @@ test("creates one ready task and replays its persisted outcome", async () => {
   assert.equal(calls.filter(([kind]) => kind === "task").length, 1);
 });
 
+test("uses an explicit package catalog when the Bridge config has no package definitions", async () => {
+  const calls = [];
+  const bridge = createBridge({
+    config: { ...config, packages: undefined },
+    packageCatalog: config.packages,
+    store: memoryStore(),
+    taskboard: {
+      ensureProject: async (project) => calls.push(["project", project]),
+      createTask: async (payload) => {
+        calls.push(["task", payload]);
+        return { id: "task_registry", identifier: "AUTO-REGISTRY" };
+      },
+    },
+  });
+  const result = await bridge.handle({ ...event, eventId: "evt_registry_catalog" });
+  assert.equal(result.taskIdentifier, "AUTO-REGISTRY");
+  assert.equal(calls.filter(([kind]) => kind === "task").length, 1);
+});
+
+test("reloads the trusted package catalog for each new event", async () => {
+  let catalog = structuredClone(config.packages);
+  const created = [];
+  const bridge = createBridge({
+    config: { ...config, packages: undefined },
+    getPackageCatalog: async () => catalog,
+    store: memoryStore(),
+    taskboard: {
+      ensureProject: async () => {},
+      createTask: async (payload) => {
+        created.push(payload);
+        return { id: `task_${created.length}`, identifier: `AUTO-${created.length}` };
+      },
+    },
+  });
+
+  const first = await bridge.handle({ ...event, eventId: "evt_dynamic_catalog_enabled" });
+  assert.equal(first.kind, "ready");
+  assert.equal(created.length, 1);
+
+  catalog = {};
+  const disabled = await bridge.handle({ ...event, eventId: "evt_dynamic_catalog_disabled" });
+  assert.equal(disabled.kind, "blocked");
+  assert.equal(created.length, 2);
+  assert.equal(created[1].status, "blocked");
+
+  catalog = {
+    "Auto-cut-小学语文": {
+      projectId: "auto-cut-primary-school-chinese",
+      projectName: "小学语文 Auto-Cut",
+      workspacePath: "D:\\trusted\\Auto-cut-primary-school-chinese",
+      prompt: "执行小学语文流程。",
+    },
+  };
+  const enabled = await bridge.handle({
+    ...event,
+    eventId: "evt_dynamic_catalog_reenabled",
+    fields: { 自动剪辑项目包: "Auto-cut-小学语文" },
+  });
+  assert.equal(enabled.kind, "ready");
+  assert.equal(enabled.packageAlias, "Auto-cut-小学语文");
+  assert.equal(created.length, 3);
+});
+
+test("uses the Taskboard Feishu provenance route when it is available", async () => {
+  const calls = [];
+  const bridge = createBridge({
+    config,
+    store: memoryStore(),
+    taskboard: {
+      ensureProject: async () => {},
+      createTask: async () => {
+        throw new Error("generic task route must not be used for Feishu events");
+      },
+      createFeishuTask: async (payload) => {
+        calls.push(payload);
+        return { id: "task_feishu", identifier: "AUTO-FEISHU" };
+      },
+    },
+  });
+  const result = await bridge.handle({ ...event, eventId: "evt_provenance" });
+  assert.equal(result.taskIdentifier, "AUTO-FEISHU");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].description, /feishu-codex-task:v1:/);
+});
+
+test("fails closed when the dedicated Feishu provenance route is unavailable", async () => {
+  const store = memoryStore();
+  const bridge = createBridge({
+    config: { ...config, allowLegacyTaskCreation: false, delivery: policy },
+    store,
+    taskboard: {
+      ensureProject: async () => {},
+      createTask: async () => ({ id: "task_generic", identifier: "AUTO-GENERIC" }),
+    },
+  });
+  const result = await bridge.handle({ ...event, eventId: "evt_missing_provenance_route" });
+  assert.equal(result.kind, "pending");
+  assert.equal(result.deliveryState, "retry_wait");
+  assert.equal((await store.get("evt_missing_provenance_route")).lastError.code,
+    "TASKBOARD_PROVENANCE_ROUTE_UNAVAILABLE");
+});
+
 test("uses an injected current-record title before building the task", async () => {
   let payload;
   const bridge = createBridge({
@@ -477,6 +583,58 @@ test("retries a temporary archive failure and completes the leave event", async 
   assert.equal(task.archivedAt, "now");
 });
 
+test("reuses the first archive subject when the table trigger is edited during retry", async () => {
+  const filename = await stateFilename();
+  let now = 0;
+  let activeConfig = { ...config, delivery: policy };
+  const task = lifecycleTask("task_frozen_archive");
+  let available = false;
+  const bridge = createBridge({
+    config: activeConfig,
+    getConfig: async () => activeConfig,
+    store: new JsonStateStore(filename),
+    now: () => now,
+    random: () => 0.5,
+    taskboard: {
+      async listTasks() {
+        if (!available) throw unavailable();
+        return task.archivedAt === null ? [task] : [];
+      },
+      async getTask() { return task; },
+      async archiveTask(value) {
+        value.archivedAt = "frozen";
+        return value;
+      },
+    },
+  });
+  const left = {
+    ...event,
+    eventId: "evt_frozen_archive",
+    beforeValue: "待剪辑",
+    afterValue: "剪辑中",
+    fields: {},
+  };
+  assert.equal((await bridge.handle(left)).deliveryState, "retry_wait");
+  const snapshot = (await (new JsonStateStore(filename)).get(left.eventId)).decisionSnapshot;
+  assert.equal(snapshot.action, "archive");
+  activeConfig = {
+    ...activeConfig,
+    tables: [{
+      ...activeConfig.tables[0],
+      name: "改名后的项目",
+      triggerField: "其他字段",
+      triggerValue: "新的开始值",
+    }],
+  };
+  now = 5;
+  available = true;
+  assert.deepEqual(await bridge.processDue(), {
+    kind: "ignored",
+    reason: "left_trigger",
+  });
+  assert.equal(task.archivedAt, "frozen");
+});
+
 test("replays partial archival safely without touching already archived tasks", async () => {
   let now = 0;
   let failedOnce = false;
@@ -539,6 +697,27 @@ test("creates a blocked task in the local project", async () => {
   assert.equal(payload.status, "blocked");
 });
 
+test("creates blocked events through the dedicated Feishu provenance route", async () => {
+  let payload;
+  const bridge = createBridge({
+    config: { ...config, allowLegacyTaskCreation: false },
+    store: memoryStore(),
+    taskboard: {
+      ensureProject: async () => assert.fail("blocked tasks do not create a subject project"),
+      createTask: async () => assert.fail("blocked events must not use the generic route"),
+      createFeishuTask: async (value) => {
+        payload = value;
+        return { id: "blocked_feishu", identifier: "AUTO-BLOCKED" };
+      },
+    },
+  });
+  const result = await bridge.handle({ ...event, eventId: "evt_blocked_provenance", fields: {} });
+  assert.equal(result.kind, "blocked");
+  assert.equal(result.taskIdentifier, "AUTO-BLOCKED");
+  assert.equal(payload.projectId, "local");
+  assert.equal(payload.status, "blocked");
+});
+
 test("defers a temporary Taskboard failure then creates exactly one task when due", async () => {
   let now = 0;
   let available = false;
@@ -570,6 +749,180 @@ test("defers a temporary Taskboard failure then creates exactly one task when du
   available = true;
   assert.equal((await bridge.processDue()).taskIdentifier, "AUTO-1");
   assert.equal((await bridge.processDue()), null);
+});
+
+test("reuses the first create decision after a retry even when routing config changes", async () => {
+  const filename = await stateFilename();
+  let now = 0;
+  let activeConfig = {
+    ...config,
+    delivery: policy,
+    tables: [{ ...config.tables[0], configVersion: 7 }],
+    packages: {
+      ...config.packages,
+      "Auto-cut-copyB": {
+        projectId: "auto-cut-copy-b",
+        projectName: "Auto-cut-copyB",
+        workspacePath: "D:\\trusted\\Auto-cut-copyB",
+        prompt: "执行 B 流程。",
+      },
+    },
+  };
+  const projects = [];
+  const payloads = [];
+  let firstAttempt = true;
+  const bridge = createBridge({
+    config: activeConfig,
+    getConfig: async () => activeConfig,
+    store: new JsonStateStore(filename),
+    now: () => now,
+    random: () => 0.5,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async (project) => {
+        projects.push(project);
+        if (firstAttempt) {
+          firstAttempt = false;
+          throw unavailable();
+        }
+      },
+      createTask: async (payload) => {
+        payloads.push(payload);
+        return { id: "task_frozen", identifier: "AUTO-FROZEN" };
+      },
+    },
+  });
+
+  assert.deepEqual(await bridge.handle({ ...event, eventId: "evt_frozen_create" }), {
+    kind: "pending",
+    deliveryState: "retry_wait",
+    attempts: 1,
+    retryAt: 5,
+  });
+  const firstSnapshot = (await (new JsonStateStore(filename)).get("evt_frozen_create")).decisionSnapshot;
+  assert.equal(firstSnapshot.kind, "ready");
+  assert.equal(firstSnapshot.packageAlias, "Auto-cut-copyA");
+
+  activeConfig = {
+    ...activeConfig,
+    tables: [{
+      ...activeConfig.tables[0],
+      name: "改名后的项目",
+      mode: "automatic",
+      triggerValue: "改后的开始值",
+      packageField: "另一个项目包字段",
+      configVersion: 8,
+    }],
+  };
+  now = 5;
+  const result = await bridge.processDue();
+  assert.equal(result.taskIdentifier, "AUTO-FROZEN");
+  assert.equal(projects.length, 2);
+  assert.equal(projects[0].workspacePath, "D:\\trusted\\Auto-cut-copyA");
+  assert.equal(projects[1].workspacePath, "D:\\trusted\\Auto-cut-copyA");
+  assert.equal(payloads.length, 1);
+  assert.match(payloads[0].description, /手动点击启动/);
+  assert.match(payloads[0].description, /Auto-cut-copyA/);
+});
+
+for (const [label, mutatePackage] of [
+  ["workspacePath", (packageConfig) => ({
+    ...packageConfig,
+    workspacePath: "D:\\trusted\\Auto-cut-copyA-replaced",
+  })],
+  ["prompt", (packageConfig) => ({
+    ...packageConfig,
+    prompt: "执行被替换的流程。",
+  })],
+]) {
+  test(`dead-letters a retry when the aliased package ${label} changes`, async () => {
+    const filename = await stateFilename();
+    let now = 0;
+    let activeConfig = { ...config, delivery: policy };
+    let ensureProjectCalls = 0;
+    let createTaskCalls = 0;
+    const bridge = createBridge({
+      config: activeConfig,
+      getConfig: async () => activeConfig,
+      store: new JsonStateStore(filename),
+      now: () => now,
+      random: () => 0.5,
+      taskboard: {
+        findTaskByEventId: async () => null,
+        ensureProject: async () => {
+          ensureProjectCalls += 1;
+          throw unavailable();
+        },
+        createTask: async () => {
+          createTaskCalls += 1;
+          return { id: "unexpected", identifier: "UNEXPECTED" };
+        },
+      },
+    });
+
+    const eventId = `evt_package_${label}_changed`;
+    assert.deepEqual(await bridge.handle({ ...event, eventId }), {
+      kind: "pending",
+      deliveryState: "retry_wait",
+      attempts: 1,
+      retryAt: 5,
+    });
+
+    const originalPackage = activeConfig.packages["Auto-cut-copyA"];
+    activeConfig = {
+      ...activeConfig,
+      packages: {
+        ...activeConfig.packages,
+        "Auto-cut-copyA": mutatePackage(originalPackage),
+      },
+    };
+    now = 5;
+
+    assert.deepEqual(await bridge.processDue(), {
+      kind: "dead_letter",
+      deliveryState: "dead_letter",
+      attempts: 2,
+      errorCode: "DECISION_SNAPSHOT_PACKAGE_UNAVAILABLE",
+    });
+    const stored = await (new JsonStateStore(filename)).get(eventId);
+    assert.equal(stored.deliveryState, "dead_letter");
+    assert.equal(stored.lastError.code, "DECISION_SNAPSHOT_PACKAGE_UNAVAILABLE");
+    assert.equal(ensureProjectCalls, 1);
+    assert.equal(createTaskCalls, 0);
+  });
+}
+
+test("migrates an older retry record without a decision snapshot before side effects", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const claim = await store.claimEvent({ ...event, eventId: "evt_legacy_retry_snapshot" }, {
+    ownerId: "old-worker",
+    now: 0,
+    leaseMs: policy.leaseMs,
+  });
+  await store.fail("evt_legacy_retry_snapshot", {
+    ownerId: "old-worker",
+    token: claim.record.lease.token,
+    error: unavailable(),
+    nextAttemptAt: 5,
+    deadLetter: false,
+    now: 0,
+  });
+  let now = 5;
+  const bridge = createBridge({
+    config: { ...config, delivery: policy },
+    store,
+    now: () => now,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async () => ({ id: "task_migrated", identifier: "AUTO-MIGRATED" }),
+    },
+  });
+  assert.equal((await bridge.processDue()).taskIdentifier, "AUTO-MIGRATED");
+  const migrated = await store.get("evt_legacy_retry_snapshot");
+  assert.equal(migrated.decisionSnapshot?.kind, "ready");
+  assert.equal(migrated.decisionSnapshot?.packageAlias, "Auto-cut-copyA");
 });
 
 test("reuses an existing Taskboard task while completing a pending event", async () => {

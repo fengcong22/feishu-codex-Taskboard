@@ -17,4 +17,5 @@ $event = @'
 }
 '@
 
-Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:47824/api/simulate/record-changed' -ContentType 'application/json; charset=utf-8' -Body $event
+$headers = @{ 'x-feishu-bridge-client' = 'local-operator' }
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:47824/api/simulate/record-changed' -ContentType 'application/json; charset=utf-8' -Headers $headers -Body $event

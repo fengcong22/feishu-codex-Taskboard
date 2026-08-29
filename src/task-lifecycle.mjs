@@ -48,6 +48,10 @@ function isNotFound(error) {
   return error?.code === "TASK_NOT_FOUND" || error?.status === 404;
 }
 
+function isNotWaiting(error) {
+  return error?.code === "TASK_NOT_WAITING";
+}
+
 function isVersionConflict(error) {
   return error?.code === "VERSION_CONFLICT" || error?.status === 409;
 }
@@ -68,7 +72,9 @@ export async function archiveWaitingFeishuTasks(
 ) {
   const tasks = await fencedCall(
     ensureActive,
-    () => taskboard.listTasks({ archived: "false" }),
+    () => typeof taskboard.listFeishuWaitingTasks === "function"
+      ? taskboard.listFeishuWaitingTasks(scope)
+      : taskboard.listTasks({ archived: "false" }),
   );
   const candidates = selectWaitingFeishuTasks(tasks, scope);
   let archivedCount = 0;
@@ -78,20 +84,26 @@ export async function archiveWaitingFeishuTasks(
     if (!current || !matchesWaitingFeishuTask(current, scope)) continue;
 
     try {
-      await fencedCall(ensureActive, () => taskboard.archiveTask(current));
+      await fencedCall(ensureActive, () => typeof taskboard.archiveFeishuTask === "function"
+        ? taskboard.archiveFeishuTask(current)
+        : taskboard.archiveTask(current));
       archivedCount += 1;
       continue;
     } catch (error) {
       if (isNotFound(error)) continue;
+      if (isNotWaiting(error)) continue;
       if (!isVersionConflict(error)) throw error;
     }
 
     current = await readTask(taskboard, candidate.id, ensureActive);
     if (!current || !matchesWaitingFeishuTask(current, scope)) continue;
     try {
-      await fencedCall(ensureActive, () => taskboard.archiveTask(current));
+      await fencedCall(ensureActive, () => typeof taskboard.archiveFeishuTask === "function"
+        ? taskboard.archiveFeishuTask(current)
+        : taskboard.archiveTask(current));
     } catch (error) {
       if (isNotFound(error)) continue;
+      if (isNotWaiting(error)) continue;
       throw error;
     }
     archivedCount += 1;

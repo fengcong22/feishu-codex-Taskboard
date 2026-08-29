@@ -51,6 +51,12 @@ test("accepts a loopback, per-table, alias-only configuration", () => {
   assert.equal(result.packages["Auto-cut-copyA"].prompt, "执行安全的演示任务。");
 });
 
+test("does not carry the legacy generic Taskboard route flag into runtime config", () => {
+  const input = validConfig();
+  input.allowLegacyTaskCreation = true;
+  assert.equal(validateConfig(input).allowLegacyTaskCreation, undefined);
+});
+
 test("accepts a valid delivery policy override", () => {
   const input = validConfig();
   input.delivery = {
@@ -140,4 +146,11 @@ test("rejects duplicate package project ids", () => {
     projectName: "Auto-cut-copyB",
   };
   assert.throws(() => validateConfig(input), /duplicate package projectId/);
+});
+
+test("allows Bridge configuration without an embedded package catalog", () => {
+  const input = validConfig();
+  delete input.packages;
+  const result = validateConfig(input);
+  assert.equal(result.packages, undefined);
 });

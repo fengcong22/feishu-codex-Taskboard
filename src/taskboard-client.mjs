@@ -1,6 +1,28 @@
 import { parseFeishuTaskMetadata } from "./task-payload.mjs";
 import { safeDeliveryErrorCode } from "./retry-policy.mjs";
 
+const FEISHU_PROVENANCE_FIELDS = [
+  "version",
+  "source",
+  "eventId",
+  "baseToken",
+  "tableId",
+  "recordId",
+  "triggerField",
+  "triggerFieldId",
+  "triggerValue",
+  "mode",
+  "subjectKey",
+  "configVersion",
+  "executionMode",
+  "uploadMode",
+  "packageAlias",
+  "packageSource",
+  "concurrencyGroup",
+  "maxConcurrent",
+  "resourceGroups",
+];
+
 function invalidResponse(pathname) {
   return new TaskboardError(`Taskboard returned an invalid response for ${pathname}`, {
     code: "TASKBOARD_INVALID_RESPONSE",
@@ -34,6 +56,35 @@ function validTaskSnapshot(value) {
     && (value.archivedAt === null || nonEmptyString(value.archivedAt));
 }
 
+function validFeishuOrigin(value) {
+  return objectPayload(value)
+    && value.version === 1
+    && value.source === "feishu-base"
+    && nonEmptyString(value.eventId)
+    && nonEmptyString(value.baseToken)
+    && nonEmptyString(value.tableId)
+    && nonEmptyString(value.recordId);
+}
+
+function validFeishuTask(value) {
+  return validTaskSnapshot(value) && validFeishuOrigin(value.feishuOrigin);
+}
+
+function matchingFeishuProvenance(value, expected) {
+  if (!validFeishuOrigin(value) || !objectPayload(expected)) return false;
+  return FEISHU_PROVENANCE_FIELDS.every((field) => {
+    const expectedHasField = Object.hasOwn(expected, field);
+    if (Object.hasOwn(value, field) !== expectedHasField) return false;
+    if (!expectedHasField) return true;
+    if (Array.isArray(expected[field])) {
+      return Array.isArray(value[field])
+        && value[field].length === expected[field].length
+        && expected[field].every((entry, index) => value[field][index] === entry);
+    }
+    return value[field] === expected[field];
+  });
+}
+
 function validArchiveInput(value) {
   return validTask(value) && validVersion(value.version);
 }
@@ -48,18 +99,27 @@ export class TaskboardError extends Error {
 }
 
 export class TaskboardClient {
-  constructor(baseUrl, { fetchImplementation = globalThis.fetch, timeoutMs = 5000 } = {}) {
+  constructor(baseUrl, {
+    fetchImplementation = globalThis.fetch,
+    timeoutMs = 5000,
+    bridgeSecret = process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  } = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.fetch = fetchImplementation;
     this.timeoutMs = timeoutMs;
+    this.bridgeSecret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : null;
   }
 
-  async #request(pathname, { method = "POST", body } = {}) {
+  async #request(pathname, { method = "POST", body, headers = {} } = {}) {
     let response;
     try {
+      const requestHeaders = { ...headers };
+      if (requestHeaders["x-taskboard-client"] === "feishu-bridge" && this.bridgeSecret) {
+        requestHeaders["x-feishu-bridge-secret"] = this.bridgeSecret;
+      }
       const options = {
         method,
-        headers: {},
+        headers: requestHeaders,
         signal: AbortSignal.timeout(this.timeoutMs),
       };
       if (body !== undefined) {
@@ -114,6 +174,68 @@ export class TaskboardClient {
     return response.task;
   }
 
+  async createFeishuTask(payload) {
+    const metadata = parseFeishuTaskMetadata(payload?.description);
+    if (!metadata || metadata.source !== "feishu-base") {
+      throw new TaskboardError("Feishu task payload is missing valid workflow metadata", {
+        code: "INVALID_FEISHU_ORIGIN",
+        status: 400,
+      });
+    }
+    const response = await this.#request("/api/local/feishu/tasks", {
+      body: payload,
+      headers: { "x-taskboard-client": "feishu-bridge" },
+    });
+    if (!validFeishuTask(response?.task)
+      || !matchingFeishuProvenance(response.task.feishuOrigin, metadata)) {
+      throw invalidResponse("/api/local/feishu/tasks");
+    }
+    return response.task;
+  }
+
+  async listFeishuWaitingTasks(options = {}) {
+    const { event, table } = options;
+    const projectId = options.projectId ?? table?.projectId;
+    const baseToken = options.baseToken ?? event?.baseToken;
+    const tableId = options.tableId ?? event?.tableId;
+    const recordId = options.recordId ?? event?.recordId;
+    const triggerFieldId = options.triggerFieldId ?? table?.triggerFieldId;
+    const triggerField = options.triggerField ?? table?.triggerField;
+    const triggerValue = options.triggerValue ?? table?.triggerValue;
+    if (![baseToken, tableId, recordId, triggerValue].every(nonEmptyString)
+      || (!nonEmptyString(triggerFieldId) && !nonEmptyString(triggerField))) {
+      throw invalidResponse("/api/local/feishu/tasks");
+    }
+    const query = new URLSearchParams({
+      ...(projectId ? { projectId } : {}), baseToken, tableId, recordId,
+      ...(triggerFieldId ? { triggerFieldId } : { triggerField }),
+      triggerValue, status: "todo", archived: "false",
+    });
+    const pathname = `/api/local/feishu/tasks?${query.toString()}`;
+    const payload = await this.#request(pathname, {
+      method: "GET", headers: { "x-taskboard-client": "feishu-bridge" },
+    });
+    if (!objectPayload(payload) || !Array.isArray(payload.tasks)
+      || payload.tasks.some((task) => !validFeishuTask(task))) throw invalidResponse(pathname);
+    return payload.tasks;
+  }
+
+  async archiveFeishuTask(task) {
+    if (!validArchiveInput(task)) {
+      throw invalidResponse("/api/local/feishu/tasks/:id/archive");
+    }
+    const pathname = `/api/local/feishu/tasks/${encodeURIComponent(task.id)}/archive`;
+    const payload = await this.#request(pathname, {
+      body: { version: task.version },
+      headers: { "x-taskboard-client": "feishu-bridge" },
+    });
+    if (!validFeishuTask(payload?.task) || payload.task.id !== task.id
+      || payload.task.status !== "todo" || !nonEmptyString(payload.task.archivedAt)) {
+      throw invalidResponse(pathname);
+    }
+    return payload.task;
+  }
+
   async listTasks({ projectId, archived = "all" } = {}) {
     const query = new URLSearchParams();
     if (projectId) query.set("projectId", projectId);
@@ -150,12 +272,16 @@ export class TaskboardClient {
   }
 
   async findTaskByEventId(eventId, projectId) {
-    const tasks = await this.listTasks({ projectId, archived: "all" });
-    const task = tasks.find((candidate) => (
-      parseFeishuTaskMetadata(candidate?.description)?.eventId === eventId
-    ));
+    if (!nonEmptyString(eventId) || !nonEmptyString(projectId)) throw invalidResponse("/api/local/feishu/tasks");
+    const pathname = `/api/local/feishu/tasks?${new URLSearchParams({ eventId, projectId, archived: "all" })}`;
+    const payload = await this.#request(pathname, {
+      method: "GET", headers: { "x-taskboard-client": "feishu-bridge" },
+    });
+    const tasks = Array.isArray(payload?.tasks) ? payload.tasks
+      : Object.hasOwn(payload ?? {}, "task") ? (payload.task === null ? [] : [payload.task]) : null;
+    if (!tasks || tasks.some((candidate) => candidate !== null && !validFeishuTask(candidate))) throw invalidResponse(pathname);
+    const task = tasks.find((candidate) => candidate.feishuOrigin.eventId === eventId);
     if (!task) return null;
-    if (!validTask(task)) throw invalidResponse("/api/tasks");
     return task;
   }
 }

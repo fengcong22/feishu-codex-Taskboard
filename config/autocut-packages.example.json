@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "packages": {
+    "Auto-cut-copyA": {
+      "alias": "Auto-cut-copyA",
+      "name": "Auto-cut-copyA",
+      "projectId": "auto-cut-copy-a",
+      "workspacePath": "D:\\codex\\codex-feishu\\examples\\harmless-auto-cut",
+      "prompt": "阅读 AGENTS.md，完成其中描述的无害演示任务。不要处理真实视频、上传文件或访问工作区外的路径。",
+      "model": null,
+      "reasoningEffort": null,
+      "zipSourceDirectory": null,
+      "maxConcurrent": 1,
+      "state": "enabled"
+    }
+  }
+}

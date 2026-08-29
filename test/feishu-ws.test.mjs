@@ -337,6 +337,101 @@ test("matches a payload whose table id is attached to the action", async () => {
   assert.equal(received.length, 1);
 });
 
+test("resolves the active table catalogue for each callback", async () => {
+  const received = [];
+  let activeTables = [table];
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [],
+    getTables: () => activeTables,
+    sdk: fakeSdk(),
+    handleEvent: async (event) => received.push(event),
+  });
+  const callback = listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT];
+  await callback(payload());
+  await listener.drain();
+  assert.equal(received.length, 1);
+
+  activeTables = [];
+  await callback(payload());
+  await listener.drain();
+  assert.equal(received.length, 1);
+});
+
+test("fails closed with a safe callback error when the active catalogue cannot be read", async () => {
+  const received = [];
+  const logs = [];
+  let failRead = true;
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [],
+    getTables: async () => {
+      if (failRead) {
+        const error = new Error("secret workflow path must not escape");
+        error.code = "secret-workflow-error";
+        throw error;
+      }
+      return [table];
+    },
+    sdk: fakeSdk(),
+    logger: { error: (...args) => logs.push(args) },
+    handleEvent: async (event) => received.push(event),
+  });
+  const callback = listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT];
+
+  await assert.rejects(
+    callback(payload()),
+    (error) => error.code === "FEISHU_WORKFLOW_CONFIG_UNAVAILABLE"
+      && !error.message.includes("secret workflow path"),
+  );
+  assert.equal(received.length, 0);
+  assert.equal(listener.health.lastError.code, "FEISHU_WORKFLOW_CONFIG_UNAVAILABLE");
+  assert.equal(JSON.stringify(logs).includes("secret workflow path"), false);
+
+  failRead = false;
+  await callback(payload());
+  await listener.drain();
+  assert.equal(received.length, 1);
+});
+
+test("fails closed when a Base token is missing for duplicate table ids across Bases", async () => {
+  const received = [];
+  const otherBase = { ...table, baseToken: "bas_other" };
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table, otherBase],
+    sdk: fakeSdk(),
+    handleEvent: async (event) => received.push(event),
+  });
+  const ambiguous = payload();
+  delete ambiguous.event.file_token;
+  await listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT](ambiguous);
+  await listener.drain();
+  assert.equal(received.length, 0);
+});
+
+test("uses the event header token to route duplicate table ids to the matching Base", async () => {
+  const received = [];
+  const otherBase = { ...table, baseToken: "bas_other" };
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table, otherBase],
+    sdk: fakeSdk(),
+    handleEvent: async (event) => received.push(event),
+  });
+  const routed = payload();
+  delete routed.event.file_token;
+  routed.header.token = "bas_demo";
+  await listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT](routed);
+  await listener.drain();
+  assert.equal(received.length, 1);
+  assert.equal(received[0].baseToken, "bas_demo");
+});
+
 test("returns a callback promise that waits for queued work and propagates failures", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });

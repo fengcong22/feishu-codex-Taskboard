@@ -84,22 +84,25 @@ export function validateConfig(input) {
     };
   });
 
-  const packageInput = plainObject(input.packages, "packages");
-  const packageProjectIds = new Set();
-  const packages = Object.fromEntries(Object.entries(packageInput).map(([alias, entry]) => {
-    nonEmptyString(alias, "package alias");
-    plainObject(entry, `packages.${alias}`);
-    const projectId = nonEmptyString(entry.projectId, `packages.${alias}.projectId`);
-    if (packageProjectIds.has(projectId)) throw new Error(`duplicate package projectId: ${projectId}`);
-    packageProjectIds.add(projectId);
-    return [alias, {
-      projectId,
-      projectName: nonEmptyString(entry.projectName, `packages.${alias}.projectName`),
-      workspacePath: absolutePath(entry.workspacePath, `packages.${alias}.workspacePath`),
-      prompt: nonEmptyString(entry.prompt, `packages.${alias}.prompt`),
-    }];
-  }));
-  if (Object.keys(packages).length === 0) throw new Error("packages must not be empty");
+  let packages;
+  if (input.packages !== undefined) {
+    const packageInput = plainObject(input.packages, "packages");
+    const packageProjectIds = new Set();
+    packages = Object.fromEntries(Object.entries(packageInput).map(([alias, entry]) => {
+      nonEmptyString(alias, "package alias");
+      plainObject(entry, `packages.${alias}`);
+      const projectId = nonEmptyString(entry.projectId, `packages.${alias}.projectId`);
+      if (packageProjectIds.has(projectId)) throw new Error(`duplicate package projectId: ${projectId}`);
+      packageProjectIds.add(projectId);
+      return [alias, {
+        projectId,
+        projectName: nonEmptyString(entry.projectName, `packages.${alias}.projectName`),
+        workspacePath: absolutePath(entry.workspacePath, `packages.${alias}.workspacePath`),
+        prompt: nonEmptyString(entry.prompt, `packages.${alias}.prompt`),
+      }];
+    }));
+    if (Object.keys(packages).length === 0) throw new Error("packages must not be empty");
+  }
 
   return {
     host,
@@ -108,7 +111,7 @@ export function validateConfig(input) {
     stateFile: absolutePath(input.stateFile, "stateFile"),
     delivery: validateDeliveryPolicy(input.delivery),
     tables,
-    packages,
+    ...(packages ? { packages } : {}),
   };
 }
 

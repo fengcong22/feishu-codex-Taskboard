@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildTaskPayload, parseFeishuTaskMetadata } from "../src/task-payload.mjs";
+import { buildTaskPayload, parseFeishuTaskMetadata, projectIdForSubject } from "../src/task-payload.mjs";
 
 const event = {
   eventId: "evt_1",
@@ -34,9 +34,10 @@ test("builds a ready Taskboard task with parseable server-owned metadata", () =>
       workspacePath: "D:\\trusted\\Auto-cut-copyA",
       prompt: "执行 A 流程。",
     },
+    subjectKey: "bas_demo:tbl_a",
     event,
   });
-  assert.equal(payload.projectId, "auto-cut-copy-a");
+  assert.equal(payload.projectId, "feishu-a760bbf074d551ab");
   assert.equal(payload.status, "todo");
   assert.equal(payload.assigneeTarget, "current-user");
   assert.deepEqual(payload.labels, ["feishu", "待剪辑", "manual", "Auto-cut-copyA"]);
@@ -44,6 +45,11 @@ test("builds a ready Taskboard task with parseable server-owned metadata", () =>
   assert.doesNotMatch(payload.description, /\"prompt\":/);
   assert.match(payload.description, /记录 ID：rec_1/);
   assert.doesNotMatch(payload.description, /D:\\trusted/);
+});
+
+test("uses the same deterministic subject project id shape as Taskboard", () => {
+  assert.equal(projectIdForSubject("bas_demo:tbl_demo"), "feishu-a20370a3de0f8d3b");
+  assert.match(projectIdForSubject("bas_demo:tbl_demo"), /^feishu-[a-f0-9]{16}$/u);
 });
 
 test("metadata marker remains parseable when record context contains HTML delimiters", () => {
@@ -76,6 +82,44 @@ test("stores the configured trigger field id in task metadata", () => {
     event,
   });
   assert.equal(parseFeishuTaskMetadata(payload.description)?.triggerFieldId, "fld_progress");
+});
+
+test("stores the task creation config and execution resource snapshot in metadata", () => {
+  const payload = buildTaskPayload({
+    kind: "ready",
+    table: {
+      ...table,
+      executionMode: "automatic",
+      uploadMode: "automatic",
+      concurrencyGroup: "primary-editor",
+      maxConcurrent: 3,
+      resourceGroups: ["jianying-desktop", "gpu"],
+    },
+    subjectKey: "bas_demo:tbl_a",
+    configVersion: 9,
+    executionMode: "automatic",
+    uploadMode: "automatic",
+    concurrencyGroup: "primary-editor",
+    maxConcurrent: 3,
+    resourceGroups: ["jianying-desktop", "gpu"],
+    packageAlias: "Auto-cut-copyA",
+    packageSource: "table-default",
+    packageConfig: {
+      projectId: "auto-cut-copy-a",
+      projectName: "Auto-cut-copyA",
+      workspacePath: "D:\\trusted\\Auto-cut-copyA",
+      prompt: "trusted",
+    },
+    event,
+  });
+  const metadata = parseFeishuTaskMetadata(payload.description);
+  assert.equal(metadata.subjectKey, "bas_demo:tbl_a");
+  assert.equal(metadata.configVersion, 9);
+  assert.equal(metadata.executionMode, "automatic");
+  assert.equal(metadata.uploadMode, "automatic");
+  assert.equal(metadata.concurrencyGroup, "primary-editor");
+  assert.equal(metadata.maxConcurrent, 3);
+  assert.deepEqual(metadata.resourceGroups, ["jianying-desktop", "gpu"]);
 });
 
 test("continues to parse existing marker metadata without a trigger field id", () => {
@@ -120,4 +164,18 @@ test("builds a blocked local task without executable metadata", () => {
   assert.equal(payload.status, "blocked");
   assert.equal(payload.assigneeTarget, "current-user");
   assert.doesNotMatch(payload.description, /workspacePath|D:\\trusted/);
+});
+
+test("keeps a blocked configured subject inside its isolated project", () => {
+  const payload = buildTaskPayload({
+    kind: "blocked",
+    reason: "unknown_package_alias",
+    table,
+    subjectKey: "bas_demo:tbl_a",
+    configVersion: 9,
+    packageAlias: "missing-package",
+    event,
+  });
+  assert.equal(payload.projectId, projectIdForSubject("bas_demo:tbl_a"));
+  assert.equal(payload.status, "blocked");
 });

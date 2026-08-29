@@ -83,6 +83,7 @@ test("preserves explicitly approved local and Bridge error codes", () => {
     "TASKBOARD_INVALID_RESPONSE",
     "TASKBOARD_UNAVAILABLE",
     "TASK_NOT_FOUND",
+    "TASK_NOT_WAITING",
     "VERSION_CONFLICT",
     "STATE_LOCK_TIMEOUT",
     "STATE_LOCK_TARGET_CHANGED",

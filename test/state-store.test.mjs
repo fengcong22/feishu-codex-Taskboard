@@ -33,6 +33,83 @@ test("claims an event into a versioned processing record", async () => {
   assert.deepEqual((await store.get(original.eventId)).event.fields, {});
 });
 
+test("persists one fenced decision snapshot without executable or local-path data", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  const claim = await store.claimEvent(event("evt_decision_snapshot"), {
+    ownerId: "one",
+    now: 0,
+    leaseMs: 100,
+  });
+  const snapshot = {
+    version: 1,
+    action: "create",
+    kind: "ready",
+    table: {
+      baseToken: "bas_demo",
+      tableId: "tbl_demo",
+      subjectKey: "bas_demo:tbl_demo",
+      name: "语文项目",
+      mode: "manual",
+      executionMode: "manual",
+      triggerField: "视频整体进度",
+      triggerFieldId: "fld_progress",
+      triggerValue: "待剪辑",
+      configVersion: 3,
+      uploadMode: "manual",
+      concurrencyGroup: "语文",
+      maxConcurrent: 2,
+      resourceGroups: ["cpu"],
+    },
+    packageAlias: "Auto-cut-copyA",
+    packageSource: "record-field",
+    packageProjectId: "auto-cut-copy-a",
+  };
+  const saved = await store.saveDecisionSnapshot("evt_decision_snapshot", {
+    ownerId: "one",
+    token: claim.record.lease.token,
+    snapshot,
+    now: 1,
+  });
+  assert.deepEqual(saved.decisionSnapshot, snapshot);
+  const persisted = await store.get("evt_decision_snapshot");
+  assert.deepEqual(persisted.decisionSnapshot, snapshot);
+  assert.doesNotMatch(JSON.stringify(persisted.decisionSnapshot), /workspacePath|prompt|command|credential|secret/i);
+
+  await assert.rejects(
+    () => store.saveDecisionSnapshot("evt_decision_snapshot", {
+      ownerId: "one",
+      token: claim.record.lease.token,
+      snapshot: { ...snapshot, packageAlias: "Auto-cut-copyB" },
+      now: 2,
+    }),
+    (error) => error?.code === "DECISION_SNAPSHOT_CONFLICT",
+  );
+});
+
+test("rejects decision snapshots containing unsupported executable fields", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  const claim = await store.claimEvent(event("evt_unsafe_decision_snapshot"), {
+    ownerId: "one",
+    now: 0,
+    leaseMs: 100,
+  });
+  await assert.rejects(
+    () => store.saveDecisionSnapshot("evt_unsafe_decision_snapshot", {
+      ownerId: "one",
+      token: claim.record.lease.token,
+      snapshot: {
+        version: 1,
+        action: "create",
+        kind: "ready",
+        workspacePath: "C:\\secret\\workspace",
+      },
+      now: 1,
+    }),
+    (error) => error?.code === "DECISION_SNAPSHOT_INVALID",
+  );
+  assert.equal((await store.get("evt_unsafe_decision_snapshot")).decisionSnapshot, null);
+});
+
 test("refreshes the lease clock after waiting for the state lock", async () => {
   const filename = await stateFilename();
   const store = new JsonStateStore(filename);

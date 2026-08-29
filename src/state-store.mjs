@@ -21,6 +21,36 @@ const DELIVERY_STATES = new Set([
   "dead_letter",
 ]);
 const DECISIONS = new Set(["ready", "blocked", "ignored"]);
+const DECISION_SNAPSHOT_VERSION = 1;
+const DECISION_SNAPSHOT_ACTIONS = new Set(["create", "archive"]);
+const DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
+  "version",
+  "action",
+  "kind",
+  "reason",
+  "effect",
+  "table",
+  "packageAlias",
+  "packageSource",
+  "packageProjectId",
+  "packageConfigFingerprint",
+]);
+const DECISION_SNAPSHOT_TABLE_FIELDS = new Set([
+  "baseToken",
+  "tableId",
+  "subjectKey",
+  "name",
+  "configVersion",
+  "mode",
+  "executionMode",
+  "uploadMode",
+  "concurrencyGroup",
+  "maxConcurrent",
+  "resourceGroups",
+  "triggerField",
+  "triggerFieldId",
+  "triggerValue",
+]);
 const MAX_FAILURE_HISTORY = 10;
 const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
   "LEGACY_EVENT_SNAPSHOT_MISSING",
@@ -50,6 +80,146 @@ function normalizeEventSnapshot(event) {
   return snapshot;
 }
 
+function snapshotInvalid(message) {
+  const error = new Error(`DECISION_SNAPSHOT_INVALID: ${message}`);
+  error.code = "DECISION_SNAPSHOT_INVALID";
+  return error;
+}
+
+function snapshotString(value, name, { optional = false } = {}) {
+  if (value === undefined || value === null || value === "") {
+    if (optional) return undefined;
+    throw snapshotInvalid(`${name} must be a non-empty string`);
+  }
+  if (typeof value !== "string" || value.trim() === "") {
+    throw snapshotInvalid(`${name} must be a non-empty string`);
+  }
+  const result = value.trim();
+  if (/[\u0000-\u001f\u007f]/u.test(result)) {
+    throw snapshotInvalid(`${name} contains control characters`);
+  }
+  return result;
+}
+
+function assertSnapshotKeys(value, allowed, name) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw snapshotInvalid(`${name}.${key} is not supported`);
+  }
+}
+
+/**
+ * Keep the retry decision independent from executable package configuration.
+ * The package alias/project id are identifiers only; workspace paths, prompts,
+ * commands and credentials are deliberately not part of this persisted shape.
+ */
+function normalizeDecisionSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw snapshotInvalid("snapshot must be an object");
+  }
+  assertSnapshotKeys(value, DECISION_SNAPSHOT_ROOT_FIELDS, "snapshot");
+  if (value.version !== DECISION_SNAPSHOT_VERSION) {
+    throw snapshotInvalid(`version must be ${DECISION_SNAPSHOT_VERSION}`);
+  }
+  const action = snapshotString(value.action, "snapshot.action");
+  if (!DECISION_SNAPSHOT_ACTIONS.has(action)) {
+    throw snapshotInvalid("snapshot.action is not supported");
+  }
+  const kind = snapshotString(value.kind, "snapshot.kind");
+  if (!DECISIONS.has(kind)) throw snapshotInvalid("snapshot.kind is not supported");
+  if ((action === "create" && !["ready", "blocked"].includes(kind))
+    || (action === "archive" && kind !== "ignored")) {
+    throw snapshotInvalid("snapshot action and kind do not match");
+  }
+
+  const table = value.table;
+  if (!table || typeof table !== "object" || Array.isArray(table)) {
+    throw snapshotInvalid("snapshot.table must be an object");
+  }
+  assertSnapshotKeys(table, DECISION_SNAPSHOT_TABLE_FIELDS, "snapshot.table");
+  const normalizedTable = {
+    baseToken: snapshotString(table.baseToken, "snapshot.table.baseToken"),
+    tableId: snapshotString(table.tableId, "snapshot.table.tableId"),
+    name: snapshotString(table.name, "snapshot.table.name"),
+    mode: snapshotString(table.mode, "snapshot.table.mode"),
+    triggerField: snapshotString(table.triggerField, "snapshot.table.triggerField"),
+    triggerValue: snapshotString(table.triggerValue, "snapshot.table.triggerValue"),
+  };
+  if (!["manual", "automatic"].includes(normalizedTable.mode)) {
+    throw snapshotInvalid("snapshot.table.mode is not supported");
+  }
+  for (const field of [
+    "subjectKey",
+    "executionMode",
+    "uploadMode",
+    "concurrencyGroup",
+    "triggerFieldId",
+  ]) {
+    const normalized = snapshotString(table[field], `snapshot.table.${field}`, { optional: true });
+    if (normalized !== undefined) normalizedTable[field] = normalized;
+  }
+  if (table.configVersion !== undefined && table.configVersion !== null) {
+    if (!Number.isSafeInteger(table.configVersion) || table.configVersion <= 0) {
+      throw snapshotInvalid("snapshot.table.configVersion must be a positive integer");
+    }
+    normalizedTable.configVersion = table.configVersion;
+  }
+  if (table.maxConcurrent !== undefined && table.maxConcurrent !== null) {
+    if (!Number.isSafeInteger(table.maxConcurrent) || table.maxConcurrent <= 0) {
+      throw snapshotInvalid("snapshot.table.maxConcurrent must be a positive integer");
+    }
+    normalizedTable.maxConcurrent = table.maxConcurrent;
+  }
+  if (table.resourceGroups !== undefined) {
+    if (!Array.isArray(table.resourceGroups)) {
+      throw snapshotInvalid("snapshot.table.resourceGroups must be an array");
+    }
+    normalizedTable.resourceGroups = table.resourceGroups.map((entry, index) => (
+      snapshotString(entry, `snapshot.table.resourceGroups[${index}]`)
+    ));
+  }
+
+  const normalized = {
+    version: DECISION_SNAPSHOT_VERSION,
+    action,
+    kind,
+    table: normalizedTable,
+  };
+  for (const field of ["reason", "effect", "packageAlias", "packageSource", "packageProjectId", "packageConfigFingerprint"]) {
+    const normalizedValue = snapshotString(value[field], `snapshot.${field}`, { optional: true });
+    if (normalizedValue !== undefined) normalized[field] = normalizedValue;
+  }
+  if (action === "archive" && normalized.effect !== "archive_waiting_tasks") {
+    throw snapshotInvalid("archive snapshots must use archive_waiting_tasks effect");
+  }
+  if (action === "create" && normalized.effect !== undefined) {
+    throw snapshotInvalid("create snapshots must not carry an archive effect");
+  }
+  if (kind === "ignored" && normalized.reason !== "left_trigger") {
+    throw snapshotInvalid("archive snapshots must preserve left_trigger reason");
+  }
+  if (kind === "ready") {
+    if (!normalized.packageAlias || !normalized.packageProjectId) {
+      throw snapshotInvalid("ready snapshots require packageAlias and packageProjectId");
+    }
+  }
+  for (const field of ["packageAlias", "packageProjectId"]) {
+    if (normalized[field] !== undefined && /[\\/:]/u.test(normalized[field])) {
+      throw snapshotInvalid(`snapshot.${field} must be an identifier`);
+    }
+  }
+  if (normalized.packageConfigFingerprint !== undefined
+    && !/^[a-f0-9]{64}$/u.test(normalized.packageConfigFingerprint)) {
+    throw snapshotInvalid("snapshot.packageConfigFingerprint must be a SHA-256 hex digest");
+  }
+  return normalized;
+}
+
+function snapshotMatchesEvent(snapshot, event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return true;
+  return snapshot.table.baseToken === event.baseToken
+    && snapshot.table.tableId === event.tableId;
+}
+
 function assertClaimOptions({ ownerId, leaseMs }) {
   if (typeof ownerId !== "string" || ownerId.trim() === "") {
     throw new Error("ownerId must be a non-empty string");
@@ -72,6 +242,7 @@ function newRecord(event, now) {
     event: normalizeEventSnapshot(event),
     deliveryState: "pending",
     decision: null,
+    decisionSnapshot: null,
     attempts: 0,
     nextAttemptAt: null,
     lease: null,
@@ -96,6 +267,7 @@ function legacyRecord(eventId, value, now) {
       event: null,
       deliveryState: "dead_letter",
       decision: null,
+      decisionSnapshot: null,
       attempts: 0,
       nextAttemptAt: null,
       lease: null,
@@ -123,6 +295,7 @@ function legacyRecord(eventId, value, now) {
     event: null,
     deliveryState: "succeeded",
     decision: value?.kind ?? null,
+    decisionSnapshot: null,
     attempts: 0,
     nextAttemptAt: null,
     lease: null,
@@ -143,6 +316,7 @@ function invalidRecord(eventId, value, now, code) {
     event: null,
     deliveryState: "dead_letter",
     decision: null,
+    decisionSnapshot: null,
     attempts,
     nextAttemptAt: null,
     lease: null,
@@ -197,6 +371,15 @@ function normalizeRecord(eventId, value, now) {
     if (record.decision !== null && !DECISIONS.has(record.decision)) {
       return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
     }
+    if (record.decisionSnapshot === undefined || record.decisionSnapshot === null) {
+      record.decisionSnapshot = null;
+    } else {
+      try {
+        record.decisionSnapshot = normalizeDecisionSnapshot(record.decisionSnapshot);
+      } catch {
+        return invalidRecord(eventId, record, now, "DECISION_SNAPSHOT_INVALID");
+      }
+    }
     if (record.nextAttemptAt === undefined) record.nextAttemptAt = null;
     if (record.nextAttemptAt !== null && !Number.isFinite(record.nextAttemptAt)) {
       return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
@@ -244,6 +427,9 @@ function normalizeRecord(eventId, value, now) {
       if (record.deliveryState === "pending" || record.deliveryState === "retry_wait") {
         return invalidRecord(eventId, record, now, "EVENT_SNAPSHOT_MISSING");
       }
+    }
+    if (record.decisionSnapshot && !snapshotMatchesEvent(record.decisionSnapshot, record.event)) {
+      return invalidRecord(eventId, record, now, "DECISION_SNAPSHOT_INVALID");
     }
     return record;
   }
@@ -516,6 +702,30 @@ export class JsonStateStore {
       due.lease = newLease(ownerId, currentNow, leaseMs);
       due.updatedAt = currentNow;
       return structuredClone(due);
+    }, now, clock);
+  }
+
+  async saveDecisionSnapshot(eventId, { ownerId, token, snapshot, now, clock }) {
+    const normalizedSnapshot = normalizeDecisionSnapshot(snapshot);
+    return this.#mutate((state, currentNow) => {
+      const record = state[eventId];
+      if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
+      assertLeaseOwner(record, ownerId, currentNow, token);
+      if (!snapshotMatchesEvent(normalizedSnapshot, record.event)) {
+        throw snapshotInvalid("snapshot subject does not match event");
+      }
+      if (record.decisionSnapshot !== null) {
+        const existing = normalizeDecisionSnapshot(record.decisionSnapshot);
+        if (JSON.stringify(existing) !== JSON.stringify(normalizedSnapshot)) {
+          const error = new Error(`Cannot replace decision snapshot for ${eventId}`);
+          error.code = "DECISION_SNAPSHOT_CONFLICT";
+          throw error;
+        }
+        return structuredClone(record);
+      }
+      record.decisionSnapshot = normalizedSnapshot;
+      record.updatedAt = currentNow;
+      return structuredClone(record);
     }, now, clock);
   }
 
