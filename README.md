@@ -2,7 +2,9 @@
 
 > 将飞书多维表格的状态变化，安全地转换为可追踪的 Taskboard 任务。
 
-这是一个仅在本机运行的自动化桥接服务：当飞书多维表格中的记录进入 `待剪辑`，本地 Bridge 会通过飞书官方 SDK 接收事件、校验和整理数据，并在 Taskboard 创建一张手动待办任务；记录离开 `待剪辑` 时，会只归档同一记录仍在“等待认领”（`todo`）的匹配任务。投递采用“至少一次处理 + 创建前元数据查找”，记录会持久化，临时故障可以有限重试并在重启后恢复；Bridge 不宣称绝对 exactly-once，因为当前 Taskboard 没有原生幂等键。Bridge 不会自动启动或停止 Codex，执行中的任务由使用者和所接入的 Taskboard 决定。
+这是一个仅在本机运行的自动化桥接服务。它同时保留两条入口：旧版表级配置继续支持 `待剪辑` 的手动任务；新版由 Taskboard 登记的受信任学科 subject 使用固定三阶段状态，并通过版本化的受信任登记接口交给 Taskboard。Bridge 通过飞书官方 SDK 接收事件、校验状态边沿和整理受控上下文，不扫描本地目录来猜 ZIP，也不把飞书单元格当作路径、命令或 prompt。
+
+分阶段登记只携带不具备执行权限的身份和来源证明：`event`、`binding`（`subjectKey`、`configVersion`、`stageId`）以及受控文档链接和命名字段结果。项目包、工作区、prompt、产物目录和上传目标由 Taskboard 的服务端配置快照决定。Taskboard/Auto-Cut 完成后通过 `driver_report` 准确绑定本次 task/run 的验收 ZIP；Bridge 不接收“最新 ZIP”猜测，也不负责实际视频剪辑。投递采用“至少一次处理 + 创建前元数据查找”，记录会持久化，临时故障可以有限重试并在重启后恢复；Bridge 不宣称绝对 exactly-once，因为当前 Taskboard 没有原生幂等键。Bridge 不会自动启动或停止 Codex，执行中的任务由使用者和所接入的 Taskboard 决定。
 
 ## 数据流
 
@@ -10,8 +12,9 @@
 flowchart LR
     A["飞书多维表格\n记录变化"] --> B["飞书官方 SDK\n长连接事件订阅"]
     B --> C["本地 Bridge\n筛选 · 标准化 · 去重"]
-    C --> D["本地 Taskboard\n创建手动任务"]
-    D --> E["使用者\n手动启动 Codex"]
+    C --> D["本地 Taskboard\n受信任任务登记"]
+    D --> E["Taskboard / Auto-Cut\n按快照执行"]
+    E --> F["driver_report\n绑定验收 ZIP 与 task/run"]
 ```
 
 所有服务只监听 `127.0.0.1`；飞书单元格不能传入本地路径、命令或提示词。
@@ -25,6 +28,10 @@ flowchart LR
 | 幂等去重 | 已持久化成功的同一 `event_id` 重放会返回 `duplicate`，正常重放不会再次创建；整体投递语义仍是至少一次。 |
 | 任务标题回退 | 优先读取“视频名称”，其次“集合文档”，失败时回退到飞书记录 ID。 |
 | Taskboard 集成 | 创建待办；记录离开 `待剪辑` 时只归档匹配的 `todo` 任务，不改动处理中或已完成任务；Bridge 不启动 Codex。 |
+| 分阶段 Auto-Cut 登记 | 只接受 Taskboard 登记的 subject；同一状态字段按 `initial`、`first_review`、`final_review` 三个固定阶段路由，阶段关闭时不补执行，必须发生新的状态边沿才会登记。 |
+| 受信任交接 | `/api/local/feishu/tasks` 接收 canonical `event`、`binding` 和 `controlledContext`；Taskboard 依据自己的 subject 快照派生项目包、执行模式、路径和 prompt。Bridge 不按文件名、mtime 或“最新 ZIP”猜任务归属。 |
+| 受控素材上下文 | 只读取 subject 指定的文档字段和命名字段；文档链接经过 Feishu Docx 形式校验，命名唯一性没有证明时保持 `false` 并由 Taskboard 阻止自动执行。Bridge 不回写飞书记录。 |
+| 配置版本快照 | 每次 subject 同步保存不可变 `configVersion`；重试使用事件、subject 和上下文快照，不重新解释当前配置。 |
 | 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
 | 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
 | 状态文件保护 | 损坏的状态文件、无效租约或不完整快照会安全停留在可诊断状态；读写（包括健康队列统计）使用同一稳定路径校验和操作系统本机互斥锁，写入使用原子替换，崩溃后可安全恢复。状态文件必须是稳定的普通文件，不接受符号链接或硬链接别名。 |
@@ -43,6 +50,8 @@ flowchart LR
 
 - `tables` 只登记允许接收事件的 Base、表、触发字段、状态值和标题字段。
 - `packages` 只登记受控的项目包别名，以及固定的 `projectId`、绝对 `workspacePath` 和提示词；飞书单元格只能选择别名，不能传路径、命令或提示词。
+- `workflowFile` 保存 Taskboard 同步的 subject 目录和版本历史；未配置时默认为 `${stateFile}.workflow.json`。分阶段 subject 必须由 Taskboard 通过受保护的 workflow sync 接口登记，不能通过飞书描述、评论或单元格内容临时改变执行策略。
+- 分阶段 subject 的每个阶段都独立保存启用开关、同一状态字段的 option ID、视频/修改意见来源、声音方式、产物目标目录和命名后缀。`video_original` 不需要音频来源；`replace_original` 必须显式配置音频来源。目录、上传目标等本地路径只在本机保存，workflow sync 响应会脱敏。
 - 本地 Taskboard 是外部依赖，且需要它自己的依赖和可用的 Codex 可执行文件。启动脚本默认在 `D:\codex\dashi-taskboard` 查找它；若安装在别处，请在启动前设置 `$env:CODEX_TASKBOARD_ROOT` 为该目录的绝对路径。
 
 不要提交 `config/bridge.local.json`、`.env.local` 或 `.runtime/`。默认示例工作区为 `examples/harmless-auto-cut`；确认测试流程稳定后，再将项目包的 `workspacePath` 和 `prompt` 调整为团队批准的真实值。
@@ -74,6 +83,43 @@ npm install
 仅当 `config/bridge.local.json` 中的测试表和字段与 `simulate-ready.ps1` 的固定样例事件相匹配时，Taskboard 才会出现一张任务。已有成功状态后再次运行同一命令应返回 `duplicate: true`，正常情况下不会出现第二张任务；该脚本没有事件参数，请使用团队提供的匹配测试配置。其他表需要维护者提供并评审匹配的模拟请求，不要将示例占位符当作有效配置。
 
 任务卡片标题按表配置读取当前记录：优先使用 `titleField`/`titleFieldId` 指定的 `视频名称`，为空时使用 `fallbackTitleField`/`fallbackTitleFieldId` 指定的 `集合文档`，两者都为空时回退到飞书记录 ID。标题读取失败不会阻止建任务，记录 ID 仍始终保留在任务描述中。
+
+### 分阶段 Auto-Cut 交接
+
+Taskboard 登记的学科 subject 只有一个单选状态字段，固定使用三个阶段 ID：`initial`（初稿）、`first_review`（初审修改）和 `final_review`（终审修改）。每个阶段可独立启用或关闭，但至少启用一个；只有状态从其他 option 变为该阶段配置的 option ID 时才登记，关闭期间不补执行。阶段之间移动时，Bridge 先归档旧阶段仍为 `todo` 的等待任务，再登记新阶段。缺少 before/after 任一侧或 option ID 不在已同步字段选项中时，Bridge fail-closed，不创建任务。
+
+每个阶段的文档/附件素材来源、声音方式、产物目标目录和命名后缀都随 `configVersion` 固定。`video_original` 使用视频原音；`replace_original` 必须有外部音频来源。文档目录查找、附件下载以及数量和时长校验由 Taskboard/Auto-Cut 完成；Bridge 只转交 subject 指定的 Feishu Docx 链接和命名字段显示值，命名值没有唯一性证明时不会放行 automatic 执行。
+
+Bridge → Taskboard 的受信任登记请求为 `POST /api/local/feishu/tasks`，请求头为 `x-taskboard-client: feishu-bridge` 和 `x-feishu-bridge-secret: <CODEX_FEISHU_BRIDGE_SECRET>`。请求体只有 `event`、`binding` 和 `controlledContext` 三部分：
+
+```json
+{
+  "event": {
+    "eventId": "evt_...",
+    "baseToken": "bas_...",
+    "tableId": "tbl_...",
+    "recordId": "rec_...",
+    "statusFieldId": "fld_...",
+    "beforeOptionId": "opt_other",
+    "afterOptionId": "opt_initial",
+    "occurredAt": 1788652800000
+  },
+  "binding": {
+    "subjectKey": "bas_...:tbl_...",
+    "configVersion": 7,
+    "stageId": "initial"
+  },
+  "controlledContext": {
+    "documentLinks": ["https://example.feishu.cn/docx/xxxxxxxx"],
+    "namingDisplayValue": "课程001",
+    "namingValueUnique": true
+  }
+}
+```
+
+Taskboard 必须用 `subjectKey + configVersion + stageId` 验证任务归属，并从自己的快照派生项目包、工作区、prompt、执行模式、产物路径和上传策略。`automatic` 与 `enqueueMode=automatic` 的实际执行属于 Taskboard/Auto-Cut；Bridge 不启动 Codex、不剪辑视频、不上传文件，也不扫描目录或按文件名、mtime、“最新 ZIP”猜测产物。剪辑完成后由 Auto-Cut/Taskboard 通过 `driver_report` 将验收通过的 ZIP、哈希和对应 task/run 绑定，再进入上传队列。
+
+Taskboard 读取受控上下文使用 `POST /api/feishu/workflow/controlled-context`，同步 subject 使用 `POST /api/feishu/workflow/sync`；两个接口都要求 `x-feishu-bridge-client: taskboard`、`x-feishu-bridge-secret`，并只接受 `127.0.0.1` 调用。同步响应不会返回本地/NAS 路径、workspace 或 prompt。普通任务、描述标记、伪造请求或没有有效 subject/version 的事件不具备分阶段自动登记资格；旧版 `tables` 的手动 `待剪辑` 流程保持不变。
 
 ### Windows 双击入口
 

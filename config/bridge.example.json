@@ -3,6 +3,7 @@
   "port": 47824,
   "taskboardUrl": "http://127.0.0.1:47823",
   "stateFile": "D:\\codex\\codex-feishu\\.runtime\\bridge\\state.json",
+  "workflowFile": "D:\\codex\\codex-feishu\\.runtime\\bridge\\workflow.json",
   "delivery": {
     "maxAttempts": 8,
     "initialDelayMs": 5000,

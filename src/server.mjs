@@ -1,4 +1,6 @@
 import { createServer } from "node:http";
+import { isIP } from "node:net";
+import { timingSafeEqual } from "node:crypto";
 
 import { safeDeliveryErrorCode } from "./retry-policy.mjs";
 
@@ -18,6 +20,139 @@ function sendJson(response, status, value) {
     "content-length": Buffer.byteLength(body),
   });
   response.end(body);
+}
+
+function loopbackAddress(value) {
+  if (typeof value !== "string") return false;
+  const normalized = value.toLowerCase().replace(/^::ffff:/u, "");
+  return normalized === "::1" || (isIP(normalized) === 4 && normalized.startsWith("127."));
+}
+
+function matchingSecret(expected, supplied) {
+  if (typeof expected !== "string" || expected.length === 0
+    || typeof supplied !== "string" || supplied.length === 0) return false;
+  const left = Buffer.from(expected, "utf8");
+  const right = Buffer.from(supplied, "utf8");
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function assertTaskboardCaller(request, expectedSecret) {
+  if (!loopbackAddress(request.socket?.remoteAddress)) {
+    const error = new Error("loopback caller required");
+    error.code = "LOOPBACK_REQUIRED";
+    error.status = 403;
+    throw error;
+  }
+  if (!matchingSecret(expectedSecret, request.headers["x-feishu-bridge-secret"])
+    || request.headers["x-feishu-bridge-client"] !== "taskboard") {
+    const error = new Error("Bridge authentication failed");
+    error.code = "BRIDGE_AUTH_FAILED";
+    error.status = 403;
+    throw error;
+  }
+}
+
+function exactKeys(value, keys, name) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    const error = new Error(`${name} must be an object`);
+    error.code = "INVALID_CONTEXT_REQUEST";
+    error.status = 400;
+    throw error;
+  }
+  const unknown = Object.keys(value).find((key) => !keys.has(key));
+  if (unknown) {
+    const error = new Error(`${name} contains unsupported fields`);
+    error.code = "INVALID_CONTEXT_REQUEST";
+    error.status = 400;
+    throw error;
+  }
+}
+
+function requiredString(value, name) {
+  if (typeof value !== "string" || value.trim() === "") {
+    const error = new Error(`${name} is required`);
+    error.code = "INVALID_CONTEXT_REQUEST";
+    error.status = 400;
+    throw error;
+  }
+  return value.trim();
+}
+
+function requiredVersion(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    const error = new Error("configVersion is invalid");
+    error.code = "INVALID_CONTEXT_REQUEST";
+    error.status = 400;
+    throw error;
+  }
+  return value;
+}
+
+function expectedVersion(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    const error = new Error("expectedVersion is invalid");
+    error.code = "INVALID_CONTEXT_REQUEST";
+    error.status = 400;
+    throw error;
+  }
+  return value;
+}
+
+function contextIdentity(body) {
+  exactKeys(body, new Set(["subjectKey", "configVersion", "baseToken", "tableId", "recordId"]), "controlled context");
+  return {
+    subjectKey: requiredString(body.subjectKey, "subjectKey"),
+    configVersion: requiredVersion(body.configVersion),
+    baseToken: requiredString(body.baseToken, "baseToken"),
+    tableId: requiredString(body.tableId, "tableId"),
+    recordId: requiredString(body.recordId, "recordId"),
+  };
+}
+
+function verifySubjectIdentity(subject, identity) {
+  if (!subject || typeof subject !== "object"
+    || subject.subjectKey !== identity.subjectKey
+    || subject.configVersion !== identity.configVersion
+    || (subject.baseToken && subject.baseToken !== identity.baseToken)
+    || (subject.tableId && subject.tableId !== identity.tableId)) {
+    const error = new Error("subject version does not match record identity");
+    error.code = "SUBJECT_VERSION_MISMATCH";
+    error.status = 409;
+    throw error;
+  }
+}
+
+function boundedContext(value) {
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    documentLinks: Array.isArray(input.documentLinks)
+      ? input.documentLinks.filter((entry) => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean).slice(0, 32)
+      : [],
+    namingDisplayValue: typeof input.namingDisplayValue === "string" ? input.namingDisplayValue.slice(0, 1024) : "",
+    namingValueUnique: input.namingValueUnique === true,
+  };
+}
+
+function portableWorkflowSubject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const subject = structuredClone(value);
+  if (subject.upload && typeof subject.upload === "object") {
+    delete subject.upload.targetPath;
+    delete subject.upload.artifactSourcePath;
+  }
+  if (subject.stages && typeof subject.stages === "object" && !Array.isArray(subject.stages)) {
+    for (const stage of Object.values(subject.stages)) {
+      if (stage && typeof stage === "object") delete stage.artifactTargetPath;
+    }
+  }
+  // Package execution details are local policy and are never part of a
+  // workflow synchronization response.
+  if (subject.packageConfig && typeof subject.packageConfig === "object") {
+    delete subject.packageConfig.workspacePath;
+    delete subject.packageConfig.prompt;
+    delete subject.packageConfig.zipSourceDirectory;
+  }
+  return subject;
 }
 
 async function readJson(request) {
@@ -52,7 +187,18 @@ function validateEvent(event) {
   };
 }
 
-export function createBridgeServer({ host, port, configSummary, handleEvent, getHealth }) {
+export function createBridgeServer({
+  host,
+  port,
+  configSummary,
+  handleEvent,
+  getHealth,
+  bridgeSecret = process.env.CODEX_FEISHU_BRIDGE_SECRET,
+  getSubjectVersion = null,
+  readControlledContext = null,
+  workflowStore = null,
+  syncSubject = null,
+}) {
   let address = null;
   const server = createServer(async (request, response) => {
     try {
@@ -63,6 +209,77 @@ export function createBridgeServer({ host, port, configSummary, handleEvent, get
       }
       if (request.method === "GET" && url.pathname === "/api/config-summary") {
         return sendJson(response, 200, configSummary);
+      }
+      if (request.method === "POST" && url.pathname === "/api/feishu/workflow/controlled-context") {
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+          const identity = contextIdentity(await readJson(request));
+          const resolver = getSubjectVersion
+            ?? (typeof workflowStore?.getSubjectVersion === "function"
+              ? workflowStore.getSubjectVersion.bind(workflowStore) : null);
+          if (!resolver) {
+            const error = new Error("subject version store is unavailable");
+            error.code = "WORKFLOW_VERSION_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          const subject = await resolver(identity.subjectKey, identity.configVersion);
+          verifySubjectIdentity(subject, identity);
+          const reader = readControlledContext
+            ?? (typeof workflowStore?.readControlledContext === "function"
+              ? workflowStore.readControlledContext.bind(workflowStore) : null);
+          if (!reader) {
+            const error = new Error("controlled context reader is unavailable");
+            error.code = "CONTROLLED_CONTEXT_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          // The subject snapshot supplies all field IDs.  The caller can only
+          // provide the opaque record identity above.
+          const context = await reader(subject, identity);
+          return sendJson(response, 200, boundedContext(context));
+        } catch (error) {
+          return sendJson(response, Number.isInteger(error?.status) ? error.status : 400, {
+            error: publicFailure(error),
+          });
+        }
+      }
+      if (request.method === "POST" && url.pathname === "/api/feishu/workflow/sync") {
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+          const body = await readJson(request);
+          exactKeys(body, new Set(["lifecycle", "expectedVersion", "subject"]), "workflow sync");
+          if (body.lifecycle !== "enabled" && body.lifecycle !== "disabled") {
+            const error = new Error("lifecycle is invalid");
+            error.code = "INVALID_CONTEXT_REQUEST";
+            error.status = 400;
+            throw error;
+          }
+          expectedVersion(body.expectedVersion);
+          if (!body.subject || typeof body.subject !== "object" || Array.isArray(body.subject)) {
+            const error = new Error("subject is required");
+            error.code = "INVALID_CONTEXT_REQUEST";
+            error.status = 400;
+            throw error;
+          }
+          const operation = syncSubject
+            ?? (typeof workflowStore?.syncSubject === "function" ? workflowStore.syncSubject.bind(workflowStore) : null);
+          if (!operation) {
+            const error = new Error("workflow store is unavailable");
+            error.code = "WORKFLOW_SYNC_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          const subject = await operation(body.subject, {
+            lifecycle: body.lifecycle,
+            expectedVersion: body.expectedVersion,
+          });
+          return sendJson(response, 200, { subject: portableWorkflowSubject(subject) });
+        } catch (error) {
+          return sendJson(response, Number.isInteger(error?.status) ? error.status : 400, {
+            error: publicFailure(error),
+          });
+        }
       }
       if (request.method === "POST" && url.pathname === "/api/simulate/record-changed") {
         let event;

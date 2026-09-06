@@ -48,13 +48,18 @@ export class TaskboardError extends Error {
 }
 
 export class TaskboardClient {
-  constructor(baseUrl, { fetchImplementation = globalThis.fetch, timeoutMs = 5000 } = {}) {
+  constructor(baseUrl, {
+    fetchImplementation = globalThis.fetch,
+    timeoutMs = 5000,
+    bridgeSecret = process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  } = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.fetch = fetchImplementation;
     this.timeoutMs = timeoutMs;
+    this.bridgeSecret = bridgeSecret;
   }
 
-  async #request(pathname, { method = "POST", body } = {}) {
+  async #request(pathname, { method = "POST", body, headers = {} } = {}) {
     let response;
     try {
       const options = {
@@ -66,6 +71,7 @@ export class TaskboardClient {
         options.headers["content-type"] = "application/json";
         options.body = JSON.stringify(body);
       }
+      Object.assign(options.headers, headers);
       response = await this.fetch(`${this.baseUrl}${pathname}`, {
         ...options,
       });
@@ -112,6 +118,79 @@ export class TaskboardClient {
     const response = await this.#request("/api/tasks", { body: payload });
     if (!validTask(response?.task)) throw invalidResponse("/api/tasks");
     return response.task;
+  }
+
+  async registerFeishuStageTask(payload, { bridgeSecret = this.bridgeSecret } = {}) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw invalidResponse("/api/local/feishu/tasks");
+    }
+    if (typeof bridgeSecret !== "string" || bridgeSecret.trim() === "") {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED",
+        status: 503,
+      });
+    }
+    const pathname = "/api/local/feishu/tasks";
+    const response = await this.#request(pathname, {
+      body: payload,
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": bridgeSecret,
+      },
+    });
+    if (!validTask(response?.task)) throw invalidResponse(pathname);
+    return response.task;
+  }
+
+  async listFeishuTasks({
+    baseToken,
+    tableId,
+    recordId,
+    statusFieldId,
+    stageId,
+    archived = "false",
+    status,
+    bridgeSecret = this.bridgeSecret,
+  } = {}) {
+    if (typeof bridgeSecret !== "string" || bridgeSecret.trim() === "") {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED", status: 503,
+      });
+    }
+    const query = new URLSearchParams();
+    for (const [name, value] of Object.entries({ baseToken, tableId, recordId, statusFieldId, stageId, status })) {
+      if (typeof value === "string" && value.trim() !== "") query.set(name, value.trim());
+    }
+    query.set("archived", archived);
+    const pathname = `/api/local/feishu/tasks?${query.toString()}`;
+    const payload = await this.#request(pathname, {
+      method: "GET",
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": bridgeSecret,
+      },
+    });
+    if (!objectPayload(payload) || !Array.isArray(payload.tasks)) throw invalidResponse(pathname);
+    return payload.tasks;
+  }
+
+  async archiveFeishuTask(task, { bridgeSecret = this.bridgeSecret } = {}) {
+    if (!validArchiveInput(task)) throw invalidResponse("/api/local/feishu/tasks/:id/archive");
+    if (typeof bridgeSecret !== "string" || bridgeSecret.trim() === "") {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED", status: 503,
+      });
+    }
+    const pathname = `/api/local/feishu/tasks/${encodeURIComponent(task.id)}/archive`;
+    const payload = await this.#request(pathname, {
+      body: { version: task.version },
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": bridgeSecret,
+      },
+    });
+    if (!validTaskSnapshot(payload?.task) || payload.task.id !== task.id) throw invalidResponse(pathname);
+    return payload.task;
   }
 
   async listTasks({ projectId, archived = "all" } = {}) {

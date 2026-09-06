@@ -62,7 +62,8 @@ export async function loadFeishuSdk() {
 export function createFeishuWsListener({
   appId,
   appSecret,
-  tables,
+  tables = [],
+  getTables = null,
   handleEvent,
   sdk,
   logger = console,
@@ -70,7 +71,7 @@ export function createFeishuWsListener({
 } = {}) {
   const normalizedAppId = nonEmpty(appId, "FEISHU_APP_ID");
   const normalizedSecret = nonEmpty(appSecret, "FEISHU_APP_SECRET");
-  if (!Array.isArray(tables) || tables.length === 0) {
+  if (!Array.isArray(tables) || (tables.length === 0 && typeof getTables !== "function")) {
     throw new Error("Feishu listener requires at least one table configuration");
   }
   if (typeof handleEvent !== "function") throw new Error("handleEvent must be a function");
@@ -106,25 +107,27 @@ export function createFeishuWsListener({
 
   const eventDispatcher = new sdkModule.EventDispatcher({}).register({
     [BITABLE_RECORD_CHANGED_EVENT]: (payload) => {
-      const source = sourceEvent(payload) ?? {};
-      const fileToken = source.file_token ?? source.fileToken ?? source.base_token ?? source.baseToken;
-      const tableIds = new Set([
-        source.table_id,
-        source.tableId,
-        ...(Array.isArray(source.action_list)
-          ? source.action_list.flatMap((action) => [action?.table_id, action?.tableId])
-          : []),
-      ].filter((value) => typeof value === "string" && value));
-      const tokenTables = tables.filter((table) => (
-        !table.baseToken || !fileToken || table.baseToken === fileToken
-      ));
-      const matchingTables = tableIds.size > 0
-        ? tokenTables.filter((table) => tableIds.has(table.tableId))
-        : tokenTables.length === 1 ? tokenTables : [];
-      const events = matchingTables.flatMap((table) => normalizeBitableRecordChanged(payload, table));
-      if (events.length === 0) return Promise.resolve();
-      lastEventAt = Date.now();
       const processing = queue.then(async () => {
+        const configured = typeof getTables === "function" ? await getTables() : tables;
+        const activeTables = Array.isArray(configured) ? configured : [];
+        const source = sourceEvent(payload) ?? {};
+        const fileToken = source.file_token ?? source.fileToken ?? source.base_token ?? source.baseToken;
+        const tableIds = new Set([
+          source.table_id,
+          source.tableId,
+          ...(Array.isArray(source.action_list)
+            ? source.action_list.flatMap((action) => [action?.table_id, action?.tableId])
+            : []),
+        ].filter((value) => typeof value === "string" && value));
+        const tokenTables = activeTables.filter((table) => (
+          !table.baseToken || !fileToken || table.baseToken === fileToken
+        ));
+        const matchingTables = tableIds.size > 0
+          ? tokenTables.filter((table) => tableIds.has(table.tableId))
+          : tokenTables.length === 1 ? tokenTables : [];
+        const events = matchingTables.flatMap((table) => normalizeBitableRecordChanged(payload, table));
+        if (events.length === 0) return;
+        lastEventAt = Date.now();
         for (const event of events) await handleEvent(event);
       });
       queue = processing.catch((error) => {

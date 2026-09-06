@@ -20,7 +20,7 @@ const DELIVERY_STATES = new Set([
   "succeeded",
   "dead_letter",
 ]);
-const DECISIONS = new Set(["ready", "blocked", "ignored"]);
+const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting"]);
 const MAX_FAILURE_HISTORY = 10;
 const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
   "LEGACY_EVENT_SNAPSHOT_MISSING",
@@ -40,6 +40,13 @@ const EVENT_SNAPSHOT_FIELDS = Object.freeze([
   "afterValue",
   "fields",
   "fieldValuesById",
+  "statusFieldId",
+  "beforePresent",
+  "afterPresent",
+  "beforeOptionId",
+  "afterOptionId",
+  "eventOccurredAt",
+  "eventOccurredAtPresent",
 ]);
 
 function normalizeEventSnapshot(event) {
@@ -77,6 +84,7 @@ function newRecord(event, now) {
     lease: null,
     lastError: null,
     failureHistory: [],
+    decisionSnapshot: null,
     outcome: null,
     createdAt: now,
     updatedAt: now,
@@ -101,6 +109,7 @@ function legacyRecord(eventId, value, now) {
       lease: null,
       lastError: { code: "LEGACY_EVENT_SNAPSHOT_MISSING", status: 0, at: now },
       failureHistory: [],
+      decisionSnapshot: null,
       outcome: null,
       createdAt: now,
       updatedAt: now,
@@ -148,6 +157,7 @@ function invalidRecord(eventId, value, now, code) {
     lease: null,
     lastError: { code, status: 0, at: now },
     failureHistory: [],
+    decisionSnapshot: null,
     outcome: null,
     createdAt,
     updatedAt: now,
@@ -158,13 +168,15 @@ function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!DECISIONS.has(value.kind) || (decision !== null && value.kind !== decision)) return null;
   const outcome = { kind: value.kind };
-  for (const field of ["reason", "taskId", "taskIdentifier", "packageAlias"]) {
+  for (const field of ["reason", "reasonCode", "taskId", "taskIdentifier", "packageAlias", "stageId", "subjectKey"]) {
     if (!Object.hasOwn(value, field)) continue;
     if (typeof value[field] !== "string" || value[field].trim() === "") return null;
     outcome[field] = value[field];
   }
-  if (value.kind !== "ignored" && !outcome.taskId && !outcome.taskIdentifier) return null;
-  if (requireTaskIdentifier && value.kind !== "ignored" && (!outcome.taskId || !outcome.taskIdentifier)) return null;
+  if (!new Set(["ignored", "archive_waiting"]).has(value.kind)
+    && !outcome.taskId && !outcome.taskIdentifier) return null;
+  if (requireTaskIdentifier && !new Set(["ignored", "archive_waiting"]).has(value.kind)
+    && (!outcome.taskId || !outcome.taskIdentifier)) return null;
   return outcome;
 }
 
@@ -221,6 +233,11 @@ function normalizeRecord(eventId, value, now) {
       .map((entry) => summarizeError(entry, now))
       .slice(-MAX_FAILURE_HISTORY);
     if (record.outcome === undefined) record.outcome = null;
+    if (record.decisionSnapshot === undefined) record.decisionSnapshot = null;
+    if (record.decisionSnapshot !== null
+      && (!record.decisionSnapshot || typeof record.decisionSnapshot !== "object" || Array.isArray(record.decisionSnapshot))) {
+      return invalidRecord(eventId, record, now, "DECISION_SNAPSHOT_INVALID");
+    }
     if (record.deliveryState === "succeeded") {
       const outcome = normalizeOutcome(record.outcome, record.decision);
       if (!outcome) return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
@@ -287,10 +304,11 @@ function assertEvent(event) {
 
 function hasEventSnapshot(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return false;
-  for (const field of ["eventId", "baseToken", "tableId", "recordId", "fieldName"]) {
+  for (const field of ["eventId", "baseToken", "tableId", "recordId"]) {
     if (typeof event[field] !== "string" || event[field].trim() === "") return false;
   }
-  if (!Object.hasOwn(event, "beforeValue") || !Object.hasOwn(event, "afterValue")) return false;
+  if ((!Object.hasOwn(event, "beforeValue") || !Object.hasOwn(event, "afterValue"))
+    && (!Object.hasOwn(event, "beforeOptionId") || !Object.hasOwn(event, "afterOptionId"))) return false;
   return Boolean(event.fields && typeof event.fields === "object" && !Array.isArray(event.fields));
 }
 
@@ -519,12 +537,34 @@ export class JsonStateStore {
     }, now, clock);
   }
 
-  async complete(eventId, { ownerId, token, decision, outcome, now, clock }) {
+  /** Persist the routing decision before any Taskboard side effect. */
+  async saveDecisionSnapshot(eventId, { ownerId, token, snapshot, now, clock }) {
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+      const error = new Error("decision snapshot must be an object");
+      error.code = "DECISION_SNAPSHOT_INVALID";
+      throw error;
+    }
     return this.#mutate((state, currentNow) => {
       const record = state[eventId];
       if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
       assertLeaseOwner(record, ownerId, currentNow, token);
-      const normalizedOutcome = normalizeOutcome(outcome, decision, { requireTaskIdentifier: true });
+      if (record.decisionSnapshot !== null && JSON.stringify(record.decisionSnapshot) !== JSON.stringify(snapshot)) {
+        const error = new Error("decision snapshot cannot be changed");
+        error.code = "DECISION_SNAPSHOT_CONFLICT";
+        throw error;
+      }
+      record.decisionSnapshot = structuredClone(snapshot);
+      record.updatedAt = currentNow;
+      return structuredClone(record);
+    }, now, clock);
+  }
+
+  async complete(eventId, { ownerId, token, decision, outcome, requireTaskIdentifier = true, now, clock }) {
+    return this.#mutate((state, currentNow) => {
+      const record = state[eventId];
+      if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
+      assertLeaseOwner(record, ownerId, currentNow, token);
+      const normalizedOutcome = normalizeOutcome(outcome, decision, { requireTaskIdentifier });
       if (!DECISIONS.has(decision) || !normalizedOutcome) {
         throw new Error("outcome must match decision and contain valid task identifiers");
       }

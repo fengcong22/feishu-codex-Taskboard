@@ -141,3 +141,75 @@ test("rejects duplicate package project ids", () => {
   };
   assert.throws(() => validateConfig(input), /duplicate package projectId/);
 });
+
+test("accepts a phased table using the Taskboard execution and upload schema", () => {
+  const input = validConfig();
+  input.tables = [{
+    subjectKey: "bas_demo:tbl_demo",
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    tableName: "演示表",
+    statusField: {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      options: [
+        { id: "opt_initial", name: "待初稿" },
+        { id: "opt_first", name: "待初审修改" },
+      ],
+    },
+    documentField: { fieldId: "fld_document", fieldName: "集合文档" },
+    namingField: { fieldId: "fld_name", fieldName: "命名" },
+    stages: {
+      initial: {
+        enabled: true,
+        trigger: { fieldId: "fld_status", optionId: "opt_initial", value: "待初稿", fieldName: "制作进度" },
+        videoSource: { kind: "docx_section", anchorText: "录屏" },
+        reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+        audio: { mode: "video_original" },
+        artifactTargetPath: "D:\\approved\\initial",
+        nameSuffix: "_初稿",
+      },
+      first_review: {
+        enabled: true,
+        trigger: { fieldId: "fld_status", optionId: "opt_first", value: "待初审修改", fieldName: "制作进度" },
+        videoSource: { kind: "docx_section", anchorText: "初审视频" },
+        reviewSource: { kind: "docx_section", anchorText: "初审意见" },
+        audio: { mode: "video_original" },
+        artifactTargetPath: "D:\\approved\\first",
+        nameSuffix: "_初审修改",
+      },
+      final_review: {
+        enabled: false,
+        trigger: { fieldId: "fld_status", optionId: "opt_final", value: "待终审修改", fieldName: "制作进度" },
+        videoSource: { kind: "docx_section", anchorText: "终审视频" },
+        reviewSource: { kind: "docx_section", anchorText: "终审意见" },
+        audio: { mode: "video_original" },
+        artifactTargetPath: "D:\\approved\\final",
+        nameSuffix: "_终审修改",
+      },
+    },
+    execution: {
+      mode: "automatic",
+      concurrencyGroup: "autocut",
+      maxConcurrent: 1,
+      resourceGroups: ["jianying"],
+    },
+    packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-copyA" },
+    upload: {
+      enqueueMode: "automatic",
+      artifactSourceMode: "driver_report",
+      artifactSourcePath: null,
+      targetId: "nas-main",
+      targetPath: "D:\\uploads",
+      uploadConcurrency: 2,
+    },
+  }];
+  const result = validateConfig(input);
+  assert.equal(result.tables[0].statusField.type, "single_select");
+  assert.equal(result.tables[0].execution.concurrencyGroup, "autocut");
+  assert.deepEqual(result.tables[0].execution.resourceGroups, ["jianying"]);
+  assert.equal(result.tables[0].upload.artifactSourceMode, "driver_report");
+  assert.equal(result.tables[0].upload.uploadConcurrency, 2);
+  assert.equal(result.tables[0].stages.initial.trigger.optionId, "opt_initial");
+});

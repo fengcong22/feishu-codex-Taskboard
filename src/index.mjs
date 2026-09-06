@@ -8,7 +8,12 @@ import { createCompensationWorker } from "./compensation-worker.mjs";
 import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
 import { createFeishuWsListener, loadFeishuSdk } from "./feishu-ws.mjs";
-import { createFeishuRecordTitleResolver } from "./feishu-record-reader.mjs";
+import {
+  createFeishuControlledContextReader,
+  createFeishuRecordTitleResolver,
+} from "./feishu-record-reader.mjs";
+import { createWorkflowConfigStore } from "./workflow-config-store.mjs";
+import { createWorkflowRuntime } from "./workflow-runtime.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 try {
@@ -18,12 +23,32 @@ try {
 }
 const configFile = process.env.BRIDGE_CONFIG ?? path.join(root, "config", "bridge.local.json");
 const config = await loadConfig(configFile);
+const workflowStore = createWorkflowConfigStore({
+  filename: config.workflowFile,
+  packageAliases: Object.keys(config.packages),
+});
+const workflowRuntime = createWorkflowRuntime({ config, store: workflowStore });
 let resolveRecordTitle = null;
+let controlledContextReader = null;
 const store = new JsonStateStore(config.stateFile);
+const taskboard = new TaskboardClient(config.taskboardUrl, {
+  bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+});
 const bridge = createBridge({
   config,
+  workflowStore,
+  workflowRuntime,
   store,
-  taskboard: new TaskboardClient(config.taskboardUrl),
+  taskboard,
+  bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  readControlledContext: async (subject, identity) => {
+    if (!controlledContextReader) {
+      const error = new Error("Feishu controlled context reader is unavailable");
+      error.code = "CONTROLLED_CONTEXT_UNAVAILABLE";
+      throw error;
+    }
+    return controlledContextReader.read(subject, identity);
+  },
   resolveRecordTitle: (...args) => resolveRecordTitle?.(...args),
 });
 const compensationWorker = createCompensationWorker({
@@ -35,6 +60,19 @@ let feishuListener = null;
 const app = createBridgeServer({
   host: config.host,
   port: config.port,
+  bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  workflowStore,
+  getSubjectVersion: (subjectKey, configVersion) => workflowStore.getSubjectVersion(subjectKey, configVersion),
+  readControlledContext: async (subject, identity) => {
+    if (!controlledContextReader) {
+      const error = new Error("Feishu controlled context reader is unavailable");
+      error.code = "CONTROLLED_CONTEXT_UNAVAILABLE";
+      error.status = 503;
+      throw error;
+    }
+    return controlledContextReader.read(subject, identity);
+  },
+  syncSubject: (subject, options) => workflowRuntime.syncSubject(subject, options),
   configSummary: {
     tables: config.tables.map(({
       baseToken,
@@ -101,6 +139,7 @@ if (listenerEnabled) {
       appId: process.env.FEISHU_APP_ID,
       appSecret: process.env.FEISHU_APP_SECRET,
       tables: config.tables,
+      getTables: () => workflowRuntime.getTables(),
       handleEvent: (event) => bridge.handle(event),
       sdk,
       logger: console,
@@ -110,6 +149,7 @@ if (listenerEnabled) {
         }
       },
     });
+    controlledContextReader = createFeishuControlledContextReader({ client: apiClient, logger: console });
     void feishuListener.start().then(() => {
       console.log("Feishu WebSocket listener started");
     }).catch(() => {
