@@ -120,7 +120,7 @@ Bridge → Taskboard 的受信任登记请求为 `POST /api/local/feishu/tasks`�
 
 Taskboard 必须用 `subjectKey + configVersion + stageId` 验证任务归属，并从自己的快照派生项目包、工作区、prompt、执行模式、产物路径和上传策略。`automatic` 与 `enqueueMode=automatic` 的实际执行属于 Taskboard/Auto-Cut；Bridge 不启动 Codex、不剪辑视频、不上传文件，也不扫描目录或按文件名、mtime、“最新 ZIP”猜测产物。剪辑完成后由 Auto-Cut/Taskboard 通过 `driver_report` 将验收通过的 ZIP、哈希和对应 task/run 绑定，再进入上传队列。
 
-Taskboard 读取受控上下文使用 `POST /api/feishu/workflow/controlled-context`，同步 subject 使用 `POST /api/feishu/workflow/sync`；两个接口都要求 `x-feishu-bridge-client: taskboard`、`x-feishu-bridge-secret`，并只接受 `127.0.0.1` 调用。同步响应不会返回本地/NAS 路径、workspace 或 prompt。普通任务、描述标记、伪造请求或没有有效 subject/version 的事件不具备分阶段自动登记资格；旧版 `tables` 的手动 `待剪辑` 流程保持不变。
+Taskboard 预览 Base 使用 `POST /api/feishu/base-preview`；Bridge 通过已配置的官方 SDK 应用身份只读 Base metadata（Base、子表、字段和单选项的稳定 ID 与显示名），不读取任务素材，也不回写飞书记录。该 reader 仅在真实飞书监听启用时初始化。Taskboard 读取受控上下文使用 `POST /api/feishu/workflow/controlled-context`，同步 subject 使用 `POST /api/feishu/workflow/sync`；三个接口都要求 `x-feishu-bridge-client: taskboard`、`x-feishu-bridge-secret`，并只接受 `127.0.0.1` 调用。同步响应不会返回本地/NAS 路径、workspace 或 prompt。普通任务、描述标记、伪造请求或没有有效 subject/version 的事件不具备分阶段自动登记资格；旧版 `tables` 的手动 `待剪辑` 流程保持不变。
 
 ### Windows 双击入口
 
