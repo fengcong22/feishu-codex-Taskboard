@@ -30,7 +30,7 @@ flowchart LR
 | Taskboard 集成 | 创建待办；记录离开 `待剪辑` 时只归档匹配的 `todo` 任务，不改动处理中或已完成任务；Bridge 不启动 Codex。 |
 | 分阶段 Auto-Cut 登记 | 只接受 Taskboard 登记的 subject；同一状态字段按 `initial`、`first_review`、`final_review` 三个固定阶段路由，阶段关闭时不补执行，必须发生新的状态边沿才会登记。 |
 | 受信任交接 | `/api/local/feishu/tasks` 接收 canonical `event`、`binding` 和 `controlledContext`；Taskboard 依据自己的 subject 快照派生项目包、执行模式、路径和 prompt。Bridge 不按文件名、mtime 或“最新 ZIP”猜任务归属。 |
-| 受控素材上下文 | 只读取 subject 指定的文档字段和命名字段；文档链接经过 Feishu Docx 形式校验，命名唯一性没有证明时保持 `false` 并由 Taskboard 阻止自动执行。Bridge 不回写飞书记录。 |
+| 受控素材上下文 | 只读取 subject 指定的文档字段和命名字段；文档链接经过 Feishu Docx/Wiki 形式校验，命名唯一性没有证明时保持 `false` 并由 Taskboard 阻止自动执行。Bridge 不回写飞书记录。 |
 | 配置版本快照 | 每次 subject 同步保存不可变 `configVersion`；重试使用事件、subject 和上下文快照，不重新解释当前配置。 |
 | 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
 | 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
@@ -89,7 +89,7 @@ npm install
 
 Taskboard 登记的学科 subject 只有一个单选状态字段，固定使用三个阶段 ID：`initial`（初稿）、`first_review`（初审修改）和 `final_review`（终审修改）。每个阶段可独立启用或关闭，但至少启用一个；只有状态从其他 option 变为该阶段配置的 option ID 时才登记，关闭期间不补执行。阶段之间移动时，Bridge 先归档旧阶段仍为 `todo` 的等待任务，再登记新阶段。缺少 before/after 任一侧或 option ID 不在已同步字段选项中时，Bridge fail-closed，不创建任务。
 
-每个阶段的文档/附件素材来源、声音方式、产物目标目录和命名后缀都随 `configVersion` 固定。`video_original` 使用视频原音；`replace_original` 必须有外部音频来源。文档目录查找、附件下载以及数量和时长校验由 Taskboard/Auto-Cut 完成；Bridge 只转交 subject 指定的 Feishu Docx 链接和命名字段显示值，命名值没有唯一性证明时不会放行 automatic 执行。
+每个阶段的文档/附件素材来源、声音方式、产物目标目录和命名后缀都随 `configVersion` 固定。`video_original` 使用视频原音；`replace_original` 必须有外部音频来源。文档目录查找、附件下载以及数量和时长校验由 Taskboard/Auto-Cut 完成；Bridge 只转交 subject 指定的 Feishu Docx 或 Wiki 链接和命名字段显示值，命名值没有唯一性证明时不会放行 automatic 执行。文档链接必须是受信任 `feishu.cn` 域的 HTTPS URL，路径精确为 `/docx/<token>` 或 `/wiki/<token>`，不接受凭据、查询参数、fragment 或额外路径。
 
 Bridge → Taskboard 的受信任登记请求为 `POST /api/local/feishu/tasks`，请求头为 `x-taskboard-client: feishu-bridge` 和 `x-feishu-bridge-secret: <CODEX_FEISHU_BRIDGE_SECRET>`。请求体只有 `event`、`binding` 和 `controlledContext` 三部分：
 

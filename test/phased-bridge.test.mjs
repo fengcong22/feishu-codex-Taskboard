@@ -83,6 +83,24 @@ function edge(beforeOptionId, afterOptionId, overrides = {}) {
   };
 }
 
+async function readDocumentLinks(documentFieldValue) {
+  const get = async () => ({
+    code: 0,
+    data: { record: { fields: { 集合文档: documentFieldValue } } },
+  });
+  const reader = createFeishuControlledContextReader({
+    client: {
+      bitable: { v1: { appTableRecord: { get } } },
+    },
+  });
+  const result = await reader.read(subject, {
+    baseToken: "bas_demo",
+    tableId: "tbl_math",
+    recordId: "rec-1",
+  });
+  return result.documentLinks;
+}
+
 test("registers only a non-target to enabled stage target edge", () => {
   const result = decideRecordChange(subject, edge("opt_other", "opt_initial"));
   assert.equal(result.kind, "register");
@@ -164,6 +182,37 @@ test("controlled context reads only configured fields and retains invalid values
   assert.equal(result.namingDisplayValue, "");
   assert.equal(result.namingValueUnique, false);
   assert.equal(calls[0].path.record_id, "rec-1");
+});
+
+test("controlled context accepts the configured record's trusted Feishu Wiki link", async () => {
+  const wikiUrl = "https://guanghe.feishu.cn/wiki/UCMRdeXEUobqXoxG1zvcT3a2nId";
+  assert.deepEqual(await readDocumentLinks(wikiUrl), [wikiUrl]);
+});
+
+test("controlled context accepts only exact credential-free Feishu Docx or Wiki links", async () => {
+  assert.deepEqual(await readDocumentLinks([
+    "https://guanghe.feishu.cn/docx/DocxToken_1-2",
+    "https://feishu.cn/wiki/WikiToken_1-2",
+    "https://user:secret@guanghe.feishu.cn/docx/Credentials",
+    "https://@guanghe.feishu.cn/docx/EmptyCredentials",
+    "https://guanghe.feishu.cn/docx/Query?download=1",
+    "https://guanghe.feishu.cn/docx/EmptyQuery?",
+    "https://guanghe.feishu.cn/docx/Fragment#section",
+    "https://guanghe.feishu.cn/docx/EmptyFragment#",
+    "https://guanghe.feishu.cn/wiki/Extra/path",
+    "https://guanghe.feishu.cn/wiki/Extra/../NormalizedAway",
+    "https://guanghe.feishu.cn\\ignored/wiki/BackslashNormalizedAway",
+    "HTTPS://guanghe.feishu.cn/wiki/UppercaseScheme",
+    "https://GUANGHE.FEISHU.CN/wiki/UppercaseHost",
+    "https://guanghe.feishu.cn/wiki/_InvalidFirstCharacter",
+    "https://guanghe.feishu.cn/wiki/Invalid.Token",
+    "http://guanghe.feishu.cn/wiki/Insecure",
+    "https://guanghe.feishu.cn.evil.example/wiki/WrongHost",
+    "https://example.com/docx/WrongHost",
+  ]), [
+    "https://guanghe.feishu.cn/docx/DocxToken_1-2",
+    "https://feishu.cn/wiki/WikiToken_1-2",
+  ]);
 });
 
 test("naming search proves uniqueness with an exact Base filter and bounded results", async () => {

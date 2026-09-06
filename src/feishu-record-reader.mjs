@@ -42,12 +42,12 @@ function collectDocumentLinks(value, result = []) {
       try {
         const url = new URL(trimmed);
         const host = url.hostname.toLowerCase();
-        if (url.protocol === "https:" && (host === "feishu.cn" || host.endsWith(".feishu.cn"))
-          && /^\/docx\/[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(url.pathname)) {
-          url.username = "";
-          url.password = "";
-          url.search = "";
-          url.hash = "";
+        if (url.toString() === trimmed && url.protocol === "https:"
+          && (host === "feishu.cn" || host.endsWith(".feishu.cn"))
+          && url.username === "" && url.password === ""
+          && url.search === "" && url.hash === ""
+          && !trimmed.includes("?") && !trimmed.includes("#")
+          && /^\/(?:docx|wiki)\/[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(url.pathname)) {
           result.push(url.toString());
         }
       } catch {
