@@ -205,6 +205,34 @@ test("naming search proves uniqueness with an exact Base filter and bounded resu
   }]);
 });
 
+test("controlled context proves naming uniqueness only for the requested record", async () => {
+  async function readWithProof(records) {
+    const reader = createFeishuControlledContextReader({
+      client: {
+        bitable: { v1: { appTableRecord: { get: async () => ({
+          code: 0,
+          data: { record: { fields: {
+            集合文档: "https://guanghe.feishu.cn/docx/one",
+            命名: "课程001",
+          } } },
+        }) } } } },
+      searchNaming: async () => ({ records }),
+    });
+    return reader.read(subject, {
+      baseToken: "bas_demo",
+      tableId: "tbl_math",
+      recordId: "rec-1",
+    });
+  }
+
+  assert.equal((await readWithProof([{ record_id: "rec-other" }])).namingValueUnique, false);
+  assert.equal((await readWithProof([{ record_id: "rec-1" }])).namingValueUnique, true);
+  assert.equal((await readWithProof([
+    { record_id: "rec-1" },
+    { record_id: "rec-other" },
+  ])).namingValueUnique, false);
+});
+
 test("index wires the Feishu naming search into controlled-context reads", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(new URL("../src/index.mjs", import.meta.url), "utf8");

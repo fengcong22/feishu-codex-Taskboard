@@ -73,14 +73,11 @@ function normalizedName(value) {
   return titleText(value).trim();
 }
 
-function uniqueProof(result) {
-  if (result === true) return true;
+function uniqueProof(result, expectedRecordId) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return false;
-  if (result.provedUnique === true || result.namingValueUnique === true || result.unique === true) return true;
-  if (result.provedUnique === false || result.namingValueUnique === false || result.unique === false) return false;
   if (Array.isArray(result.records) || Array.isArray(result.items)) {
     const entries = result.records ?? result.items;
-    return entries.length === 1;
+    return entries.length === 1 && entries[0]?.record_id === expectedRecordId;
   }
   return false;
 }
@@ -190,7 +187,7 @@ export function createFeishuControlledContextReader({ client, searchNaming = nul
           fieldName: namingField.fieldName ?? namingField.name,
           value: namingDisplayValue,
         });
-        namingValueUnique = uniqueProof(proof);
+        namingValueUnique = uniqueProof(proof, recordId);
       } catch (error) {
         try { logger.warn?.("Feishu naming uniqueness proof unavailable"); } catch {}
         namingValueUnique = false;

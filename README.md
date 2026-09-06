@@ -52,7 +52,7 @@ flowchart LR
 - `packages` 只登记受控的项目包别名，以及固定的 `projectId`、绝对 `workspacePath` 和提示词；飞书单元格只能选择别名，不能传路径、命令或提示词。
 - `workflowFile` 保存 Taskboard 同步的 subject 目录和版本历史；未配置时默认为 `${stateFile}.workflow.json`。分阶段 subject 必须由 Taskboard 通过受保护的 workflow sync 接口登记，不能通过飞书描述、评论或单元格内容临时改变执行策略。
 - 分阶段 subject 的每个阶段都独立保存启用开关、同一状态字段的 option ID、视频/修改意见来源、声音方式、产物目标目录和命名后缀。`video_original` 不需要音频来源；`replace_original` 必须显式配置音频来源。目录、上传目标等本地路径只在本机保存，workflow sync 响应会脱敏。
-- Bridge 到 Taskboard 的专用接口使用本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。`start-local.ps1` 会优先使用启动环境中已有的值，否则为本次启动生成随机值，并只把同一个值注入 Taskboard 与 Bridge 进程；Taskboard 启动 Codex 前会剔除该变量。密钥不会写入配置、任务描述或日志；单独启动两个服务时，需在各自环境中配置相同值。
+- Bridge 到 Taskboard 的专用接口使用本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。配置固定环境值时，`start-local.ps1` 会把同一个值注入 Taskboard 与 Bridge；未配置时，启动脚本会先按持久化 PID、启动时间和脚本身份验证并停止已存在的两端，对未标记实例还会核对脚本和 loopback 端口，再生成一次只存在于内存中的随机值并成对启动，避免单端重启后密钥不一致。无法验证进程身份时会拒绝停止和启动。Taskboard 启动 Codex 前会剔除该变量；密钥不会写入配置、运行时文件、任务描述或日志。
 - 本地 Taskboard 是外部依赖，且需要它自己的依赖和可用的 Codex 可执行文件。启动脚本默认在 `D:\codex\dashi-taskboard` 查找它；若安装在别处，请在启动前设置 `$env:CODEX_TASKBOARD_ROOT` 为该目录的绝对路径。
 
 不要提交 `config/bridge.local.json`、`.env.local` 或 `.runtime/`。默认示例工作区为 `examples/harmless-auto-cut`；确认测试流程稳定后，再将项目包的 `workspacePath` 和 `prompt` 调整为团队批准的真实值。
