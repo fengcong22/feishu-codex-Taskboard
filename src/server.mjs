@@ -194,6 +194,7 @@ export function createBridgeServer({
   handleEvent,
   getHealth,
   bridgeSecret = process.env.CODEX_FEISHU_BRIDGE_SECRET,
+  metadataReader = null,
   getSubjectVersion = null,
   readControlledContext = null,
   workflowStore = null,
@@ -209,6 +210,25 @@ export function createBridgeServer({
       }
       if (request.method === "GET" && url.pathname === "/api/config-summary") {
         return sendJson(response, 200, configSummary);
+      }
+      if (request.method === "POST" && url.pathname === "/api/feishu/base-preview") {
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+          const body = await readJson(request);
+          exactKeys(body, new Set(["url"]), "Base preview");
+          const sourceUrl = requiredString(body.url, "url");
+          if (typeof metadataReader?.preview !== "function") {
+            const error = new Error("Feishu metadata validation is unavailable");
+            error.code = "FEISHU_METADATA_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          return sendJson(response, 200, await metadataReader.preview(sourceUrl));
+        } catch (error) {
+          return sendJson(response, Number.isInteger(error?.status) ? error.status : 400, {
+            error: publicFailure(error),
+          });
+        }
       }
       if (request.method === "POST" && url.pathname === "/api/feishu/workflow/controlled-context") {
         try {

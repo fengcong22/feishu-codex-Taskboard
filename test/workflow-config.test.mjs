@@ -12,6 +12,7 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { configuredTables } from "../src/decide-event.mjs";
+import { createWorkflowRuntime } from "../src/workflow-runtime.mjs";
 
 function validSubject(overrides = {}) {
   return {
@@ -110,6 +111,31 @@ test("sync enforces the expected version and stores a portable subject snapshot"
   const snapshot = await store.getSubjectVersion("bas_demo:tbl_math", 1);
   assert.equal(snapshot.stages.initial.artifactTargetPath, undefined);
   assert.equal(snapshot.upload.targetPath, undefined);
+});
+
+test("workflow runtime validates an enabled sync through its metadata reader", async () => {
+  const subject = validSubject();
+  let validatedSubject = null;
+  let storedSubject = null;
+  const runtime = createWorkflowRuntime({
+    config: { tables: [] },
+    store: {
+      read: async () => ({ bases: [] }),
+      syncSubject: async (value) => {
+        storedSubject = value;
+        return value;
+      },
+    },
+    metadataReader: {
+      validateSubject: async (value) => { validatedSubject = value; },
+    },
+  });
+
+  const result = await runtime.syncSubject(subject, { lifecycle: "enabled" });
+
+  assert.equal(validatedSubject, subject);
+  assert.equal(storedSubject, subject);
+  assert.equal(result, subject);
 });
 
 test("keeps legacy tables active alongside synchronized phased subjects", () => {

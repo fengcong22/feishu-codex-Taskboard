@@ -240,6 +240,17 @@ test("index wires the Feishu naming search into controlled-context reads", async
   assert.match(source, /searchNaming\s*:/);
 });
 
+test("index shares the Feishu metadata reader with workflow validation and Base preview", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
+  assert.match(source, /createFeishuBaseMetadataReader/);
+  assert.match(
+    source,
+    /createWorkflowRuntime\(\{\s*config,\s*store: workflowStore,\s*metadataReader,\s*\}\)/,
+  );
+  assert.match(source, /createBridgeServer\(\{[\s\S]*?\n\s*metadataReader,/);
+});
+
 test("trusted task payload contains binding and context but no executable path", () => {
   const payload = buildTrustedTaskPayload({
     kind: "register",

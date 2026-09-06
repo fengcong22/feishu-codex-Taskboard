@@ -8,6 +8,7 @@ import { createCompensationWorker } from "./compensation-worker.mjs";
 import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
 import { createFeishuWsListener, loadFeishuSdk } from "./feishu-ws.mjs";
+import { createFeishuBaseMetadataReader } from "./feishu-base-metadata.mjs";
 import {
   createFeishuControlledContextReader,
   createFeishuNamingSearch,
@@ -28,7 +29,20 @@ const workflowStore = createWorkflowConfigStore({
   filename: config.workflowFile,
   packageAliases: Object.keys(config.packages),
 });
-const workflowRuntime = createWorkflowRuntime({ config, store: workflowStore });
+const listenerEnabled = ["1", "true", "yes", "on"].includes(
+  String(process.env.FEISHU_LISTENER_ENABLED ?? "").trim().toLowerCase(),
+);
+const sdk = listenerEnabled ? await loadFeishuSdk() : null;
+const apiClient = sdk ? new sdk.Client({
+  appId: process.env.FEISHU_APP_ID,
+  appSecret: process.env.FEISHU_APP_SECRET,
+}) : null;
+const metadataReader = apiClient ? createFeishuBaseMetadataReader({ client: apiClient }) : null;
+const workflowRuntime = createWorkflowRuntime({
+  config,
+  store: workflowStore,
+  metadataReader,
+});
 let resolveRecordTitle = null;
 let controlledContextReader = null;
 const store = new JsonStateStore(config.stateFile);
@@ -62,6 +76,7 @@ const app = createBridgeServer({
   host: config.host,
   port: config.port,
   bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  metadataReader,
   workflowStore,
   getSubjectVersion: (subjectKey, configVersion) => workflowStore.getSubjectVersion(subjectKey, configVersion),
   readControlledContext: async (subject, identity) => {
@@ -125,16 +140,8 @@ const address = await app.listen();
 console.log(`Feishu bridge listening on http://127.0.0.1:${address.port}`);
 compensationWorker.start();
 
-const listenerEnabled = ["1", "true", "yes", "on"].includes(
-  String(process.env.FEISHU_LISTENER_ENABLED ?? "").trim().toLowerCase(),
-);
 if (listenerEnabled) {
   try {
-    const sdk = await loadFeishuSdk();
-    const apiClient = new sdk.Client({
-      appId: process.env.FEISHU_APP_ID,
-      appSecret: process.env.FEISHU_APP_SECRET,
-    });
     resolveRecordTitle = createFeishuRecordTitleResolver({ client: apiClient, logger: console });
     feishuListener = createFeishuWsListener({
       appId: process.env.FEISHU_APP_ID,
