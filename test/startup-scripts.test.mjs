@@ -44,6 +44,35 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /FEISHU_LISTENER_ENABLED/);
 });
 
+test("startup creates one shared Bridge secret without exporting it from the launcher", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /function\s+New-BridgeSecret/);
+  assert.match(source, /CODEX_FEISHU_BRIDGE_SECRET\s*=\s*\$taskboardBridgeSecret/);
+  assert.match(source, /\$bridgeEnvironment[\s\S]*CODEX_FEISHU_BRIDGE_SECRET\s*=\s*\$taskboardBridgeSecret/);
+  assert.doesNotMatch(source, /\$env:CODEX_FEISHU_BRIDGE_SECRET\s*=\s*\$taskboardBridgeSecret/);
+
+  const command = [
+    `$source = Get-Content -LiteralPath ${powershellLiteral(fileURLToPath(files.start))} -Raw`,
+    "$tokens = $null",
+    "$errors = $null",
+    "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+    "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-BridgeSecret' }, $true)",
+    "if (-not $definition) { throw 'New-BridgeSecret definition is missing' }",
+    "Invoke-Expression $definition.Extent.Text",
+    "$env:CODEX_FEISHU_BRIDGE_SECRET = 'configured-secret'",
+    "$configured = New-BridgeSecret",
+    "if ($configured -ne 'configured-secret') { throw 'configured secret was not reused' }",
+    "Remove-Item Env:CODEX_FEISHU_BRIDGE_SECRET",
+    "$generated = New-BridgeSecret",
+    "if ([string]::IsNullOrWhiteSpace($generated) -or $generated.Length -lt 32) { throw 'generated secret is too short' }",
+    "if ($generated -notmatch '^[A-Za-z0-9_-]+$') { throw 'generated secret is not transport-safe' }",
+  ].join(";");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
 test("bridge startup tracks listener mode and only replaces an owned mismatched process", async () => {
   const source = await readFile(files.start, "utf8");
   assert.match(source, /bridge\.feishu-mode/);

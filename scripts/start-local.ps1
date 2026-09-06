@@ -106,6 +106,25 @@ function Get-ExpectedListenerState([string]$RequestedMode) {
   return 'disabled'
 }
 
+function New-BridgeSecret {
+  $configured = [string]$env:CODEX_FEISHU_BRIDGE_SECRET
+  if (-not [string]::IsNullOrWhiteSpace($configured)) {
+    if ($configured -match '[\x00-\x1f\x7f]') {
+      throw 'CODEX_FEISHU_BRIDGE_SECRET contains control characters.'
+    }
+    return $configured
+  }
+
+  $bytes = New-Object byte[] 32
+  $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $generator.GetBytes($bytes)
+  } finally {
+    $generator.Dispose()
+  }
+  return ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
+}
+
 function Test-StartedNodeIdentity([object]$Process, [hashtable]$Entry) {
   if ($null -eq $Entry.CreationDate) { return $false }
   $currentCreation = Get-ProcessCreationTicks $Process
@@ -471,6 +490,8 @@ try {
   }
   if (-not $startupMutexAcquired) { throw 'Another Taskboard startup is already in progress.' }
 
+  $taskboardBridgeSecret = New-BridgeSecret
+
   $taskboardScript = Join-Path $taskboardRoot 'server\index.mjs'
   $taskboardPid = Start-LocalNode $taskboardPidFile $taskboardIdentityFile $taskboardScript $taskboardStdout $taskboardStderr @{
     CODEX_TASKBOARD_HOST = '127.0.0.1'
@@ -478,6 +499,7 @@ try {
     CODEX_TASKBOARD_DATA_DIR = $taskboardData
     CODEX_EXECUTABLE = $codexExecutable
     CODEX_FEISHU_PACKAGES_PATH = $config
+    CODEX_FEISHU_BRIDGE_SECRET = $taskboardBridgeSecret
   } $null $null 47823
   $taskboardIdentity = Read-PersistedProcessIdentity $taskboardIdentityFile
   if (-not $taskboardIdentity) { throw 'Taskboard process identity marker is missing or invalid after startup.' }
@@ -487,6 +509,7 @@ try {
   $bridgeMode = if ($EnableFeishu) { 'enabled' } else { 'disabled' }
   $bridgeEnvironment = @{
     BRIDGE_CONFIG = $config
+    CODEX_FEISHU_BRIDGE_SECRET = $taskboardBridgeSecret
   }
   if ($EnableFeishu) {
     $bridgeEnvironment.FEISHU_LISTENER_ENABLED = '1'

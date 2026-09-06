@@ -10,6 +10,7 @@ import { TaskboardClient } from "./taskboard-client.mjs";
 import { createFeishuWsListener, loadFeishuSdk } from "./feishu-ws.mjs";
 import {
   createFeishuControlledContextReader,
+  createFeishuNamingSearch,
   createFeishuRecordTitleResolver,
 } from "./feishu-record-reader.mjs";
 import { createWorkflowConfigStore } from "./workflow-config-store.mjs";
@@ -149,7 +150,11 @@ if (listenerEnabled) {
         }
       },
     });
-    controlledContextReader = createFeishuControlledContextReader({ client: apiClient, logger: console });
+    controlledContextReader = createFeishuControlledContextReader({
+      client: apiClient,
+      searchNaming: createFeishuNamingSearch({ client: apiClient }),
+      logger: console,
+    });
     void feishuListener.start().then(() => {
       console.log("Feishu WebSocket listener started");
     }).catch(() => {

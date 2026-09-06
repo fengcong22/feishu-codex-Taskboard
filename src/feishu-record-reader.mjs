@@ -86,6 +86,66 @@ function uniqueProof(result) {
 }
 
 /**
+ * Build a read-only exact-value search for the configured naming field.
+ * Returning null when the SDK does not expose search keeps the reader
+ * fail-closed: Taskboard will not treat an unproved name as unique.
+ */
+export function createFeishuNamingSearch({ client } = {}) {
+  const search = client?.bitable?.v1?.appTableRecord?.search;
+  if (typeof search !== "function") return null;
+  const searchRecords = search.bind(client.bitable.v1.appTableRecord);
+
+  return async function searchNaming({
+    baseToken,
+    tableId,
+    fieldId,
+    fieldName,
+    value,
+  } = {}) {
+    const field = typeof fieldName === "string" && fieldName.trim() !== ""
+      ? fieldName.trim()
+      : typeof fieldId === "string" && fieldId.trim() !== ""
+        ? fieldId.trim()
+        : null;
+    if (typeof baseToken !== "string" || baseToken.trim() === ""
+      || typeof tableId !== "string" || tableId.trim() === ""
+      || !field || typeof value !== "string" || value.trim() === "") {
+      return { provedUnique: false };
+    }
+    const response = await searchRecords({
+      path: {
+        app_token: baseToken.trim(),
+        table_id: tableId.trim(),
+      },
+      data: {
+        field_names: [field],
+        filter: {
+          conjunction: "and",
+          conditions: [{ field_name: field, operator: "is", value: [value] }],
+        },
+      },
+      params: { page_size: 2 },
+    });
+    if (response?.code !== 0) {
+      const error = new Error("Feishu naming search failed");
+      error.code = String(response?.code ?? "FEISHU_NAMING_SEARCH_FAILED");
+      error.status = 502;
+      throw error;
+    }
+    const data = response?.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)
+      || !Array.isArray(data.items)) {
+      const error = new Error("Feishu naming search response is invalid");
+      error.code = "FEISHU_NAMING_SEARCH_INVALID_RESPONSE";
+      error.status = 502;
+      throw error;
+    }
+    if (data.has_more === true) return { provedUnique: false };
+    return { records: data.items.slice(0, 2) };
+  };
+}
+
+/**
  * Create a read-only reader for the controlled document and naming fields.
  * The reader intentionally returns bounded inert values; source cardinality
  * and naming validity are enforced by Taskboard at run preparation time.

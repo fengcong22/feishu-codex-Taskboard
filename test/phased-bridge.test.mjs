@@ -8,6 +8,7 @@ import {
 } from "../src/task-payload.mjs";
 import {
   createFeishuControlledContextReader,
+  createFeishuNamingSearch,
   readControlledRecordContext,
 } from "../src/feishu-record-reader.mjs";
 import { createBridgeServer } from "../src/server.mjs";
@@ -163,6 +164,52 @@ test("controlled context reads only configured fields and retains invalid values
   assert.equal(result.namingDisplayValue, "");
   assert.equal(result.namingValueUnique, false);
   assert.equal(calls[0].path.record_id, "rec-1");
+});
+
+test("naming search proves uniqueness with an exact Base filter and bounded results", async () => {
+  const calls = [];
+  const searchNaming = createFeishuNamingSearch({
+    client: {
+      bitable: { v1: { appTableRecord: { search: async (request) => {
+        calls.push(request);
+        return {
+          code: 0,
+          data: {
+            items: [{ record_id: "rec-1" }],
+            has_more: false,
+          },
+        };
+      } } } },
+    },
+  });
+  assert.equal(typeof searchNaming, "function");
+  const proof = await searchNaming({
+    baseToken: "bas_demo",
+    tableId: "tbl_math",
+    recordId: "rec-1",
+    fieldId: "fld_name",
+    fieldName: "命名",
+    value: "课程001",
+  });
+  assert.deepEqual(proof, { records: [{ record_id: "rec-1" }] });
+  assert.deepEqual(calls, [{
+    path: { app_token: "bas_demo", table_id: "tbl_math" },
+    data: {
+      field_names: ["命名"],
+      filter: {
+        conjunction: "and",
+        conditions: [{ field_name: "命名", operator: "is", value: ["课程001"] }],
+      },
+    },
+    params: { page_size: 2 },
+  }]);
+});
+
+test("index wires the Feishu naming search into controlled-context reads", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
+  assert.match(source, /createFeishuNamingSearch/);
+  assert.match(source, /searchNaming\s*:/);
 });
 
 test("trusted task payload contains binding and context but no executable path", () => {
