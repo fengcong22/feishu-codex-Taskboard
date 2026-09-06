@@ -42,12 +42,18 @@ function collectDocumentLinks(value, result = []) {
       try {
         const url = new URL(trimmed);
         const host = url.hostname.toLowerCase();
+        const navigationHints = url.searchParams.getAll("pre_pathname");
+        const hasNoQuery = url.search === "" && !trimmed.includes("?");
+        const hasOnlyNavigationHint = navigationHints.length === 1
+          && navigationHints[0] !== ""
+          && [...url.searchParams].length === 1;
         if (url.toString() === trimmed && url.protocol === "https:"
           && (host === "feishu.cn" || host.endsWith(".feishu.cn"))
           && url.username === "" && url.password === ""
-          && url.search === "" && url.hash === ""
-          && !trimmed.includes("?") && !trimmed.includes("#")
+          && (hasNoQuery || hasOnlyNavigationHint)
+          && url.hash === "" && !trimmed.includes("#")
           && /^\/(?:docx|wiki)\/[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(url.pathname)) {
+          url.search = "";
           result.push(url.toString());
         }
       } catch {
@@ -92,6 +98,25 @@ export function createFeishuNamingSearch({ client } = {}) {
   if (typeof search !== "function") return null;
   const searchRecords = search.bind(client.bitable.v1.appTableRecord);
 
+  async function searchPage(request) {
+    const response = await searchRecords(request);
+    if (response?.code !== 0) {
+      const error = new Error("Feishu naming search failed");
+      error.code = String(response?.code ?? "FEISHU_NAMING_SEARCH_FAILED");
+      error.status = 502;
+      throw error;
+    }
+    const data = response?.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)
+      || !Array.isArray(data.items)) {
+      const error = new Error("Feishu naming search response is invalid");
+      error.code = "FEISHU_NAMING_SEARCH_INVALID_RESPONSE";
+      error.status = 502;
+      throw error;
+    }
+    return data;
+  }
+
   return async function searchNaming({
     baseToken,
     tableId,
@@ -109,10 +134,13 @@ export function createFeishuNamingSearch({ client } = {}) {
       || !field || typeof value !== "string" || value.trim() === "") {
       return { provedUnique: false };
     }
-    const response = await searchRecords({
+    const path = {
+      app_token: baseToken.trim(),
+      table_id: tableId.trim(),
+    };
+    const data = await searchPage({
       path: {
-        app_token: baseToken.trim(),
-        table_id: tableId.trim(),
+        ...path,
       },
       data: {
         field_names: [field],
@@ -123,22 +151,37 @@ export function createFeishuNamingSearch({ client } = {}) {
       },
       params: { page_size: 2 },
     });
-    if (response?.code !== 0) {
-      const error = new Error("Feishu naming search failed");
-      error.code = String(response?.code ?? "FEISHU_NAMING_SEARCH_FAILED");
-      error.status = 502;
-      throw error;
-    }
-    const data = response?.data;
-    if (!data || typeof data !== "object" || Array.isArray(data)
-      || !Array.isArray(data.items)) {
-      const error = new Error("Feishu naming search response is invalid");
-      error.code = "FEISHU_NAMING_SEARCH_INVALID_RESPONSE";
-      error.status = 502;
-      throw error;
-    }
     if (data.has_more === true) return { provedUnique: false };
-    return { records: data.items.slice(0, 2) };
+    if (data.items.length > 0) return { records: data.items.slice(0, 2) };
+
+    const matches = [];
+    const seenPageTokens = new Set();
+    let pageToken = null;
+    do {
+      const page = await searchPage({
+        path,
+        data: { field_names: [field] },
+        params: { page_size: 500, ...(pageToken ? { page_token: pageToken } : {}) },
+      });
+      for (const record of page.items) {
+        const fieldValue = configuredFieldValue(record?.fields, { fieldId, fieldName: field });
+        if (normalizedName(fieldValue) === value.trim()) {
+          matches.push({ record_id: record.record_id });
+          if (matches.length === 2) return { records: matches };
+        }
+      }
+      if (page.has_more !== true) break;
+      const nextPageToken = typeof page.page_token === "string" ? page.page_token.trim() : "";
+      if (!nextPageToken || seenPageTokens.has(nextPageToken)) {
+        const error = new Error("Feishu naming search response is invalid");
+        error.code = "FEISHU_NAMING_SEARCH_INVALID_RESPONSE";
+        error.status = 502;
+        throw error;
+      }
+      seenPageTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    } while (pageToken);
+    return { records: matches };
   };
 }
 

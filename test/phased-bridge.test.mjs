@@ -189,6 +189,12 @@ test("controlled context accepts the configured record's trusted Feishu Wiki lin
   assert.deepEqual(await readDocumentLinks(wikiUrl), [wikiUrl]);
 });
 
+test("controlled context strips Feishu's Base navigation hint from a trusted Wiki link", async () => {
+  const wikiUrl = "https://guanghe.feishu.cn/wiki/D4mIwGfEviHFPjkht6ic1iManzh";
+  const baseCellUrl = `${wikiUrl}?pre_pathname=%2Fdrive%2Fhome%2Frecents%2F`;
+  assert.deepEqual(await readDocumentLinks(baseCellUrl), [wikiUrl]);
+});
+
 test("controlled context accepts only exact credential-free Feishu Docx or Wiki links", async () => {
   assert.deepEqual(await readDocumentLinks([
     "https://guanghe.feishu.cn/docx/DocxToken_1-2",
@@ -254,6 +260,56 @@ test("naming search proves uniqueness with an exact Base filter and bounded resu
   }]);
 });
 
+test("naming search scans formula results exactly when Feishu filtering returns no rows", async () => {
+  const calls = [];
+  const searchNaming = createFeishuNamingSearch({
+    client: {
+      bitable: { v1: { appTableRecord: { search: async (request) => {
+        calls.push(request);
+        if (request.data.filter) {
+          return { code: 0, data: { items: [], has_more: false } };
+        }
+        if (!request.params.page_token) {
+          return {
+            code: 0,
+            data: {
+              items: [
+                { record_id: "rec-1", fields: { 命名: [{ text: "课程001" }] } },
+                { record_id: "rec-2", fields: { 命名: [{ text: "课程002" }] } },
+              ],
+              has_more: true,
+              page_token: "page-2",
+            },
+          };
+        }
+        return {
+          code: 0,
+          data: {
+            items: [{ record_id: "rec-3", fields: { 命名: [{ text: "课程003" }] } }],
+            has_more: false,
+          },
+        };
+      } } } },
+    },
+  });
+  const proof = await searchNaming({
+    baseToken: "bas_demo",
+    tableId: "tbl_math",
+    recordId: "rec-1",
+    fieldId: "fld_name",
+    fieldName: "命名",
+    value: "课程001",
+  });
+  assert.deepEqual(proof.records.map((record) => record.record_id), ["rec-1"]);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[1], {
+    path: { app_token: "bas_demo", table_id: "tbl_math" },
+    data: { field_names: ["命名"] },
+    params: { page_size: 500 },
+  });
+  assert.equal(calls[2].params.page_token, "page-2");
+});
+
 test("controlled context proves naming uniqueness only for the requested record", async () => {
   async function readWithProof(records) {
     const reader = createFeishuControlledContextReader({
@@ -287,6 +343,17 @@ test("index wires the Feishu naming search into controlled-context reads", async
   const source = await readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
   assert.match(source, /createFeishuNamingSearch/);
   assert.match(source, /searchNaming\s*:/);
+});
+
+test("index can enable read-only Feishu APIs without starting the WebSocket listener", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
+  assert.match(source, /FEISHU_READ_ENABLED/);
+  assert.match(source, /const sdk = apiEnabled \? await loadFeishuSdk\(\) : null/);
+  assert.ok(
+    source.indexOf("controlledContextReader = createFeishuControlledContextReader")
+      < source.lastIndexOf("if (listenerEnabled)"),
+  );
 });
 
 test("index shares the Feishu metadata reader with workflow validation and Base preview", async () => {

@@ -29,10 +29,14 @@ const workflowStore = createWorkflowConfigStore({
   filename: config.workflowFile,
   packageAliases: Object.keys(config.packages),
 });
-const listenerEnabled = ["1", "true", "yes", "on"].includes(
-  String(process.env.FEISHU_LISTENER_ENABLED ?? "").trim().toLowerCase(),
-);
-const sdk = listenerEnabled ? await loadFeishuSdk() : null;
+function envEnabled(name) {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env[name] ?? "").trim().toLowerCase(),
+  );
+}
+const listenerEnabled = envEnabled("FEISHU_LISTENER_ENABLED");
+const apiEnabled = listenerEnabled || envEnabled("FEISHU_READ_ENABLED");
+const sdk = apiEnabled ? await loadFeishuSdk() : null;
 const apiClient = sdk ? new sdk.Client({
   appId: process.env.FEISHU_APP_ID,
   appSecret: process.env.FEISHU_APP_SECRET,
@@ -43,8 +47,16 @@ const workflowRuntime = createWorkflowRuntime({
   store: workflowStore,
   metadataReader,
 });
-let resolveRecordTitle = null;
-let controlledContextReader = null;
+const resolveRecordTitle = apiClient
+  ? createFeishuRecordTitleResolver({ client: apiClient, logger: console })
+  : null;
+const controlledContextReader = apiClient
+  ? createFeishuControlledContextReader({
+    client: apiClient,
+    searchNaming: createFeishuNamingSearch({ client: apiClient }),
+    logger: console,
+  })
+  : null;
 const store = new JsonStateStore(config.stateFile);
 const taskboard = new TaskboardClient(config.taskboardUrl, {
   bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
@@ -142,7 +154,6 @@ compensationWorker.start();
 
 if (listenerEnabled) {
   try {
-    resolveRecordTitle = createFeishuRecordTitleResolver({ client: apiClient, logger: console });
     feishuListener = createFeishuWsListener({
       appId: process.env.FEISHU_APP_ID,
       appSecret: process.env.FEISHU_APP_SECRET,
@@ -156,11 +167,6 @@ if (listenerEnabled) {
           console.error(`Feishu listener error: ${detail.code}`);
         }
       },
-    });
-    controlledContextReader = createFeishuControlledContextReader({
-      client: apiClient,
-      searchNaming: createFeishuNamingSearch({ client: apiClient }),
-      logger: console,
     });
     void feishuListener.start().then(() => {
       console.log("Feishu WebSocket listener started");
