@@ -4021,7 +4021,7 @@ export class TaskboardDatabase {
           origin.baseToken ?? null,
           origin.tableId ?? null,
           origin.recordId ?? null,
-          origin.statusFieldId ?? origin.triggerFieldId ?? null,
+          origin.statusFieldId ?? null,
           origin.beforeOptionId ?? null,
           origin.afterOptionId ?? null,
           origin.eventOccurredAt ?? null,
