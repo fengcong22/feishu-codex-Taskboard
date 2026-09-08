@@ -7,9 +7,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 $taskboardDefaultCandidates = @(
-  (Join-Path (Split-Path -Parent $root) 'worktrees\dashi-taskboard-autocut-workflow'),
-  (Join-Path (Split-Path -Parent $root) 'dashi-taskboard'),
-  'D:\codex\dashi-taskboard'
+  (Join-Path $root 'taskboard')
 )
 
 function Resolve-TaskboardRoot(

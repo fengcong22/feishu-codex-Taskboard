@@ -41,15 +41,34 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /packageRegistry/);
   assert.match(source, /autocut-packages\.example\.json/);
   assert.match(source, /CODEX_FEISHU_BRIDGE_SECRET/);
-  assert.match(source, /New-Guid/);
+  assert.match(source, /\[Guid\]::NewGuid\(\)\.ToString\('N'\)/);
+  assert.doesNotMatch(source, /\(New-Guid\)/);
   assert.match(source, /CODEX_TASKBOARD_ROOT/);
   assert.match(source, /\[string\]\$TaskboardRoot/);
-  assert.match(source, /worktrees\\dashi-taskboard-autocut-workflow/);
+  assert.match(source, /Join-Path \$root 'taskboard'/);
   assert.match(source, /Resolve-TaskboardRoot/);
   assert.match(source, /dist\\web\\index\.html/);
   assert.match(source, /\/health/);
   assert.match(source, /EnableFeishu/);
   assert.match(source, /FEISHU_LISTENER_ENABLED/);
+  assert.match(source, /function Build-TaskboardWeb/);
+  assert.match(source, /Build-TaskboardWeb \$taskboardRoot/);
+  assert.match(source, /run 'build:web'/);
+});
+
+test("startup and stop default only to the bundled Taskboard", async () => {
+  const [start, stop] = await Promise.all([
+    readFile(files.start, "utf8"),
+    readFile(files.stop, "utf8"),
+  ]);
+  for (const source of [start, stop]) {
+    assert.match(
+      source,
+      /\$taskboardDefaultCandidates\s*=\s*@\(\s*\(Join-Path \$root 'taskboard'\)\s*\)/s,
+    );
+    assert.doesNotMatch(source, /worktrees\\dashi-taskboard-autocut-workflow/);
+    assert.doesNotMatch(source, /D:\\codex\\dashi-taskboard/);
+  }
 });
 
 test("startup resolves an explicit complete Taskboard root before the environment override", async () => {

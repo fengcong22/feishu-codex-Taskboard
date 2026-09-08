@@ -8,9 +8,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 $taskboardDefaultCandidates = @(
-  (Join-Path (Split-Path -Parent $root) 'worktrees\dashi-taskboard-autocut-workflow'),
-  (Join-Path (Split-Path -Parent $root) 'dashi-taskboard'),
-  'D:\codex\dashi-taskboard'
+  (Join-Path $root 'taskboard')
 )
 
 function Resolve-TaskboardRoot(
@@ -89,6 +87,8 @@ $launcher = Join-Path $root 'scripts\detached-launcher.mjs'
 . (Join-Path $root 'scripts\process-identity.ps1')
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 $node = if ($nodeCommand) { $nodeCommand.Source } else { 'C:\Program Files\nodejs\node.exe' }
+$npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+$npm = if ($npmCommand) { $npmCommand.Source } else { 'npm.cmd' }
 $codexCommand = Get-Command codex.exe -ErrorAction SilentlyContinue
 $npmRoot = Join-Path $env:APPDATA 'npm\node_modules\@openai\codex\node_modules'
 $codexCandidates = @(
@@ -121,6 +121,18 @@ if (-not (Test-Path -LiteralPath $packageRegistry -PathType Leaf)) {
 }
 if ([string]::IsNullOrWhiteSpace($codexExecutable) -or -not (Test-Path -LiteralPath $codexExecutable -PathType Leaf)) {
   throw 'Codex executable was not found. Install the Codex desktop app or set CODEX_EXECUTABLE explicitly.'
+}
+
+function Build-TaskboardWeb([string]$TaskboardRoot) {
+  Push-Location -LiteralPath $TaskboardRoot
+  try {
+    & $npm run 'build:web'
+    if ($LASTEXITCODE -ne 0) {
+      throw "Taskboard web build failed with exit code $LASTEXITCODE."
+    }
+  } finally {
+    Pop-Location
+  }
 }
 
 function Test-Ready(
@@ -546,9 +558,10 @@ try {
 
   $taskboardBridgeSecret = [string]$env:CODEX_FEISHU_BRIDGE_SECRET
   if ([string]::IsNullOrWhiteSpace($taskboardBridgeSecret)) {
-    $taskboardBridgeSecret = ((New-Guid).Guid.Replace('-', '') + (New-Guid).Guid.Replace('-', ''))
+    $taskboardBridgeSecret = ([Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N'))
   }
 
+  Build-TaskboardWeb $taskboardRoot
   $taskboardScript = Join-Path $taskboardRoot 'server\index.mjs'
   $taskboardPid = Start-LocalNode $taskboardPidFile $taskboardIdentityFile $taskboardScript $taskboardStdout $taskboardStderr @{
     CODEX_TASKBOARD_HOST = '127.0.0.1'
