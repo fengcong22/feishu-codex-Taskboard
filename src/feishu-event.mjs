@@ -6,6 +6,35 @@ function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
+function optionIdValue(value) {
+  const decoded = decodeJsonValue(value);
+  if (typeof decoded === "string") return decoded.trim() || null;
+  if (Array.isArray(decoded)) {
+    const ids = decoded.map(optionIdValue).filter(Boolean);
+    return ids.length === 1 ? ids[0] : null;
+  }
+  const object = objectValue(decoded);
+  if (!object) return null;
+  for (const key of ["option_id", "optionId", "id"]) {
+    if (typeof object[key] === "string" && object[key].trim() !== "") return object[key].trim();
+  }
+  for (const key of ["value", "text", "name", "label", "string_value"]) {
+    if (Object.hasOwn(object, key)) return optionIdValue(object[key]);
+  }
+  return null;
+}
+
+function occurrenceTime(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+    const number = typeof value === "string" ? Number(value.trim()) : value;
+    if (Number.isFinite(number)) return number;
+    const parsed = Date.parse(String(value));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 function decodeJsonValue(value) {
   if (typeof value !== "string") return value;
   const trimmed = value.trim();
@@ -58,6 +87,25 @@ function fieldMap(entries, table) {
     result.set(fieldId, displayValue(entry.field_value ?? entry.fieldValue, table));
   }
   return result;
+}
+
+function fieldRawMap(entries) {
+  const result = new Map();
+  for (const entry of fieldEntries(entries)) {
+    result.set(entry.field_id ?? entry.fieldId, entry.field_value ?? entry.fieldValue);
+  }
+  return result;
+}
+
+function fieldDisplayValue(raw, table, optionId) {
+  const configuredOptions = table?.statusField?.options;
+  if (optionId && Array.isArray(configuredOptions)) {
+    const option = configuredOptions.find((candidate) => (
+      (candidate.optionId ?? candidate.option_id ?? candidate.id) === optionId
+    ));
+    if (option) return option.value ?? option.name ?? option.text ?? option.label ?? optionId;
+  }
+  return displayValue(raw, table);
 }
 
 function equalValue(left, right) {
@@ -154,12 +202,25 @@ export function normalizeBitableRecordChanged(payload, table) {
       actionObject.after_value ?? actionObject.afterValue ?? event.after_value ?? event.afterValue,
       table,
     );
+    const beforeRaw = fieldRawMap(
+      actionObject.before_value ?? actionObject.beforeValue ?? event.before_value ?? event.beforeValue,
+    );
+    const afterRaw = fieldRawMap(
+      actionObject.after_value ?? actionObject.afterValue ?? event.after_value ?? event.afterValue,
+    );
     const changedIds = changedFieldIds(before, after);
     const triggerFieldId = table.triggerFieldId && (before.has(table.triggerFieldId) || after.has(table.triggerFieldId))
       ? table.triggerFieldId
       : changedIds[0] ?? table.triggerFieldId ?? "";
-    const beforeValue = before.get(triggerFieldId) ?? "";
-    const afterValue = after.get(triggerFieldId) ?? "";
+    const statusFieldId = table.statusField?.fieldId ?? table.statusField?.field_id ?? table.triggerFieldId ?? triggerFieldId;
+    const beforeOptionId = optionIdValue(beforeRaw.get(statusFieldId));
+    const afterOptionId = optionIdValue(afterRaw.get(statusFieldId));
+    const beforeValue = before.has(triggerFieldId)
+      ? fieldDisplayValue(beforeRaw.get(triggerFieldId), table, beforeOptionId)
+      : "";
+    const afterValue = after.has(triggerFieldId)
+      ? fieldDisplayValue(afterRaw.get(triggerFieldId), table, afterOptionId)
+      : "";
     const packageValue = packageFieldValue(table, after, actionObject);
     const fields = {};
     if (table.packageField && packageValue !== undefined) fields[table.packageField] = packageValue;
@@ -178,7 +239,7 @@ export function normalizeBitableRecordChanged(payload, table) {
         ? `${sourceEventId}:${tableId}:${recordId}:${actionSignature}:${occurrence}`
         : sourceEventId)
       : fallbackId;
-    normalized.push({
+    const baseResult = {
       eventId,
       baseToken,
       tableId,
@@ -199,7 +260,35 @@ export function normalizeBitableRecordChanged(payload, table) {
       afterValue,
       fields,
       fieldValuesById: Object.fromEntries(after.entries()),
-    });
+    };
+    // Keep the legacy event shape byte-for-byte for old table configurations;
+    // phased subjects opt into the presence-aware fields below.
+    const phased = Boolean(table.statusField || table.stages || table.subjectKey || table.configVersion);
+    if (phased) {
+      const occurredAt = occurrenceTime(
+        actionObject.event_occurred_at,
+        actionObject.eventOccurredAt,
+        actionObject.create_time,
+        actionObject.createTime,
+        event.event_occurred_at,
+        event.eventOccurredAt,
+        event.create_time,
+        event.createTime,
+        header.event_occurred_at,
+        header.eventOccurredAt,
+        header.create_time,
+        header.createTime,
+      );
+      baseResult.statusFieldId = statusFieldId;
+      baseResult.beforePresent = beforeRaw.has(statusFieldId);
+      baseResult.afterPresent = afterRaw.has(statusFieldId);
+      baseResult.beforeOptionId = beforeOptionId;
+      baseResult.afterOptionId = afterOptionId;
+      baseResult.eventOccurredAtPresent = occurredAt !== null;
+      if (occurredAt !== null) baseResult.eventOccurredAt = occurredAt;
+      else baseResult.eventOccurredAt = null;
+    }
+    normalized.push(baseResult);
   });
 
   return normalized;

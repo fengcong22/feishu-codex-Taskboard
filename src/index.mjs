@@ -8,8 +8,13 @@ import { createBridgeServer } from "./server.mjs";
 import { createCompensationWorker } from "./compensation-worker.mjs";
 import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
-import { createFeishuWsListener } from "./feishu-ws.mjs";
-import { createFeishuRecordTitleResolver } from "./feishu-record-reader.mjs";
+import { createFeishuWsListener, loadFeishuSdk } from "./feishu-ws.mjs";
+import { createFeishuBaseMetadataReader } from "./feishu-base-metadata.mjs";
+import {
+  createFeishuControlledContextReader,
+  createFeishuNamingSearch,
+  createFeishuRecordTitleResolver,
+} from "./feishu-record-reader.mjs";
 import { createFeishuApiContext } from "./feishu-api.mjs";
 import { createWorkflowConfigStore } from "./workflow-config-store.mjs";
 import { createWorkflowRuntime } from "./workflow-runtime.mjs";
@@ -25,29 +30,46 @@ const config = await loadConfig(configFile);
 const packageRegistryFile = process.env.CODEX_FEISHU_PACKAGES_PATH
   ?? path.join(root, "config", "taskboard-feishu-packages.json");
 const packageCatalog = await loadPackageRegistry(packageRegistryFile);
-const listenerEnabled = ["1", "true", "yes", "on"].includes(
-  String(process.env.FEISHU_LISTENER_ENABLED ?? "").trim().toLowerCase(),
-);
-const feishuApi = await createFeishuApiContext({
-  appId: process.env.FEISHU_APP_ID,
-  appSecret: process.env.FEISHU_APP_SECRET,
-  listenerEnabled,
-});
-const feishuMetadataReader = feishuApi.metadataReader;
-const resolveRecordTitle = listenerEnabled
-  ? createFeishuRecordTitleResolver({ client: feishuApi.client, logger: console })
+function envEnabled(name) {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env[name] ?? "").trim().toLowerCase(),
+  );
+}
+const listenerEnabled = envEnabled("FEISHU_LISTENER_ENABLED");
+const apiEnabled = listenerEnabled || envEnabled("FEISHU_READ_ENABLED");
+const sdk = apiEnabled ? await loadFeishuSdk() : null;
+const feishuApi = apiEnabled
+  ? await createFeishuApiContext({
+    appId: process.env.FEISHU_APP_ID,
+    appSecret: process.env.FEISHU_APP_SECRET,
+    listenerEnabled,
+    loadSdk: async () => sdk,
+    createMetadataReader: createFeishuBaseMetadataReader,
+  })
+  : Object.freeze({ sdk: null, client: null, metadataReader: null });
+const apiClient = feishuApi.client;
+const metadataReader = feishuApi.metadataReader;
+const resolveRecordTitle = apiClient
+  ? createFeishuRecordTitleResolver({ client: apiClient, logger: console })
+  : null;
+const controlledContextReader = apiClient
+  ? createFeishuControlledContextReader({
+    client: apiClient,
+    searchNaming: createFeishuNamingSearch({ client: apiClient }),
+    logger: console,
+  })
   : null;
 const workflowStore = createWorkflowConfigStore({
   filename: process.env.BRIDGE_WORKFLOW_CONFIG
     ?? path.join(root, ".runtime", "bridge", "workflow.json"),
   initial: { schemaVersion: 1, configVersion: 1, bases: [] },
   packageAliases: () => loadPackageRegistry(packageRegistryFile),
-  metadataReader: feishuMetadataReader,
+  metadataReader,
 });
 const workflowRuntime = createWorkflowRuntime({
   config,
   store: workflowStore,
-  metadataReader: feishuMetadataReader,
+  metadataReader,
 });
 const store = new JsonStateStore(config.stateFile);
 const bridge = createBridge({
@@ -55,6 +77,18 @@ const bridge = createBridge({
   packageCatalog,
   getPackageCatalog: () => loadPackageRegistry(packageRegistryFile),
   getConfig: workflowRuntime.getConfig,
+  workflowStore,
+  workflowRuntime,
+  bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  readControlledContext: async (subject, identity) => {
+    if (!controlledContextReader) {
+      const error = new Error("Feishu controlled context reader is unavailable");
+      error.code = "CONTROLLED_CONTEXT_UNAVAILABLE";
+      error.status = 503;
+      throw error;
+    }
+    return controlledContextReader.read(subject, identity);
+  },
   store,
   taskboard: new TaskboardClient(config.taskboardUrl, {
     bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET,
@@ -70,6 +104,22 @@ let feishuListener = null;
 const app = createBridgeServer({
   host: config.host,
   port: config.port,
+  bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET ?? null,
+  metadataReader,
+  workflowStore,
+  getSubjectVersion: (subjectKey, configVersion) => (
+    workflowRuntime.getSubjectVersion(subjectKey, configVersion)
+  ),
+  readControlledContext: async (subject, identity) => {
+    if (!controlledContextReader) {
+      const error = new Error("Feishu controlled context reader is unavailable");
+      error.code = "CONTROLLED_CONTEXT_UNAVAILABLE";
+      error.status = 503;
+      throw error;
+    }
+    return controlledContextReader.read(subject, identity);
+  },
+  syncSubject: (subject, options) => workflowRuntime.syncSubject(subject, options),
   configSummary: {
     tables: config.tables.map(({
       baseToken,
@@ -108,7 +158,7 @@ const app = createBridgeServer({
   },
   handleEvent: (event) => bridge.handle(event),
   workflowStore: workflowRuntime,
-  baseMetadataReader: feishuMetadataReader,
+  baseMetadataReader: metadataReader,
   getHealth: async () => ({
     ok: true,
     feishuListener: feishuListener?.health ?? {

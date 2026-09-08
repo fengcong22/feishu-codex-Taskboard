@@ -111,3 +111,71 @@ export async function archiveWaitingFeishuTasks(
 
   return { archivedCount };
 }
+
+function trustedStageOrigin(task) {
+  if (task?.feishuOrigin && typeof task.feishuOrigin === "object") return task.feishuOrigin;
+  const metadata = parseFeishuTaskMetadata(task?.description);
+  return metadata && typeof metadata === "object" ? metadata : null;
+}
+
+function matchesStageWaitingTask(task, scope) {
+  if (!task || task.archivedAt !== null || task.status !== "todo") return false;
+  const origin = trustedStageOrigin(task);
+  if (!origin) return false;
+  const event = scope?.event ?? {};
+  return origin.baseToken === event.baseToken
+    && origin.tableId === event.tableId
+    && origin.recordId === event.recordId
+    && (origin.statusFieldId === scope.statusFieldId || origin.triggerFieldId === scope.statusFieldId)
+    && (origin.stageId === undefined || origin.stageId === scope.stageId || scope.stageId === undefined);
+}
+
+/** Archive only waiting tasks bound to one immutable phased stage identity. */
+export async function archiveWaitingFeishuStageTasks(
+  taskboard,
+  scope,
+  { ensureActive = async () => {} } = {},
+) {
+  const list = typeof taskboard.listFeishuTasks === "function"
+    ? () => taskboard.listFeishuTasks({
+      baseToken: scope.event.baseToken,
+      tableId: scope.event.tableId,
+      recordId: scope.event.recordId,
+      statusFieldId: scope.statusFieldId,
+      stageId: scope.stageId,
+      archived: "false",
+    })
+    : () => taskboard.listTasks({ archived: "false" });
+  const tasks = await fencedCall(ensureActive, list);
+  let archivedCount = 0;
+  for (const candidate of Array.isArray(tasks) ? tasks : []) {
+    if (!matchesStageWaitingTask(candidate, scope)) continue;
+    let current = candidate;
+    if (typeof taskboard.getTask === "function") {
+      current = await readTask(taskboard, candidate.id, ensureActive);
+    }
+    if (!matchesStageWaitingTask(current, scope)) continue;
+    const archive = typeof taskboard.archiveFeishuTask === "function"
+      ? () => taskboard.archiveFeishuTask(current)
+      : () => taskboard.archiveTask(current);
+    try {
+      await fencedCall(ensureActive, archive);
+      archivedCount += 1;
+    } catch (error) {
+      if (isNotFound(error)) continue;
+      if (isVersionConflict(error)) {
+        const refreshed = await readTask(taskboard, candidate.id, ensureActive);
+        if (!matchesStageWaitingTask(refreshed, scope)) continue;
+        await fencedCall(ensureActive, () => (
+          typeof taskboard.archiveFeishuTask === "function"
+            ? taskboard.archiveFeishuTask(refreshed)
+            : taskboard.archiveTask(refreshed)
+        ));
+        archivedCount += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+  return { archivedCount };
+}

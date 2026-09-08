@@ -82,5 +82,18 @@ export function createWorkflowRuntime({ config, store, metadataReader = null } =
     return store.disable(key, options);
   }
 
-  return Object.freeze({ ...store, getConfig, getTables, syncSubject, enable, disable });
+  return Object.freeze({
+    ...store,
+    getConfig,
+    getTables,
+    syncSubject,
+    enable,
+    disable,
+    ...(typeof store.getSubjectVersion === "function"
+      ? { getSubjectVersion: store.getSubjectVersion.bind(store) }
+      : {}),
+    ...(typeof store.resolveSubjectVersionAt === "function"
+      ? { resolveSubjectVersionAt: store.resolveSubjectVersionAt.bind(store) }
+      : {}),
+  });
 }

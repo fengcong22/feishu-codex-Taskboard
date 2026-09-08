@@ -174,6 +174,132 @@ test("startup prefers the first complete default Taskboard candidate and falls b
   }
 });
 
+test("ephemeral secret startup restarts both owned services before creating one in-memory secret", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /function\s+New-BridgeSecret/);
+  assert.match(source, /function\s+Stop-ExistingLocalNodeForEphemeralSecret/);
+  assert.doesNotMatch(source, /bridge\.secret/);
+  assert.match(source, /CODEX_FEISHU_BRIDGE_SECRET\s*=\s*\$taskboardBridgeSecret/);
+  assert.match(source, /\$bridgeEnvironment[\s\S]*CODEX_FEISHU_BRIDGE_SECRET\s*=\s*\$taskboardBridgeSecret/);
+  assert.doesNotMatch(source, /\$env:CODEX_FEISHU_BRIDGE_SECRET\s*=\s*\$taskboardBridgeSecret/);
+  assert.doesNotMatch(source, /(?:Set-Content|WriteAllText|Write-Host|Write-Output)[^\r\n]*\$taskboardBridgeSecret/);
+
+  const taskboardRestart = source.indexOf("Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard'");
+  const bridgeRestart = source.indexOf("Stop-ExistingLocalNodeForEphemeralSecret 'Feishu Bridge'");
+  const secretCreation = source.indexOf("$taskboardBridgeSecret = New-BridgeSecret");
+  assert.ok(taskboardRestart >= 0 && bridgeRestart > taskboardRestart);
+  assert.ok(secretCreation > bridgeRestart, "the shared secret must be created only after both old services stop");
+  assert.equal(source.match(/-RequireFresh:\$useEphemeralBridgeSecret/g)?.length, 2);
+
+  const command = [
+    `$source = Get-Content -LiteralPath ${powershellLiteral(fileURLToPath(files.start))} -Raw`,
+    "$tokens = $null",
+    "$errors = $null",
+    "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+    "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-BridgeSecret' }, $true)",
+    "if (-not $definition) { throw 'New-BridgeSecret definition is missing' }",
+    "Invoke-Expression $definition.Extent.Text",
+    "$env:CODEX_FEISHU_BRIDGE_SECRET = 'configured-secret'",
+    "$configured = New-BridgeSecret",
+    "if ($configured -ne 'configured-secret') { throw 'configured secret was not reused' }",
+    "Remove-Item Env:CODEX_FEISHU_BRIDGE_SECRET",
+    "$generated = New-BridgeSecret",
+    "if ([string]::IsNullOrWhiteSpace($generated) -or $generated.Length -lt 32) { throw 'generated secret is too short' }",
+    "if ($generated -notmatch '^[A-Za-z0-9_-]+$') { throw 'generated secret is not transport-safe' }",
+  ].join(";");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test("partial ephemeral restart stops the surviving identity match and clears its stale peer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-ephemeral-pair-"));
+  const taskboardPidFile = join(directory, "taskboard.pid");
+  const taskboardIdentityFile = join(directory, "taskboard.process.json");
+  const bridgePidFile = join(directory, "bridge.pid");
+  const bridgeIdentityFile = join(directory, "bridge.process.json");
+  const bridgeModeFile = join(directory, "bridge.feishu-mode");
+  try {
+    await Promise.all([
+      writeFile(taskboardPidFile, "4241", "utf8"),
+      writeFile(taskboardIdentityFile, "{}", "utf8"),
+      writeFile(bridgePidFile, "4242", "utf8"),
+      writeFile(bridgeIdentityFile, "{}", "utf8"),
+      writeFile(bridgeModeFile, "enabled", "utf8"),
+    ]);
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(fileURLToPath(files.start))} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stop-ExistingLocalNodeForEphemeralSecret' }, $true)",
+      "if (-not $definition) { throw 'paired restart function is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      "$global:node = 'node.exe'",
+      "$global:identityMatches = $true",
+      "$global:stopped = @()",
+      "$global:removed = @()",
+      `function global:Read-PersistedProcessId { param([string]$Path) if ($Path -eq ${powershellLiteral(taskboardPidFile)}) { return 4241 }; return 4242 }`,
+      "function global:Read-PersistedProcessIdentity { param([string]$Path) $markerPid = if ($Path -like '*taskboard*') { 4241 } else { 4242 }; [pscustomobject]@{ Version = 1; Pid = $markerPid; CreationTicks = $markerPid } }",
+      "function global:Get-ProcessMarkerFileSnapshot { param([string]$Path) [pscustomobject]@{ Exists = $true; Bytes = $Path } }",
+      "function global:Get-ProcessQueryResult { param([int]$ProcessId) $process = if ($ProcessId -eq 4241) { [pscustomobject]@{ ProcessId = $ProcessId } } else { $null }; [pscustomobject]@{ Succeeded = $true; Process = $process; Error = $null } }",
+      "function global:Test-PersistedProcessIdentity { param([object]$Process, [object]$Identity) return $global:identityMatches }",
+      "function global:Test-NodeScriptProcess { return $true }",
+      "function global:Stop-ValidatedNode { param([object]$Process) $global:stopped += [int]$Process.ProcessId }",
+      "function global:Remove-PersistedProcessMarkersIfMatch { param([string]$PidFile, [string]$IdentityFile, [object]$ExpectedIdentity, [string[]]$AdditionalFiles, [object[]]$AdditionalFileSnapshots) $global:removed += [int]$ExpectedIdentity.Pid; return $true }",
+      `Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823`,
+      `Stop-ExistingLocalNodeForEphemeralSecret 'Feishu Bridge' ${powershellLiteral(bridgePidFile)} ${powershellLiteral(bridgeIdentityFile)} 'C:\\bridge\\src\\index.mjs' ${powershellLiteral(bridgeModeFile)} 47824`,
+      "if (($global:stopped -join ',') -ne '4241' -or ($global:removed -join ',') -ne '4241,4242') { throw 'the surviving service or stale peer was not reset' }",
+      "$global:identityMatches = $false",
+      "$before = $global:stopped.Count",
+      `$rejected = $false; try { Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823 } catch { $rejected = $true }`,
+      "if (-not $rejected -or $global:stopped.Count -ne $before) { throw 'identity mismatch was allowed to stop a process' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral startup refuses a process that appears after paired preflight", async () => {
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /\[switch\]\$RequireFresh/);
+  const directory = await mkdtemp(join(tmpdir(), "codex-ephemeral-race-"));
+  try {
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(fileURLToPath(files.start))} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-LocalNode' }, $true)",
+      "Invoke-Expression $definition.Extent.Text",
+      "$global:node = 'node.exe'",
+      "$global:startedNodes = New-Object System.Collections.ArrayList",
+      "$global:adopted = $false",
+      "function global:Get-ProcessMarkerFileSnapshot { [pscustomobject]@{ Exists = $false; Bytes = $null } }",
+      "function global:Get-CimInstance { [pscustomobject]@{ ProcessId = 4243; CreationDate = [DateTime]::UtcNow } }",
+      "function global:Test-NodeScriptProcess { return $true }",
+      "function global:Test-ListeningPortOwner { return $true }",
+      "function global:Test-Ready { return $true }",
+      "function global:Get-VerifiedCurrentNodeProcess { param([object]$ObservedProcess) return $ObservedProcess }",
+      "function global:Set-ProcessMarkers { $global:adopted = $true }",
+      `$failure = $null; try { Start-LocalNode ${powershellLiteral(join(directory, "taskboard.pid"))} ${powershellLiteral(join(directory, "taskboard.process.json"))} 'C:\\taskboard\\server\\index.mjs' 'out.log' 'err.log' @{} $null $null 47823 -RequireFresh } catch { $failure = $_.Exception.Message }`,
+      "if ($failure -notmatch 'fresh|paired') { throw 'the post-preflight process was not rejected by the fresh-start gate' }",
+      "if ($global:adopted) { throw 'the post-preflight process was adopted' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("bridge startup tracks listener mode and only replaces an owned mismatched process", async () => {
   const source = await readFile(files.start, "utf8");
   assert.match(source, /bridge\.feishu-mode/);

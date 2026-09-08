@@ -193,6 +193,57 @@ export class TaskboardClient {
     return response.task;
   }
 
+  async registerFeishuStageTask(payload, { bridgeSecret = this.bridgeSecret } = {}) {
+    if (!objectPayload(payload)) throw invalidResponse("/api/local/feishu/tasks");
+    const secret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : "";
+    if (!secret) {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED",
+        status: 503,
+      });
+    }
+    const pathname = "/api/local/feishu/tasks";
+    const response = await this.#request(pathname, {
+      body: payload,
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": secret,
+      },
+    });
+    if (!validTask(response?.task)) throw invalidResponse(pathname);
+    return response.task;
+  }
+
+  async listFeishuTasks(options = {}) {
+    const query = new URLSearchParams();
+    for (const field of [
+      "eventId",
+      "projectId",
+      "baseToken",
+      "tableId",
+      "recordId",
+      "triggerFieldId",
+      "triggerField",
+      "triggerValue",
+      "status",
+    ]) {
+      if (nonEmptyString(options[field])) query.set(field, options[field].trim());
+    }
+    query.set("archived", options.archived === "all" ? "all" : "false");
+    const pathname = `/api/local/feishu/tasks?${query.toString()}`;
+    const payload = await this.#request(pathname, {
+      method: "GET",
+      headers: { "x-taskboard-client": "feishu-bridge" },
+    });
+    const tasks = Array.isArray(payload?.tasks)
+      ? payload.tasks
+      : Object.hasOwn(payload ?? {}, "task") ? (payload.task ? [payload.task] : []) : null;
+    if (!tasks || tasks.some((task) => !validFeishuTask(task))) throw invalidResponse(pathname);
+    return options.stageId === undefined
+      ? tasks
+      : tasks.filter((task) => task.feishuOrigin.stageId === options.stageId);
+  }
+
   async listFeishuWaitingTasks(options = {}) {
     const { event, table } = options;
     const projectId = options.projectId ?? table?.projectId;

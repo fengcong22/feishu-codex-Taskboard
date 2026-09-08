@@ -13,10 +13,12 @@ import { isDeepStrictEqual } from "node:util";
 import { withStateLock } from "./state-lock.mjs";
 import {
   activeTables as getActiveTables,
+  portableSubject,
   subjectKey,
   validateWorkflowConfig,
 } from "./workflow-config.mjs";
 import { compareSubjectMetadata } from "./feishu-base-metadata.mjs";
+import { SubjectVersionHistory } from "./subject-version-history.mjs";
 
 function clone(value) {
   return structuredClone(value);
@@ -89,6 +91,19 @@ function sameSyncedSubject(currentSubject, candidate) {
   // payload. Preserve the persisted value when comparing a replay.
   comparable.updatedAt = currentSubject.updatedAt;
   return isDeepStrictEqual(comparable, currentSubject);
+}
+
+function versionConflict() {
+  const error = new Error("SUBJECT_VERSION_CONFLICT");
+  error.code = "SUBJECT_VERSION_CONFLICT";
+  return error;
+}
+
+function withoutHistoryInterval(subject) {
+  const result = clone(subject);
+  delete result.enabledAt;
+  delete result.closedAt;
+  return result;
 }
 
 function mergePatch(current, patch, fieldName = "patch") {
@@ -430,6 +445,7 @@ export function createWorkflowConfigStore({
   metadataReader = null,
 } = {}) {
   const target = pathFor(filename);
+  const history = new SubjectVersionHistory(`${target}.versions.json`, { now });
   const validatedInitial = validateWorkflowConfig(initial ?? { schemaVersion: 1, configVersion: 1, bases: [] });
   const packageAliasesLoader = typeof packageAliases === "function" ? packageAliases : null;
   const packages = packageCatalog(packageAliasesLoader ? null : packageAliases);
@@ -455,7 +471,10 @@ export function createWorkflowConfigStore({
     return withDocument(async (current) => {
       const before = clone(current);
       const result = await operation(current);
-      if (result?.persist === false) return result.value;
+      if (result?.persist === false) {
+        if (typeof result.afterMutation === "function") await result.afterMutation();
+        return result.value;
+      }
       const changed = result?.config ?? current;
       const timestamp = nowValue(now);
       changed.updatedAt = timestamp;
@@ -463,7 +482,27 @@ export function createWorkflowConfigStore({
       // another machine's share file.
       changed.configVersion = before.configVersion + 1;
       await writeAtomic(target, changed);
+      if (typeof result?.afterMutation === "function") await result.afterMutation();
       return result?.value ?? changed;
+    });
+  }
+
+  async function syncHistorySubject(subject, { transitionAt } = {}) {
+    const portable = portableSubject(subject);
+    const existing = await history.getSubjectVersion(portable.subjectKey, portable.configVersion);
+    if (existing) {
+      if (!isDeepStrictEqual(withoutHistoryInterval(existing), withoutHistoryInterval(portable))) {
+        throw versionConflict();
+      }
+      return existing;
+    }
+    return history.syncSubject({
+      ...portable,
+      // A pre-existing workflow.json without a sidecar cannot prove when its
+      // current version became active.  An idempotent replay therefore starts
+      // the interval now instead of backdating delayed events into it.
+      enabledAt: transitionAt ?? nowValue(now),
+      closedAt: null,
     });
   }
 
@@ -507,6 +546,10 @@ export function createWorkflowConfigStore({
       title: input.title ?? current.title ?? { fieldId: null, fieldName: null },
       execution: input.execution ?? current.execution,
       packageRoute: input.packageRoute ?? current.packageRoute,
+      statusField: input.statusField ?? current.statusField,
+      documentField: input.documentField ?? current.documentField,
+      namingField: input.namingField ?? current.namingField,
+      stages: input.stages ?? current.stages,
       upload: {
         ...(current.upload ?? {}),
         ...(input.upload ?? {}),
@@ -514,6 +557,9 @@ export function createWorkflowConfigStore({
         targetPath: null,
       },
     };
+    for (const field of ["statusField", "documentField", "namingField", "stages"]) {
+      if (next[field] === undefined) delete next[field];
+    }
     delete next.activeSnapshot;
     return next;
   }
@@ -593,7 +639,12 @@ export function createWorkflowConfigStore({
             ? { ...entry, subjects: entry.subjects.map((entrySubject) => entrySubject === subject ? next : entrySubject) }
             : entry),
         });
-        return { config: normalized, value: findSubject(normalized, key).subject };
+        const value = findSubject(normalized, key).subject;
+        return {
+          config: normalized,
+          value,
+          afterMutation: () => syncHistorySubject(value, { transitionAt: next.updatedAt }),
+        };
       });
     },
 
@@ -612,7 +663,12 @@ export function createWorkflowConfigStore({
             ? { ...entry, subjects: entry.subjects.map((entrySubject) => entrySubject === subject ? next : entrySubject) }
             : entry),
         });
-        return { config: normalized, value: findSubject(normalized, key).subject };
+        const value = findSubject(normalized, key).subject;
+        return {
+          config: normalized,
+          value,
+          afterMutation: () => syncHistorySubject(value, { transitionAt: next.updatedAt }),
+        };
       });
     },
 
@@ -627,7 +683,11 @@ export function createWorkflowConfigStore({
         const nextSubject = normalizedSyncedSubject(input, lifecycle, existingSubject, configVersion);
         if (existingSubject?.configVersion === configVersion) {
           if (sameSyncedSubject(existingSubject, nextSubject)) {
-            return { persist: false, value: existingSubject };
+            return {
+              persist: false,
+              value: existingSubject,
+              afterMutation: () => syncHistorySubject(existingSubject),
+            };
           }
           throw versionMismatch(expectedVersion, existingSubject.configVersion);
         }
@@ -653,8 +713,21 @@ export function createWorkflowConfigStore({
           current.bases = current.bases.map((base) => base.baseToken === baseToken ? nextBase : base);
         }
         const normalized = validateWorkflowConfig(current);
-        return { config: normalized, value: findSubject(normalized, key).subject };
+        const value = findSubject(normalized, key).subject;
+        return {
+          config: normalized,
+          value,
+          afterMutation: () => syncHistorySubject(value, { transitionAt: nextSubject.updatedAt }),
+        };
       });
+    },
+
+    async getSubjectVersion(key, configVersion) {
+      return history.getSubjectVersion(key, configVersion);
+    },
+
+    async resolveSubjectVersionAt(key, occurredAt, options = {}) {
+      return history.resolveSubjectVersionAt(key, occurredAt, options);
     },
 
     async exportShareable() {
@@ -676,6 +749,8 @@ export function createWorkflowConfigStore({
       });
       return shareImportResult(merged, diagnostics);
     },
+
+    history,
   };
   return store;
 }

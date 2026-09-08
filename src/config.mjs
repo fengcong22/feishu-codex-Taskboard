@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { validateDeliveryPolicy } from "./retry-policy.mjs";
+import { subjectKey as makeSubjectKey, validateSubjectConfig } from "./workflow-config.mjs";
 
 function plainObject(value, name) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -40,15 +41,46 @@ export function validateConfig(input) {
     throw new Error("taskboardUrl must use loopback HTTP");
   }
 
-  if (!Array.isArray(input.tables) || input.tables.length === 0) {
-    throw new Error("tables must be a non-empty array");
+  if (input.tables !== undefined && !Array.isArray(input.tables)) {
+    throw new Error("tables must be an array");
   }
   const tableIds = new Set();
-  const tables = input.tables.map((entry, index) => {
+  const tables = (input.tables ?? []).map((entry, index) => {
     plainObject(entry, `tables[${index}]`);
     const tableId = nonEmptyString(entry.tableId, `tables[${index}].tableId`);
     if (tableIds.has(tableId)) throw new Error(`duplicate tableId: ${tableId}`);
     tableIds.add(tableId);
+
+    // Workflow subjects are synchronized by Taskboard and use the fixed
+    // three-stage contract. Keep the old table shape below for legacy/manual
+    // configurations, but normalize a phased entry without requiring legacy
+    // trigger/title fields that are not part of that contract.
+    if (entry.statusField || entry.stages) {
+      const baseToken = optionalString(entry.baseToken, `tables[${index}].baseToken`);
+      const subject = validateSubjectConfig({
+        ...entry,
+        subjectKey: entry.subjectKey ?? (baseToken ? makeSubjectKey(baseToken, tableId) : undefined),
+        baseToken,
+        tableId,
+        tableName: entry.tableName ?? entry.name ?? tableId,
+        execution: entry.execution ?? { mode: entry.mode ?? "manual", enqueueMode: entry.mode ?? "manual" },
+        packageRoute: entry.packageRoute ?? { packageAlias: entry.defaultPackageAlias },
+        upload: entry.upload ?? { enqueueMode: entry.execution?.enqueueMode ?? entry.mode ?? "manual" },
+      });
+      return {
+        ...subject,
+        name: subject.tableName ?? subject.name ?? tableId,
+        mode: subject.execution?.mode ?? "manual",
+        triggerField: subject.statusField?.fieldName ?? "",
+        triggerFieldId: subject.statusField?.fieldId ?? null,
+        triggerValue: "",
+        triggerOptionId: null,
+        packageField: null,
+        packageFieldId: null,
+        defaultPackageAlias: subject.packageRoute?.packageAlias ?? null,
+      };
+    }
+
     if (entry.mode !== "manual" && entry.mode !== "automatic") {
       throw new Error(`tables[${index}].mode must be manual or automatic`);
     }
@@ -104,11 +136,17 @@ export function validateConfig(input) {
     if (Object.keys(packages).length === 0) throw new Error("packages must not be empty");
   }
 
+  const stateFile = absolutePath(input.stateFile, "stateFile");
+  const workflowFile = input.workflowFile === undefined || input.workflowFile === null || input.workflowFile === ""
+    ? `${stateFile}.workflow.json`
+    : absolutePath(input.workflowFile, "workflowFile");
+
   return {
     host,
     port: input.port,
     taskboardUrl: taskboard.origin,
-    stateFile: absolutePath(input.stateFile, "stateFile"),
+    stateFile,
+    workflowFile,
     delivery: validateDeliveryPolicy(input.delivery),
     tables,
     ...(packages ? { packages } : {}),

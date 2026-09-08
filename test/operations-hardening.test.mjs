@@ -67,6 +67,13 @@ test("README points team members to the operating contract", async () => {
   assert.match(source, /check-local\.ps1/);
 });
 
+test("README documents the authenticated read-only Base preview boundary", async () => {
+  const source = await readFile(readmeUrl, "utf8");
+  assert.match(source, /POST \/api\/feishu\/base-preview/);
+  assert.match(source, /x-feishu-bridge-client: taskboard/);
+  assert.match(source, /只读.*metadata|metadata.*只读/i);
+});
+
 test("README presents the verified bridge capabilities without claiming unsupported features", async () => {
   const source = await readFile(readmeUrl, "utf8");
   assert.match(source, /飞书 Bridge × Codex Taskboard/);

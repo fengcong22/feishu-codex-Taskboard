@@ -13,7 +13,8 @@ $taskboardDefaultCandidates = @(
 
 function Resolve-TaskboardRoot(
   [string]$ExplicitRoot = $null,
-  [string[]]$DefaultCandidates = $null
+  [string[]]$DefaultCandidates = $null,
+  [switch]$RequireServerOnly
 ) {
   $hasExplicitOverride = -not [string]::IsNullOrWhiteSpace($ExplicitRoot)
   $hasEnvironmentOverride = -not [string]::IsNullOrWhiteSpace($env:CODEX_TASKBOARD_ROOT)
@@ -46,13 +47,15 @@ function Resolve-TaskboardRoot(
     $serverEntry = Join-Path $resolvedRoot 'server\index.mjs'
     $webEntry = Join-Path $resolvedRoot 'dist\web\index.html'
     if ((Test-Path -LiteralPath $serverEntry -PathType Leaf) -and
-      (Test-Path -LiteralPath $webEntry -PathType Leaf)) {
+      ($RequireServerOnly -or (Test-Path -LiteralPath $webEntry -PathType Leaf))) {
       return $resolvedRoot
     }
     if ($hasExplicitOverride -or $hasEnvironmentOverride) {
-      throw "Taskboard root is incomplete: $resolvedRoot. Expected server\index.mjs and dist\web\index.html."
+      $expectedEntries = if ($RequireServerOnly) { 'server\index.mjs' } else { 'server\index.mjs and dist\web\index.html' }
+      throw "Taskboard root is incomplete: $resolvedRoot. Expected $expectedEntries."
     }
-    [void]$checked.Add("$resolvedRoot (missing server\index.mjs or dist\web\index.html)")
+    $missingEntries = if ($RequireServerOnly) { 'server\index.mjs' } else { 'server\index.mjs or dist\web\index.html' }
+    [void]$checked.Add("$resolvedRoot (missing $missingEntries)")
   }
   if ($checked.Count -gt 0) {
     throw "No complete Taskboard checkout was found. Checked: $($checked -join '; '). Set -TaskboardRoot or CODEX_TASKBOARD_ROOT to a Taskboard checkout."
@@ -60,7 +63,7 @@ function Resolve-TaskboardRoot(
   throw 'No Taskboard root candidates were configured. Set -TaskboardRoot or CODEX_TASKBOARD_ROOT.'
 }
 
-$taskboardRoot = Resolve-TaskboardRoot $TaskboardRoot $taskboardDefaultCandidates
+$taskboardRoot = Resolve-TaskboardRoot $TaskboardRoot $taskboardDefaultCandidates -RequireServerOnly
 $runtime = Join-Path $root '.runtime'
 $logs = Join-Path $runtime 'logs'
 $taskboardData = Join-Path $runtime 'taskboard'
@@ -191,6 +194,18 @@ function Get-ExpectedListenerState([string]$RequestedMode) {
   return 'disabled'
 }
 
+function New-BridgeSecret {
+  $configured = [string]$env:CODEX_FEISHU_BRIDGE_SECRET
+  if (-not [string]::IsNullOrWhiteSpace($configured)) {
+    if ($configured -match '[\x00-\x1f\x7f]') {
+      throw 'CODEX_FEISHU_BRIDGE_SECRET contains control characters.'
+    }
+    return $configured
+  }
+
+  return ([Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N'))
+}
+
 function Test-StartedNodeIdentity([object]$Process, [hashtable]$Entry) {
   if ($null -eq $Entry.CreationDate) { return $false }
   $currentCreation = Get-ProcessCreationTicks $Process
@@ -257,6 +272,63 @@ function Remove-StartedMarkers([hashtable]$Entry, [object]$ExpectedIdentity) {
   Remove-PersistedProcessMarkersIfMatch $Entry.PidFile $Entry.IdentityFile $ExpectedIdentity $additionalFiles $additionalSnapshots | Out-Null
 }
 
+function Stop-ExistingLocalNodeForEphemeralSecret(
+  [string]$Name,
+  [string]$PidFile,
+  [string]$IdentityFile,
+  [string]$Script,
+  [string]$ModeFile = $null,
+  [int]$Port = 0
+) {
+  $pidPathPresent = Test-Path -LiteralPath $PidFile
+  $identityPathPresent = Test-Path -LiteralPath $IdentityFile
+  $modeSnapshot = if ([string]::IsNullOrWhiteSpace($ModeFile)) { $null } else { Get-ProcessMarkerFileSnapshot $ModeFile }
+
+  if ($pidPathPresent -or $identityPathPresent) {
+    $persistedPid = Read-PersistedProcessId $PidFile
+    $persistedIdentity = Read-PersistedProcessIdentity $IdentityFile
+    if ($null -eq $persistedPid -or -not $persistedIdentity -or
+      [int]$persistedIdentity.Pid -ne [int]$persistedPid) {
+      throw "Cannot safely restart $Name for an ephemeral Bridge secret because its process markers are missing or invalid."
+    }
+
+    $query = Get-ProcessQueryResult $persistedPid
+    if (-not $query.Succeeded) {
+      throw "Cannot safely query $Name PID $persistedPid before the paired restart. ($($query.Error))"
+    }
+    if ($query.Process) {
+      if (-not (Test-PersistedProcessIdentity $query.Process $persistedIdentity) -or
+        -not (Test-NodeScriptProcess $query.Process $Script $node)) {
+        throw "Cannot safely restart $Name because its persisted process identity does not match."
+      }
+      Stop-ValidatedNode $query.Process $Script $persistedIdentity $node
+    }
+
+    $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
+    $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeSnapshot) }
+    if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
+      throw "Could not clear $Name process markers after the paired restart check."
+    }
+    return
+  }
+
+  $existing = Get-CimInstance Win32_Process |
+    Where-Object {
+      (Test-NodeScriptProcess $_ $Script $node) -and
+      ($Port -le 0 -or (Test-ListeningPortOwner $Port $_.ProcessId))
+    } |
+    Sort-Object CreationDate -Descending |
+    Select-Object -First 1
+  if (-not $existing) { return }
+
+  $verified = Get-VerifiedCurrentNodeProcess $existing $Script $Port $node
+  $verifiedIdentity = New-PersistedProcessIdentity $verified
+  if (-not $verified -or -not $verifiedIdentity) {
+    throw "Cannot safely restart unmarked $Name before creating an ephemeral Bridge secret."
+  }
+  Stop-ValidatedNode $verified $Script $verifiedIdentity $node
+}
+
 function Start-LocalNode(
   [string]$PidFile,
   [string]$IdentityFile,
@@ -266,13 +338,17 @@ function Start-LocalNode(
   [hashtable]$Environment,
   [string]$ModeFile = $null,
   [string]$RequestedMode = $null,
-  [int]$Port = 0
+  [int]$Port = 0,
+  [switch]$RequireFresh
 ) {
   $tracksMode = -not [string]::IsNullOrWhiteSpace($ModeFile)
   [int]$blockedPid = 0
   $pidMarkerSnapshot = Get-ProcessMarkerFileSnapshot $PidFile
   $identityMarkerSnapshot = Get-ProcessMarkerFileSnapshot $IdentityFile
   $modeMarkerSnapshot = if ($tracksMode) { Get-ProcessMarkerFileSnapshot $ModeFile } else { $null }
+  if ($RequireFresh -and ((Test-Path -LiteralPath $PidFile) -or (Test-Path -LiteralPath $IdentityFile))) {
+    throw "Process markers appeared after the paired restart; refusing to reuse $Script with an ephemeral Bridge secret."
+  }
   if (Test-Path -LiteralPath $PidFile) {
     $oldPid = Read-PersistedProcessId $PidFile
     if ($null -eq $oldPid) {
@@ -377,6 +453,9 @@ function Start-LocalNode(
     Sort-Object CreationDate -Descending |
     Select-Object -First 1
   if ($existing) {
+    if ($RequireFresh) {
+      throw "A process appeared after the paired restart; refusing to adopt $Script with an ephemeral Bridge secret."
+    }
     if ($blockedPid -gt 0 -and [int]$existing.ProcessId -eq $blockedPid) {
       throw "An unverified process is already using port $Port (PID $blockedPid); it was left running. Stop it manually before starting another instance."
     }
@@ -556,13 +635,23 @@ try {
   }
   if (-not $startupMutexAcquired) { throw 'Another Taskboard startup is already in progress.' }
 
-  $taskboardBridgeSecret = [string]$env:CODEX_FEISHU_BRIDGE_SECRET
-  if ([string]::IsNullOrWhiteSpace($taskboardBridgeSecret)) {
-    $taskboardBridgeSecret = ([Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N'))
-  }
+  $taskboardScript = Join-Path $taskboardRoot 'server\index.mjs'
+  $bridgeScript = Join-Path $root 'src\index.mjs'
+  $bridgeMode = if ($EnableFeishu) { 'enabled' } else { 'disabled' }
 
   Build-TaskboardWeb $taskboardRoot
-  $taskboardScript = Join-Path $taskboardRoot 'server\index.mjs'
+  $taskboardWebEntry = Join-Path $taskboardRoot 'dist\web\index.html'
+  if (-not (Test-Path -LiteralPath $taskboardWebEntry -PathType Leaf)) {
+    throw "Taskboard web build completed without producing dist\web\index.html: $taskboardRoot"
+  }
+
+  $useEphemeralBridgeSecret = [string]::IsNullOrWhiteSpace([string]$env:CODEX_FEISHU_BRIDGE_SECRET)
+  if ($useEphemeralBridgeSecret) {
+    Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' $taskboardPidFile $taskboardIdentityFile $taskboardScript $null 47823
+    Stop-ExistingLocalNodeForEphemeralSecret 'Feishu Bridge' $bridgePidFile $bridgeIdentityFile $bridgeScript $bridgeModeFile 47824
+  }
+  $taskboardBridgeSecret = New-BridgeSecret
+
   $taskboardPid = Start-LocalNode $taskboardPidFile $taskboardIdentityFile $taskboardScript $taskboardStdout $taskboardStderr @{
     CODEX_TASKBOARD_HOST = '127.0.0.1'
     CODEX_TASKBOARD_PORT = '47823'
@@ -570,13 +659,11 @@ try {
     CODEX_EXECUTABLE = $codexExecutable
     CODEX_FEISHU_PACKAGES_PATH = $packageRegistry
     CODEX_FEISHU_BRIDGE_SECRET = $taskboardBridgeSecret
-  } $null $null 47823
+  } $null $null 47823 -RequireFresh:$useEphemeralBridgeSecret
   $taskboardIdentity = Read-PersistedProcessIdentity $taskboardIdentityFile
   if (-not $taskboardIdentity) { throw 'Taskboard process identity marker is missing or invalid after startup.' }
   Wait-Ready 'Taskboard' 'http://127.0.0.1:47823/api/meta' $taskboardPid 47823 $taskboardScript $node $taskboardIdentity
 
-  $bridgeScript = Join-Path $root 'src\index.mjs'
-  $bridgeMode = if ($EnableFeishu) { 'enabled' } else { 'disabled' }
   $bridgeEnvironment = @{
     BRIDGE_CONFIG = $config
     CODEX_FEISHU_PACKAGES_PATH = $packageRegistry
@@ -585,7 +672,7 @@ try {
   if ($EnableFeishu) {
     $bridgeEnvironment.FEISHU_LISTENER_ENABLED = '1'
   }
-  $bridgePid = Start-LocalNode $bridgePidFile $bridgeIdentityFile $bridgeScript $bridgeStdout $bridgeStderr $bridgeEnvironment $bridgeModeFile $bridgeMode 47824
+  $bridgePid = Start-LocalNode $bridgePidFile $bridgeIdentityFile $bridgeScript $bridgeStdout $bridgeStderr $bridgeEnvironment $bridgeModeFile $bridgeMode 47824 -RequireFresh:$useEphemeralBridgeSecret
   $bridgeIdentity = Read-PersistedProcessIdentity $bridgeIdentityFile
   if (-not $bridgeIdentity) { throw 'Bridge process identity marker is missing or invalid after startup.' }
   Wait-Ready 'Feishu Bridge' 'http://127.0.0.1:47824/health' $bridgePid 47824 $bridgeScript $node $bridgeIdentity

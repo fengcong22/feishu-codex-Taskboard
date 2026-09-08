@@ -129,3 +129,59 @@ export function buildTaskPayload(decision) {
     assigneeTarget: "current-user",
   };
 }
+
+function safeContext(context) {
+  const input = context && typeof context === "object" && !Array.isArray(context) ? context : {};
+  const links = Array.isArray(input.documentLinks)
+    ? input.documentLinks.filter((value) => typeof value === "string").map((value) => value.trim()).filter(Boolean).slice(0, 16)
+    : [];
+  return {
+    documentLinks: links,
+    namingDisplayValue: typeof input.namingDisplayValue === "string" ? input.namingDisplayValue.trim().slice(0, 1024) : "",
+    namingValueUnique: input.namingValueUnique === true,
+  };
+}
+
+/**
+ * Build the narrow body accepted by Taskboard's trusted Feishu registration
+ * route.  All executable policy (package, paths, prompt and mode) stays on
+ * Taskboard; this object carries only opaque identity and bounded read data.
+ */
+export function buildTrustedTaskPayload(decision, context = {}) {
+  if (!decision || typeof decision !== "object" || !decision.event) {
+    throw new Error("decision is required");
+  }
+  const event = decision.event;
+  const subjectKey = decision.subjectKey
+    ?? decision.subject?.subjectKey
+    ?? `${event.baseToken}:${event.tableId}`;
+  const configVersion = decision.configVersion ?? decision.subject?.configVersion;
+  if (!Number.isSafeInteger(configVersion) || configVersion < 1) {
+    const error = new Error("configVersion is required");
+    error.code = "MISSING_ACTIVE_CONFIG_VERSION";
+    throw error;
+  }
+  if (typeof decision.stageId !== "string" || decision.stageId.trim() === "") {
+    throw new Error("stageId is required");
+  }
+  return {
+    event: {
+      eventId: String(event.eventId ?? "").trim(),
+      baseToken: String(event.baseToken ?? "").trim(),
+      tableId: String(event.tableId ?? "").trim(),
+      recordId: String(event.recordId ?? "").trim(),
+      statusFieldId: String(event.statusFieldId ?? decision.table?.statusField?.fieldId ?? decision.table?.triggerFieldId ?? "").trim(),
+      beforeOptionId: String(event.beforeOptionId ?? "").trim(),
+      afterOptionId: String(event.afterOptionId ?? "").trim(),
+      ...(event.eventOccurredAtPresent && Number.isFinite(event.eventOccurredAt)
+        ? { occurredAt: event.eventOccurredAt }
+        : Number.isFinite(event.eventOccurredAt) ? { occurredAt: event.eventOccurredAt } : {}),
+    },
+    binding: {
+      subjectKey: String(subjectKey).trim(),
+      configVersion,
+      stageId: decision.stageId.trim(),
+    },
+    controlledContext: safeContext(context),
+  };
+}

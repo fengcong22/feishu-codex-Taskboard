@@ -343,7 +343,11 @@ export function createFeishuBaseMetadataReader({ client } = {}) {
     const baseToken = identifier(subject?.baseToken, "Base token");
     const tableId = identifier(subject?.tableId, "table id");
     const metadata = await preview({ baseToken, tableId });
-    assertSubjectMetadata(subject, metadata);
+    if (subject?.statusField && subject?.stages) {
+      assertPhasedSubjectMetadata(subject, metadata);
+    } else {
+      assertSubjectMetadata(subject, metadata);
+    }
   }
 
   return Object.freeze({ readBase, listTables, listFields, preview, validateSubject });
@@ -580,4 +584,78 @@ function isSelectField(field) {
     ? field.uiType.replace(/[^A-Za-z]/gu, "").toLowerCase()
     : "";
   return uiType === "singleselect" || uiType === "multiselect" || uiType === "multipleselect";
+}
+
+function phasedField(subject, metadata, descriptor, pathName) {
+  const table = metadata.tables?.find((candidate) => candidate.tableId === subject.tableId);
+  const fieldId = descriptor?.fieldId ?? descriptor?.field_id;
+  const field = table?.fields?.find((candidate) => candidate.fieldId === fieldId);
+  if (!field) {
+    const error = configurationChanged(`${pathName} is not present in Feishu metadata`);
+    error.code = "INVALID_FIELD";
+    throw error;
+  }
+  const expectedName = descriptor?.fieldName ?? descriptor?.name;
+  if (expectedName && field.fieldName !== expectedName) {
+    throw configurationChanged(`${pathName} name no longer matches Feishu metadata`);
+  }
+  return field;
+}
+
+/** Validate the fixed three-stage subject against a live metadata snapshot. */
+export function assertPhasedSubjectMetadata(subject, metadata) {
+  if (!metadata || metadata.baseToken !== subject?.baseToken) {
+    const error = new Error("Feishu Base metadata does not match subject");
+    error.code = "FEISHU_BASE_NOT_FOUND";
+    error.status = 409;
+    throw error;
+  }
+  const table = metadata.tables?.find((candidate) => candidate.tableId === subject.tableId);
+  if (!table) {
+    const error = new Error("Feishu subject table was not found");
+    error.code = "FEISHU_TABLE_NOT_FOUND";
+    error.status = 409;
+    throw error;
+  }
+  const status = phasedField(subject, metadata, subject.statusField, "statusField");
+  if (!isSelectField(status) && String(status.type ?? "").toLowerCase() !== "single_select") {
+    throw configurationChanged("statusField must be a single-select field");
+  }
+  phasedField(subject, metadata, subject.documentField, "documentField");
+  phasedField(subject, metadata, subject.namingField, "namingField");
+  const options = Array.isArray(status.options) ? status.options : [];
+  const enabled = Object.entries(subject.stages ?? {}).filter(([, stage]) => stage?.enabled);
+  if (enabled.length === 0) throw configurationChanged("at least one stage must be enabled");
+  const seen = new Set();
+  for (const [stageId, stage] of enabled) {
+    const trigger = stage.trigger ?? {};
+    if (trigger.fieldId !== subject.statusField.fieldId) {
+      throw configurationChanged(`${stageId}.trigger.fieldId must match statusField.fieldId`);
+    }
+    if (seen.has(trigger.optionId)) {
+      throw configurationChanged("enabled stage trigger options must be unique");
+    }
+    seen.add(trigger.optionId);
+    const matches = options.filter((option) => (
+      option.id === trigger.optionId && option.name === trigger.value
+    ));
+    if (matches.length !== 1) {
+      throw configurationChanged(`${stageId}.trigger option is missing or changed`);
+    }
+  }
+  return true;
+}
+
+export function comparePhasedSubjectMetadata(subject, metadata) {
+  try {
+    assertPhasedSubjectMetadata(subject, metadata);
+    return [];
+  } catch (error) {
+    return [{
+      code: error?.code ?? "FEISHU_METADATA_INVALID_RESPONSE",
+      path: error?.path ?? "subject",
+      message: error?.message ?? "Feishu metadata validation failed",
+      errorCode: error?.code ?? "FEISHU_METADATA_INVALID_RESPONSE",
+    }];
+  }
 }

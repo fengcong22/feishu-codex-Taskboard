@@ -320,6 +320,21 @@ test("rejects missing application credentials before constructing a client", () 
   }), /FEISHU_APP_ID/);
 });
 
+test("loads tables from a dynamic workflow provider", async () => {
+  const received = [];
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    getTables: async () => [table],
+    sdk: fakeSdk(),
+    handleEvent: async (event) => received.push(event),
+  });
+  await listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT](payload());
+  await listener.drain();
+  assert.equal(received.length, 1);
+  assert.equal(received[0].recordId, "rec_ws");
+});
+
 test("matches a payload whose table id is attached to the action", async () => {
   const received = [];
   const listener = createFeishuWsListener({

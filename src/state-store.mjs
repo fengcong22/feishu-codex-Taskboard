@@ -11,6 +11,7 @@ import path from "node:path";
 
 import { safeDeliveryErrorCode } from "./retry-policy.mjs";
 import { withEventLock as withEventIpcLock, withStateLock } from "./state-lock.mjs";
+import { portableSubject } from "./workflow-config.mjs";
 
 const TERMINAL_STATES = new Set(["succeeded", "dead_letter"]);
 const DELIVERY_STATES = new Set([
@@ -20,10 +21,10 @@ const DELIVERY_STATES = new Set([
   "succeeded",
   "dead_letter",
 ]);
-const DECISIONS = new Set(["ready", "blocked", "ignored"]);
+const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting"]);
 const DECISION_SNAPSHOT_VERSION = 1;
-const DECISION_SNAPSHOT_ACTIONS = new Set(["create", "archive"]);
-const DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
+const LEGACY_DECISION_SNAPSHOT_ACTIONS = new Set(["create", "archive"]);
+const LEGACY_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
   "version",
   "action",
   "kind",
@@ -51,6 +52,35 @@ const DECISION_SNAPSHOT_TABLE_FIELDS = new Set([
   "triggerFieldId",
   "triggerValue",
 ]);
+const PHASED_DECISION_SNAPSHOT_ACTIONS = new Set([
+  "register",
+  "blocked",
+  "ignored",
+  "archive_waiting",
+]);
+const PHASED_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
+  "version",
+  "action",
+  "kind",
+  "subjectKey",
+  "configVersion",
+  "stageId",
+  "previousStageId",
+  "eventOccurredAt",
+  "beforeOptionId",
+  "afterOptionId",
+  "event",
+  "subject",
+  "reason",
+  "reasonCode",
+  "controlledContext",
+]);
+const PHASED_STAGE_IDS = new Set(["initial", "first_review", "final_review"]);
+const CONTROLLED_CONTEXT_FIELDS = new Set([
+  "documentLinks",
+  "namingDisplayValue",
+  "namingValueUnique",
+]);
 const MAX_FAILURE_HISTORY = 10;
 const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
   "LEGACY_EVENT_SNAPSHOT_MISSING",
@@ -70,6 +100,13 @@ const EVENT_SNAPSHOT_FIELDS = Object.freeze([
   "afterValue",
   "fields",
   "fieldValuesById",
+  "statusFieldId",
+  "beforePresent",
+  "afterPresent",
+  "beforeOptionId",
+  "afterOptionId",
+  "eventOccurredAt",
+  "eventOccurredAtPresent",
 ]);
 
 function normalizeEventSnapshot(event) {
@@ -107,21 +144,59 @@ function assertSnapshotKeys(value, allowed, name) {
   }
 }
 
-/**
- * Keep the retry decision independent from executable package configuration.
- * The package alias/project id are identifiers only; workspace paths, prompts,
- * commands and credentials are deliberately not part of this persisted shape.
- */
-function normalizeDecisionSnapshot(value) {
+function optionalSnapshotString(value, name) {
+  return snapshotString(value, name, { optional: true }) ?? null;
+}
+
+function snapshotTimestamp(value, name) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw snapshotInvalid(`${name} must be a non-negative timestamp`);
+  }
+  return value;
+}
+
+function normalizeControlledContext(value) {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw snapshotInvalid("snapshot.controlledContext must be an object or null");
+  }
+  assertSnapshotKeys(value, CONTROLLED_CONTEXT_FIELDS, "snapshot.controlledContext");
+  if (!Array.isArray(value.documentLinks) || value.documentLinks.length > 32) {
+    throw snapshotInvalid("snapshot.controlledContext.documentLinks must be a bounded array");
+  }
+  const documentLinks = value.documentLinks.map((entry, index) => {
+    const link = snapshotString(entry, `snapshot.controlledContext.documentLinks[${index}]`);
+    if (link.length > 2048) {
+      throw snapshotInvalid(`snapshot.controlledContext.documentLinks[${index}] is too long`);
+    }
+    return link;
+  });
+  if (typeof value.namingDisplayValue !== "string"
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value.namingDisplayValue)
+    || value.namingDisplayValue.length > 1024) {
+    throw snapshotInvalid("snapshot.controlledContext.namingDisplayValue is invalid");
+  }
+  if (typeof value.namingValueUnique !== "boolean") {
+    throw snapshotInvalid("snapshot.controlledContext.namingValueUnique must be boolean");
+  }
+  return {
+    documentLinks,
+    namingDisplayValue: value.namingDisplayValue,
+    namingValueUnique: value.namingValueUnique,
+  };
+}
+
+function normalizeLegacyDecisionSnapshot(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw snapshotInvalid("snapshot must be an object");
   }
-  assertSnapshotKeys(value, DECISION_SNAPSHOT_ROOT_FIELDS, "snapshot");
+  assertSnapshotKeys(value, LEGACY_DECISION_SNAPSHOT_ROOT_FIELDS, "snapshot");
   if (value.version !== DECISION_SNAPSHOT_VERSION) {
     throw snapshotInvalid(`version must be ${DECISION_SNAPSHOT_VERSION}`);
   }
   const action = snapshotString(value.action, "snapshot.action");
-  if (!DECISION_SNAPSHOT_ACTIONS.has(action)) {
+  if (!LEGACY_DECISION_SNAPSHOT_ACTIONS.has(action)) {
     throw snapshotInvalid("snapshot.action is not supported");
   }
   const kind = snapshotString(value.kind, "snapshot.kind");
@@ -214,10 +289,101 @@ function normalizeDecisionSnapshot(value) {
   return normalized;
 }
 
+function normalizePhasedDecisionSnapshot(value) {
+  assertSnapshotKeys(value, PHASED_DECISION_SNAPSHOT_ROOT_FIELDS, "snapshot");
+  if (value.version !== DECISION_SNAPSHOT_VERSION) {
+    throw snapshotInvalid(`version must be ${DECISION_SNAPSHOT_VERSION}`);
+  }
+  const action = snapshotString(value.action, "snapshot.action");
+  const kind = snapshotString(value.kind, "snapshot.kind");
+  if (!PHASED_DECISION_SNAPSHOT_ACTIONS.has(action) || action !== kind) {
+    throw snapshotInvalid("snapshot phased action and kind must match");
+  }
+  const subjectKey = snapshotString(value.subjectKey, "snapshot.subjectKey");
+  if (!subjectKey.includes(":")) throw snapshotInvalid("snapshot.subjectKey is invalid");
+  if (!Number.isSafeInteger(value.configVersion) || value.configVersion < 1) {
+    throw snapshotInvalid("snapshot.configVersion must be a positive integer");
+  }
+  const stageId = optionalSnapshotString(value.stageId, "snapshot.stageId");
+  const previousStageId = optionalSnapshotString(value.previousStageId, "snapshot.previousStageId");
+  for (const [name, stage] of [["stageId", stageId], ["previousStageId", previousStageId]]) {
+    if (stage !== null && !PHASED_STAGE_IDS.has(stage)) {
+      throw snapshotInvalid(`snapshot.${name} is not supported`);
+    }
+  }
+  if (kind === "register" && stageId === null) {
+    throw snapshotInvalid("register snapshots require stageId");
+  }
+  if (kind === "archive_waiting" && stageId === null) {
+    throw snapshotInvalid("archive_waiting snapshots require stageId");
+  }
+  if (!value.subject || typeof value.subject !== "object" || Array.isArray(value.subject)) {
+    // The first handoff tests exercise the minimal immutable binding. Full
+    // Bridge retry snapshots additionally include the portable subject.
+    if (value.subject !== undefined && value.subject !== null) {
+      throw snapshotInvalid("snapshot.subject must be an object or null");
+    }
+  }
+  let subject = null;
+  if (value.subject) {
+    try {
+      subject = portableSubject(value.subject);
+    } catch {
+      throw snapshotInvalid("snapshot.subject is invalid");
+    }
+    if (subject.subjectKey !== subjectKey || subject.configVersion !== value.configVersion) {
+      throw snapshotInvalid("snapshot subject identity does not match the binding");
+    }
+  }
+  const event = value.event === undefined || value.event === null
+    ? null
+    : normalizeEventSnapshot(value.event);
+  if (value.event !== undefined && value.event !== null
+    && (!value.event || typeof value.event !== "object" || Array.isArray(value.event))) {
+    throw snapshotInvalid("snapshot.event must be an object or null");
+  }
+  const normalized = {
+    version: DECISION_SNAPSHOT_VERSION,
+    action,
+    kind,
+    subjectKey,
+    configVersion: value.configVersion,
+    stageId,
+    previousStageId,
+    eventOccurredAt: snapshotTimestamp(value.eventOccurredAt, "snapshot.eventOccurredAt"),
+    beforeOptionId: optionalSnapshotString(value.beforeOptionId, "snapshot.beforeOptionId"),
+    afterOptionId: optionalSnapshotString(value.afterOptionId, "snapshot.afterOptionId"),
+    event,
+    subject,
+    reason: optionalSnapshotString(value.reason, "snapshot.reason"),
+    reasonCode: optionalSnapshotString(value.reasonCode, "snapshot.reasonCode"),
+    controlledContext: normalizeControlledContext(value.controlledContext),
+  };
+  return normalized;
+}
+
+/** Keep retry decisions independent from executable or machine-local data. */
+function normalizeDecisionSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw snapshotInvalid("snapshot must be an object");
+  }
+  return Object.hasOwn(value, "table")
+    ? normalizeLegacyDecisionSnapshot(value)
+    : normalizePhasedDecisionSnapshot(value);
+}
+
 function snapshotMatchesEvent(snapshot, event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return true;
-  return snapshot.table.baseToken === event.baseToken
-    && snapshot.table.tableId === event.tableId;
+  if (snapshot.table) {
+    return snapshot.table.baseToken === event.baseToken
+      && snapshot.table.tableId === event.tableId;
+  }
+  const [baseToken, tableId] = snapshot.subjectKey.split(":");
+  return baseToken === event.baseToken
+    && tableId === event.tableId
+    && (snapshot.event === null || snapshot.event.eventId === event.eventId)
+    && (snapshot.beforeOptionId === null || snapshot.beforeOptionId === event.beforeOptionId)
+    && (snapshot.afterOptionId === null || snapshot.afterOptionId === event.afterOptionId);
 }
 
 function assertClaimOptions({ ownerId, leaseMs }) {
@@ -332,13 +498,22 @@ function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!DECISIONS.has(value.kind) || (decision !== null && value.kind !== decision)) return null;
   const outcome = { kind: value.kind };
-  for (const field of ["reason", "taskId", "taskIdentifier", "packageAlias"]) {
+  for (const field of [
+    "reason",
+    "reasonCode",
+    "taskId",
+    "taskIdentifier",
+    "packageAlias",
+    "stageId",
+    "subjectKey",
+  ]) {
     if (!Object.hasOwn(value, field)) continue;
     if (typeof value[field] !== "string" || value[field].trim() === "") return null;
     outcome[field] = value[field];
   }
-  if (value.kind !== "ignored" && !outcome.taskId && !outcome.taskIdentifier) return null;
-  if (requireTaskIdentifier && value.kind !== "ignored" && (!outcome.taskId || !outcome.taskIdentifier)) return null;
+  const noTaskOutcome = value.kind === "ignored" || value.kind === "archive_waiting" || value.kind === "blocked";
+  if (!noTaskOutcome && !outcome.taskId && !outcome.taskIdentifier) return null;
+  if (requireTaskIdentifier && !noTaskOutcome && (!outcome.taskId || !outcome.taskIdentifier)) return null;
   return outcome;
 }
 
@@ -473,10 +648,16 @@ function assertEvent(event) {
 
 function hasEventSnapshot(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return false;
-  for (const field of ["eventId", "baseToken", "tableId", "recordId", "fieldName"]) {
+  for (const field of ["eventId", "baseToken", "tableId", "recordId"]) {
     if (typeof event[field] !== "string" || event[field].trim() === "") return false;
   }
-  if (!Object.hasOwn(event, "beforeValue") || !Object.hasOwn(event, "afterValue")) return false;
+  const legacyEdge = typeof event.fieldName === "string" && event.fieldName.trim() !== ""
+    && Object.hasOwn(event, "beforeValue") && Object.hasOwn(event, "afterValue");
+  const phasedEdge = typeof event.statusFieldId === "string" && event.statusFieldId.trim() !== ""
+    && event.beforePresent === true && event.afterPresent === true
+    && typeof event.beforeOptionId === "string" && event.beforeOptionId.trim() !== ""
+    && typeof event.afterOptionId === "string" && event.afterOptionId.trim() !== "";
+  if (!legacyEdge && !phasedEdge) return false;
   return Boolean(event.fields && typeof event.fields === "object" && !Array.isArray(event.fields));
 }
 
@@ -729,12 +910,20 @@ export class JsonStateStore {
     }, now, clock);
   }
 
-  async complete(eventId, { ownerId, token, decision, outcome, now, clock }) {
+  async complete(eventId, {
+    ownerId,
+    token,
+    decision,
+    outcome,
+    requireTaskIdentifier = true,
+    now,
+    clock,
+  }) {
     return this.#mutate((state, currentNow) => {
       const record = state[eventId];
       if (!record) throw new Error(`Cannot update unknown delivery record ${eventId}`);
       assertLeaseOwner(record, ownerId, currentNow, token);
-      const normalizedOutcome = normalizeOutcome(outcome, decision, { requireTaskIdentifier: true });
+      const normalizedOutcome = normalizeOutcome(outcome, decision, { requireTaskIdentifier });
       if (!DECISIONS.has(decision) || !normalizedOutcome) {
         throw new Error("outcome must match decision and contain valid task identifiers");
       }
