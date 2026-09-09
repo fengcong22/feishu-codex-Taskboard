@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.mjs";
 import { loadPackageRegistry } from "./package-config.mjs";
 import { createBridge } from "./bridge.mjs";
-import { createBridgeServer } from "./server.mjs";
+import { createBridgeServer, resolveSimulationEnabled } from "./server.mjs";
 import { createCompensationWorker } from "./compensation-worker.mjs";
 import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
@@ -36,6 +36,7 @@ function envEnabled(name) {
   );
 }
 const listenerEnabled = envEnabled("FEISHU_LISTENER_ENABLED");
+const automaticExecutionEnabled = envEnabled("CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION");
 const apiEnabled = listenerEnabled || envEnabled("FEISHU_READ_ENABLED");
 const sdk = apiEnabled ? await loadFeishuSdk() : null;
 const feishuApi = apiEnabled
@@ -157,6 +158,7 @@ const app = createBridgeServer({
     packages: Object.keys(packageCatalog),
   },
   handleEvent: (event) => bridge.handle(event),
+  simulationEnabled: resolveSimulationEnabled({ listenerEnabled, automaticExecutionEnabled }),
   workflowStore: workflowRuntime,
   baseMetadataReader: metadataReader,
   getHealth: async () => ({

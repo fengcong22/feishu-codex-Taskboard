@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { signalProcessTree } from "../shared/process-tree.mjs";
 
 function runnerError(code, message) {
@@ -24,7 +25,7 @@ function collect(stream) {
 
 function runtimeEnvironment(environment, run) {
   return {
-    ...Object.fromEntries(Object.entries(environment).filter(
+    ...Object.fromEntries(Object.entries(withoutTaskboardLauncherEnvironment(environment)).filter(
       ([key]) => !key.toUpperCase().startsWith("CODEX_AUTOCUT_"),
     )),
     CODEX_AUTOCUT_SOURCE_MANIFEST_PATH: run.manifestPath,

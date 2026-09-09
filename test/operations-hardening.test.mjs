@@ -6,11 +6,17 @@ import test from "node:test";
 const checkUrl = new URL("../scripts/check-local.ps1", import.meta.url);
 const agentsUrl = new URL("../AGENTS.md", import.meta.url);
 const readmeUrl = new URL("../README.md", import.meta.url);
+const packageUrl = new URL("../package.json", import.meta.url);
 const reliabilitySpecUrl = new URL(
   "../docs/superpowers/specs/2026-08-19-feishu-bridge-reliability-compensation-design.md",
   import.meta.url,
 );
+const autoCutWorkflowSpecUrl = new URL(
+  "../docs/superpowers/specs/2026-08-21-feishu-autocut-workflow-design.md",
+  import.meta.url,
+);
 const taskboardScreenshotUrl = new URL("../docs/assets/taskboard-kanban-demo.jpg", import.meta.url);
+const rootCheckWorkflowUrl = new URL("../.github/workflows/check.yml", import.meta.url);
 
 function windowsPath(url) {
   return decodeURIComponent(url.pathname).replace(/^\/(?:([A-Za-z]:))/, "$1");
@@ -61,6 +67,32 @@ test("root AGENTS documents the fixed flow and safe change rules", async () => {
   assert.match(source, /npm test/);
 });
 
+test("root operating contract distinguishes legacy and phased event lifecycles", async () => {
+  const source = await readFile(agentsUrl, "utf8");
+  assert.match(source, /旧版.*`tables`|`tables`.*旧版/s);
+  assert.match(source, /`待剪辑`/);
+  assert.match(source, /`initial`.*`first_review`.*`final_review`/s);
+  assert.match(source, /已启用阶段/);
+  assert.match(source, /模拟事件.*自动执行资格|自动执行资格.*模拟事件/s);
+});
+
+test("root npm test enforces the bundled Taskboard quality gates", async () => {
+  const packageJson = JSON.parse(await readFile(packageUrl, "utf8"));
+  const command = packageJson.scripts?.test ?? "";
+  assert.match(command, /node --test/);
+  assert.match(command, /npm --prefix taskboard run typecheck/);
+  assert.match(command, /npm --prefix taskboard run build:web/);
+  assert.match(command, /npm --prefix taskboard run test:components/);
+});
+
+test("root CI installs both workspaces and runs the complete root gate", async () => {
+  const source = await readFile(rootCheckWorkflowUrl, "utf8");
+  assert.match(source, /runs-on:\s*windows-latest/);
+  assert.match(source, /npm ci\s*$/m);
+  assert.match(source, /npm ci --prefix taskboard/);
+  assert.match(source, /npm test\s*$/m);
+});
+
 test("README points team members to the operating contract", async () => {
   const source = await readFile(readmeUrl, "utf8");
   assert.match(source, /AGENTS\.md/);
@@ -85,10 +117,14 @@ test("README presents the verified bridge capabilities without claiming unsuppor
   assert.match(source, /5 分钟快速体验/);
   assert.match(source, /不会自动启动 Codex/);
   assert.match(source, /不会回写飞书记录/);
-  assert.match(source, /不处理真实视频/);
+  assert.match(source, /CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION/);
+  assert.match(source, /活动配置快照.*automatic|automatic.*活动配置快照/s);
+  assert.match(source, /可信来源|专用来源/);
+  assert.match(source, /项目包.*白名单|白名单.*项目包/s);
+  assert.match(source, /Auto-Cut.*Taskboard|Taskboard.*Auto-Cut/s);
+  assert.match(source, /模拟事件.*自动执行资格|自动执行资格.*模拟事件/s);
   assert.match(source, /完成本地配置后/);
   assert.match(source, /团队提供的匹配测试配置/);
-  assert.match(source, /Taskboard 的手动启动与网页展示属于外部 Taskboard 能力/);
   assert.match(source, /持久化重试|自动重试/);
   assert.match(source, /死信|dead.?letter/i);
   assert.match(source, /SDK.*自动重连/);
@@ -109,6 +145,14 @@ test("reliability contract states the Taskboard idempotency boundary", async () 
   assert.match(agents, /原生幂等|exactly.?once/i);
   assert.match(spec, /至少一次/);
   assert.match(spec, /不宣称绝对 exactly-once/);
+});
+
+test("Auto-Cut workflow design records the implemented phased amendment", async () => {
+  const source = await readFile(autoCutWorkflowSpecUrl, "utf8");
+  assert.match(source, /状态：.*已实现/);
+  assert.match(source, /三阶段修订/);
+  assert.match(source, /`initial`.*`first_review`.*`final_review`/s);
+  assert.match(source, /旧版 `tables`/);
 });
 
 test("README embeds a real Taskboard screenshot labeled as local test data", async () => {

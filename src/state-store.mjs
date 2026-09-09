@@ -107,11 +107,13 @@ const EVENT_SNAPSHOT_FIELDS = Object.freeze([
   "afterOptionId",
   "eventOccurredAt",
   "eventOccurredAtPresent",
+  "deliverySource",
 ]);
 
 function normalizeEventSnapshot(event) {
   const snapshot = {};
   for (const field of EVENT_SNAPSHOT_FIELDS) {
+    if (field === "deliverySource" && event[field] !== "simulation") continue;
     if (Object.hasOwn(event, field)) snapshot[field] = structuredClone(event[field]);
   }
   return snapshot;

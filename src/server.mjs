@@ -224,6 +224,13 @@ function requireLocalJsonWrite(request, response, expectedClient) {
   return true;
 }
 
+export function resolveSimulationEnabled({
+  listenerEnabled = false,
+  automaticExecutionEnabled = false,
+} = {}) {
+  return listenerEnabled === false && automaticExecutionEnabled === false;
+}
+
 async function readJson(request) {
   let body = "";
   for await (const chunk of request) {
@@ -286,6 +293,7 @@ export function createBridgeServer({
   getSubjectVersion = null,
   readControlledContext = null,
   syncSubject = null,
+  simulationEnabled = false,
 }) {
   let address = null;
   const server = createServer(async (request, response) => {
@@ -444,14 +452,12 @@ export function createBridgeServer({
           });
         }
         if (!requireLocalJsonWrite(request, response, "taskboard")) return;
-        if (typeof bridgeSecret === "string" && bridgeSecret.length > 0) {
-          try {
-            assertTaskboardCaller(request, bridgeSecret);
-          } catch (error) {
-            return sendJson(response, controlledErrorStatus(error), {
-              error: publicFailure(error),
-            });
-          }
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+        } catch (error) {
+          return sendJson(response, controlledErrorStatus(error), {
+            error: publicFailure(error),
+          });
         }
         const operation = syncSubject
           ?? (typeof workflowStore?.syncSubject === "function"
@@ -491,6 +497,11 @@ export function createBridgeServer({
         }
       }
       if (request.method === "POST" && url.pathname === "/api/simulate/record-changed") {
+        if (simulationEnabled !== true) {
+          return sendJson(response, 403, {
+            error: { code: "SIMULATION_DISABLED", message: "Simulated events are disabled" },
+          });
+        }
         if (!requireLocalJsonWrite(request, response, "local-operator")) return;
         let event;
         try {
@@ -500,7 +511,7 @@ export function createBridgeServer({
             error: { code: "INVALID_EVENT", message: "Invalid simulated event" },
           });
         }
-        const outcome = await handleEvent(event);
+        const outcome = await handleEvent({ ...event, deliverySource: "simulation" });
         const status = outcome.kind === "pending" || outcome.kind === "dead_letter" ? 202
           : outcome.kind === "ready" || outcome.kind === "blocked" ? (outcome.duplicate ? 200 : 201)
             : 200;

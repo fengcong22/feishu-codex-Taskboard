@@ -7,14 +7,18 @@ const OPERATOR_WRITE_HEADERS = {
   "content-type": "application/json",
   "x-feishu-bridge-client": "local-operator",
 };
+const BRIDGE_SECRET = "workflow-sync-test-secret";
 
-async function start(workflowStore) {
+async function start(workflowStore, options = {}) {
   const app = createBridgeServer({
     host: "127.0.0.1",
     port: 0,
     configSummary: { tables: [], packages: [] },
     handleEvent: async () => ({ kind: "ignored" }),
     workflowStore,
+    ...(Object.hasOwn(options, "bridgeSecret")
+      ? { bridgeSecret: options.bridgeSecret }
+      : {}),
   });
   const address = await app.listen();
   return { app, url: `http://127.0.0.1:${address.port}` };
@@ -174,7 +178,7 @@ test("requires and forwards the workflow sync expected version", async (t) => {
       calls.push({ subject, options });
       return { ...subject, lifecycle: options.lifecycle };
     },
-  });
+  }, { bridgeSecret: BRIDGE_SECRET });
   t.after(app.app.close);
   const subject = {
     subjectKey: "bas_demo:tbl_demo",
@@ -184,7 +188,11 @@ test("requires and forwards the workflow sync expected version", async (t) => {
   };
   const missing = await fetch(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
-    headers: { ...OPERATOR_WRITE_HEADERS, "x-feishu-bridge-client": "taskboard" },
+    headers: {
+      ...OPERATOR_WRITE_HEADERS,
+      "x-feishu-bridge-client": "taskboard",
+      "x-feishu-bridge-secret": BRIDGE_SECRET,
+    },
     body: JSON.stringify({ lifecycle: "enabled", subject }),
   });
   assert.equal(missing.status, 400);
@@ -192,9 +200,47 @@ test("requires and forwards the workflow sync expected version", async (t) => {
 
   const valid = await fetch(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
-    headers: { ...OPERATOR_WRITE_HEADERS, "x-feishu-bridge-client": "taskboard" },
+    headers: {
+      ...OPERATOR_WRITE_HEADERS,
+      "x-feishu-bridge-client": "taskboard",
+      "x-feishu-bridge-secret": BRIDGE_SECRET,
+    },
     body: JSON.stringify({ lifecycle: "enabled", expectedVersion: 2, subject }),
   });
   assert.equal(valid.status, 200);
   assert.deepEqual(calls, [{ subject, options: { lifecycle: "enabled", expectedVersion: 2 } }]);
+});
+
+test("workflow sync fails closed when the Bridge secret is missing", async (t) => {
+  let calls = 0;
+  const app = await start({
+    syncSubject: async () => {
+      calls += 1;
+      return {};
+    },
+  }, { bridgeSecret: null });
+  t.after(app.app.close);
+
+  const response = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+    method: "POST",
+    headers: {
+      ...OPERATOR_WRITE_HEADERS,
+      "x-feishu-bridge-client": "taskboard",
+      "x-feishu-bridge-secret": BRIDGE_SECRET,
+    },
+    body: JSON.stringify({
+      lifecycle: "enabled",
+      expectedVersion: 1,
+      subject: {
+        subjectKey: "bas_demo:tbl_demo",
+        baseToken: "bas_demo",
+        tableId: "tbl_demo",
+        configVersion: 1,
+      },
+    }),
+  });
+
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).error.code, "BRIDGE_FAILURE");
+  assert.equal(calls, 0);
 });

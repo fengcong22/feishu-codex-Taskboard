@@ -22,7 +22,7 @@ function stage(stageId, optionId, value) {
   };
 }
 
-async function fixture() {
+async function fixture({ allowAutomaticExecution = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-stage-registration-"));
   const workspace = path.join(directory, "workspace");
   const zipSourceDirectory = path.join(directory, "zips");
@@ -32,6 +32,7 @@ async function fixture() {
     dataDirectory: directory,
     codexExecutable: process.execPath,
     feishuBridgeSecret: SECRET,
+    allowAutomaticExecution,
     feishuWorkflowSync: async () => ({ ok: true }),
     feishuPackages: {
       packages: {
@@ -186,6 +187,34 @@ test("canonical stage registration derives execution policy from the enabled sna
     const replay = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
     assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
     assert.equal(replay.body.task.id, first.body.task.id);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("simulated stage registration is never eligible for automatic execution", async () => {
+  const fixtureData = await fixture({ allowAutomaticExecution: true });
+  try {
+    const subject = await enableSubject(fixtureData);
+    const simulated = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, {
+        event: { eventId: "evt-stage-simulated", deliverySource: "simulation" },
+      }),
+    );
+    assert.equal(simulated.response.status, 201, JSON.stringify(simulated.body));
+    assert.equal(simulated.body.task.status, "todo");
+    assert.equal(simulated.body.task.feishuOrigin.deliverySource, "simulation");
+    assert.equal(simulated.body.task.feishuOrigin.mode, "manual");
+    assert.equal(simulated.body.task.feishuOrigin.executionMode, "manual");
+    assert.equal(simulated.body.task.feishuOrigin.uploadMode, "automatic");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stored = fixtureData.app.database.getTask(simulated.body.task.id);
+    assert.equal(stored.status, "todo");
+    assert.equal(stored.threadId, null);
+    assert.equal(fixtureData.app.database.getFeishuExecution(stored.id), null);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

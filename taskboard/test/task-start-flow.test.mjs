@@ -2509,7 +2509,7 @@ test("automatic execution requests remain explicitly disabled until the policy i
   }
 });
 
-test("enabled automatic policy keeps a successful task processing until its ZIP is verified", async () => {
+test("legacy automatic metadata requires an explicit start even when automatic policy is enabled", async () => {
   const fixture = await createFixture({ allowAutomaticExecution: true });
   try {
     const project = await request(fixture.baseUrl, "/api/projects", {
@@ -2528,12 +2528,16 @@ test("enabled automatic policy keeps a successful task processing until its ZIP 
         labels: ["feishu", "automatic"],
       },
     });
-    await waitForTask(
-      fixture.baseUrl,
-      created.body.task.id,
-      (current) => current.status === "in_progress",
-      8_000,
-    );
+    assert.equal(created.response.status, 201);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fixture.app.database.getTask(created.body.task.id).status, "todo");
+    assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id), null);
+
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    assert.equal(started.response.status, 202);
     await waitForTaskAiStartSettled(fixture.app, created.body.task.id);
     assert.equal(fixture.app.database.getTask(created.body.task.id).status, "in_progress");
   } finally {

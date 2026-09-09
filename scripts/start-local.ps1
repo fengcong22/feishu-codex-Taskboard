@@ -329,6 +329,54 @@ function Stop-ExistingLocalNodeForEphemeralSecret(
   Stop-ValidatedNode $verified $Script $verifiedIdentity $node
 }
 
+function Invoke-DetachedLauncher(
+  [string]$Node,
+  [string[]]$Arguments,
+  [hashtable]$Environment
+) {
+  $previousEnvironment = @{}
+  $processEnvironment = [Environment]::GetEnvironmentVariables('Process')
+  try {
+    foreach ($entry in $Environment.GetEnumerator()) {
+      $name = [string]$entry.Key
+      if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+        throw "Invalid environment variable name: $name"
+      }
+      $existingName = $null
+      foreach ($candidateName in $processEnvironment.Keys) {
+        if ([string]::Equals([string]$candidateName, $name, [StringComparison]::OrdinalIgnoreCase)) {
+          $existingName = [string]$candidateName
+          break
+        }
+      }
+      $previousEnvironment[$name] = [pscustomobject]@{
+        Present = $null -ne $existingName
+        Name = if ($null -ne $existingName) { $existingName } else { $name }
+        Value = if ($null -ne $existingName) {
+          [Environment]::GetEnvironmentVariable($existingName, 'Process')
+        } else {
+          $null
+        }
+      }
+      [Environment]::SetEnvironmentVariable($name, [string]$entry.Value, 'Process')
+    }
+
+    $output = @(& $Node @Arguments)
+    return [pscustomobject]@{
+      Output = $output
+      ExitCode = $LASTEXITCODE
+    }
+  } finally {
+    foreach ($entry in $previousEnvironment.GetEnumerator()) {
+      if ($entry.Value.Present) {
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value.Value, 'Process')
+      } else {
+        Remove-Item -LiteralPath "Env:$($entry.Key)" -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
+}
+
 function Start-LocalNode(
   [string]$PidFile,
   [string]$IdentityFile,
@@ -490,11 +538,9 @@ function Start-LocalNode(
     '--stdout', $StdoutFile,
     '--stderr', $StderrFile
   )
-  foreach ($entry in $Environment.GetEnumerator()) {
-    $arguments += @('--env', "$($entry.Key)=$($entry.Value)")
-  }
-  $launcherOutput = @(& $node @arguments)
-  $launcherExitCode = $LASTEXITCODE
+  $launchResult = Invoke-DetachedLauncher $node $arguments $Environment
+  $launcherOutput = @($launchResult.Output)
+  $launcherExitCode = $launchResult.ExitCode
   $launchedPid = $null
   foreach ($line in $launcherOutput) {
     $parsedPid = 0

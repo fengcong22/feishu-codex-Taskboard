@@ -2,7 +2,13 @@
 
 日期：2026-08-21
 
-状态：设计稿，等待用户审阅
+状态：已实现；以下三阶段修订覆盖原始单触发值设计中与其冲突的描述
+
+## 三阶段修订（2026-09-09）
+
+实现保留旧版 `tables` 的单可开始值流程，同时把 Taskboard 管理的 subject 扩展为 `initial`、`first_review`、`final_review` 三个固定阶段。每个阶段独立保存启用状态和同一状态字段下的单选 option；只有从其他 option 进入已启用阶段 option 才登记该阶段任务，离开或跨阶段时只归档上一阶段仍为 `todo` 的任务。它不是“飞书状态直接映射 Taskboard 列”：`in_progress`、`in_review`、`done` 等执行状态仍由 Taskboard/Codex 管理。
+
+自动执行由 Taskboard 发起，Bridge 永不启动 Codex。只有专用接口登记的真实事件任务、可验证的活动配置版本为 `automatic`、项目包处于本机启用白名单且 `CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION` 显式开启时，Taskboard 才可自动调度。模拟事件、旧版登记体、普通任务、复制的描述标记或标签均不得取得自动执行资格。本文后续出现“每个学科只有一个可开始值”“第一期仅手动”等原始阶段性表述时，以本修订和根目录 `AGENTS.md` 为准。
 
 ## 1. 背景
 

@@ -3,7 +3,7 @@ import { request as httpRequest } from "node:http";
 import test from "node:test";
 
 import { createFeishuBaseMetadataReader } from "../src/feishu-base-metadata.mjs";
-import { createBridgeServer } from "../src/server.mjs";
+import { createBridgeServer, resolveSimulationEnabled } from "../src/server.mjs";
 
 const TASKBOARD_WRITE_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -13,6 +13,7 @@ const SIMULATION_WRITE_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "x-feishu-bridge-client": "local-operator",
 };
+const BRIDGE_SECRET = "server-test-bridge-secret";
 
 async function postWithRawHeaders(url, headers, body) {
   const target = new URL(url);
@@ -32,7 +33,7 @@ async function postWithRawHeaders(url, headers, body) {
   });
 }
 
-async function start(handler, getHealth, baseMetadataReader, workflowStore) {
+async function start(handler, getHealth, baseMetadataReader, workflowStore, options = {}) {
   const app = createBridgeServer({
     host: "127.0.0.1",
     port: 0,
@@ -41,6 +42,10 @@ async function start(handler, getHealth, baseMetadataReader, workflowStore) {
     getHealth,
     baseMetadataReader,
     workflowStore,
+    simulationEnabled: options.simulationEnabled ?? true,
+    ...(Object.hasOwn(options, "bridgeSecret")
+      ? { bridgeSecret: options.bridgeSecret }
+      : {}),
   });
   const address = await app.listen();
   return {
@@ -182,11 +187,15 @@ test("syncs an enabled workflow subject through the loopback Bridge store", asyn
       received = { subject, options };
       return { ...subject, lifecycle: options.lifecycle };
     },
-  });
+  }, { bridgeSecret: BRIDGE_SECRET });
   t.after(app.close);
   const response = await fetch(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
-    headers: { ...TASKBOARD_WRITE_HEADERS, origin: "http://127.0.0.1:47823" },
+    headers: {
+      ...TASKBOARD_WRITE_HEADERS,
+      "x-feishu-bridge-secret": BRIDGE_SECRET,
+      origin: "http://127.0.0.1:47823",
+    },
     body: JSON.stringify({
       lifecycle: "enabled",
       expectedVersion: 1,
@@ -391,10 +400,43 @@ test("validates and handles a simulated event", async (t) => {
       beforeValue: "素材齐全",
       afterValue: "待剪辑",
       fields: { 自动剪辑项目包: "Auto-cut-copyA" },
+      deliverySource: "feishu",
     }),
   });
   assert.equal(response.status, 201);
   assert.equal(received.eventId, "evt_1");
+  assert.equal(received.deliverySource, "simulation");
+});
+
+test("disables simulation whenever the real listener or automatic execution is enabled", async (t) => {
+  assert.equal(resolveSimulationEnabled({ listenerEnabled: false, automaticExecutionEnabled: false }), true);
+  assert.equal(resolveSimulationEnabled({ listenerEnabled: true, automaticExecutionEnabled: false }), false);
+  assert.equal(resolveSimulationEnabled({ listenerEnabled: false, automaticExecutionEnabled: true }), false);
+  assert.equal(resolveSimulationEnabled({ listenerEnabled: "false", automaticExecutionEnabled: false }), false);
+
+  let calls = 0;
+  const app = await start(async () => {
+    calls += 1;
+    return { kind: "ignored" };
+  }, undefined, undefined, undefined, { simulationEnabled: false });
+  t.after(app.close);
+  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST",
+    headers: SIMULATION_WRITE_HEADERS,
+    body: JSON.stringify({
+      eventId: "evt_disabled",
+      baseToken: "bas_demo",
+      tableId: "tbl_a",
+      recordId: "rec_1",
+      fieldName: "视频整体进度",
+      beforeValue: "素材齐全",
+      afterValue: "待剪辑",
+      fields: {},
+    }),
+  });
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).error.code, "SIMULATION_DISABLED");
+  assert.equal(calls, 0);
 });
 
 test("rejects non-loopback Host and Origin values before simulation", async (t) => {

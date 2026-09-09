@@ -122,6 +122,36 @@ test("stores the task creation config and execution resource snapshot in metadat
   assert.deepEqual(metadata.resourceGroups, ["jianying-desktop", "gpu"]);
 });
 
+test("marks simulated automatic events as manual-only tasks", () => {
+  const payload = buildTaskPayload({
+    kind: "ready",
+    table: {
+      ...table,
+      mode: "automatic",
+      executionMode: "automatic",
+      uploadMode: "automatic",
+    },
+    executionMode: "automatic",
+    uploadMode: "automatic",
+    packageAlias: "Auto-cut-copyA",
+    packageConfig: {
+      projectId: "auto-cut-copy-a",
+      projectName: "Auto-cut-copyA",
+      workspacePath: "D:\\trusted\\Auto-cut-copyA",
+      prompt: "trusted",
+    },
+    event: { ...event, deliverySource: "simulation" },
+  });
+  const metadata = parseFeishuTaskMetadata(payload.description);
+  assert.equal(metadata.deliverySource, "simulation");
+  assert.equal(metadata.mode, "manual");
+  assert.equal(metadata.executionMode, "manual");
+  assert.equal(metadata.uploadMode, "automatic");
+  assert.ok(payload.labels.includes("manual"));
+  assert.equal(payload.labels.includes("automatic"), false);
+  assert.match(payload.description, /手动点击启动/);
+});
+
 test("continues to parse existing marker metadata without a trigger field id", () => {
   const encoded = Buffer.from(JSON.stringify({
     version: 1,

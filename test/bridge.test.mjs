@@ -8,6 +8,7 @@ import test from "node:test";
 
 import { createBridge } from "../src/bridge.mjs";
 import { JsonStateStore } from "../src/state-store.mjs";
+import { parseFeishuTaskMetadata } from "../src/task-payload.mjs";
 
 const config = {
   // Legacy generic task creation is enabled only for these historical unit
@@ -302,6 +303,40 @@ test("creates one ready task and replays its persisted outcome", async () => {
   assert.equal(first.taskIdentifier, "AUTO-1");
   assert.deepEqual(replay, { ...first, duplicate: true });
   assert.equal(calls.filter(([kind]) => kind === "task").length, 1);
+});
+
+test("simulated deliveries cannot inherit automatic execution eligibility", async () => {
+  let payload;
+  const bridge = createBridge({
+    config: {
+      ...config,
+      tables: [{
+        ...config.tables[0],
+        mode: "automatic",
+        executionMode: "automatic",
+        uploadMode: "automatic",
+      }],
+    },
+    store: memoryStore(),
+    taskboard: {
+      ensureProject: async () => {},
+      createTask: async (value) => {
+        payload = value;
+        return { id: "task_simulated", identifier: "AUTO-SIMULATED" };
+      },
+    },
+  });
+
+  const result = await bridge.handle({
+    ...event,
+    eventId: "evt_simulated_automatic",
+    deliverySource: "simulation",
+  });
+  const metadata = parseFeishuTaskMetadata(payload.description);
+  assert.equal(result.taskIdentifier, "AUTO-SIMULATED");
+  assert.equal(metadata.deliverySource, "simulation");
+  assert.equal(metadata.mode, "manual");
+  assert.equal(metadata.executionMode, "manual");
 });
 
 test("uses an explicit package catalog when the Bridge config has no package definitions", async () => {

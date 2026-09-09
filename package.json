@@ -8,12 +8,12 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test"
+    "test": "node --test && npm --prefix taskboard run typecheck && npm --prefix taskboard run build:web && npm --prefix taskboard run test:components"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.36.0"
   },
-  "description": "这是一个仅在本机运行的 MVP。它会把飞书多维表格中“进入待剪辑”的记录变成 Taskboard 任务，并由用户手动启动 Codex。",
+  "description": "仅在本机运行的飞书多维表格到 Codex Taskboard 受控 Auto-Cut 工作流。",
   "main": "index.js",
   "directories": {
     "doc": "docs",

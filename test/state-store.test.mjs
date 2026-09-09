@@ -19,7 +19,7 @@ async function stateFilename() {
 
 test("claims an event into a versioned processing record", async () => {
   const store = new JsonStateStore(await stateFilename());
-  const original = event();
+  const original = { ...event(), deliverySource: "simulation" };
   const result = await store.claimEvent(original, { ownerId: "one", now: 100, leaseMs: 1_000 });
   assert.equal(result.kind, "claimed");
   assert.equal(result.record.schemaVersion, 2);

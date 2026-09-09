@@ -11,6 +11,7 @@ const FEISHU_PROVENANCE_FIELDS = [
   "triggerField",
   "triggerFieldId",
   "triggerValue",
+  "deliverySource",
   "mode",
   "subjectKey",
   "configVersion",

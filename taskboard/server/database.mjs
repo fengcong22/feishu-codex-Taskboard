@@ -407,6 +407,9 @@ function normalizeFeishuTaskOrigin(value) {
   if (value.mode !== undefined && !["manual", "automatic"].includes(value.mode)) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin mode is invalid");
   }
+  if (value.deliverySource !== undefined && value.deliverySource !== "simulation") {
+    throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin delivery source is invalid");
+  }
   const origin = {
     version: value.version === undefined ? 1 : value.version,
     source: "feishu-base",
@@ -430,6 +433,7 @@ function normalizeFeishuTaskOrigin(value) {
       ? { stageId: value.stageId.trim() } : {}),
     ...(Number.isSafeInteger(value.eventOccurredAt) && value.eventOccurredAt >= 0
       ? { eventOccurredAt: value.eventOccurredAt } : {}),
+    ...(value.deliverySource === "simulation" ? { deliverySource: "simulation" } : {}),
     ...(value.mode ? { mode: value.mode } : {}),
     ...(typeof value.subjectKey === "string" && value.subjectKey.trim()
       ? { subjectKey: value.subjectKey.trim() } : {}),

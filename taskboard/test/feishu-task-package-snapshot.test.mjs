@@ -9,7 +9,7 @@ import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
 
 const SECRET = "fixture-bridge-secret";
 
-async function fixture() {
+async function fixture({ allowAutomaticExecution = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-snapshot-"));
   const workspace = path.join(directory, "workspace");
   await mkdir(workspace);
@@ -33,6 +33,7 @@ async function fixture() {
       },
     },
     feishuWorkflowSync: async () => ({ ok: true }),
+    allowAutomaticExecution,
   });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   return { app, directory, baseUrl: `http://127.0.0.1:${address.port}` };
@@ -106,6 +107,35 @@ test("Bridge registration stores a server-owned package snapshot outside the tas
     assert.equal(snapshot.prompt, "run fixture workflow");
     assert.equal(snapshot.workspacePath, path.join(fixtureData.directory, "workspace"));
     assert.equal(snapshot.zipSourceDirectory, path.join(fixtureData.directory, "zips"));
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy registration cannot gain automatic execution eligibility without an active subject snapshot", async () => {
+  const fixtureData = await fixture({ allowAutomaticExecution: true });
+  try {
+    const projectId = subjectProjectId("bas_snapshot:tbl_subject");
+    fixtureData.app.database.createProject({ id: projectId, name: "语文", workspacePath: fixtureData.directory });
+    const result = await request(fixtureData.baseUrl, {
+      projectId,
+      title: "Legacy automatic task",
+      description: description({
+        eventId: "evt-legacy-automatic",
+        recordId: "rec-legacy-automatic",
+        mode: "automatic",
+        executionMode: "automatic",
+      }),
+      status: "todo",
+      priority: "high",
+      labels: ["feishu"],
+    });
+    assert.equal(result.response.status, 201);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fixtureData.app.database.getFeishuExecution(result.body.task.id), null);
+    assert.deepEqual(fixtureData.app.database.listTaskAiStarts(), []);
+    assert.deepEqual(fixtureData.app.database.listAiChatThreads(), []);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

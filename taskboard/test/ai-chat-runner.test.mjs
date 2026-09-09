@@ -728,7 +728,8 @@ if (process.env.FAKE_ENVIRONMENT_CAPTURE_PATH) {
   appendFileSync(process.env.FAKE_ENVIRONMENT_CAPTURE_PATH, JSON.stringify({
     args,
     launcherKeys: Object.keys(process.env).filter((name) => (
-      name.startsWith("CODEX_TASKBOARD_") || name === "CODEX_FEISHU_BRIDGE_SECRET"
+      name.startsWith("CODEX_TASKBOARD_")
+      || ["CODEX_FEISHU_BRIDGE_SECRET", "FEISHU_APP_ID", "FEISHU_APP_SECRET"].includes(name.toUpperCase())
     )),
   }) + "\\n");
 }
@@ -842,6 +843,8 @@ if (args[0] === "app-server") {
       CODEX_TASKBOARD_PORT: "47823",
       CODEX_TASKBOARD_VERSION: "0.2.0",
       CODEX_FEISHU_BRIDGE_SECRET: "must-not-reach-codex",
+      FEISHU_APP_ID: "must-not-reach-codex",
+      FEISHU_APP_SECRET: "must-not-reach-codex",
     },
     killGraceMs: 50,
     ...(trustedAutoCutSource ? {

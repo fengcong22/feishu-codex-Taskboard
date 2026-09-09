@@ -69,7 +69,11 @@ test("launches the installed Auto-Cut runtime with only the bound run paths", as
   const capturePath = path.join(os.tmpdir(), `taskboard-runner-capture-${process.pid}-${Date.now()}.json`);
   const current = await fixture(`
 const { writeFileSync } = require("node:fs");
-const keys = Object.keys(process.env).filter((key) => key.startsWith("CODEX_AUTOCUT_"));
+const keys = Object.keys(process.env).filter((key) => (
+  key.startsWith("CODEX_AUTOCUT_")
+  || key === "FEISHU_APP_ID"
+  || key === "FEISHU_APP_SECRET"
+));
 writeFileSync(process.env.RUNNER_CAPTURE_PATH, JSON.stringify({
   args: process.argv.slice(2),
   cwd: process.cwd(),
@@ -86,6 +90,8 @@ process.stdout.write("fixture complete");
         LOCALAPPDATA: current.localAppData,
         RUNNER_CAPTURE_PATH: capturePath,
         CODEX_AUTOCUT_UNTRUSTED: "must-not-reach-the-runtime",
+        FEISHU_APP_ID: "must-not-reach-the-runtime",
+        FEISHU_APP_SECRET: "must-not-reach-the-runtime",
       },
     });
     const capture = await waitForJson(capturePath);

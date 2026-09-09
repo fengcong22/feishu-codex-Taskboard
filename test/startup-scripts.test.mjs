@@ -213,6 +213,75 @@ test("ephemeral secret startup restarts both owned services before creating one 
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
 
+test("startup injects service environment without placing values in detached-launcher argv", async () => {
+  const helper = fileURLToPath(files.start);
+  const secret = "bridge-secret-must-not-appear-in-argv";
+  const source = await readFile(files.start, "utf8");
+  assert.match(source, /Invoke-DetachedLauncher \$node \$arguments \$Environment/);
+  assert.doesNotMatch(source, /\$arguments\s*\+=\s*@\(\s*['"]--env['"]/);
+  const command = [
+    `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+    "$tokens = $null",
+    "$errors = $null",
+    "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+    "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-DetachedLauncher' }, $true)",
+    "if (-not $definition) { throw 'Invoke-DetachedLauncher definition is missing' }",
+    "Invoke-Expression $definition.Extent.Text",
+    "$env:CODEX_FEISHU_BRIDGE_SECRET = 'original-parent-value'",
+    "$env:SAFE_LAUNCH_VALUE = $null",
+    "$global:capturedArguments = @()",
+    "$global:capturedSecret = $null",
+    "$global:capturedSafeValue = $null",
+    "function global:fake-node.exe { param([Parameter(ValueFromRemainingArguments=$true)][object[]]$Arguments) $global:capturedArguments = @($Arguments); $global:capturedSecret = $env:CODEX_FEISHU_BRIDGE_SECRET; $global:capturedSafeValue = $env:SAFE_LAUNCH_VALUE; $global:LASTEXITCODE = 0; '4242' }",
+    `$result = Invoke-DetachedLauncher 'fake-node.exe' @('detached-launcher.mjs', '--script', 'service.mjs') @{ CODEX_FEISHU_BRIDGE_SECRET = ${powershellLiteral(secret)}; SAFE_LAUNCH_VALUE = 'safe-value' }`,
+    "if ($result.ExitCode -ne 0 -or @($result.Output)[0] -ne '4242') { throw 'launcher result was not preserved' }",
+    `if (($global:capturedArguments -join ' ') -match ${powershellLiteral(secret)}) { throw 'secret appeared in launcher argv' }`,
+    "if ($global:capturedArguments -contains '--env') { throw 'environment was serialized into launcher argv' }",
+    `if ($global:capturedSecret -ne ${powershellLiteral(secret)}) { throw 'launcher did not inherit the injected secret' }`,
+    "if ($global:capturedSafeValue -ne 'safe-value') { throw 'launcher did not inherit the injected value' }",
+    "if ($env:CODEX_FEISHU_BRIDGE_SECRET -ne 'original-parent-value') { throw 'parent secret was not restored' }",
+    "if ($null -ne [Environment]::GetEnvironmentVariable('SAFE_LAUNCH_VALUE', 'Process')) { throw 'new parent environment value was not removed' }",
+  ].join(";");
+  let executedShells = 0;
+  for (const shell of ["powershell.exe", "pwsh.exe"]) {
+    const result = spawnSync(shell, ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    if (result.error?.code === "ENOENT") continue;
+    executedShells += 1;
+    assert.equal(result.status, 0, `${shell}: ${result.stderr || result.stdout}`);
+  }
+  assert.ok(executedShells > 0, "no PowerShell runtime was available");
+});
+
+test("detached launcher restores inherited environment names case-insensitively", async () => {
+  const helper = fileURLToPath(files.start);
+  const command = [
+    `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+    "$tokens = $null",
+    "$errors = $null",
+    "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+    "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-DetachedLauncher' }, $true)",
+    "if (-not $definition) { throw 'Invoke-DetachedLauncher definition is missing' }",
+    "Invoke-Expression $definition.Extent.Text",
+    "$env:codex_feishu_bridge_secret = 'lowercase-parent-value'",
+    "function global:fake-node.exe { param([Parameter(ValueFromRemainingArguments=$true)][object[]]$Arguments) $global:LASTEXITCODE = 0; '4242' }",
+    "$result = Invoke-DetachedLauncher 'fake-node.exe' @('detached-launcher.mjs') @{ CODEX_FEISHU_BRIDGE_SECRET = 'temporary-value' }",
+    "if ($result.ExitCode -ne 0 -or @($result.Output)[0] -ne '4242') { throw 'launcher result was not preserved' }",
+    "if ([Environment]::GetEnvironmentVariable('codex_feishu_bridge_secret', 'Process') -ne 'lowercase-parent-value') { throw 'case-insensitive parent environment value was not restored' }",
+  ].join(";");
+  let executedShells = 0;
+  for (const shell of ["powershell.exe", "pwsh.exe"]) {
+    const result = spawnSync(shell, ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    if (result.error?.code === "ENOENT") continue;
+    executedShells += 1;
+    assert.equal(result.status, 0, `${shell}: ${result.stderr || result.stdout}`);
+  }
+  assert.ok(executedShells > 0, "no PowerShell runtime was available");
+});
+
 test("partial ephemeral restart stops the surviving identity match and clears its stale peer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "codex-ephemeral-pair-"));
   const taskboardPidFile = join(directory, "taskboard.pid");

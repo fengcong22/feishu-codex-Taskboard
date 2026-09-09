@@ -1540,6 +1540,7 @@ function parseFeishuTaskMetadata(description) {
         && (typeof metadata.packageAlias !== "string" || metadata.packageAlias.trim() === ""))
       || (metadata.packageSource !== undefined
         && (typeof metadata.packageSource !== "string" || metadata.packageSource.trim() === ""))
+      || (metadata.deliverySource !== undefined && metadata.deliverySource !== "simulation")
     ) return null;
     return {
       ...(typeof metadata.packageAlias === "string" ? { packageAlias: metadata.packageAlias.trim() } : {}),
@@ -1566,6 +1567,7 @@ function parseFeishuTaskMetadata(description) {
         ? { stageId: metadata.stageId.trim() } : {}),
       ...(Number.isSafeInteger(metadata.eventOccurredAt) && metadata.eventOccurredAt >= 0
         ? { eventOccurredAt: metadata.eventOccurredAt } : {}),
+      ...(metadata.deliverySource === "simulation" ? { deliverySource: "simulation" } : {}),
       mode: metadata.mode === "automatic" ? "automatic" : "manual",
       ...(typeof metadata.subjectKey === "string" && metadata.subjectKey.trim()
         ? { subjectKey: metadata.subjectKey.trim() } : {}),
@@ -1599,7 +1601,7 @@ function parseFeishuStageRegistrationBody(body) {
   assertPlainObject(body.event);
   assertAllowedKeys(body.event, new Set([
     "eventId", "baseToken", "tableId", "recordId", "statusFieldId",
-    "beforeOptionId", "afterOptionId", "occurredAt",
+    "beforeOptionId", "afterOptionId", "occurredAt", "deliverySource",
   ]));
   const event = {
     eventId: stringField(body.event.eventId, "event.eventId", { required: true, maxLength: 256 }),
@@ -1615,6 +1617,12 @@ function parseFeishuStageRegistrationBody(body) {
       throw new ApiError(400, "INVALID_FIELD", "event.occurredAt must be a non-negative timestamp");
     }
     event.occurredAt = body.event.occurredAt;
+  }
+  if (body.event.deliverySource !== undefined) {
+    if (body.event.deliverySource !== "simulation") {
+      throw new ApiError(400, "INVALID_FIELD", "event.deliverySource is invalid");
+    }
+    event.deliverySource = "simulation";
   }
 
   assertPlainObject(body.binding);
@@ -2518,7 +2526,7 @@ export function createTaskboardServer(options = {}) {
     for (const key of [
       "version", "source", "eventId", "baseToken", "tableId", "recordId",
       "triggerField", "triggerFieldId", "triggerValue", "statusFieldId", "beforeOptionId",
-      "afterOptionId", "stageId", "eventOccurredAt", "mode", "executionMode",
+      "afterOptionId", "stageId", "eventOccurredAt", "deliverySource", "mode", "executionMode",
       "subjectKey", "configVersion", "uploadMode", "packageAlias", "packageSource",
       "concurrencyGroup", "maxConcurrent", "resourceGroups",
     ]) {
@@ -2602,7 +2610,7 @@ export function createTaskboardServer(options = {}) {
     if (!existing) return false;
     for (const key of [
       "source", "eventId", "baseToken", "tableId", "recordId", "statusFieldId",
-      "beforeOptionId", "afterOptionId", "stageId", "eventOccurredAt", "subjectKey",
+      "beforeOptionId", "afterOptionId", "stageId", "eventOccurredAt", "deliverySource", "subjectKey",
       "configVersion", "packageAlias", "executionMode", "uploadMode",
     ]) {
       if (JSON.stringify(existing[key]) !== JSON.stringify(expected[key])) return false;
@@ -2660,7 +2668,9 @@ export function createTaskboardServer(options = {}) {
       throw new ApiError(409, "PACKAGE_DISABLED", "The configured Auto-Cut package is disabled");
     }
     const packageSnapshot = packageSnapshotFromRecord(packageRecord, packageAlias);
-    const executionMode = subjectVersion.execution?.mode === "automatic" ? "automatic" : "manual";
+    const executionMode = event.deliverySource === "simulation"
+      ? "manual"
+      : (subjectVersion.execution?.mode === "automatic" ? "automatic" : "manual");
     const uploadMode = subjectVersion.upload?.enqueueMode === "automatic" ? "automatic" : "manual";
     const triggerField = subjectVersion.statusField?.fieldName ?? event.statusFieldId;
     const origin = {
@@ -2678,6 +2688,7 @@ export function createTaskboardServer(options = {}) {
       afterOptionId: event.afterOptionId,
       stageId: binding.stageId,
       ...(event.occurredAt === undefined ? {} : { eventOccurredAt: event.occurredAt }),
+      ...(event.deliverySource === "simulation" ? { deliverySource: "simulation" } : {}),
       mode: executionMode,
       executionMode,
       subjectKey: binding.subjectKey,
@@ -2728,6 +2739,7 @@ export function createTaskboardServer(options = {}) {
       afterOptionId: event.afterOptionId,
       stageId: binding.stageId,
       ...(event.occurredAt === undefined ? {} : { eventOccurredAt: event.occurredAt }),
+      ...(event.deliverySource === "simulation" ? { deliverySource: "simulation" } : {}),
       mode: executionMode,
       executionMode,
       subjectKey: binding.subjectKey,
@@ -5721,17 +5733,6 @@ export function createTaskboardServer(options = {}) {
           feishuOrigin: metadata,
         }, packageSnapshot);
         events.emit("task.created", { task });
-        if (allowAutomaticExecution && !closing) {
-          const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
-          if (metadata && executionModeForMetadata(metadata) === "automatic") {
-            void startTrackedTask(task.id, () => executionCoordinator.schedule(
-              task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
-            )).catch((error) => {
-              if (["SERVER_SHUTTING_DOWN", "REQUEST_CANCELLED"].includes(error?.code)) return;
-              console.error(`Automatic execution failed for task '${task.id}': ${error.code ?? "EXECUTION_FAILED"}`);
-            });
-          }
-        }
         return sendJson(response, 201, { task });
       }
 

@@ -31,7 +31,10 @@ export function projectIdForSubject(value, fallback = "local") {
 }
 
 function metadata(decision) {
-  const executionMode = decision.executionMode ?? decision.table.executionMode ?? decision.table.mode;
+  const simulated = decision.event?.deliverySource === "simulation";
+  const executionMode = simulated
+    ? "manual"
+    : decision.executionMode ?? decision.table.executionMode ?? decision.table.mode;
   const uploadMode = decision.uploadMode ?? decision.table.uploadMode ?? decision.table.upload?.enqueueMode;
   const concurrencyGroup = decision.concurrencyGroup ?? decision.table.concurrencyGroup ?? decision.table.execution?.concurrencyGroup;
   const maxConcurrent = decision.maxConcurrent ?? decision.table.maxConcurrent ?? decision.table.execution?.maxConcurrent;
@@ -46,7 +49,8 @@ function metadata(decision) {
     triggerField: decision.table.triggerField,
     ...(decision.table.triggerFieldId ? { triggerFieldId: decision.table.triggerFieldId } : {}),
     triggerValue: decision.table.triggerValue,
-    mode: decision.table.mode,
+    mode: simulated ? "manual" : decision.table.mode,
+    ...(simulated ? { deliverySource: "simulation" } : {}),
     subjectKey: decision.subjectKey ?? `${decision.event.baseToken}:${decision.event.tableId}`,
     ...(Number.isInteger(decision.configVersion) ? { configVersion: decision.configVersion } : {}),
     ...(executionMode ? { executionMode } : {}),
@@ -81,6 +85,9 @@ export function parseFeishuTaskMetadata(description) {
 }
 
 export function buildTaskPayload(decision) {
+  const executionMode = decision.event?.deliverySource === "simulation"
+    ? "manual"
+    : decision.executionMode ?? decision.table.executionMode ?? decision.table.mode;
   const title = `[待剪辑] ${decision.event.recordTitle || decision.event.recordId}`;
   const transition = `${text(decision.event.beforeValue)} → ${text(decision.event.afterValue)}`;
   if (decision.kind === "blocked") {
@@ -117,7 +124,7 @@ export function buildTaskPayload(decision) {
       `- 记录 ID：${decision.event.recordId}`,
       `- 字段变化：${decision.table.triggerField}（${transition}）`,
       `- ${packageLine}`,
-      `- 启动方式：${decision.table.mode === "manual" ? "手动点击启动" : "自动模式（MVP 暂按手动启动）"}`,
+      `- 启动方式：${executionMode === "manual" ? "手动点击启动" : "自动模式（MVP 暂按手动启动）"}`,
       "",
       "点击任务中的“启动 Codex”后，Codex 将在服务器白名单映射的项目目录内执行预设流程。",
       "",
@@ -125,7 +132,7 @@ export function buildTaskPayload(decision) {
     ].join("\n"),
     status: "todo",
     priority: "high",
-    labels: ["feishu", "待剪辑", decision.table.mode, decision.packageAlias],
+    labels: ["feishu", "待剪辑", executionMode, decision.packageAlias],
     assigneeTarget: "current-user",
   };
 }
@@ -173,6 +180,7 @@ export function buildTrustedTaskPayload(decision, context = {}) {
       statusFieldId: String(event.statusFieldId ?? decision.table?.statusField?.fieldId ?? decision.table?.triggerFieldId ?? "").trim(),
       beforeOptionId: String(event.beforeOptionId ?? "").trim(),
       afterOptionId: String(event.afterOptionId ?? "").trim(),
+      ...(event.deliverySource === "simulation" ? { deliverySource: "simulation" } : {}),
       ...(event.eventOccurredAtPresent && Number.isFinite(event.eventOccurredAt)
         ? { occurredAt: event.eventOccurredAt }
         : Number.isFinite(event.eventOccurredAt) ? { occurredAt: event.eventOccurredAt } : {}),

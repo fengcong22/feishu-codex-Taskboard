@@ -140,6 +140,7 @@ test("rejects successful Feishu creates whose provenance differs from the reques
     ["triggerField", "其他进度"],
     ["triggerFieldId", "fld_other"],
     ["triggerValue", "已剪辑"],
+    ["deliverySource", "simulation"],
     ["mode", "manual"],
     ["subjectKey", "bas_other:tbl_other"],
     ["configVersion", 10],

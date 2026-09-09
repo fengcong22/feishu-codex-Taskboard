@@ -413,6 +413,22 @@ test("trusted task payload contains binding and context but no executable path",
   assert.equal(Object.hasOwn(payload, "artifactTargetPath"), false);
 });
 
+test("trusted phased payload preserves server-owned simulation provenance", () => {
+  const payload = buildTrustedTaskPayload({
+    kind: "register",
+    subject,
+    stageId: "initial",
+    configVersion: 7,
+    packageAlias: "Auto-cut-lite",
+    event: { ...edge("opt_other", "opt_initial"), deliverySource: "simulation" },
+  }, {
+    documentLinks: [],
+    namingDisplayValue: "课程001",
+    namingValueUnique: true,
+  });
+  assert.equal(payload.event.deliverySource, "simulation");
+});
+
 test("controlled context endpoint requires Taskboard identity and shared secret", async (t) => {
   const app = createBridgeServer({
     host: "127.0.0.1",
