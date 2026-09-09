@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, copyFile as realCopyFile, mkdir, mkdtemp, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -1748,16 +1748,14 @@ test("fallback publication preserves a destination won by a concurrent writer", 
   };
   const fileSystem = {
     async link() {
+      await writeFile(destination, competing);
       throw Object.assign(new Error("hard links unavailable"), { code: "EXDEV" });
     },
-    async copyFile(source, target, flags) {
-      if (target === destination) await writeFile(destination, competing);
-      return realCopyFile(source, target, flags);
+    async copyFile() {
+      throw new Error("unsafe copy fallback must not run");
     },
-    async rename(source, target) {
-      await writeFile(target, competing);
-      await realCopyFile(source, target);
-      await unlink(source);
+    async rename() {
+      throw new Error("overwriting rename fallback must not run");
     },
   };
   const worker = createArtifactUploadWorker({

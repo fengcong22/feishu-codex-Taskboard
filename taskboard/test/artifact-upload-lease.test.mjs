@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -491,12 +491,13 @@ test("worker fences and reclaims an expired lease while the original upload is s
   }
 });
 
-test("fallback copy interruption never leaves a partial destination ZIP", async () => {
+test("unsupported atomic publication never exposes a partial destination ZIP", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-upload-atomic-fallback-"));
   const targetPath = path.join(directory, "target");
   const bytes = Buffer.from("atomic fallback upload bytes", "utf8");
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   let claimed = false;
+  let copyCount = 0;
   let failure = null;
   const database = {
     claimNextArtifactUpload() {
@@ -526,9 +527,9 @@ test("fallback copy interruption never leaves a partial destination ZIP", async 
     artifactService: { createDownloadStream: () => Readable.from([bytes]) },
     fileSystem: {
       async link() { throw Object.assign(new Error("hard links unavailable"), { code: "EXDEV" }); },
-      async copyFile(_source, destination) {
-        await writeFile(destination, bytes.subarray(0, 5));
-        throw new Error("simulated NAS interruption");
+      async copyFile() {
+        copyCount += 1;
+        throw new Error("unsafe copy fallback must not run");
       },
       async rename() {
         throw new Error("rename should not run after an interrupted copy");
@@ -538,6 +539,7 @@ test("fallback copy interruption never leaves a partial destination ZIP", async 
   try {
     await worker.start();
     assert.equal(failure?.code, "UPLOAD_COPY_FAILED");
+    assert.equal(copyCount, 0);
     await assert.rejects(access(path.join(targetPath, "fallback.zip")));
   } finally {
     await worker.close();

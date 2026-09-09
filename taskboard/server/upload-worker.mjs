@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, createReadStream } from "node:fs";
-import { copyFile, link, mkdir, open, stat, unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { link, mkdir, open, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -90,40 +90,21 @@ function hardLinkIsUnsupported(error) {
 
 async function promoteTemporaryFile(temporary, destination, expectedHash, fileSystem = {}) {
   const linkFile = fileSystem.link ?? link;
-  const copyFileImpl = fileSystem.copyFile ?? copyFile;
   const statFile = fileSystem.stat ?? stat;
   try {
     await linkFile(temporary, destination);
     return { created: true, identity: await statFile(destination) };
   } catch (error) {
-    if (error?.code === "EEXIST") {
-      const concurrentHash = await destinationHash(destination);
-      if (concurrentHash === expectedHash) return { created: false, identity: null };
+    // The verified temporary already lives beside the destination. Without an
+    // atomic no-replace link, copying or renaming would expose partial data or
+    // overwrite a concurrent writer, so leave the final name untouched.
+    if (error?.code !== "EEXIST" && !hardLinkIsUnsupported(error)) throw error;
+    const concurrentHash = await destinationHash(destination);
+    if (concurrentHash === expectedHash) return { created: false, identity: null };
+    if (concurrentHash !== null) {
       throw new UploadFailure("TARGET_FILE_CONFLICT", "The destination already contains a different ZIP");
     }
-    if (!hardLinkIsUnsupported(error)) throw error;
-  }
-
-  const publishTemporary = `${destination}.${randomUUID()}.part`;
-  try {
-    await copyFileImpl(temporary, publishTemporary, constants.COPYFILE_EXCL);
-    const copiedHash = await hashFile(publishTemporary);
-    if (copiedHash !== expectedHash) {
-      throw new UploadFailure("ARTIFACT_HASH_MISMATCH", "The local ZIP no longer matches its verified checksum");
-    }
-    try {
-      await copyFileImpl(publishTemporary, destination, constants.COPYFILE_EXCL);
-      return { created: true, identity: await statFile(destination) };
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      const concurrentHash = await destinationHash(destination);
-      if (concurrentHash === expectedHash) return { created: false, identity: null };
-      throw new UploadFailure("TARGET_FILE_CONFLICT", "The destination already contains a different ZIP");
-    }
-  } catch (error) {
     throw error;
-  } finally {
-    await removeIfPresent(publishTemporary);
   }
 }
 
