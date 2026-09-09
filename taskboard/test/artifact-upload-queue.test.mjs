@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile as realCopyFile, mkdir, mkdtemp, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { test } from "node:test";
 
 import { createTaskboardServer as createTaskboardServerBase } from "../server/index.mjs";
@@ -1707,6 +1708,71 @@ test("upload queue is idempotent for the same artifact and destination", async (
     await access(path.join(destinationDirectory, artifact.filename));
   } finally {
     await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("fallback publication preserves a destination won by a concurrent writer", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-upload-publish-race-"));
+  const destination = path.join(directory, "race.zip");
+  const artifact = Buffer.from("verified artifact");
+  const competing = Buffer.from("concurrent writer");
+  const upload = {
+    id: "upload-race",
+    taskId: "task-race",
+    storageKey: "artifact-race",
+    targetPath: directory,
+    filename: "race.zip",
+    sha256: createHash("sha256").update(artifact).digest("hex"),
+    claimToken: "claim-race",
+    status: "uploading",
+  };
+  let claimed = false;
+  let settled = null;
+  const database = {
+    recoverUploadingArtifactUploads: () => 0,
+    getNextArtifactUploadLeaseExpiry: () => null,
+    claimNextArtifactUpload() {
+      if (claimed) return null;
+      claimed = true;
+      return { ...upload };
+    },
+    markArtifactUploadUploaded() {
+      settled = { ...upload, status: "uploaded", errorCode: null };
+      return settled;
+    },
+    markArtifactUploadFailed(_id, _claimToken, error) {
+      settled = { ...upload, status: "failed", errorCode: error.code };
+      return settled;
+    },
+  };
+  const fileSystem = {
+    async link() {
+      throw Object.assign(new Error("hard links unavailable"), { code: "EXDEV" });
+    },
+    async copyFile(source, target, flags) {
+      if (target === destination) await writeFile(destination, competing);
+      return realCopyFile(source, target, flags);
+    },
+    async rename(source, target) {
+      await writeFile(target, competing);
+      await realCopyFile(source, target);
+      await unlink(source);
+    },
+  };
+  const worker = createArtifactUploadWorker({
+    database,
+    artifactService: { createDownloadStream: () => Readable.from([artifact]) },
+    fileSystem,
+  });
+
+  try {
+    await worker.start();
+    assert.equal(settled?.status, "failed");
+    assert.equal(settled?.errorCode, "TARGET_FILE_CONFLICT");
+    assert.deepEqual(await readFile(destination), competing);
+  } finally {
+    await worker.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -143,6 +143,22 @@ test("reuses the same fallback event id when a headerless payload is replayed", 
   assert.equal(firstEvent.eventId, secondEvent.eventId);
 });
 
+test("isolates fallback event ids for identical records in different Bases", () => {
+  const first = rawEvent();
+  delete first.header.event_id;
+  const second = rawEvent();
+  delete second.header.event_id;
+  second.event.file_token = "bas_other";
+
+  const [firstEvent] = normalizeBitableRecordChanged(first, table);
+  const [secondEvent] = normalizeBitableRecordChanged(second, {
+    ...table,
+    baseToken: "bas_other",
+  });
+
+  assert.notEqual(firstEvent.eventId, secondEvent.eventId);
+});
+
 test("keeps batched event ids stable when action order changes", () => {
   const first = rawEvent();
   first.event.action_list.push({

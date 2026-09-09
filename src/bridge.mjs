@@ -13,6 +13,7 @@ import { archiveWaitingFeishuTasks, archiveWaitingFeishuStageTasks } from "./tas
 import { readControlledRecordContext } from "./feishu-record-reader.mjs";
 
 const DEFAULT_TITLE_LOOKUP_TIMEOUT_MS = 5_000;
+const MISSING_ACTIVE_CONFIG_VERSION = Symbol("MISSING_ACTIVE_CONFIG_VERSION");
 
 function withTimeout(operation, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -182,6 +183,17 @@ function decisionFromSnapshot(record, snapshot, runtimeConfig) {
 function isPhasedSubject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
     && value.statusField && value.stages);
+}
+
+function isPhasedEvent(event) {
+  return Boolean(event && typeof event === "object" && (
+    Object.hasOwn(event, "statusFieldId")
+    || Object.hasOwn(event, "beforePresent")
+    || Object.hasOwn(event, "afterPresent")
+    || Object.hasOwn(event, "beforeOptionId")
+    || Object.hasOwn(event, "afterOptionId")
+    || Object.hasOwn(event, "eventOccurredAtPresent")
+  ));
 }
 
 function eventSubjectKey(event) {
@@ -447,6 +459,9 @@ export function createBridge({
 
   async function resolvePhasedSubject(event, runtimeConfig) {
     const key = eventSubjectKey(event);
+    const configured = findConfiguredSubject(runtimeConfig, event);
+    const phased = isPhasedEvent(event) || Boolean(configured);
+    if (!phased) return configured;
     if (typeof getSubjectVersion === "function" && key
       && Number.isSafeInteger(event.configVersion) && event.configVersion > 0) {
       const exact = await getSubjectVersion(key, event.configVersion);
@@ -461,8 +476,10 @@ export function createBridge({
         event.eventOccurredAtPresent ? event.eventOccurredAt : undefined,
       );
       if (historical) return historical;
+      return MISSING_ACTIVE_CONFIG_VERSION;
     }
-    return findConfiguredSubject(runtimeConfig, event);
+    if (phased) return MISSING_ACTIVE_CONFIG_VERSION;
+    return configured;
   }
 
   async function readPhasedContext(subject, event) {
@@ -662,6 +679,25 @@ export function createBridge({
       }
       const phasedSubject = persistedPhased?.subject
         ?? await resolvePhasedSubject(event, runtimeConfig);
+      if (phasedSubject === MISSING_ACTIVE_CONFIG_VERSION) {
+        const outcome = {
+          kind: "blocked",
+          reason: "active workflow configuration version cannot be proven",
+          reasonCode: "MISSING_ACTIVE_CONFIG_VERSION",
+        };
+        await heartbeat.ensureActive();
+        await store.complete(record.eventId, {
+          ownerId,
+          token: record.lease?.token,
+          decision: "blocked",
+          outcome,
+          requireTaskIdentifier: false,
+          now: now(),
+          clock: now,
+        });
+        localDecisionSnapshots.delete(record.eventId);
+        return outcome;
+      }
       if (isPhasedSubject(phasedSubject)) {
         return await deliverPhasedRecord(record, phasedSubject, heartbeat, persistedPhased);
       }

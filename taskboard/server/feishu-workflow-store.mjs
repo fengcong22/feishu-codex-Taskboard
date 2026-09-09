@@ -997,6 +997,16 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       assertTriggerMetadata(currentConfig);
       await assertPackageAlias(currentConfig.packageRoute.packageAlias);
       if (
+        currentConfig.upload.artifactSourceMode === "driver_report"
+        && !(typeof currentConfig.upload.artifactSourcePath === "string" && currentConfig.upload.artifactSourcePath.trim())
+      ) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_SOURCE_PATH_UNBOUND",
+          "Set a ZIP artifact source path before enabling driver reporting",
+        );
+      }
+      if (
         currentConfig.upload.enqueueMode === "automatic"
         && !(typeof currentConfig.upload.targetPath === "string" && currentConfig.upload.targetPath.trim())
       ) {

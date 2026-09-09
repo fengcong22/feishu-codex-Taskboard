@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
-import { copyFile, link, mkdir, open, rename, stat, unlink } from "node:fs/promises";
+import { copyFile, link, mkdir, open, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -91,7 +91,6 @@ function hardLinkIsUnsupported(error) {
 async function promoteTemporaryFile(temporary, destination, expectedHash, fileSystem = {}) {
   const linkFile = fileSystem.link ?? link;
   const copyFileImpl = fileSystem.copyFile ?? copyFile;
-  const renameFile = fileSystem.rename ?? rename;
   const statFile = fileSystem.stat ?? stat;
   try {
     await linkFile(temporary, destination);
@@ -113,7 +112,7 @@ async function promoteTemporaryFile(temporary, destination, expectedHash, fileSy
       throw new UploadFailure("ARTIFACT_HASH_MISMATCH", "The local ZIP no longer matches its verified checksum");
     }
     try {
-      await renameFile(publishTemporary, destination);
+      await copyFileImpl(publishTemporary, destination, constants.COPYFILE_EXCL);
       return { created: true, identity: await statFile(destination) };
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;

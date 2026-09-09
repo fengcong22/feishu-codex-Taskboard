@@ -433,6 +433,45 @@ async function writeAtomic(filename, document) {
   }
 }
 
+async function restoreDocument(filename, document, existed) {
+  if (existed) {
+    await writeAtomic(filename, document);
+    return;
+  }
+  await unlink(filename).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+}
+
+async function readMutationJournal(filename) {
+  let details;
+  try {
+    details = await lstat(filename);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!details.isFile() || details.nlink !== 1) {
+    throw new Error("WORKFLOW_TRANSACTION_UNSUPPORTED: recovery journal must be a single-link regular file");
+  }
+  const value = JSON.parse(await readFile(filename, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || value.schemaVersion !== 1
+    || !value.config || typeof value.config !== "object" || Array.isArray(value.config)
+    || typeof value.config.exists !== "boolean"
+    || !value.history || typeof value.history !== "object" || Array.isArray(value.history)) {
+    throw new Error("WORKFLOW_TRANSACTION_INVALID: recovery journal is malformed");
+  }
+  return {
+    schemaVersion: 1,
+    config: {
+      exists: value.config.exists,
+      document: validateWorkflowConfig(value.config.document),
+    },
+    history: value.history,
+  };
+}
+
 /**
  * Local, versioned catalog store.  All mutations are serialized in-process and
  * guarded by the same loopback state lock used by the Bridge state store.
@@ -446,6 +485,7 @@ export function createWorkflowConfigStore({
 } = {}) {
   const target = pathFor(filename);
   const history = new SubjectVersionHistory(`${target}.versions.json`, { now });
+  const transactionTarget = `${target}.transaction.json`;
   const validatedInitial = validateWorkflowConfig(initial ?? { schemaVersion: 1, configVersion: 1, bases: [] });
   const packageAliasesLoader = typeof packageAliases === "function" ? packageAliases : null;
   const packages = packageCatalog(packageAliasesLoader ? null : packageAliases);
@@ -456,9 +496,26 @@ export function createWorkflowConfigStore({
     return packageCatalog(await packageAliasesLoader());
   }
 
+  async function recoverMutation() {
+    const journal = await readMutationJournal(transactionTarget);
+    if (!journal) return;
+    const restored = await Promise.allSettled([
+      restoreDocument(target, journal.config.document, journal.config.exists),
+      history.restoreState(journal.history),
+    ]);
+    const failures = restored
+      .filter((entry) => entry.status === "rejected")
+      .map((entry) => entry.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "workflow config recovery could not restore the previous pair");
+    }
+    await unlink(transactionTarget);
+  }
+
   async function withDocument(operation) {
     let result;
     writeQueue = writeQueue.catch(() => {}).then(async () => withStateLock(target, async () => {
+      await recoverMutation();
       const current = await readDocument(target, validatedInitial);
       result = await operation(current);
       return result;
@@ -481,8 +538,33 @@ export function createWorkflowConfigStore({
       // configVersion is local monotonic revision, not a value imported from
       // another machine's share file.
       changed.configVersion = before.configVersion + 1;
-      await writeAtomic(target, changed);
-      if (typeof result?.afterMutation === "function") await result.afterMutation();
+      const persistedBefore = await store.hasPersistedConfig();
+      const previousHistory = typeof result?.afterMutation === "function"
+        ? await history.captureState()
+        : null;
+      if (previousHistory !== null) {
+        await writeAtomic(transactionTarget, {
+          schemaVersion: 1,
+          config: { exists: persistedBefore, document: before },
+          history: previousHistory,
+        });
+      }
+      try {
+        await writeAtomic(target, changed);
+        if (typeof result?.afterMutation === "function") await result.afterMutation();
+        if (previousHistory !== null) await unlink(transactionTarget);
+      } catch (error) {
+        if (previousHistory === null) throw error;
+        try {
+          await recoverMutation();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            "workflow config mutation failed and rollback could not restore the previous pair",
+          );
+        }
+        throw error;
+      }
       return result?.value ?? changed;
     });
   }

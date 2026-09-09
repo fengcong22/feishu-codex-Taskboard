@@ -233,7 +233,7 @@ export function normalizeBitableRecordChanged(payload, table) {
     const occurrenceKey = `${tableId}:${recordId}:${actionSignature}`;
     const occurrence = actionOccurrences.get(occurrenceKey) ?? 0;
     actionOccurrences.set(occurrenceKey, occurrence + 1);
-    const fallbackId = `feishu:${tableId}:${recordId}:${actionSignature}:${occurrence}`;
+    const fallbackId = `feishu:${baseToken}:${tableId}:${recordId}:${actionSignature}:${occurrence}`;
     const eventId = sourceEventId
       ? (batched
         ? `${sourceEventId}:${tableId}:${recordId}:${actionSignature}:${occurrence}`

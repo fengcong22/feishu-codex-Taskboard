@@ -481,6 +481,39 @@ test("registers a phased task through the dedicated route after archiving the pr
   assert.deepEqual(order, ["register:first_review"]);
 });
 
+test("blocks a phased event when no active configuration version can be proven", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-missing-version-"));
+  let registrations = 0;
+  const store = new JsonStateStore(path.join(dir, "state.json"));
+  const bridge = createBridge({
+    config: {
+      delivery: { maxAttempts: 2, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 },
+      tables: [subject],
+      packages: { "Auto-cut-lite": { projectId: "p", projectName: "p", workspacePath: "D:\\trusted", prompt: "fixed" } },
+    },
+    store,
+    workflowStore: { resolveSubjectVersionAt: async () => null },
+    taskboard: {
+      registerFeishuStageTask: async () => {
+        registrations += 1;
+        return { id: "task-1", identifier: "FEI-1" };
+      },
+    },
+  });
+
+  const result = await bridge.handle(edge("opt_other", "opt_initial", {
+    eventId: "evt-missing-active-version",
+    eventOccurredAt: 1500,
+  }));
+
+  assert.equal(result.kind, "blocked");
+  assert.equal(result.reasonCode, "MISSING_ACTIVE_CONFIG_VERSION");
+  assert.equal(registrations, 0);
+  const record = await store.get("evt-missing-active-version");
+  assert.equal(record.deliveryState, "succeeded");
+  assert.equal(record.outcome.reasonCode, "MISSING_ACTIVE_CONFIG_VERSION");
+});
+
 test("archives a previous stage when the new target stage is disabled", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-bridge-"));
   const order = [];

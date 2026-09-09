@@ -105,12 +105,41 @@ export class SubjectVersionHistory {
   }
 
   async #read() {
+    return (await this.#capture()).state;
+  }
+
+  async #capture() {
     try {
-      return normalizeState(JSON.parse(await readFile(this.#filename, "utf8")));
+      return {
+        exists: true,
+        state: normalizeState(JSON.parse(await readFile(this.#filename, "utf8"))),
+      };
     } catch (error) {
-      if (error?.code === "ENOENT") return emptyState();
+      if (error?.code === "ENOENT") return { exists: false, state: emptyState() };
       throw error;
     }
+  }
+
+  async captureState() {
+    return withStateLock(this.#filename, async () => clone(await this.#capture()));
+  }
+
+  async restoreState(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || typeof value.exists !== "boolean") {
+      throw new Error("SUBJECT_HISTORY_INVALID: state snapshot is malformed");
+    }
+    const state = normalizeState(value.state);
+    return withStateLock(this.#filename, async () => {
+      if (value.exists) {
+        await atomicWrite(this.#filename, state);
+      } else {
+        await unlink(this.#filename).catch((error) => {
+          if (error?.code !== "ENOENT") throw error;
+        });
+      }
+      return clone({ exists: value.exists, state });
+    });
   }
 
   async #mutate(operation) {

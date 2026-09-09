@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   WORKFLOW_SCHEMA_VERSION,
@@ -66,6 +68,27 @@ function validConfig(overrides = {}) {
     }],
     ...overrides,
   };
+}
+
+async function waitForFile(filename) {
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    try {
+      await readFile(filename);
+      return;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await delay(20);
+    }
+  }
+  throw new Error(`timed out waiting for ${filename}`);
+}
+
+function waitForExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    child.once("exit", resolve);
+    child.once("error", reject);
+  });
 }
 
 test("subjectKey uses base token and table id and keeps identities isolated", () => {
@@ -145,6 +168,68 @@ test("workflow config store keeps drafts separate from active subjects and versi
   const persisted = JSON.parse(await readFile(filename, "utf8"));
   assert.equal(persisted.bases[0].subjects[0].configVersion, 4);
   assert.equal((await stat(filename)).isFile(), true);
+});
+
+test("preserves the previous config when the history sidecar cannot be committed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-config-sidecar-failure-"));
+  const filename = path.join(directory, "workflow.json");
+  const store = createWorkflowConfigStore({ filename, initial: validConfig() });
+  await store.saveDraft("bas_demo_123:tbl_math_123", { displayEnabled: false });
+  const before = await readFile(filename, "utf8");
+  await mkdir(`${filename}.versions.json`);
+
+  await assert.rejects(
+    () => store.enable("bas_demo_123:tbl_math_123"),
+    (error) => error?.code === "STATE_LOCK_TARGET_UNSUPPORTED",
+  );
+
+  assert.equal(await readFile(filename, "utf8"), before);
+  const persisted = JSON.parse(before);
+  assert.equal(persisted.bases[0].subjects[0].lifecycle, "draft");
+  assert.equal(persisted.bases[0].subjects[0].configVersion, 2);
+});
+
+test("recovers the previous config and history pair after interruption between writes", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-config-interrupted-pair-"));
+  const filename = path.join(directory, "workflow.json");
+  const marker = path.join(directory, "history-write-entered");
+  const store = createWorkflowConfigStore({ filename, initial: validConfig() });
+  await store.saveDraft("bas_demo_123:tbl_math_123", { displayEnabled: false });
+  const before = await readFile(filename, "utf8");
+  const moduleUrl = new URL("../src/workflow-config-store.mjs", import.meta.url).href;
+  const source = `
+    import { writeFile } from "node:fs/promises";
+    import { createWorkflowConfigStore } from ${JSON.stringify(moduleUrl)};
+    const store = createWorkflowConfigStore({ filename: process.argv[1] });
+    store.history.syncSubject = async () => {
+      await writeFile(process.argv[2], "entered");
+      await new Promise(() => setInterval(() => {}, 1000));
+    };
+    await store.enable("bas_demo_123:tbl_math_123");
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source, filename, marker], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await waitForExit(child).catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  await waitForFile(marker);
+  assert.equal(JSON.parse(await readFile(filename, "utf8")).bases[0].subjects[0].lifecycle, "enabled");
+  child.kill();
+  await waitForExit(child);
+
+  const recovered = createWorkflowConfigStore({ filename });
+  const current = await recovered.read();
+  assert.equal(current.bases[0].subjects[0].lifecycle, "draft");
+  assert.equal(current.bases[0].subjects[0].configVersion, 2);
+  assert.equal(await readFile(filename, "utf8"), before);
+  await assert.rejects(
+    () => readFile(`${filename}.versions.json`, "utf8"),
+    (error) => error?.code === "ENOENT",
+  );
 });
 
 test("share export removes local paths and import creates drafts without enabling", async () => {

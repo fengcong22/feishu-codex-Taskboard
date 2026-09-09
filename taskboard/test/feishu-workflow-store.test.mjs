@@ -242,6 +242,32 @@ test("subject draft save increments version and enable/disable use optimistic ch
   }
 });
 
+test("enabling driver reporting requires an artifact source path", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(preview());
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", {
+      ...subjectPatch(),
+      upload: {
+        ...subjectPatch().upload,
+        artifactSourceMode: "driver_report",
+        artifactSourcePath: null,
+      },
+    });
+
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "ARTIFACT_SOURCE_PATH_UNBOUND" && error.status === 409,
+    );
+    const current = await store.getSubject(draft.subjectKey);
+    assert.equal(current.lifecycle, "draft");
+    assert.equal(current.configVersion, draft.configVersion);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("subject draft accepts a human-readable upload target alias", async () => {
   const { directory, database, store } = await fixture();
   try {

@@ -320,7 +320,11 @@ function automaticFeishuDescription() {
   return `<!-- feishu-codex-task:v1:${encoded} -->\n\nfixture prompt`;
 }
 
-async function enableArtifactSource(fixture, artifactSourceMode, { bindSourcePath = true } = {}) {
+async function enableArtifactSource(
+  fixture,
+  artifactSourceMode,
+  { bindSourcePath = true, expectedEnableStatus = 200 } = {},
+) {
   const artifactSourcePath = artifactSourceMode === "driver_report" && bindSourcePath
     ? path.join(fixture.directory, "accepted-autocut-zips")
     : null;
@@ -378,8 +382,8 @@ async function enableArtifactSource(fixture, artifactSourceMode, { bindSourcePat
     method: "POST",
     body: { expectedVersion: draft.body.subject.configVersion },
   });
-  assert.equal(enabled.response.status, 200);
-  return enabled.body.subject;
+  assert.equal(enabled.response.status, expectedEnableStatus);
+  return expectedEnableStatus === 200 ? enabled.body.subject : enabled;
 }
 
 test("manual start creates and runs a task-linked local Codex thread", async () => {
@@ -875,41 +879,14 @@ test("manual-select trusted runs do not receive artifact report capability", asy
   }
 });
 
-test("driver-report capability requires a creation-time source path", async () => {
+test("driver-report configuration cannot be enabled without a source path", async () => {
   const fixture = await createFixture();
   try {
-    const subject = await enableArtifactSource(fixture, "driver_report", { bindSourcePath: false });
-    const task = await request(fixture.baseUrl, "/api/tasks", {
-      method: "POST",
-      body: {
-        projectId: subject.projectId,
-        title: "Unbound driver report Auto-Cut package",
-        description: feishuDescriptionWith({
-          configVersion: subject.configVersion,
-          uploadMode: subject.upload.enqueueMode,
-        }),
-        status: "todo",
-        priority: "high",
-        labels: ["feishu"],
-      },
+    const enabled = await enableArtifactSource(fixture, "driver_report", {
+      bindSourcePath: false,
+      expectedEnableStatus: 409,
     });
-    assert.equal(task.response.status, 201);
-
-    const started = await request(fixture.baseUrl, `/api/tasks/${task.body.task.id}/start-ai`, {
-      method: "POST",
-      body: {},
-    });
-    assert.equal(started.response.status, 202);
-    await waitForRun(
-      fixture.baseUrl,
-      started.body.thread.id,
-      (current) => current.status === "completed",
-    );
-
-    const context = JSON.parse(await readFile(fixture.artifactReportContextCapturePath, "utf8"));
-    assert.deepEqual(context, {});
-    const prompt = await readFile(fixture.promptCapturePath, "utf8");
-    assert.doesNotMatch(prompt, /taskctl artifact report --file/);
+    assert.equal(enabled.body.error.code, "ARTIFACT_SOURCE_PATH_UNBOUND");
   } finally {
     await fixture.app.close();
     await rm(fixture.directory, { recursive: true, force: true });
