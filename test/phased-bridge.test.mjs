@@ -14,7 +14,7 @@ import {
 import { createBridgeServer } from "../src/server.mjs";
 import { createBridge } from "../src/bridge.mjs";
 import { JsonStateStore } from "../src/state-store.mjs";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -427,6 +427,54 @@ test("trusted phased payload preserves server-owned simulation provenance", () =
     namingValueUnique: true,
   });
   assert.equal(payload.event.deliverySource, "simulation");
+});
+
+test("rehydrated ambiguous phased events remain manual-only in registration payloads", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-provenance-"));
+  const filename = path.join(dir, "state.json");
+  const eventId = "evt-phased-ambiguous-replay";
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: null,
+      deliveryProvenance: { version: 1, source: "simulation" },
+      deliveryState: "dead_letter",
+      decision: null,
+      decisionSnapshot: null,
+      attempts: 1,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: { code: "EVENT_SNAPSHOT_MISSING", status: 0, at: 0 },
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+  let registration;
+  const bridge = createBridge({
+    config: {
+      delivery: { maxAttempts: 2, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 },
+      tables: [subject],
+      packages: { "Auto-cut-lite": { projectId: "p", projectName: "p", workspacePath: "D:\\trusted", prompt: "fixed" } },
+    },
+    store: new JsonStateStore(filename),
+    workflowStore: { resolveSubjectVersionAt: async () => subject },
+    readControlledContext: async () => ({
+      documentLinks: [], namingDisplayValue: "课程001", namingValueUnique: true,
+    }),
+    taskboard: {
+      registerFeishuStageTask: async (payload) => {
+        registration = payload;
+        return { id: "task-ambiguous", identifier: "FEI-AMBIGUOUS" };
+      },
+    },
+  });
+
+  const result = await bridge.handle(edge("opt_other", "opt_initial", { eventId }));
+  assert.equal(result.kind, "register");
+  assert.equal(registration.event.deliverySource, "simulation");
 });
 
 test("controlled context endpoint requires Taskboard identity and shared secret", async (t) => {

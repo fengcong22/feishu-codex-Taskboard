@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -337,6 +337,123 @@ test("simulated deliveries cannot inherit automatic execution eligibility", asyn
   assert.equal(metadata.deliverySource, "simulation");
   assert.equal(metadata.mode, "manual");
   assert.equal(metadata.executionMode, "manual");
+});
+
+test("downgrades ambiguous pre-provenance retries before task registration", async () => {
+  const filename = await stateFilename();
+  const eventId = "evt_pre_provenance_retry";
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: { ...event, eventId },
+      deliveryState: "retry_wait",
+      decision: null,
+      decisionSnapshot: {
+        version: 1,
+        action: "create",
+        kind: "ready",
+        table: {
+          baseToken: "bas_demo",
+          tableId: "tbl_a",
+          name: "语文项目",
+          mode: "automatic",
+          executionMode: "automatic",
+          uploadMode: "automatic",
+          triggerField: "视频整体进度",
+          triggerValue: "待剪辑",
+        },
+        packageAlias: "Auto-cut-copyA",
+        packageSource: "record-field",
+        packageProjectId: "auto-cut-copy-a",
+      },
+      attempts: 1,
+      nextAttemptAt: 5,
+      lease: null,
+      lastError: { code: "TASKBOARD_UNAVAILABLE", status: 503, at: 0 },
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+  let payload;
+  const store = new JsonStateStore(filename);
+  const bridge = createBridge({
+    config: {
+      ...config,
+      delivery: policy,
+      tables: [{
+        ...config.tables[0],
+        mode: "automatic",
+        executionMode: "automatic",
+        uploadMode: "automatic",
+      }],
+    },
+    store,
+    now: () => 5,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async (value) => {
+        payload = value;
+        return { id: "task_pre_provenance", identifier: "AUTO-PRE-PROVENANCE" };
+      },
+    },
+  });
+
+  const result = await bridge.processDue();
+  const metadata = parseFeishuTaskMetadata(payload.description);
+  assert.equal(result.taskIdentifier, "AUTO-PRE-PROVENANCE");
+  assert.equal(metadata.deliverySource, "simulation");
+  assert.equal(metadata.mode, "manual");
+  assert.equal(metadata.executionMode, "manual");
+  assert.deepEqual((await store.get(eventId)).deliveryProvenance, {
+    version: 1,
+    source: "simulation",
+  });
+  assert.deepEqual(JSON.parse(await readFile(filename, "utf8"))[eventId].deliveryProvenance, {
+    version: 1,
+    source: "simulation",
+  });
+});
+
+test("persists current real deliveries as proven Feishu without changing automatic behavior", async () => {
+  const filename = await stateFilename();
+  const eventId = "evt_current_real_automatic";
+  let payload;
+  const store = new JsonStateStore(filename);
+  const bridge = createBridge({
+    config: {
+      ...config,
+      tables: [{
+        ...config.tables[0],
+        mode: "automatic",
+        executionMode: "automatic",
+        uploadMode: "automatic",
+      }],
+    },
+    store,
+    taskboard: {
+      findTaskByEventId: async () => null,
+      ensureProject: async () => {},
+      createTask: async (value) => {
+        payload = value;
+        return { id: "task_current_real", identifier: "AUTO-CURRENT-REAL" };
+      },
+    },
+  });
+
+  const result = await bridge.handle({ ...event, eventId });
+  const metadata = parseFeishuTaskMetadata(payload.description);
+  assert.equal(result.taskIdentifier, "AUTO-CURRENT-REAL");
+  assert.equal(Object.hasOwn(metadata, "deliverySource"), false);
+  assert.equal(metadata.mode, "automatic");
+  assert.equal(metadata.executionMode, "automatic");
+  assert.deepEqual((await store.get(eventId)).deliveryProvenance, {
+    version: 1,
+    source: "feishu",
+  });
 });
 
 test("uses an explicit package catalog when the Bridge config has no package definitions", async () => {

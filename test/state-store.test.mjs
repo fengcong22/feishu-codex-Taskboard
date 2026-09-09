@@ -33,6 +33,262 @@ test("claims an event into a versioned processing record", async () => {
   assert.deepEqual((await store.get(original.eventId)).event.fields, {});
 });
 
+test("persists explicit provenance for current Feishu and simulated deliveries", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const real = await store.claimEvent(event("evt_real_provenance"), {
+    ownerId: "real-worker", now: 100, leaseMs: 1_000,
+  });
+  const simulated = await store.claimEvent({
+    ...event("evt_simulated_provenance"),
+    deliverySource: "simulation",
+  }, {
+    ownerId: "simulation-worker", now: 100, leaseMs: 1_000,
+  });
+  assert.deepEqual(real.record.deliveryProvenance, { version: 1, source: "feishu" });
+  assert.deepEqual(simulated.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(Object.hasOwn(real.record.event, "deliverySource"), false);
+  assert.equal(simulated.record.event.deliverySource, "simulation");
+});
+
+test("rejects an unrecognized delivery source instead of upgrading it to Feishu", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  await assert.rejects(
+    store.claimEvent({
+      ...event("evt_unknown_provenance"),
+      deliverySource: "legacy_unknown",
+    }, {
+      ownerId: "unknown-worker",
+      now: 100,
+      leaseMs: 1_000,
+    }),
+    /event\.deliverySource is invalid/,
+  );
+  assert.equal(await store.get("evt_unknown_provenance"), null);
+});
+
+test("fails closed on an unrecognized persisted delivery source", async () => {
+  const eventId = "evt_persisted_unknown_provenance";
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: {
+        ...event(eventId),
+        deliverySource: "future-source",
+      },
+      deliveryProvenance: { version: 1, source: "feishu" },
+      deliveryState: "pending",
+      decision: null,
+      decisionSnapshot: null,
+      attempts: 0,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: null,
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+
+  const store = new JsonStateStore(filename);
+  const record = await store.get(eventId);
+  assert.equal(record.deliveryState, "dead_letter");
+  assert.equal(record.lastError.code, "EVENT_RECORD_INVALID");
+  assert.deepEqual(record.deliveryProvenance, { version: 1, source: "simulation" });
+
+  const claimed = await store.claimNextDue({ ownerId: "worker", now: 100, leaseMs: 10 });
+  assert.equal(claimed, null);
+});
+
+test("keeps the conservative source when stored provenance and event disagree", async () => {
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    evt_mismatched_provenance: {
+      schemaVersion: 2,
+      eventId: "evt_mismatched_provenance",
+      event: {
+        ...event("evt_mismatched_provenance"),
+        deliverySource: "simulation",
+      },
+      deliveryProvenance: { version: 1, source: "feishu" },
+      deliveryState: "pending",
+      decision: null,
+      decisionSnapshot: null,
+      attempts: 0,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: null,
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+  const record = await (new JsonStateStore(filename)).get("evt_mismatched_provenance");
+  assert.deepEqual(record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(record.event.deliverySource, "simulation");
+});
+
+test("downgrades pre-provenance nonterminal snapshots to an ambiguous manual-only source", async () => {
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    evt_ambiguous_provenance: {
+      schemaVersion: 2,
+      eventId: "evt_ambiguous_provenance",
+      event: event("evt_ambiguous_provenance"),
+      deliveryState: "retry_wait",
+      decision: null,
+      decisionSnapshot: null,
+      attempts: 1,
+      nextAttemptAt: 100,
+      lease: null,
+      lastError: { code: "TASKBOARD_UNAVAILABLE", status: 503, at: 1 },
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 1,
+    },
+  }));
+  const store = new JsonStateStore(filename);
+  const record = await store.get("evt_ambiguous_provenance");
+  assert.deepEqual(record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(record.event.deliverySource, "simulation");
+
+  const claimed = await store.claimNextDue({ ownerId: "worker", now: 100, leaseMs: 10 });
+  assert.equal(claimed.event.deliverySource, "simulation");
+  assert.deepEqual(claimed.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.deepEqual(
+    JSON.parse(await readFile(filename, "utf8")).evt_ambiguous_provenance.deliveryProvenance,
+    { version: 1, source: "simulation" },
+  );
+});
+
+test("preserves conservative provenance when rehydrating ambiguous snapshots", async () => {
+  for (const [deliveryState, lease] of [
+    ["pending", null],
+    ["processing", { ownerId: "expired-worker", token: "expired-token", leaseUntil: 1 }],
+  ]) {
+    const eventId = `evt_ambiguous_rehydrate_${deliveryState}`;
+    const filename = await stateFilename();
+    await writeFile(filename, JSON.stringify({
+      [eventId]: {
+        schemaVersion: 2,
+        eventId,
+        event: { eventId },
+        deliveryState,
+        decision: null,
+        decisionSnapshot: null,
+        attempts: 1,
+        nextAttemptAt: null,
+        lease,
+        lastError: null,
+        failureHistory: [],
+        outcome: null,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    }));
+
+    const store = new JsonStateStore(filename);
+    if (deliveryState === "pending") {
+      const invalid = await store.get(eventId);
+      assert.equal(invalid.deliveryState, "dead_letter");
+      assert.equal(invalid.lastError.code, "EVENT_SNAPSHOT_MISSING");
+    }
+    const replay = await store.claimEvent(event(eventId), {
+      ownerId: "replay-worker",
+      now: 100,
+      leaseMs: 1_000,
+    });
+    assert.equal(replay.kind, "claimed", deliveryState);
+    assert.deepEqual(replay.record.deliveryProvenance, {
+      version: 1,
+      source: "simulation",
+    }, deliveryState);
+    assert.equal(replay.record.event.deliverySource, "simulation", deliveryState);
+  }
+});
+
+test("a simulated replay cannot retain Feishu provenance while rehydrating", async () => {
+  const eventId = "evt_feishu_snapshot_simulated_replay";
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: null,
+      deliveryProvenance: { version: 1, source: "feishu" },
+      deliveryState: "dead_letter",
+      decision: null,
+      decisionSnapshot: null,
+      attempts: 1,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: { code: "EVENT_SNAPSHOT_MISSING", status: 0, at: 0 },
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+
+  const replay = await (new JsonStateStore(filename)).claimEvent({
+    ...event(eventId),
+    deliverySource: "simulation",
+  }, {
+    ownerId: "simulation-worker",
+    now: 100,
+    leaseMs: 1_000,
+  });
+  assert.equal(replay.kind, "claimed");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(replay.record.event.deliverySource, "simulation");
+});
+
+test("does not upgrade a simulated malformed snapshot during rehydration", async () => {
+  const eventId = "evt_simulated_malformed_rehydrate";
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: {
+        ...event(eventId),
+        deliverySource: "simulation",
+      },
+      deliveryProvenance: { version: 1, source: "feishu" },
+      deliveryState: "pending",
+      decision: null,
+      decisionSnapshot: null,
+      attempts: -1,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: null,
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+
+  const store = new JsonStateStore(filename);
+  const invalid = await store.get(eventId);
+  assert.equal(invalid.deliveryState, "dead_letter");
+  assert.equal(invalid.lastError.code, "EVENT_RECORD_INVALID");
+  assert.deepEqual(invalid.deliveryProvenance, { version: 1, source: "simulation" });
+
+  const replay = await store.claimEvent(event(eventId), {
+    ownerId: "replay-worker",
+    now: 100,
+    leaseMs: 1_000,
+  });
+  assert.equal(replay.kind, "terminal");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+});
+
 test("persists one fenced decision snapshot without executable or local-path data", async () => {
   const store = new JsonStateStore(await stateFilename());
   const claim = await store.claimEvent(event("evt_decision_snapshot"), {
@@ -593,7 +849,7 @@ test("migrates legacy pending records to dead letter and rehydrates on replay", 
   assert.equal(await store.claimNextDue({ ownerId: "one", now: 100, leaseMs: 10 }), null);
   const replay = await store.claimEvent(event("evt_old"), { ownerId: "one", now: 100, leaseMs: 10 });
   assert.equal(replay.kind, "claimed");
-  assert.deepEqual(replay.record.event, event("evt_old"));
+  assert.deepEqual(replay.record.event, { ...event("evt_old"), deliverySource: "simulation" });
 });
 
 test("migrates legacy terminal outcomes as succeeded records", async () => {
@@ -735,6 +991,7 @@ test("rehydrates a v2 missing-snapshot dead letter after lease recovery", async 
       schemaVersion: 2,
       eventId: "evt_recover_snapshot",
       event: null,
+      deliveryProvenance: { version: 1, source: "simulation" },
       deliveryState: "processing",
       decision: null,
       attempts: 1,
@@ -756,7 +1013,11 @@ test("rehydrates a v2 missing-snapshot dead letter after lease recovery", async 
     ownerId: "worker", now: 100, leaseMs: 10,
   });
   assert.equal(replay.kind, "claimed");
-  assert.deepEqual(replay.record.event, event("evt_recover_snapshot"));
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.deepEqual(replay.record.event, {
+    ...event("evt_recover_snapshot"),
+    deliverySource: "simulation",
+  });
 });
 
 test("rehydrates a partial processing snapshot after lease recovery", async () => {
@@ -786,7 +1047,11 @@ test("rehydrates a partial processing snapshot after lease recovery", async () =
     leaseMs: 10,
   });
   assert.equal(replay.kind, "claimed");
-  assert.deepEqual(replay.record.event, event("evt_partial_snapshot"));
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.deepEqual(replay.record.event, {
+    ...event("evt_partial_snapshot"),
+    deliverySource: "simulation",
+  });
 });
 
 test("fails closed on invalid record values instead of treating them as succeeded", async () => {
@@ -1010,6 +1275,8 @@ test("moves a retry record with a missing event snapshot to rehydratable dead le
     leaseMs: 10,
   });
   assert.equal(replay.kind, "claimed");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(replay.record.event.deliverySource, "simulation");
 });
 
 test("normalizes a partial pending snapshot to rehydratable dead letter", async () => {
@@ -1091,7 +1358,10 @@ test("rehydrates a v2 record with a missing event property from a complete repla
     leaseMs: 10,
   });
   assert.equal(result.kind, "claimed");
-  assert.deepEqual(result.record.event, event("evt_missing_event"));
+  assert.deepEqual(result.record.event, {
+    ...event("evt_missing_event"),
+    deliverySource: "simulation",
+  });
 });
 
 test("rehydrates an incomplete v2 record when the replay includes a complete snapshot", async () => {
@@ -1119,7 +1389,11 @@ test("rehydrates an incomplete v2 record when the replay includes a complete sna
     leaseMs: 10,
   });
   assert.equal(result.kind, "claimed");
-  assert.deepEqual(result.record.event, event("evt_malformed"));
+  assert.deepEqual(result.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.deepEqual(result.record.event, {
+    ...event("evt_malformed"),
+    deliverySource: "simulation",
+  });
 });
 
 test("normalizes legacy v2 snapshots before a due record is persisted again", async () => {

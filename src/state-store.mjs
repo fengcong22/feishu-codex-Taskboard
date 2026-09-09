@@ -82,6 +82,8 @@ const CONTROLLED_CONTEXT_FIELDS = new Set([
   "namingValueUnique",
 ]);
 const MAX_FAILURE_HISTORY = 10;
+const DELIVERY_PROVENANCE_VERSION = 1;
+const DELIVERY_PROVENANCE_SOURCES = new Set(["feishu", "simulation"]);
 const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
   "LEGACY_EVENT_SNAPSHOT_MISSING",
   "EVENT_SNAPSHOT_MISSING",
@@ -117,6 +119,57 @@ function normalizeEventSnapshot(event) {
     if (Object.hasOwn(event, field)) snapshot[field] = structuredClone(event[field]);
   }
   return snapshot;
+}
+
+function deliveryProvenanceForEvent(event) {
+  return {
+    version: DELIVERY_PROVENANCE_VERSION,
+    source: event?.deliverySource === "simulation" ? "simulation" : "feishu",
+  };
+}
+
+function normalizeDeliveryProvenance(value, { legacy = false } = {}) {
+  if (legacy) {
+    return { version: DELIVERY_PROVENANCE_VERSION, source: "simulation" };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || value.version !== DELIVERY_PROVENANCE_VERSION
+    || !DELIVERY_PROVENANCE_SOURCES.has(value.source)
+    || Object.keys(value).some((key) => key !== "version" && key !== "source")) {
+    return null;
+  }
+  return { version: DELIVERY_PROVENANCE_VERSION, source: value.source };
+}
+
+function conservativeDeliveryProvenance(record, replayEvent) {
+  const storedEvent = record?.event;
+  const hasStoredSource = storedEvent
+    && typeof storedEvent === "object"
+    && !Array.isArray(storedEvent)
+    && Object.hasOwn(storedEvent, "deliverySource");
+  const hasReplaySource = replayEvent
+    && typeof replayEvent === "object"
+    && !Array.isArray(replayEvent)
+    && Object.hasOwn(replayEvent, "deliverySource");
+  if (hasStoredSource || hasReplaySource) {
+    return { version: DELIVERY_PROVENANCE_VERSION, source: "simulation" };
+  }
+  return normalizeDeliveryProvenance(record?.deliveryProvenance)
+    ?? { version: DELIVERY_PROVENANCE_VERSION, source: "simulation" };
+}
+
+function applyDeliveryProvenance(event, provenance) {
+  if (!event) return event;
+  if (!provenance || provenance.source === "feishu") {
+    if (!Object.hasOwn(event, "deliverySource")) return event;
+    const normalized = { ...event };
+    delete normalized.deliverySource;
+    return normalized;
+  }
+  // Historical non-terminal records predate durable source provenance. They
+  // may have come from the local simulator, so migrate them to the simulator's
+  // manual-only execution path instead of inferring a production delivery.
+  return { ...event, deliverySource: "simulation" };
 }
 
 function snapshotInvalid(message) {
@@ -408,6 +461,7 @@ function newRecord(event, now) {
     schemaVersion: 2,
     eventId: event.eventId,
     event: normalizeEventSnapshot(event),
+    deliveryProvenance: deliveryProvenanceForEvent(event),
     deliveryState: "pending",
     decision: null,
     decisionSnapshot: null,
@@ -433,6 +487,7 @@ function legacyRecord(eventId, value, now) {
       schemaVersion: 2,
       eventId,
       event: null,
+      deliveryProvenance: { version: DELIVERY_PROVENANCE_VERSION, source: "simulation" },
       deliveryState: "dead_letter",
       decision: null,
       decisionSnapshot: null,
@@ -482,6 +537,7 @@ function invalidRecord(eventId, value, now, code) {
     schemaVersion: 2,
     eventId,
     event: null,
+    deliveryProvenance: conservativeDeliveryProvenance(value),
     deliveryState: "dead_letter",
     decision: null,
     decisionSnapshot: null,
@@ -522,6 +578,13 @@ function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {
 function normalizeRecord(eventId, value, now) {
   if (value?.schemaVersion === 2) {
     const record = structuredClone(value);
+    let provenance = normalizeDeliveryProvenance(record.deliveryProvenance, {
+      legacy: record.deliveryProvenance === undefined && !TERMINAL_STATES.has(record.deliveryState),
+    });
+    if (!provenance && record.deliveryProvenance !== undefined && !TERMINAL_STATES.has(record.deliveryState)) {
+      return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+    }
+    if (provenance) record.deliveryProvenance = provenance;
     const snapshotEventId = record.event
       && typeof record.event === "object"
       && !Array.isArray(record.event)
@@ -594,7 +657,15 @@ function normalizeRecord(eventId, value, now) {
     if (record.deliveryState !== "retry_wait") record.nextAttemptAt = null;
     if (record.deliveryState !== "processing") record.lease = null;
     if (record.event && typeof record.event === "object" && !Array.isArray(record.event)) {
+      if (Object.hasOwn(record.event, "deliverySource") && record.event.deliverySource !== "simulation") {
+        return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
+      }
       record.event = normalizeEventSnapshot(record.event);
+      if (record.event.deliverySource === "simulation" && provenance?.source === "feishu") {
+        provenance = { version: DELIVERY_PROVENANCE_VERSION, source: "simulation" };
+        record.deliveryProvenance = provenance;
+      }
+      record.event = applyDeliveryProvenance(record.event, provenance);
     } else if (record.event !== null && record.event !== undefined) {
       return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
     }
@@ -645,6 +716,9 @@ function assertEvent(event) {
   }
   if (typeof event.eventId !== "string" || event.eventId.trim() === "") {
     throw new Error("event.eventId must be a non-empty string");
+  }
+  if (event.deliverySource !== undefined && event.deliverySource !== "simulation") {
+    throw new Error("event.deliverySource is invalid");
   }
 }
 
@@ -819,7 +893,10 @@ export class JsonStateStore {
         && REHYDRATABLE_SNAPSHOT_ERRORS.has(record.lastError?.code)
       ) {
         if (!hasEventSnapshot(event)) return { kind: "terminal", record: structuredClone(record) };
+        const provenance = conservativeDeliveryProvenance(record, event);
         record = newRecord(event, currentNow);
+        record.deliveryProvenance = provenance;
+        record.event = applyDeliveryProvenance(record.event, provenance);
         state[event.eventId] = record;
       }
 
@@ -836,7 +913,9 @@ export class JsonStateStore {
           state[event.eventId] = record;
           return { kind: "terminal", record: structuredClone(record) };
         }
-        record.event = normalizeEventSnapshot(event);
+        const provenance = conservativeDeliveryProvenance(record, event);
+        record.event = applyDeliveryProvenance(normalizeEventSnapshot(event), provenance);
+        record.deliveryProvenance = provenance;
         record.deliveryState = "pending";
         record.nextAttemptAt = null;
         record.lease = null;

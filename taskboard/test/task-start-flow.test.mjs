@@ -2477,32 +2477,64 @@ test("the unified execution endpoint starts a Feishu task and drag-to-processing
   }
 });
 
-test("automatic execution requests remain explicitly disabled until the policy is enabled", async () => {
-  const fixture = await createFixture();
+test("the external execution endpoint cannot claim the automatic trigger", async () => {
+  const fixture = await createFixture({ allowAutomaticExecution: true });
   try {
-    const project = await request(fixture.baseUrl, "/api/projects", {
-      method: "POST",
-      body: { id: "auto-cut-copy-a", name: "Auto-cut-copyA", workspacePath: fixture.workspace },
-    });
-    assert.equal(project.response.status, 201);
-    const task = await request(fixture.baseUrl, "/api/tasks", {
-      method: "POST",
-      body: {
-        projectId: "auto-cut-copy-a",
-        title: "Automatic execution",
-        description: feishuDescription(),
-        status: "todo",
-        priority: "high",
-        labels: ["feishu"],
+    const cases = [
+      {
+        name: "manual",
+        description: feishuDescriptionWith({
+          eventId: "fixture-manual-external-automatic",
+          recordId: "rec_manual_external_automatic",
+          mode: "manual",
+          executionMode: "manual",
+        }),
       },
-    });
-    const result = await request(fixture.baseUrl, `/api/local/tasks/${task.body.task.id}/execute`, {
-      method: "POST",
-      body: { trigger: "automatic" },
-    });
-    assert.equal(result.response.status, 409);
-    assert.equal(result.body.error.code, "AUTOMATIC_EXECUTION_DISABLED");
-    assert.equal(fixture.app.database.getTask(task.body.task.id).status, "todo");
+      {
+        name: "legacy automatic",
+        description: feishuDescriptionWith({
+          eventId: "fixture-legacy-external-automatic",
+          recordId: "rec_legacy_external_automatic",
+          mode: "automatic",
+          executionMode: "automatic",
+        }),
+      },
+      {
+        name: "simulated",
+        description: feishuDescriptionWith({
+          eventId: "fixture-simulated-external-automatic",
+          recordId: "rec_simulated_external_automatic",
+          deliverySource: "simulation",
+          mode: "manual",
+          executionMode: "manual",
+        }),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const created = await request(fixture.baseUrl, "/api/tasks", {
+        method: "POST",
+        body: {
+          projectId: FEISHU_PROJECT_ID,
+          title: `${testCase.name} task`,
+          description: testCase.description,
+          status: "todo",
+          priority: "high",
+          labels: ["feishu"],
+        },
+      });
+      assert.equal(created.response.status, 201, testCase.name);
+
+      const result = await request(
+        fixture.baseUrl,
+        `/api/local/tasks/${created.body.task.id}/execute`,
+        { method: "POST", body: { trigger: "automatic" } },
+      );
+      assert.equal(result.response.status, 409, testCase.name);
+      assert.equal(result.body.error.code, "AUTOMATIC_EXECUTION_NOT_ALLOWED", testCase.name);
+      assert.equal(fixture.app.database.getTask(created.body.task.id).status, "todo", testCase.name);
+      assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id), null, testCase.name);
+    }
   } finally {
     await fixture.app.close();
     await rm(fixture.directory, { recursive: true, force: true });

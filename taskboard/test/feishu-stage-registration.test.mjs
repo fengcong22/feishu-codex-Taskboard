@@ -193,6 +193,31 @@ test("canonical stage registration derives execution policy from the enabled sna
   }
 });
 
+test("canonical stage registration still schedules automatic execution internally", async () => {
+  const fixtureData = await fixture({ allowAutomaticExecution: true });
+  try {
+    const subject = await enableSubject(fixtureData);
+    const registeredAt = Date.now();
+    const result = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, { event: { eventId: "evt-stage-internal-automatic" } }),
+    );
+    assert.equal(result.response.status, 201, JSON.stringify(result.body));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const execution = fixtureData.app.database.getFeishuExecution(result.body.task.id);
+    assert.equal(execution?.trigger, "automatic");
+    assert.equal(execution?.mode, "automatic");
+    assert.equal(execution?.state, "delayed");
+    assert.ok(execution.readyAt >= registeredAt + 4_000);
+    assert.equal(fixtureData.app.database.getTask(result.body.task.id).status, "todo");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
 test("simulated stage registration is never eligible for automatic execution", async () => {
   const fixtureData = await fixture({ allowAutomaticExecution: true });
   try {

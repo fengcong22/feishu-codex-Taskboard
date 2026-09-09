@@ -1676,8 +1676,15 @@ function parseExecutionBody(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["trigger"]));
   const trigger = body.trigger ?? "manual";
-  if (!["manual", "move", "automatic"].includes(trigger)) {
-    throw new ApiError(400, "INVALID_FIELD", "'trigger' must be manual, move, or automatic");
+  if (trigger === "automatic") {
+    throw new ApiError(
+      409,
+      "AUTOMATIC_EXECUTION_NOT_ALLOWED",
+      "The automatic execution trigger is reserved for server-managed workflow registration",
+    );
+  }
+  if (!["manual", "move"].includes(trigger)) {
+    throw new ApiError(400, "INVALID_FIELD", "'trigger' must be manual or move");
   }
   return { trigger };
 }

@@ -186,7 +186,7 @@ The Bridge uses these loopback routes for lifecycle reconciliation:
 
 - `GET /api/local/feishu/tasks` — query trusted tasks by event or Base/table/record/trigger scope.
 - `POST /api/local/feishu/tasks/:id/archive` — archive only a trusted task after an optimistic version check.
-- `POST /api/local/tasks/:id/execute` — the single execution claim path used by manual start and drag-to-`in_progress`. Repeated requests for the same task and trigger reuse the existing reservation; a different trigger remains protected by the start-in-progress conflict.
+- `POST /api/local/tasks/:id/execute` — the execution claim path used by manual start and drag-to-`in_progress`. Its request body accepts only `manual` or `move`; `automatic` is reserved for Taskboard's internal trusted-registration scheduler and is rejected at this endpoint. Repeated requests for the same task and trigger reuse the existing reservation; a different trigger remains protected by the start-in-progress conflict.
 
 Each Base/table subject has a deterministic isolated project id: `feishu-` plus the first 16 hexadecimal characters of `sha256(baseToken:tableId)`. The Bridge and Taskboard must use this same rule; existing legacy project ids are not rewritten automatically, and newly delivered tasks use the 16-character form.
 
