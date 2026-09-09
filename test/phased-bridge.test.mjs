@@ -190,6 +190,31 @@ test("controlled context accepts the configured record's trusted Feishu Wiki lin
   assert.deepEqual(await readDocumentLinks(wikiUrl), [wikiUrl]);
 });
 
+test("controlled context requests structured text so Docx mentions retain their link", async () => {
+  const docxUrl = "https://guanghe.feishu.cn/docx/UlB9d4x5loey36xW3zMcnjC7nFb";
+  const calls = [];
+  const reader = createFeishuControlledContextReader({
+    client: {
+      bitable: { v1: { appTableRecord: { get: async (request) => {
+        calls.push(request);
+        const value = request.params?.text_field_as_array === true
+          ? [{ type: "mention", mentionType: "Docx", text: "课程文档", link: docxUrl }]
+          : "课程文档";
+        return { code: 0, data: { record: { fields: { 集合文档: value } } } };
+      } } } },
+    },
+  });
+
+  const result = await reader.read(subject, {
+    baseToken: "bas_demo",
+    tableId: "tbl_math",
+    recordId: "rec-1",
+  });
+
+  assert.deepEqual(result.documentLinks, [docxUrl]);
+  assert.deepEqual(calls[0].params, { text_field_as_array: true });
+});
+
 test("controlled context strips Feishu's Base navigation hint from a trusted Wiki link", async () => {
   const wikiUrl = "https://guanghe.feishu.cn/wiki/D4mIwGfEviHFPjkht6ic1iManzh";
   const baseCellUrl = `${wikiUrl}?pre_pathname=%2Fdrive%2Fhome%2Frecents%2F`;

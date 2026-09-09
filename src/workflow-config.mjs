@@ -674,4 +674,3 @@ export const __internal = Object.freeze({
   localPath,
   clone,
 });
-

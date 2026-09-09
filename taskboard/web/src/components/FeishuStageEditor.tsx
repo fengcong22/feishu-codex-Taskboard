@@ -269,4 +269,3 @@ export function FeishuStageEditor({
 }
 
 export const FEISHU_STAGE_LABELS = STAGE_LABELS;
-

@@ -47,4 +47,3 @@ test("controlled-context refresh sends only immutable record identity", async ()
     globalThis.fetch = originalFetch;
   }
 });
-
