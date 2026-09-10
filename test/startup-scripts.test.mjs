@@ -1059,7 +1059,7 @@ test("stop preserves a live valid sidecar when its PID marker is missing or malf
     const stopScript = join(scripts, "stop-local.ps1");
     const helperScript = join(scripts, "process-identity.ps1");
     const fakePid = 2147482996;
-    const nodeExecutable = "C:\\Program Files\\nodejs\\node.exe";
+    const nodeExecutable = process.execPath;
 
     try {
       await Promise.all([
@@ -1199,7 +1199,7 @@ test("stop checks the second target after refusing the first live target", async
   const helperScript = join(scripts, "process-identity.ps1");
   const bridgeScript = join(repository, "src", "index.mjs");
   const killMarker = join(directory, "taskkill-called.txt");
-  const nodeExecutable = "C:\\Program Files\\nodejs\\node.exe";
+  const nodeExecutable = process.execPath;
 
   try {
     const helperSource = await readFile(files.processIdentity, "utf8");
@@ -1262,7 +1262,7 @@ test("stop treats a CIM query error as refusal and still stops the second target
   const stopScript = join(scripts, "stop-local.ps1");
   const helperScript = join(scripts, "process-identity.ps1");
   const killMarker = join(directory, "taskkill-called.txt");
-  const nodeExecutable = "C:\\Program Files\\nodejs\\node.exe";
+  const nodeExecutable = process.execPath;
 
   try {
     const helperSource = await readFile(files.processIdentity, "utf8");
@@ -1332,7 +1332,7 @@ test("stop continues after marker deletion fails for an already stopped target",
   const stopScript = join(scripts, "stop-local.ps1");
   const helperScript = join(scripts, "process-identity.ps1");
   const killMarker = join(directory, "taskkill-called.txt");
-  const nodeExecutable = "C:\\Program Files\\nodejs\\node.exe";
+  const nodeExecutable = process.execPath;
 
   try {
     const helperSource = await readFile(files.processIdentity, "utf8");
@@ -1399,7 +1399,7 @@ test("stop terminates only an isolated process with matching persisted identity"
   const helperScript = join(scripts, "process-identity.ps1");
   const killMarker = join(directory, "taskkill-called.txt");
   const fakePid = 2147482999;
-  const nodeExecutable = "C:\\Program Files\\nodejs\\node.exe";
+  const nodeExecutable = process.execPath;
 
   try {
     const helperSource = await readFile(files.processIdentity, "utf8");
