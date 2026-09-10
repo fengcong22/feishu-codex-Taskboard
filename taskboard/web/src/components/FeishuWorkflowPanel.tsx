@@ -80,6 +80,15 @@ function currentFieldName(
   return uniqueMetadataField(fields, descriptor?.fieldId)?.fieldName ?? descriptor?.fieldName ?? "";
 }
 
+function uniqueMetadataOption(
+  field: FeishuFieldMetadata | undefined,
+  optionId: string | null | undefined,
+) {
+  if (!optionId) return undefined;
+  const matches = (field?.options ?? []).filter((option) => option.id === optionId);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata[]): FeishuStageConfigMap {
   const status = subject.statusField;
   const statusField = fields.find((field) => field.fieldId === status?.fieldId)
@@ -106,7 +115,11 @@ function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata
     if (!old) return [stageId, fallback];
     const cloned = structuredClone(old);
     const currentTriggerField = uniqueMetadataField(fields, cloned.trigger.fieldId);
-    if (currentTriggerField) cloned.trigger.fieldName = currentTriggerField.fieldName;
+    if (currentTriggerField) {
+      cloned.trigger.fieldName = currentTriggerField.fieldName;
+      const currentOption = uniqueMetadataOption(currentTriggerField, cloned.trigger.optionId);
+      if (currentOption) cloned.trigger.value = currentOption.name;
+    }
     return [stageId, cloned];
   })) as FeishuStageConfigMap;
 }
@@ -195,7 +208,12 @@ function phasedFieldNamesNeedRefresh(subject: FeishuSubjectConfig): boolean {
     return Boolean(current && descriptor?.fieldName !== current.fieldName);
   };
   return [subject.statusField, subject.documentField, subject.namingField].some(descriptorIsStale)
-    || Object.values(subject.stages ?? {}).some((stage) => descriptorIsStale(stage.trigger));
+    || Object.values(subject.stages ?? {}).some((stage) => {
+      if (descriptorIsStale(stage.trigger)) return true;
+      const field = uniqueMetadataField(fields, stage.trigger.fieldId);
+      const option = uniqueMetadataOption(field, stage.trigger.optionId);
+      return Boolean(option && stage.trigger.value !== option.name);
+    });
 }
 
 function resourceGroupsFrom(value: string): string[] {

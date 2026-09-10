@@ -148,7 +148,7 @@ function bridgeShareDiagnosticContext(configuration) {
     for (const subject of Array.isArray(base.subjects) ? base.subjects : []) {
       const subjectPath = `${basePath}.subjects.${subject.tableId}`;
       for (const suffix of [
-        "", ".fields", ".trigger.fieldId", ".trigger.fieldName", ".trigger.startValue",
+        "", ".fields", ".trigger.fieldId", ".trigger.fieldName", ".trigger.optionId", ".trigger.startValue",
         ".title.fieldId", ".title.fieldName", ".subjectCode.fieldId", ".subjectCode.fieldName",
         ".packageRoute", ".upload.artifactSourcePath", ".upload.targetPath",
       ]) paths.add(`${subjectPath}${suffix}`);

@@ -285,7 +285,11 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     configured.metadata = {
       fields: [
         ...fields.map((field) => field.fieldId === "fld_status"
-          ? { ...field, fieldName: "新状态" }
+          ? {
+            ...field,
+            fieldName: "新状态",
+            options: field.options.map((option) => ({ ...option, name: `新${option.name}` })),
+          }
           : field),
         { fieldId: "fld_document", fieldName: "新素材文档", type: 1, uiType: "Text", options: [] },
         { fieldId: "fld_name", fieldName: "新命名", type: 1, uiType: "Text", options: [] },
@@ -304,6 +308,7 @@ describe("FeishuWorkflowPanel audio drafts", () => {
 
     expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value).toBe("fld_status");
     expect(within(screen.getByRole("combobox", { name: "状态字段" })).getByRole("option", { name: "新状态" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "启用" }).getAttribute("title")).toBe("请先保存草稿");
     fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
     await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
 
@@ -319,6 +324,9 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(patch.namingField.fieldName).toBe("新命名");
     expect(Object.values(patch.stages).map((value) => value.trigger.fieldName)).toEqual([
       "新状态", "新状态", "新状态",
+    ]);
+    expect(Object.values(patch.stages).map((value) => value.trigger.value)).toEqual([
+      "新初稿", "新初审修改", "新终审修改",
     ]);
   });
 

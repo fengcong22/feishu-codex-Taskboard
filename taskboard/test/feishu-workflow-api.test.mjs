@@ -1724,6 +1724,9 @@ test("share import preserves safe legacy diagnostics from the real Bridge valida
         }),
         legacySubject("tbl_missing"),
         legacySubject("tbl_ambiguous"),
+        legacySubject("tbl_text_trigger", {
+          trigger: { fieldId: "fld_status", fieldName: "Status", startValue: "Ready", optionId: "opt_ready" },
+        }),
         legacySubject("tbl_invalid"),
       ],
     }],
@@ -1766,6 +1769,10 @@ test("share import preserves safe legacy diagnostics from the real Bridge valida
             { id: "opt_ready_a", name: "Ready" },
             { id: "opt_ready_b", name: "Ready" },
           ])],
+        }, {
+          tableId: "tbl_text_trigger",
+          tableName: "tbl_text_trigger",
+          fields: [{ fieldId: "fld_status", fieldName: "Status", type: 1, uiType: "Text", options: [] }],
         }, invalidTable, structuredClone(invalidTable)],
       }),
     },
@@ -1808,6 +1815,7 @@ test("share import preserves safe legacy diagnostics from the real Bridge valida
         ["FIELD_NAME_MISMATCH", "bases.bas_legacy_share.subjects.tbl_names.title.fieldName"],
         ["OPTION_NOT_FOUND", "bases.bas_legacy_share.subjects.tbl_missing.trigger.startValue"],
         ["OPTION_AMBIGUOUS", "bases.bas_legacy_share.subjects.tbl_ambiguous.trigger.startValue"],
+        ["OPTION_NOT_FOUND", "bases.bas_legacy_share.subjects.tbl_text_trigger.trigger.optionId"],
         ["FEISHU_METADATA_INVALID_RESPONSE", "bases.bas_legacy_share.subjects.tbl_invalid"],
       ],
     );
