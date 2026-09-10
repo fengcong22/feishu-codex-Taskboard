@@ -82,9 +82,9 @@ test("trigger settings bind Feishu metadata field and option identities", async 
   assert.match(types, /options: FeishuFieldOption\[\]/);
   assert.match(panel, /selected\.metadata\?\.fields/);
   assert.match(panel, /triggerFieldId/);
-  assert.match(panel, /fieldId: subjectForm\.triggerFieldId/);
-  assert.match(panel, /fieldName: subjectForm\.triggerFieldName/);
-  assert.match(panel, /optionId: subjectForm\.optionId/);
+  assert.match(panel, /fieldId: firstEnabledStage\?\.trigger\.fieldId \?\? subjectForm\.triggerFieldId/);
+  assert.match(panel, /fieldName: firstEnabledStage\?\.trigger\.fieldName \?\? subjectForm\.triggerFieldName/);
+  assert.match(panel, /optionId: firstEnabledStage\?\.trigger\.optionId \?\? subjectForm\.optionId/);
   assert.match(panel, /expectedVersion: selected\.configVersion/);
   assert.match(panel, /startValueOptions/);
   assert.match(panel, /option\.id/);

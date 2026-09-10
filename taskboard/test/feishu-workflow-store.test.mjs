@@ -406,6 +406,114 @@ test("keeps unresolved phased option bindings as a blocked repairable draft afte
   }
 });
 
+test("rejects phased save and enable when a configured metadata option id is duplicated", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const duplicate = structuredClone(original);
+    duplicate.metadataRefreshedAt = 1710000004000;
+    duplicate.tables[0].fields = duplicate.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status"
+        ? { ...field, options: [{ id: "opt_ready", name: "待制作" }, { id: "opt_ready", name: "重复待制作" }] }
+        : field
+    ));
+    const refreshed = await store.upsertBasePreview(duplicate);
+    const draft = refreshed.subjects[0];
+    assert.equal(draft.lifecycle, "draft");
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(draft.subjectKey, { expectedVersion: draft.configVersion }),
+      (error) => error.code === "TRIGGER_OPTION_NOT_UNIQUE" && error.status === 400,
+    );
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "TRIGGER_OPTION_NOT_UNIQUE" && error.status === 409,
+    );
+    assert.equal((await store.getSubject(draft.subjectKey)).configVersion, enabled.configVersion + 1);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects phased save and enable when a configured metadata field id is duplicated", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const duplicate = structuredClone(original);
+    duplicate.metadataRefreshedAt = 1710000004500;
+    duplicate.tables[0].fields.push({
+      ...structuredClone(duplicate.tables[0].fields.find((field) => field.fieldId === "fld_status")),
+      fieldName: "重复流程字段",
+    });
+    const refreshed = await store.upsertBasePreview(duplicate);
+    const draft = refreshed.subjects[0];
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(draft.subjectKey, { expectedVersion: draft.configVersion }),
+      (error) => error.code === "FIELD_NOT_UNIQUE" && error.status === 400,
+    );
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "TRIGGER_FIELD_NOT_UNIQUE" && error.status === 409,
+    );
+    assert.equal((await store.getSubject(draft.subjectKey)).configVersion, enabled.configVersion + 1);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("derives the legacy trigger from the first enabled phased stage on direct repair saves", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const renamed = structuredClone(original);
+    renamed.metadataRefreshedAt = 1710000005000;
+    renamed.tables[0].fields = renamed.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status"
+        ? { ...field, options: [{ id: "opt_ready", name: "新初稿" }] }
+        : field
+    ));
+    const refreshed = await store.upsertBasePreview(renamed);
+    const draft = refreshed.subjects[0];
+    const repaired = await store.saveSubjectDraft(draft.subjectKey, {
+      expectedVersion: draft.configVersion,
+      statusField: { fieldId: "fld_status", fieldName: "待制作" },
+      stages: {
+        initial: {
+          trigger: { fieldId: "fld_status", fieldName: "待制作", optionId: "opt_ready", value: "新初稿" },
+        },
+      },
+    });
+
+    assert.deepEqual(repaired.trigger, {
+      fieldId: "fld_status",
+      fieldName: "待制作",
+      startValue: "新初稿",
+      optionId: "opt_ready",
+    });
+    const reenabled = await store.enableSubject(repaired.subjectKey, repaired.configVersion);
+    assert.equal(reenabled.lifecycle, "enabled");
+    assert.equal(reenabled.configVersion, enabled.configVersion + 3);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("database Feishu archive reports a missing task as TASK_NOT_FOUND", async () => {
   const { directory, database } = await fixture();
   try {

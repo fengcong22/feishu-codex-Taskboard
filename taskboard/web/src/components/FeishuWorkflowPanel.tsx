@@ -73,6 +73,11 @@ function uniqueMetadataField(fields: FeishuFieldMetadata[], fieldId: string | nu
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+function metadataFieldMatches(fields: FeishuFieldMetadata[], fieldId: string | null | undefined): FeishuFieldMetadata[] {
+  if (!fieldId) return [];
+  return fields.filter((field) => field.fieldId === fieldId);
+}
+
 function currentFieldName(
   fields: FeishuFieldMetadata[],
   descriptor: { fieldId?: string | null; fieldName?: string | null } | null | undefined,
@@ -229,6 +234,7 @@ function reconcileFormMetadata(form: SubjectForm, fields: FeishuFieldMetadata[])
     statusFieldName: statusField?.fieldName ?? form.statusFieldName,
     documentFieldName: documentField?.fieldName ?? form.documentFieldName,
     namingFieldName: namingField?.fieldName ?? form.namingFieldName,
+    titleFieldName: uniqueMetadataField(fields, form.titleFieldId)?.fieldName ?? form.titleFieldName,
     stages,
   };
 }
@@ -245,6 +251,10 @@ function editableSubjectSignature(subject: FeishuSubjectConfig): string {
     namingField: subject.namingField ?? null,
     stages: subject.stages ?? null,
   });
+}
+
+function metadataSignature(subject: FeishuSubjectConfig): string {
+  return JSON.stringify(subject.metadata ?? null);
 }
 
 function phasedFieldNamesNeedRefresh(subject: FeishuSubjectConfig): boolean {
@@ -305,6 +315,8 @@ export function FeishuWorkflowPanel({
   const [packageOptions, setPackageOptions] = useState<FeishuPackageSummary[] | null>(null);
   const shareFileRef = useRef<HTMLInputElement | null>(null);
   const preserveDirtyFormForSubjectRef = useRef<string | null>(null);
+  const metadataRefreshNeedsSaveRef = useRef(new Map<string, number>());
+  const [, setMetadataRefreshRevision] = useState(0);
   const scopedCatalog = useMemo(() => (
     configurationBaseToken
       ? catalog.filter((base) => base.baseToken === configurationBaseToken)
@@ -326,10 +338,13 @@ export function FeishuWorkflowPanel({
   const previousSelectedRef = useRef(selected ? {
     subjectKey: selected.subjectKey,
     editableSignature: editableSubjectSignature(selected),
+    configVersion: selected.configVersion,
+    metadataSignature: metadataSignature(selected),
   } : null);
   const subjectFormDirty = Boolean(selected && subjectForm
     && (JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected))
-      || phasedFieldNamesNeedRefresh(selected)));
+      || phasedFieldNamesNeedRefresh(selected)
+      || metadataRefreshNeedsSaveRef.current.get(selected.subjectKey) === selected.configVersion));
   const selectedPackage = packageOptions?.find((item) => item.alias === subjectForm?.packageAlias);
   const visibleSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => subject.displayEnabled);
   const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);
@@ -361,10 +376,13 @@ export function FeishuWorkflowPanel({
         const matches = statusOptions.filter((option) => option.id === stage.trigger.optionId);
         if (matches.length === 0) errors.push(`${phaseLabel}的触发选项当前不可用`);
         else if (matches.length > 1) errors.push(`${phaseLabel}的触发选项不唯一`);
-        else if (stage.trigger.value !== matches[0].name) errors.push(`${phaseLabel}的触发选项名称需要刷新`);
       }
       if (stage.videoSource.kind === "docx_section" && !stage.videoSource.anchorText?.trim()) errors.push(`${phaseLabel}需要视频目录标题`);
-      if (stage.videoSource.kind === "base_attachment" && !stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
+      if (stage.enabled && stage.trigger.fieldId !== subjectForm.statusFieldId) errors.push(`${phaseLabel}的触发字段与状态字段不一致`);
+      if (stage.videoSource.kind === "base_attachment") {
+        if (!stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
+        else if (!attachmentFieldIds.has(stage.videoSource.fieldId)) errors.push(`${phaseLabel}的视频附件字段当前不可用`);
+      }
       if (!stage.reviewSource.anchorText?.trim()) errors.push(`${phaseLabel}需要剪辑意见目录标题`);
       if (stage.audio.mode === "replace_original") {
         if (stage.audio.source?.kind === "docx_section") {
@@ -384,8 +402,12 @@ export function FeishuWorkflowPanel({
       if (subjectForm.enqueueMode === "automatic" && !stage.artifactTargetPath?.trim()) errors.push(`${phaseLabel}需要 ZIP 目标目录`);
     }
     if (!subjectForm.statusFieldId) errors.push("请选择状态字段");
+    else if (metadataFieldMatches(triggerFields, subjectForm.statusFieldId).length !== 1) errors.push("状态字段当前不可用或不唯一");
     if (!subjectForm.documentFieldId) errors.push("请选择素材文档字段");
+    else if (metadataFieldMatches(triggerFields, subjectForm.documentFieldId).length === 0) errors.push("素材文档字段当前不可用");
     if (!subjectForm.namingFieldId) errors.push("请选择命名字段");
+    else if (metadataFieldMatches(triggerFields, subjectForm.namingFieldId).length === 0) errors.push("命名字段当前不可用");
+    else if (metadataFieldMatches(triggerFields, subjectForm.namingFieldId).length > 1) errors.push("命名字段不唯一");
     return [...new Set(errors)];
   }, [attachmentFieldIds, subjectForm]);
   const enableBlockedReason = subjectFormDirty
@@ -436,11 +458,19 @@ export function FeishuWorkflowPanel({
     const previousSelected = previousSelectedRef.current;
     const sameSubject = previousSelected?.subjectKey === selected.subjectKey;
     const editableSignature = editableSubjectSignature(selected);
-    const metadataOnlyRefresh = sameSubject && previousSelected.editableSignature === editableSignature;
+    const metadataOnlyRefresh = sameSubject
+      && previousSelected.editableSignature === editableSignature
+      && previousSelected.metadataSignature !== metadataSignature(selected);
+    if (metadataOnlyRefresh) {
+      metadataRefreshNeedsSaveRef.current.set(selected.subjectKey, selected.configVersion);
+      setMetadataRefreshRevision((value) => value + 1);
+    }
     const preserveCurrentForm = preserveDirtyForm || metadataOnlyRefresh;
     previousSelectedRef.current = {
       subjectKey: selected.subjectKey,
       editableSignature,
+      configVersion: selected.configVersion,
+      metadataSignature: metadataSignature(selected),
     };
     const cached = audioDraftsBySubjectRef.current.get(selected.subjectKey);
     if (!cached || (!preserveCurrentForm && cached.configVersion !== selected.configVersion)) {
@@ -630,7 +660,11 @@ export function FeishuWorkflowPanel({
         } : {}),
       };
       const subject = await (onSaveDraft ? onSaveDraft(selected.subjectKey, patch) : saveFeishuWorkflowDraft(selected.subjectKey, patch));
-      if (subject) onSubjectChange(subject);
+      if (subject) {
+        metadataRefreshNeedsSaveRef.current.delete(selected.subjectKey);
+        setMetadataRefreshRevision((value) => value + 1);
+        onSubjectChange(subject);
+      }
     }
     catch (error) { onError?.(error instanceof Error ? error.message : "无法保存草稿"); }
     finally { setBusy(false); }
@@ -760,8 +794,8 @@ export function FeishuWorkflowPanel({
                 onChange={(event) => selectPhasedField("status", event.target.value)}
               >
                 <option value="">选择单选状态字段</option>
-                {triggerFields.filter(isSingleSelectField).map((field) => (
-                  <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>
+                {triggerFields.filter(isSingleSelectField).map((field, index) => (
+                  <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>
                 ))}
               </select>
             </label>
@@ -773,7 +807,7 @@ export function FeishuWorkflowPanel({
                 onChange={(event) => selectPhasedField("document", event.target.value)}
               >
                 <option value="">选择文档字段</option>
-                {metadataFieldOptions.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+                {metadataFieldOptions.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
               </select>
             </label>
             <label>
@@ -784,7 +818,7 @@ export function FeishuWorkflowPanel({
                 onChange={(event) => selectPhasedField("naming", event.target.value)}
               >
                 <option value="">选择命名字段</option>
-                {metadataFieldOptions.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+                {metadataFieldOptions.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
               </select>
             </label>
           </div>
@@ -810,12 +844,12 @@ export function FeishuWorkflowPanel({
         <div className="feishu-settings-grid">
           <label>触发字段<select value={subjectForm.triggerFieldId} onChange={(event) => selectTriggerField(event.target.value)}>
             {!hasConfiguredTriggerField && <option value={subjectForm.triggerFieldId}>{subjectForm.triggerFieldName}（已有配置）</option>}
-            {triggerFields.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+            {triggerFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
           </select></label>
           <label>可开始值（如待剪辑/待制作）{startValueOptions.length > 0
             ? <select value={startValueSelectValue} onChange={(event) => selectStartValue(event.target.value)}>
               {!configuredStartValueOption && <option value={startValueSelectValue}>{subjectForm.startValue}（已有配置）</option>}
-              {startValueOptions.map((option) => <option key={option.id} value={`option:${option.id}`}>{option.name}</option>)}
+              {startValueOptions.map((option, index) => <option key={`${option.id}:${index}`} value={`option:${option.id}`}>{option.name}</option>)}
             </select>
             : <input value={subjectForm.startValue} onChange={(event) => setSubjectForm({ ...subjectForm, startValue: event.target.value, optionId: null })} />}
           </label>
@@ -823,7 +857,7 @@ export function FeishuWorkflowPanel({
             <option value="">使用记录 ID</option>
             {!hasConfiguredTitleField && subjectForm.titleFieldId
               && <option value={subjectForm.titleFieldId}>{subjectForm.titleFieldName}（已有配置）</option>}
-            {triggerFields.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+            {triggerFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
           </select></label>
           <label>剪辑模式<select value={subjectForm.executionMode} onChange={(event) => setSubjectForm({ ...subjectForm, executionMode: event.target.value as SubjectForm["executionMode"] })}><option value="manual">手动</option><option value="automatic">自动</option></select></label>
           <label>并发组<input value={subjectForm.concurrencyGroup} onChange={(event) => setSubjectForm({ ...subjectForm, concurrencyGroup: event.target.value })} /></label>

@@ -337,7 +337,8 @@ describe("FeishuWorkflowPanel audio drafts", () => {
   it("preserves unsaved operator edits while reconciling a same-subject metadata refresh", async () => {
     const configured = subject("refresh", "刷新学科");
     const refreshed = structuredClone(configured);
-    refreshed.configVersion = configured.configVersion + 1;
+    // A metadata-only refresh can arrive with the same config version.
+    refreshed.configVersion = configured.configVersion;
     refreshed.metadata = {
       fields: fields.map((field) => field.fieldId === "fld_status"
         ? {
@@ -378,6 +379,7 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect((screen.getByRole("textbox", { name: "初稿命名后缀" }) as HTMLInputElement).value).toBe("_用户未保存");
     expect(within(screen.getByRole("combobox", { name: "状态字段" })).getByRole("option", { name: "刷新状态" })).toBeTruthy();
     expect(within(screen.getByRole("combobox", { name: "初稿触发选项" })).getByRole("option", { name: "刷新初稿" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "启用" }).getAttribute("title")).toBe("请先保存草稿");
 
     fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
     await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
@@ -459,6 +461,27 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(screen.getByText("初稿的触发选项不唯一")).toBeTruthy();
     expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("blocks save when phased field bindings are missing, ambiguous, or inconsistent", () => {
+    const configured = subject("invalid-fields", "无效字段");
+    configured.documentField = { fieldId: "fld_deleted", fieldName: "已删除文档" };
+    configured.namingField = { fieldId: "fld_text", fieldName: "名称" };
+    configured.metadata = {
+      fields: [...fields, { ...fields[1], fieldName: "重复普通文本" }],
+    };
+    configured.stages!.initial.trigger.fieldId = "fld_other_status";
+    configured.stages!.initial.videoSource = { kind: "base_attachment", fieldId: "fld_deleted_video" };
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="invalid-fields"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {

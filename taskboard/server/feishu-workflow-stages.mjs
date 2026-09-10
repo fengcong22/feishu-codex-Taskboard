@@ -189,6 +189,10 @@ function metadataField(metadata, id) {
   return metadataFields(metadata).find((field) => fieldId(field) === id) ?? null;
 }
 
+function metadataFieldMatches(metadata, id) {
+  return metadataFields(metadata).filter((field) => fieldId(field) === id);
+}
+
 function normalizedType(value) {
   if (typeof value === "number" && Number.isSafeInteger(value)) return value;
   if (typeof value === "string" && /^\d+$/u.test(value.trim())) return Number(value.trim());
@@ -316,6 +320,8 @@ function validateMetadataField(metadata, descriptor, name, predicate = null, { r
   const configuredName = text(descriptor?.fieldName ?? descriptor?.field_name, `${name}.fieldName`, { optional: !required });
   if (id === null) return { fieldId: null, fieldName: null };
   const field = metadataField(metadata, id);
+  const matches = metadataFieldMatches(metadata, id);
+  if (matches.length > 1) throw fail(`${name}.fieldId is not unique in metadata`, "FIELD_NOT_UNIQUE");
   if (metadataFields(metadata).length > 0 && !field) throw fail(`${name}.fieldId is not present in metadata`, "FIELD_NOT_FOUND");
   if (field && predicate && !predicate(field)) throw fail(`${name}.fieldId has an incompatible type`, "FIELD_TYPE_INVALID");
   return { fieldId: id, fieldName: configuredName ?? text(fieldName(field), `${name}.fieldName`) };
@@ -341,12 +347,18 @@ export function assertPhasedAttachmentBindings(value, metadata = value?.metadata
   }
   const resolve = (source, path) => {
     if (!source || source.kind !== "base_attachment") return;
-    const field = fields.find((candidate) => fieldId(candidate) === source.fieldId);
-    if (!field) {
+    const matches = fields.filter((candidate) => fieldId(candidate) === source.fieldId);
+    if (matches.length === 0) {
       const error = fail(`${path} is not present in metadata`, "FIELD_NOT_FOUND");
       error.path = path;
       throw error;
     }
+    if (matches.length > 1) {
+      const error = fail(`${path} is not unique in metadata`, "FIELD_NOT_UNIQUE");
+      error.path = path;
+      throw error;
+    }
+    const field = matches[0];
     if (!isAttachmentMetadataField(field)) {
       const error = fail(`${path} must identify an attachment field`, "FIELD_TYPE_INVALID");
       error.path = path;
@@ -398,10 +410,16 @@ export function validatePhasedSubjectConfig(value) {
   const optionIds = enabled.map((stageId) => stages[stageId].trigger.optionId);
   if (new Set(optionIds).size !== optionIds.length) throw fail("enabled stage trigger options must be unique");
   const field = metadataField(metadata, statusField.fieldId);
+  const statusFieldMatches = metadataFieldMatches(metadata, statusField.fieldId);
+  if (statusFieldMatches.length > 1) {
+    throw fail("statusField.fieldId is not unique in metadata", "FIELD_NOT_UNIQUE");
+  }
   if (field && Array.isArray(field.options)) {
     for (const stageId of enabled) {
-      const option = field.options.find((candidate) => candidate?.id === stages[stageId].trigger.optionId);
-      if (!option) throw fail(`stages.${stageId}.trigger.optionId is not present in metadata`, "TRIGGER_OPTION_NOT_FOUND");
+      const matches = field.options.filter((candidate) => candidate?.id === stages[stageId].trigger.optionId);
+      if (matches.length === 0) throw fail(`stages.${stageId}.trigger.optionId is not present in metadata`, "TRIGGER_OPTION_NOT_FOUND");
+      if (matches.length > 1) throw fail(`stages.${stageId}.trigger.optionId is not unique in metadata`, "TRIGGER_OPTION_NOT_UNIQUE");
+      const option = matches[0];
       if (option.name !== stages[stageId].trigger.value) {
         throw fail(`stages.${stageId}.trigger.value does not match metadata`, "TRIGGER_OPTION_NOT_FOUND");
       }

@@ -446,6 +446,18 @@ export function validateSubjectConfig(value) {
         }
       }
       for (const key of ["statusField", "documentField", "namingField", "stages"]) value[key] = normalized[key];
+      const firstEnabledStage = STAGE_IDS
+        .map((stageId) => normalized.stages[stageId])
+        .find((stage) => stage?.enabled);
+      if (firstEnabledStage) {
+        value.trigger = {
+          ...value.trigger,
+          fieldId: firstEnabledStage.trigger.fieldId,
+          fieldName: firstEnabledStage.trigger.fieldName,
+          startValue: firstEnabledStage.trigger.value,
+          optionId: firstEnabledStage.trigger.optionId,
+        };
+      }
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
@@ -475,13 +487,19 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     try {
       assertPhasedAttachmentBindings(subject, subject.metadata);
     } catch (error) {
-      const code = error?.code === "FIELD_TYPE_INVALID" ? "FIELD_TYPE_INVALID" : "FIELD_NOT_FOUND";
+      const code = error?.code === "FIELD_TYPE_INVALID"
+        ? "FIELD_TYPE_INVALID"
+        : error?.code === "FIELD_NOT_UNIQUE"
+          ? "FIELD_NOT_UNIQUE"
+          : "FIELD_NOT_FOUND";
       throw new ApiError(
         409,
         code,
         code === "FIELD_TYPE_INVALID"
           ? "A configured phased source is not an attachment field"
-          : "A configured phased attachment field is not present in the latest Base metadata",
+          : code === "FIELD_NOT_UNIQUE"
+            ? "A configured phased field is not unique in the latest Base metadata"
+            : "A configured phased attachment field is not present in the latest Base metadata",
         error?.path ? { path: error.path } : undefined,
       );
     }
@@ -496,29 +514,36 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
 
   function assertTriggerMetadata(subject) {
     const fields = Array.isArray(subject?.metadata?.fields) ? subject.metadata.fields : [];
-    const field = fields.find((candidate) => (
+    const fieldMatches = fields.filter((candidate) => (
       candidate && typeof candidate === "object"
       && (candidate.fieldId ?? candidate.id) === subject.trigger.fieldId
     ));
-    if (!field) {
+    if (fieldMatches.length === 0) {
       throw new ApiError(
         409,
         "TRIGGER_FIELD_NOT_FOUND",
         "The configured trigger field is not present in the latest Base metadata",
       );
     }
+    if (fieldMatches.length > 1) {
+      throw new ApiError(409, "TRIGGER_FIELD_NOT_UNIQUE", "The configured trigger field is not unique in the latest Base metadata");
+    }
+    const field = fieldMatches[0];
     if (subject.trigger.optionId) {
       const options = Array.isArray(field.options) ? field.options : [];
-      const option = options.find((candidate) => (
+      const optionMatches = options.filter((candidate) => (
         candidate && typeof candidate === "object"
         && candidate.id === subject.trigger.optionId
       ));
-      if (!option || option.name !== subject.trigger.startValue) {
+      if (optionMatches.length === 0 || optionMatches.length > 1) {
         throw new ApiError(
           409,
-          "TRIGGER_OPTION_NOT_FOUND",
+          optionMatches.length > 1 ? "TRIGGER_OPTION_NOT_UNIQUE" : "TRIGGER_OPTION_NOT_FOUND",
           "The configured start option is not present in the latest Base metadata",
         );
+      }
+      if (optionMatches[0].name !== subject.trigger.startValue) {
+        throw new ApiError(409, "TRIGGER_OPTION_NOT_FOUND", "The configured start option is not present in the latest Base metadata");
       }
     }
   }

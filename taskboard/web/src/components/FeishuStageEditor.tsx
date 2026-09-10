@@ -213,7 +213,7 @@ export function FeishuStageEditor({
             onChange={(event) => updateSource(key, { kind: "base_attachment", fieldId: event.target.value })}
           >
             <option value="">选择附件字段</option>
-            {attachmentFields.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+            {attachmentFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
           </select>
         </label>
       )}
@@ -305,7 +305,7 @@ export function FeishuStageEditor({
               {audioDraft.baseAttachmentFieldId
                 && !attachmentFields.some((field) => field.fieldId === audioDraft.baseAttachmentFieldId)
                 && <option value={audioDraft.baseAttachmentFieldId} disabled>已配置字段（当前不可用）</option>}
-              {attachmentFields.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+              {attachmentFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
             </select>
           </label>}
           <label>
