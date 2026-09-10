@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp as createTempDirectory, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,10 @@ const files = {
 
 function powershellLiteral(value) {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+async function mkdtemp(prefix) {
+  return realpath(await createTempDirectory(prefix));
 }
 
 test("startup binds both services to loopback and scopes runtime paths", async () => {

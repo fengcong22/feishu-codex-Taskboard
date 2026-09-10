@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -106,7 +106,7 @@ process.stdout.write("fixture complete");
       "--result-path", current.run.resultPath,
       "--json",
     ]);
-    assert.equal(path.resolve(capture.cwd), path.resolve(current.runtimeRoot));
+    assert.equal(await realpath(capture.cwd), await realpath(current.runtimeRoot));
     assert.deepEqual(capture.env, {
       CODEX_AUTOCUT_CONFIG_VERSION: "7",
       CODEX_AUTOCUT_DRAFTS_ROOT: current.run.draftsRoot,

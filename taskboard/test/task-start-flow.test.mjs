@@ -2910,7 +2910,7 @@ test("different Auto-Cut packages keep their own Codex settings", async () => {
       { slug: "fixture-two", default_reasoning_level: "high", supported_reasoning_levels: [{ effort: "high" }] },
     ],
   });
-  const packageBWorkspace = await mkdtemp(path.join(fixture.directory, "package-b-workspace-"));
+  const packageBWorkspace = await realpath(await mkdtemp(path.join(fixture.directory, "package-b-workspace-")));
   packages["Auto-cut-A"].workspacePath = fixture.workspace;
   packages["Auto-cut-B"].workspacePath = packageBWorkspace;
   try {
