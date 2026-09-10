@@ -1288,6 +1288,11 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
         path: "bases.bas_share.subjects.tbl_subject.stages.final_review.audio.source.fieldId",
         message: "Bridge reports a staged audio field with the wrong type",
       }, {
+        code: "INVALID_FIELD",
+        severity: "error",
+        path: "bases.bas_share.subjects.tbl_subject",
+        message: "Bridge reports a changed status field: C:\\Users\\secret\\status-field.txt",
+      }, {
         code: "FIELD_NOT_FOUND",
         severity: "warning",
         path: "bases.bas_share.subjects.tbl_subject.stages.initial.audio.source.fieldId.extra",
@@ -1396,6 +1401,11 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
     assert.ok(result.body.diagnostics.some((entry) => (
       entry.code === "FIELD_TYPE_INVALID"
       && entry.path === "bases.bas_share.subjects.tbl_subject.stages.final_review.audio.source.fieldId"
+    )));
+    assert.ok(result.body.diagnostics.some((entry) => (
+      entry.code === "INVALID_FIELD"
+      && entry.path === "bases.bas_share.subjects.tbl_subject"
+      && entry.message === "A configured workflow field or stage trigger no longer matches the live subject table"
     )));
     assert.equal(result.body.diagnostics.some((entry) => entry.path?.endsWith(".extra")), false);
     assert.deepEqual(

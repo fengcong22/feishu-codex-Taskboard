@@ -587,9 +587,9 @@ function isSelectField(field) {
 }
 
 function phasedField(subject, metadata, descriptor, pathName) {
-  const table = metadata.tables?.find((candidate) => candidate.tableId === subject.tableId);
+  const table = metadata.tables?.find((candidate) => candidate?.tableId === subject.tableId);
   const fieldId = descriptor?.fieldId ?? descriptor?.field_id;
-  const field = table?.fields?.find((candidate) => candidate.fieldId === fieldId);
+  const field = table?.fields?.find((candidate) => candidate?.fieldId === fieldId);
   if (!field) {
     const error = configurationChanged(`${pathName} is not present in Feishu metadata`);
     error.code = "INVALID_FIELD";
@@ -613,7 +613,7 @@ function isAttachmentField(field) {
 
 function phasedAttachmentField(subject, metadata, source, pathName) {
   if (!source || source.kind !== "base_attachment") return;
-  const table = metadata.tables?.find((candidate) => candidate.tableId === subject.tableId);
+  const table = metadata.tables?.find((candidate) => candidate?.tableId === subject.tableId);
   const fieldId = source.fieldId ?? source.field_id;
   const field = table?.fields?.find((candidate) => (
     candidate?.fieldId === fieldId || candidate?.field_id === fieldId || candidate?.id === fieldId
@@ -632,21 +632,90 @@ function phasedAttachmentField(subject, metadata, source, pathName) {
   }
 }
 
-/** Validate the fixed three-stage subject against a live metadata snapshot. */
-export function assertPhasedSubjectMetadata(subject, metadata) {
-  if (!metadata || metadata.baseToken !== subject?.baseToken) {
-    const error = new Error("Feishu Base metadata does not match subject");
-    error.code = "FEISHU_BASE_NOT_FOUND";
-    error.status = 409;
-    throw error;
+function phasedAttachmentErrors(subject, metadata) {
+  const errors = [];
+  const check = (source, pathName) => {
+    try {
+      phasedAttachmentField(subject, metadata, source, pathName);
+    } catch (error) {
+      errors.push(error);
+    }
+  };
+  for (const [stageId, stage] of Object.entries(subject.stages ?? {})) {
+    if (!stage || typeof stage !== "object") continue;
+    check(
+      stage.videoSource ?? stage.video_source,
+      `stages.${stageId}.videoSource.fieldId`,
+    );
+    const audio = stage.audio;
+    if (audio?.mode === "replace_original") {
+      check(audio.source, `stages.${stageId}.audio.source.fieldId`);
+    }
   }
-  const table = metadata.tables?.find((candidate) => candidate.tableId === subject.tableId);
-  if (!table) {
-    const error = new Error("Feishu subject table was not found");
-    error.code = "FEISHU_TABLE_NOT_FOUND";
-    error.status = 409;
-    throw error;
+  return errors;
+}
+
+function phasedValidationError(message, code, path) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 409;
+  error.path = path;
+  return error;
+}
+
+function phasedSubjectPaths(subject) {
+  const basePath = `bases.${subject?.baseToken ?? "unknown"}`;
+  return { basePath, subjectPath: `${basePath}.subjects.${subject?.tableId ?? "unknown"}` };
+}
+
+function metadataObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function phasedDiagnosticCode(errorCode) {
+  if (errorCode === "FEISHU_BASE_NOT_FOUND") return "BASE_NOT_FOUND";
+  if (errorCode === "FEISHU_TABLE_NOT_FOUND") return "TABLE_NOT_FOUND";
+  if (errorCode === "FEISHU_METADATA_INVALID_RESPONSE") return "FEISHU_METADATA_UNAVAILABLE";
+  return errorCode ?? "FEISHU_METADATA_INVALID_RESPONSE";
+}
+
+function phasedMetadataTable(subject, metadata) {
+  const { basePath, subjectPath } = phasedSubjectPaths(subject);
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)
+    || !Array.isArray(metadata.tables)) {
+    throw phasedValidationError(
+      "Feishu returned unusable metadata for this Base",
+      "FEISHU_METADATA_INVALID_RESPONSE",
+      basePath,
+    );
   }
+  if (!metadata.tables.every(metadataObject)) {
+    throw phasedValidationError(
+      "Feishu returned unusable metadata for this Base",
+      "FEISHU_METADATA_INVALID_RESPONSE",
+      basePath,
+    );
+  }
+  if (metadata.baseToken !== subject?.baseToken) {
+    throw phasedValidationError("Feishu Base metadata does not match subject", "FEISHU_BASE_NOT_FOUND", basePath);
+  }
+  const tables = metadata.tables.filter((candidate) => candidate?.tableId === subject?.tableId);
+  if (tables.length === 0) {
+    throw phasedValidationError("Feishu subject table was not found", "FEISHU_TABLE_NOT_FOUND", subjectPath);
+  }
+  if (tables.length !== 1 || !Array.isArray(tables[0]?.fields)
+    || !tables[0].fields.every(metadataObject)) {
+    throw phasedValidationError(
+      "Feishu returned unusable metadata for this subject table",
+      "FEISHU_METADATA_INVALID_RESPONSE",
+      subjectPath,
+    );
+  }
+  return tables[0];
+}
+
+function assertPhasedSubjectConfiguration(subject, metadata) {
+  phasedMetadataTable(subject, metadata);
   const status = phasedField(subject, metadata, subject.statusField, "statusField");
   if (!isSelectField(status) && String(status.type ?? "").toLowerCase() !== "single_select") {
     throw configurationChanged("statusField must be a single-select field");
@@ -654,6 +723,14 @@ export function assertPhasedSubjectMetadata(subject, metadata) {
   phasedField(subject, metadata, subject.documentField, "documentField");
   phasedField(subject, metadata, subject.namingField, "namingField");
   const options = Array.isArray(status.options) ? status.options : [];
+  if (!options.every(metadataObject)) {
+    const { subjectPath } = phasedSubjectPaths(subject);
+    throw phasedValidationError(
+      "Feishu returned unusable metadata for the status field",
+      "FEISHU_METADATA_INVALID_RESPONSE",
+      `${subjectPath}.statusField.options`,
+    );
+  }
   const enabled = Object.entries(subject.stages ?? {}).filter(([, stage]) => stage?.enabled);
   if (enabled.length === 0) throw configurationChanged("at least one stage must be enabled");
   const seen = new Set();
@@ -673,37 +750,38 @@ export function assertPhasedSubjectMetadata(subject, metadata) {
       throw configurationChanged(`${stageId}.trigger option is missing or changed`);
     }
   }
-  for (const [stageId, stage] of Object.entries(subject.stages ?? {})) {
-    if (!stage || typeof stage !== "object") continue;
-    phasedAttachmentField(
-      subject,
-      metadata,
-      stage.videoSource ?? stage.video_source,
-      `stages.${stageId}.videoSource.fieldId`,
-    );
-    const audio = stage.audio;
-    if (audio?.mode === "replace_original") {
-      phasedAttachmentField(
-        subject,
-        metadata,
-        audio.source,
-        `stages.${stageId}.audio.source.fieldId`,
-      );
-    }
-  }
+}
+
+/** Validate the fixed three-stage subject against a live metadata snapshot. */
+export function assertPhasedSubjectMetadata(subject, metadata) {
+  assertPhasedSubjectConfiguration(subject, metadata);
+  const [attachmentError] = phasedAttachmentErrors(subject, metadata);
+  if (attachmentError) throw attachmentError;
   return true;
 }
 
 export function comparePhasedSubjectMetadata(subject, metadata) {
+  const { subjectPath } = phasedSubjectPaths(subject);
   try {
-    assertPhasedSubjectMetadata(subject, metadata);
-    return [];
+    assertPhasedSubjectConfiguration(subject, metadata);
   } catch (error) {
     return [{
-      code: error?.code ?? "FEISHU_METADATA_INVALID_RESPONSE",
-      path: error?.path ?? "subject",
+      code: phasedDiagnosticCode(error?.code),
+      path: error?.path ?? subjectPath,
       message: error?.message ?? "Feishu metadata validation failed",
       errorCode: error?.code ?? "FEISHU_METADATA_INVALID_RESPONSE",
     }];
   }
+  const attachments = phasedAttachmentErrors(subject, metadata);
+  if (attachments.length > 0) {
+    return attachments.map((error) => ({
+      code: error?.code ?? "FEISHU_METADATA_INVALID_RESPONSE",
+      path: error?.path?.startsWith("stages.")
+        ? `${subjectPath}.${error.path}`
+        : subjectPath,
+      message: error?.message ?? "Feishu metadata validation failed",
+      errorCode: error?.code ?? "FEISHU_METADATA_INVALID_RESPONSE",
+    }));
+  }
+  return [];
 }

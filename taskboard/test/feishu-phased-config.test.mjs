@@ -213,6 +213,19 @@ test("keeps stale attachment bindings structurally but rejects them at the stric
     (error) => error.code === "FIELD_NOT_FOUND"
       && error.path === "stages.initial.audio.source.fieldId",
   );
+
+  const stringTypedAttachment = subject();
+  const audioField = stringTypedAttachment.metadata.fields.find((field) => field.fieldId === "fld_audio");
+  audioField.type = "17";
+  audioField.uiType = null;
+  stringTypedAttachment.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  assert.equal(
+    phasedStageContract.assertPhasedAttachmentBindings(stringTypedAttachment),
+    true,
+  );
 });
 
 test("requires a ZIP destination for every enabled stage in automatic upload mode", () => {

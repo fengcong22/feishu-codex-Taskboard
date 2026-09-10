@@ -957,3 +957,84 @@ test("share import dry-run reuses enable metadata comparisons for saved names an
   );
   assert.equal((await store.activeTables()).length, 0);
 });
+
+test("share import dry-run reports every phased attachment mismatch from live metadata", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-import-phased-attachments-"));
+  const filename = path.join(directory, "workflow.json");
+  const stage = (optionId, value) => ({
+    enabled: true,
+    trigger: { fieldId: "fld_progress", fieldName: "制作进度", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: `${value}录屏` },
+    reviewSource: { kind: "docx_section", anchorText: `${value}修改意见` },
+    audio: { mode: "video_original" },
+    artifactTargetPath: null,
+    nameSuffix: `_${value}`,
+  });
+  const imported = validConfig();
+  Object.assign(imported.bases[0].subjects[0], {
+    statusField: { fieldId: "fld_progress", fieldName: "制作进度" },
+    documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+    namingField: { fieldId: "fld_title", fieldName: "脚本名称" },
+    stages: {
+      initial: {
+        ...stage("opt_initial", "初稿"),
+        videoSource: { kind: "base_attachment", fieldId: "fld_missing_video" },
+      },
+      first_review: {
+        ...stage("opt_first_review", "初审修改"),
+        audio: {
+          mode: "replace_original",
+          source: { kind: "base_attachment", fieldId: "fld_text_audio" },
+          durationToleranceSeconds: 3,
+        },
+      },
+      final_review: stage("opt_final_review", "终审修改"),
+    },
+  });
+  const metadataReader = {
+    async preview({ baseToken }) {
+      return {
+        baseToken,
+        baseName: "课程库",
+        tables: [{
+          tableId: "tbl_math_123",
+          tableName: "数学",
+          fields: [
+            {
+              fieldId: "fld_progress",
+              fieldName: "制作进度",
+              type: 3,
+              options: [
+                { id: "opt_initial", name: "初稿" },
+                { id: "opt_first_review", name: "初审修改" },
+                { id: "opt_final_review", name: "终审修改" },
+              ],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, options: [] },
+            { fieldId: "fld_title", fieldName: "脚本名称", type: 1, options: [] },
+            { fieldId: "fld_text_audio", fieldName: "音频文本", type: 1, options: [] },
+          ],
+        }],
+      };
+    },
+  };
+  const store = createWorkflowConfigStore({
+    filename,
+    metadataReader,
+    packageAliases: { "Auto-cut-copyA": { workspacePath: "D:\\Auto-Cut\\copyA" } },
+  });
+
+  const result = await store.importShareable(imported, { dryRun: true });
+
+  assert.deepEqual(
+    result.diagnostics
+      .filter((entry) => entry.path.includes(".stages."))
+      .map((entry) => [entry.code, entry.path]),
+    [
+      ["FIELD_NOT_FOUND", "bases.bas_demo_123.subjects.tbl_math_123.stages.initial.videoSource.fieldId"],
+      ["FIELD_TYPE_INVALID", "bases.bas_demo_123.subjects.tbl_math_123.stages.first_review.audio.source.fieldId"],
+    ],
+  );
+  assert.equal(result.diagnosticsOk, false);
+  await assert.rejects(() => readFile(filename, "utf8"), (error) => error?.code === "ENOENT");
+});

@@ -56,7 +56,7 @@ function isSingleSelect(field) {
 
 function isAttachment(field) {
   const uiType = String(field?.uiType ?? field?.type ?? "").toLowerCase().replace(/[\s_-]/gu, "");
-  return uiType === "attachment" || uiType === "attachments" || field?.type === 17;
+  return uiType === "attachment" || uiType === "attachments" || String(field?.type ?? "") === "17";
 }
 
 function normalizeSource(source, metadata, name, { review = false } = {}) {

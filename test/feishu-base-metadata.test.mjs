@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   assertPhasedSubjectMetadata,
+  comparePhasedSubjectMetadata,
   createFeishuBaseMetadataReader,
   parseBaseLink,
 } from "../src/feishu-base-metadata.mjs";
@@ -496,6 +497,87 @@ test("validates phased video and replacement audio attachment bindings against l
     source: { kind: "base_attachment", fieldId: "fld_missing" },
   };
   assert.equal(assertPhasedSubjectMetadata(docxAndOriginal, metadata), true);
+});
+
+test("phased metadata comparison reports unavailable metadata before staged attachment diagnostics", () => {
+  const subject = phasedSubject({
+    stages: {
+      initial: {
+        ...phasedSubject().stages.initial,
+        videoSource: { kind: "base_attachment", fieldId: "fld_missing_video" },
+      },
+      first_review: phasedSubject().stages.first_review,
+      final_review: phasedSubject().stages.final_review,
+    },
+  });
+
+  assert.deepEqual(comparePhasedSubjectMetadata(subject, {
+    baseToken: "bas_demo",
+    baseName: "课程库",
+    tables: [],
+  }), [{
+    code: "TABLE_NOT_FOUND",
+    path: "bases.bas_demo.subjects.tbl_math",
+    message: "Feishu subject table was not found",
+    errorCode: "FEISHU_TABLE_NOT_FOUND",
+  }]);
+
+  assert.deepEqual(comparePhasedSubjectMetadata(subject, {
+    baseToken: "bas_demo",
+    baseName: "课程库",
+    tables: {},
+  }), [{
+    code: "FEISHU_METADATA_UNAVAILABLE",
+    path: "bases.bas_demo",
+    message: "Feishu returned unusable metadata for this Base",
+    errorCode: "FEISHU_METADATA_INVALID_RESPONSE",
+  }]);
+});
+
+test("phased metadata comparison and assertion fail closed for null metadata entries", () => {
+  const subject = phasedSubject();
+  const fields = () => [
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+  ];
+  const table = (fieldValues = fields()) => ({
+    tableId: "tbl_math",
+    tableName: "小学数学",
+    fields: fieldValues,
+  });
+  const nullOptionFields = fields();
+  nullOptionFields[0].options.unshift(null);
+  const scenarios = [
+    { name: "tables", metadata: { ...phasedMetadata(), tables: [null, table()] } },
+    { name: "fields", metadata: phasedMetadata([null, ...fields()]) },
+    { name: "status options", metadata: phasedMetadata(nullOptionFields) },
+  ];
+
+  for (const { name, metadata } of scenarios) {
+    let diagnostics;
+    assert.doesNotThrow(() => {
+      diagnostics = comparePhasedSubjectMetadata(subject, metadata);
+    }, name);
+    assert.doesNotMatch(JSON.stringify(diagnostics), /Cannot read properties/u, name);
+    assert.throws(
+      () => assertPhasedSubjectMetadata(subject, metadata),
+      (error) => error?.code === "FEISHU_METADATA_INVALID_RESPONSE"
+        && error.status === 409
+        && !/Cannot read properties/u.test(error.message),
+      name,
+    );
+  }
 });
 
 test("validates every configured field name and subject-code binding during enable", async (t) => {

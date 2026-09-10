@@ -101,6 +101,7 @@ const BRIDGE_DIAGNOSTIC_MESSAGES = new Map([
   ["TABLE_NOT_FOUND", "The configured subject table is not present in this Base"],
   ["FIELD_NOT_FOUND", "A configured field is not present in the live subject table"],
   ["FIELD_TYPE_INVALID", "A configured field has an incompatible type in the live subject table"],
+  ["INVALID_FIELD", "A configured workflow field or stage trigger no longer matches the live subject table"],
   ["FEISHU_METADATA_UNAVAILABLE", "Live Feishu metadata could not be verified"],
   ["PACKAGE_ALIAS_UNAVAILABLE", "The Auto-Cut package alias is not configured for the Bridge"],
   ["PACKAGE_WORKSPACE_PATH_UNBOUND", "The Bridge Auto-Cut package workspace is not bound on this machine"],
