@@ -9,7 +9,13 @@ import type {
   FeishuSubjectConfig,
   FeishuWorkflowShareDiagnostic,
 } from "../types";
-import { FeishuStageEditor, type FeishuStageValue } from "./FeishuStageEditor";
+import {
+  audioDraftFromStage,
+  FeishuStageEditor,
+  isAttachmentField,
+  type FeishuStageAudioDraft,
+  type FeishuStageValue,
+} from "./FeishuStageEditor";
 import {
   addFeishuBaseFromUrl,
   exportFeishuWorkflowShare,
@@ -114,6 +120,19 @@ type SubjectForm = {
   stages: FeishuStageConfigMap | null;
 };
 
+type SubjectAudioDrafts = {
+  configVersion: number;
+  stages: Partial<Record<FeishuStageId, FeishuStageAudioDraft>>;
+};
+
+function audioDraftsForStages(stages: FeishuStageConfigMap | null): SubjectAudioDrafts["stages"] {
+  if (!stages) return {};
+  return Object.fromEntries(PHASE_IDS.map((stageId) => [
+    stageId,
+    audioDraftFromStage(stages[stageId].audio),
+  ])) as SubjectAudioDrafts["stages"];
+}
+
 function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
   const fields = subject.metadata?.fields ?? [];
   const statusField = subject.statusField;
@@ -199,6 +218,13 @@ export function FeishuWorkflowPanel({
     ?? scopedCatalog.flatMap((base) => base.subjects)[0]
     ?? null, [scopedCatalog, selectedSubjectKey]);
   const [subjectForm, setSubjectForm] = useState<SubjectForm | null>(() => selected ? formForSubject(selected) : null);
+  const audioDraftsBySubjectRef = useRef(new Map<string, SubjectAudioDrafts>(selected ? [[
+    selected.subjectKey,
+    {
+      configVersion: selected.configVersion,
+      stages: audioDraftsForStages(formForSubject(selected).stages),
+    },
+  ]] : []));
   const subjectFormDirty = Boolean(selected && subjectForm
     && JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected)));
   const selectedPackage = packageOptions?.find((item) => item.alias === subjectForm?.packageAlias);
@@ -211,6 +237,9 @@ export function FeishuWorkflowPanel({
     : undefined;
   const statusOptions = selectedStatusField?.options ?? [];
   const metadataFieldOptions = triggerFields;
+  const attachmentFieldIds = useMemo(() => new Set(
+    triggerFields.filter(isAttachmentField).map((field) => field.fieldId),
+  ), [triggerFields]);
   const phasedValidationErrors = useMemo(() => {
     if (!subjectForm?.stages) return [];
     const errors: string[] = [];
@@ -228,8 +257,20 @@ export function FeishuWorkflowPanel({
       if (stage.videoSource.kind === "docx_section" && !stage.videoSource.anchorText?.trim()) errors.push(`${phaseLabel}需要视频目录标题`);
       if (stage.videoSource.kind === "base_attachment" && !stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
       if (!stage.reviewSource.anchorText?.trim()) errors.push(`${phaseLabel}需要剪辑意见目录标题`);
-      if (stage.audio.mode === "replace_original" && !stage.audio.source?.fieldId && !stage.audio.source?.anchorText) errors.push(`${phaseLabel}需要外部音频来源`);
-      if (stage.audio.mode === "replace_original" && (!(stage.audio.durationToleranceSeconds ?? 0) || (stage.audio.durationToleranceSeconds ?? 0) <= 0)) errors.push(`${phaseLabel}的时长误差必须为正数`);
+      if (stage.audio.mode === "replace_original") {
+        if (stage.audio.source?.kind === "docx_section") {
+          if (!stage.audio.source.anchorText?.trim()) errors.push(`${phaseLabel}需要音频目录标题`);
+        } else if (stage.audio.source?.kind === "base_attachment") {
+          if (!stage.audio.source.fieldId) errors.push(`${phaseLabel}需要音频附件字段`);
+          else if (!attachmentFieldIds.has(stage.audio.source.fieldId)) errors.push(`${phaseLabel}的音频附件字段当前不可用`);
+        } else {
+          errors.push(`${phaseLabel}需要有效的音频来源`);
+        }
+        const tolerance = stage.audio.durationToleranceSeconds;
+        if (typeof tolerance !== "number" || !Number.isFinite(tolerance) || tolerance <= 0) {
+          errors.push(`${phaseLabel}的时长误差必须为正数`);
+        }
+      }
       if (!stage.nameSuffix.trim()) errors.push(`${phaseLabel}需要命名后缀`);
       if (subjectForm.enqueueMode === "automatic" && !stage.artifactTargetPath?.trim()) errors.push(`${phaseLabel}需要 ZIP 目标目录`);
     }
@@ -237,7 +278,7 @@ export function FeishuWorkflowPanel({
     if (!subjectForm.documentFieldId) errors.push("请选择素材文档字段");
     if (!subjectForm.namingFieldId) errors.push("请选择命名字段");
     return [...new Set(errors)];
-  }, [subjectForm]);
+  }, [attachmentFieldIds, subjectForm]);
   const enableBlockedReason = subjectFormDirty
     ? "请先保存草稿"
     : packageOptions === null
@@ -280,7 +321,19 @@ export function FeishuWorkflowPanel({
       return;
     }
     preserveDirtyFormForSubjectRef.current = null;
-    setSubjectForm(selected ? formForSubject(selected) : null);
+    if (!selected) {
+      setSubjectForm(null);
+      return;
+    }
+    const persistedForm = formForSubject(selected);
+    const cached = audioDraftsBySubjectRef.current.get(selected.subjectKey);
+    if (!cached || cached.configVersion !== selected.configVersion) {
+      audioDraftsBySubjectRef.current.set(selected.subjectKey, {
+        configVersion: selected.configVersion,
+        stages: audioDraftsForStages(persistedForm.stages),
+      });
+    }
+    setSubjectForm(persistedForm);
   }, [selected?.subjectKey, selected?.configVersion]);
 
   useEffect(() => {
@@ -370,6 +423,23 @@ export function FeishuWorkflowPanel({
       ...subjectForm,
       stages: { ...subjectForm.stages, [stageId]: value as FeishuStageConfig },
     });
+  }
+
+  function updateStageAudio(
+    stageId: FeishuStageId,
+    audio: FeishuStageValue["audio"],
+    draft: FeishuStageAudioDraft,
+  ) {
+    if (!selected || !subjectForm?.stages) return;
+    const cached = audioDraftsBySubjectRef.current.get(selected.subjectKey) ?? {
+      configVersion: selected.configVersion,
+      stages: {},
+    };
+    audioDraftsBySubjectRef.current.set(selected.subjectKey, {
+      ...cached,
+      stages: { ...cached.stages, [stageId]: draft },
+    });
+    updateStage(stageId, { ...subjectForm.stages[stageId], audio });
   }
 
   async function addBase() {
@@ -600,7 +670,10 @@ export function FeishuWorkflowPanel({
             metadataFields={triggerFields}
             statusOptions={statusOptions}
             disabled={busy}
+            audioDraft={audioDraftsBySubjectRef.current.get(selected.subjectKey)?.stages[stageId]
+              ?? audioDraftFromStage(subjectForm.stages![stageId].audio)}
             onChange={(value) => updateStage(stageId, value)}
+            onAudioChange={(audio, draft) => updateStageAudio(stageId, audio, draft)}
             validationErrors={phasedValidationErrors.filter((error) => error.startsWith(PHASE_LABELS[stageId]))}
           />)}
         </div>
