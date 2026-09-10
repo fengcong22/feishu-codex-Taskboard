@@ -103,8 +103,12 @@ const BRIDGE_DIAGNOSTIC_MESSAGES = new Map([
   ["TABLE_NAME_MISMATCH", "The configured subject table name no longer matches Feishu metadata"],
   ["FIELD_NOT_FOUND", "A configured field is not present in the live subject table"],
   ["FIELD_TYPE_INVALID", "A configured field has an incompatible type in the live subject table"],
+  ["FIELD_NAME_MISMATCH", "A configured field name no longer matches the live subject table"],
+  ["OPTION_NOT_FOUND", "A configured trigger option is not present in the live subject table"],
+  ["OPTION_AMBIGUOUS", "A configured trigger option is ambiguous in the live subject table"],
   ["INVALID_FIELD", "A configured workflow field or stage trigger no longer matches the live subject table"],
   ["FEISHU_METADATA_UNAVAILABLE", "Live Feishu metadata could not be verified"],
+  ["FEISHU_METADATA_INVALID_RESPONSE", "Live Feishu metadata could not be safely interpreted"],
   ["PACKAGE_ALIAS_UNAVAILABLE", "The Auto-Cut package alias is not configured for the Bridge"],
   ["PACKAGE_WORKSPACE_PATH_UNBOUND", "The Bridge Auto-Cut package workspace is not bound on this machine"],
   ["ARTIFACT_SOURCE_PATH_UNBOUND", "The ZIP artifact source path is not bound on this machine"],
@@ -144,7 +148,8 @@ function bridgeShareDiagnosticContext(configuration) {
     for (const subject of Array.isArray(base.subjects) ? base.subjects : []) {
       const subjectPath = `${basePath}.subjects.${subject.tableId}`;
       for (const suffix of [
-        "", ".fields", ".trigger.fieldId", ".title.fieldId", ".subjectCode.fieldId",
+        "", ".fields", ".trigger.fieldId", ".trigger.fieldName", ".trigger.startValue",
+        ".title.fieldId", ".title.fieldName", ".subjectCode.fieldId", ".subjectCode.fieldName",
         ".packageRoute", ".upload.artifactSourcePath", ".upload.targetPath",
       ]) paths.add(`${subjectPath}${suffix}`);
       for (const fieldName of ["statusField", "documentField", "namingField"]) {

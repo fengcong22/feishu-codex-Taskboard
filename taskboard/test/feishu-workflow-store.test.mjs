@@ -357,6 +357,120 @@ test("enabling rejects trigger fields and select options missing from refreshed 
   }
 });
 
+test("subject draft snake_case phased patch overwrites persisted camelCase values", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const basePreview = phasedPreview();
+    basePreview.tables[0].fields.push(
+      {
+        fieldId: "fld_status_next",
+        fieldName: "新流程",
+        type: 3,
+        uiType: "SingleSelect",
+        options: [{ id: "opt_next", name: "新阶段" }],
+      },
+      { fieldId: "fld_document_next", fieldName: "新素材文档", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_name_next", fieldName: "新命名", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_audio_next", fieldName: "新音频", type: 17, uiType: "Attachment", options: [] },
+    );
+    await store.upsertBasePreview(basePreview);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+
+    const updated = await store.saveSubjectDraft(saved.subjectKey, {
+      expectedVersion: saved.configVersion,
+      statusField: { field_id: "fld_status_next", field_name: "新流程" },
+      documentField: { field_id: "fld_document_next", field_name: "新素材文档" },
+      namingField: { field_id: "fld_name_next", field_name: "新命名" },
+      stages: {
+        initial: {
+          trigger: {
+            field_id: "fld_status_next",
+            field_name: "新流程",
+            option_id: "opt_next",
+            start_value: "新阶段",
+          },
+          video_source: { kind: "base_attachment", field_id: "fld_audio_next" },
+          review_source: { kind: "docx_section", anchor_text: "新修改意见" },
+          audio: {
+            mode: "replace_original",
+            source: { kind: "base_attachment", field_id: "fld_audio_next" },
+            duration_tolerance_seconds: 1.25,
+          },
+          artifact_target_path: "C:\\approved\\updated",
+          name_suffix: "_新阶段",
+        },
+      },
+    });
+
+    assert.deepEqual(updated.statusField, { fieldId: "fld_status_next", fieldName: "新流程" });
+    assert.deepEqual(updated.documentField, { fieldId: "fld_document_next", fieldName: "新素材文档" });
+    assert.deepEqual(updated.namingField, { fieldId: "fld_name_next", fieldName: "新命名" });
+    assert.deepEqual(updated.stages.initial.trigger, {
+      fieldId: "fld_status_next",
+      fieldName: "新流程",
+      optionId: "opt_next",
+      value: "新阶段",
+    });
+    assert.deepEqual(updated.stages.initial.videoSource, { kind: "base_attachment", fieldId: "fld_audio_next" });
+    assert.deepEqual(updated.stages.initial.reviewSource, { kind: "docx_section", anchorText: "新修改意见" });
+    assert.deepEqual(updated.stages.initial.audio, {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_audio_next" },
+      durationToleranceSeconds: 1.25,
+    });
+    assert.equal(updated.stages.initial.artifactTargetPath, "C:\\approved\\updated");
+    assert.equal(updated.stages.initial.nameSuffix, "_新阶段");
+    assert.doesNotMatch(JSON.stringify(updated), /(?:field_id|field_name|option_id|start_value|video_source|review_source|anchor_text|duration_tolerance_seconds|artifact_target_path|name_suffix)/u);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("subject draft rejects conflicting phased aliases and unknown keys hidden in snake_case patches", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+
+    const rejectedPatches = [
+      {
+        patch: { stages: { initial: { nameSuffix: "_safe", name_suffix: "_conflict" } } },
+        path: "stages.initial.nameSuffix",
+      },
+      {
+        patch: { stages: { initial: { video_source: { kind: "docx_section", anchor_text: "safe", command: "run" } } } },
+        path: "stages.initial.videoSource.command",
+      },
+      {
+        patch: { stages: { initial: { audio: { source: { kind: "base_attachment", field_id: "fld_audio", credential: "secret" } } } } },
+        path: "stages.initial.audio.source.credential",
+      },
+      {
+        patch: { statusField: { fieldId: "fld_status", field_id: "fld_other" } },
+        path: "statusField.fieldId",
+      },
+      { patch: { statusField: { command: "run" } }, path: "statusField.command" },
+      { patch: { documentField: { credential: "secret" } }, path: "documentField.credential" },
+      { patch: { namingField: { executable: "tool.exe" } }, path: "namingField.executable" },
+    ];
+
+    for (const { patch, path: rejectedPath } of rejectedPatches) {
+      await assert.rejects(
+        () => store.saveSubjectDraft(saved.subjectKey, { expectedVersion: saved.configVersion, ...patch }),
+        (error) => ["INVALID_FIELD", "UNKNOWN_FIELD"].includes(error?.code)
+          && error.status === 400
+          && error.message.includes(rejectedPath),
+        rejectedPath,
+      );
+    }
+    assert.equal((await store.getSubject(saved.subjectKey)).configVersion, saved.configVersion);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("retains stale phased attachment bindings after refresh but rejects save and enable", async () => {
   const { directory, database, store } = await fixture();
   try {

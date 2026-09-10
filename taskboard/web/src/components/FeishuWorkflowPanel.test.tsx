@@ -273,6 +273,55 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(within(status).queryByRole("option", { name: "伪状态界面" })).toBeNull();
   });
 
+  it("saves current metadata names for phased field IDs after fields are renamed", async () => {
+    const configured = subject("renamed", "重命名学科");
+    configured.statusField = { fieldId: "fld_status", fieldName: "旧状态" };
+    configured.documentField = { fieldId: "fld_document", fieldName: "旧素材文档" };
+    configured.namingField = { fieldId: "fld_name", fieldName: "旧命名" };
+    configured.stages = Object.fromEntries(Object.entries(stageMap()).map(([stageId, value]) => [
+      stageId,
+      { ...value, trigger: { ...value.trigger, fieldName: "旧状态" } },
+    ])) as FeishuStageConfigMap;
+    configured.metadata = {
+      fields: [
+        ...fields.map((field) => field.fieldId === "fld_status"
+          ? { ...field, fieldName: "新状态" }
+          : field),
+        { fieldId: "fld_document", fieldName: "新素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "新命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const onSaveDraft = vi.fn(async (_subjectKey: string, _patch: unknown) => configured);
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="renamed"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+      onSaveDraft={onSaveDraft}
+    />);
+
+    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value).toBe("fld_status");
+    expect(within(screen.getByRole("combobox", { name: "状态字段" })).getByRole("option", { name: "新状态" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+
+    const [, rawPatch] = onSaveDraft.mock.calls[0];
+    const patch = rawPatch as {
+      statusField: { fieldName: string };
+      documentField: { fieldName: string };
+      namingField: { fieldName: string };
+      stages: FeishuStageConfigMap;
+    };
+    expect(patch.statusField.fieldName).toBe("新状态");
+    expect(patch.documentField.fieldName).toBe("新素材文档");
+    expect(patch.namingField.fieldName).toBe("新命名");
+    expect(Object.values(patch.stages).map((value) => value.trigger.fieldName)).toEqual([
+      "新状态", "新状态", "新状态",
+    ]);
+  });
+
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {
     const subjectA = subject("history", "高中历史");
     const subjectB = subject("geography", "高中地理");

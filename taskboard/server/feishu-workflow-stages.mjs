@@ -34,6 +34,7 @@ const AUDIO_KEYS = new Set([
   "durationToleranceSeconds",
   "duration_tolerance_seconds",
 ]);
+const FIELD_DESCRIPTOR_KEYS = new Set(["fieldId", "field_id", "fieldName", "field_name"]);
 const SINGLE_SELECT_UI_TYPES = new Set(["singleselect", "select"]);
 const ATTACHMENT_UI_TYPES = new Set(["attachment", "attachments"]);
 
@@ -70,6 +71,105 @@ function assertKnownKeys(value, allowed, name) {
   plainObject(value, name);
   const unknown = Object.keys(value).find((key) => !allowed.has(key));
   if (unknown) throw fail(`${name}.${unknown} is not supported`, "UNKNOWN_FIELD");
+}
+
+function aliasValue(value, canonicalKey, aliases, name) {
+  const present = [canonicalKey, ...aliases].filter((key) => Object.hasOwn(value, key));
+  if (present.length > 1) {
+    throw fail(`${name}.${canonicalKey} has multiple representations`, "INVALID_FIELD");
+  }
+  return present.length === 0 ? undefined : value[present[0]];
+}
+
+function canonicalizeObject(value, allowed, aliases, name) {
+  assertKnownKeys(value, allowed, name);
+  const result = {};
+  const aliasKeys = new Set(Object.values(aliases).flat());
+  for (const [key, entry] of Object.entries(value)) {
+    if (!aliasKeys.has(key)) result[key] = entry;
+  }
+  for (const [canonicalKey, alternateKeys] of Object.entries(aliases)) {
+    const entry = aliasValue(value, canonicalKey, alternateKeys, name);
+    if (entry !== undefined || [canonicalKey, ...alternateKeys].some((key) => Object.hasOwn(value, key))) {
+      result[canonicalKey] = entry;
+    }
+  }
+  return result;
+}
+
+function canonicalizeSource(source, name) {
+  return canonicalizeObject(source, SOURCE_KEYS, {
+    anchorText: ["anchor_text"],
+    fieldId: ["field_id"],
+  }, name);
+}
+
+function canonicalizeTrigger(trigger, name) {
+  return canonicalizeObject(trigger, TRIGGER_KEYS, {
+    fieldId: ["field_id"],
+    fieldName: ["field_name"],
+    optionId: ["option_id"],
+    value: ["startValue", "start_value"],
+  }, name);
+}
+
+function canonicalizeAudio(audio, name) {
+  const result = canonicalizeObject(audio, AUDIO_KEYS, {
+    durationToleranceSeconds: ["duration_tolerance_seconds"],
+  }, name);
+  if (Object.hasOwn(result, "source") && result.source !== null && result.source !== undefined) {
+    result.source = canonicalizeSource(result.source, `${name}.source`);
+  }
+  return result;
+}
+
+function canonicalizeStage(stage, stageId) {
+  const name = `stages.${stageId}`;
+  const result = canonicalizeObject(stage, STAGE_KEYS, {
+    videoSource: ["video_source"],
+    reviewSource: ["review_source"],
+    artifactTargetPath: ["artifact_target_path"],
+    nameSuffix: ["name_suffix"],
+  }, name);
+  if (Object.hasOwn(result, "trigger") && result.trigger !== null && result.trigger !== undefined) {
+    result.trigger = canonicalizeTrigger(result.trigger, `${name}.trigger`);
+  }
+  if (Object.hasOwn(result, "videoSource") && result.videoSource !== null && result.videoSource !== undefined) {
+    result.videoSource = canonicalizeSource(result.videoSource, `${name}.videoSource`);
+  }
+  if (Object.hasOwn(result, "reviewSource") && result.reviewSource !== null && result.reviewSource !== undefined) {
+    result.reviewSource = canonicalizeSource(result.reviewSource, `${name}.reviewSource`);
+  }
+  if (Object.hasOwn(result, "audio") && result.audio !== null && result.audio !== undefined) {
+    result.audio = canonicalizeAudio(result.audio, `${name}.audio`);
+  }
+  return result;
+}
+
+function canonicalizeFieldDescriptor(descriptor, name) {
+  return canonicalizeObject(descriptor, FIELD_DESCRIPTOR_KEYS, {
+    fieldId: ["field_id"],
+    fieldName: ["field_name"],
+  }, name);
+}
+
+export function canonicalizePhasedSubjectPatch(value) {
+  plainObject(value, "Subject patch");
+  const result = { ...value };
+  for (const fieldNameValue of ["statusField", "documentField", "namingField"]) {
+    if (Object.hasOwn(result, fieldNameValue)) {
+      result[fieldNameValue] = canonicalizeFieldDescriptor(result[fieldNameValue], fieldNameValue);
+    }
+  }
+  if (Object.hasOwn(result, "stages")) {
+    const stages = plainObject(result.stages, "stages");
+    const unknownStage = Object.keys(stages).find((key) => !STAGE_IDS.includes(key));
+    if (unknownStage) throw fail(`Unknown stage '${unknownStage}'`);
+    result.stages = Object.fromEntries(Object.entries(stages).map(([stageId, stage]) => (
+      [stageId, canonicalizeStage(stage, stageId)]
+    )));
+  }
+  return result;
 }
 
 function fieldId(field) {
@@ -119,7 +219,7 @@ export function isAttachmentMetadataField(field) {
 }
 
 function normalizeSource(source, metadata, name, { review = false } = {}) {
-  assertKnownKeys(source, SOURCE_KEYS, name);
+  source = canonicalizeSource(source, name);
   const kind = text(source.kind, `${name}.kind`);
   if (kind === "docx_section") {
     const anchorText = text(source.anchorText ?? source.anchor_text, `${name}.anchorText`);
@@ -133,7 +233,7 @@ function normalizeSource(source, metadata, name, { review = false } = {}) {
 }
 
 function normalizeAudio(audio, metadata, name) {
-  assertKnownKeys(audio, AUDIO_KEYS, name);
+  audio = canonicalizeAudio(audio, name);
   const mode = text(audio.mode, `${name}.mode`);
   if (mode === "video_original") {
     if (audio.source && typeof audio.source === "object" && !Array.isArray(audio.source)) {
@@ -161,13 +261,12 @@ function normalizeAudio(audio, metadata, name) {
  * field/source contract without importing either application's internals.
  */
 export function normalizeStage(stage, metadata = null, stageId = "stage") {
-  assertKnownKeys(stage, STAGE_KEYS, `stages.${stageId}`);
   if (!STAGE_IDS.includes(stageId)) throw fail(`Unknown stage '${stageId}'`);
+  stage = canonicalizeStage(stage, stageId);
   const enabled = stage.enabled === undefined ? false : stage.enabled;
   if (typeof enabled !== "boolean") throw fail(`stages.${stageId}.enabled must be boolean`);
 
-  const triggerInput = stage.trigger ?? {};
-  assertKnownKeys(triggerInput, TRIGGER_KEYS, `stages.${stageId}.trigger`);
+  const triggerInput = canonicalizeTrigger(stage.trigger ?? {}, `stages.${stageId}.trigger`);
   const triggerFieldId = identifier(triggerInput.fieldId ?? triggerInput.field_id, `stages.${stageId}.trigger.fieldId`, { optional: !enabled });
   const optionId = identifier(triggerInput.optionId ?? triggerInput.option_id, `stages.${stageId}.trigger.optionId`, { optional: !enabled });
   const value = text(
@@ -212,6 +311,7 @@ export function normalizeStage(stage, metadata = null, stageId = "stage") {
 }
 
 function validateMetadataField(metadata, descriptor, name, predicate = null, { required = true } = {}) {
+  descriptor = canonicalizeFieldDescriptor(descriptor, name);
   const id = identifier(descriptor?.fieldId ?? descriptor?.field_id, `${name}.fieldId`, { optional: !required });
   const configuredName = text(descriptor?.fieldName ?? descriptor?.field_name, `${name}.fieldName`, { optional: !required });
   if (id === null) return { fieldId: null, fieldName: null };

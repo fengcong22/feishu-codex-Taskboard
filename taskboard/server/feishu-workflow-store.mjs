@@ -4,6 +4,7 @@ import { ApiError } from "./database.mjs";
 import {
   STAGE_IDS,
   assertPhasedAttachmentBindings,
+  canonicalizePhasedSubjectPatch,
   isAttachmentMetadataField,
   isPhasedSubject,
   normalizeStage,
@@ -920,7 +921,13 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             actualVersion: current.config_version,
           });
         }
-        const { expectedVersion: _expectedVersion, ...changes } = patch;
+        const { expectedVersion: _expectedVersion, ...rawChanges } = patch;
+        let changes;
+        try {
+          changes = canonicalizePhasedSubjectPatch(rawChanges);
+        } catch (error) {
+          throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
+        }
         const next = validate({
           ...mergeObjects(rowSubject(current), changes),
           subjectKey: key,

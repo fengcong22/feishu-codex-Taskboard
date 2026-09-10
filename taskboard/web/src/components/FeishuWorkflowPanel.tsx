@@ -67,6 +67,19 @@ function fieldNameOf(field: FeishuFieldMetadata | undefined): string {
   return field?.fieldName ?? "";
 }
 
+function uniqueMetadataField(fields: FeishuFieldMetadata[], fieldId: string | null | undefined): FeishuFieldMetadata | undefined {
+  if (!fieldId) return undefined;
+  const matches = fields.filter((field) => field.fieldId === fieldId);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function currentFieldName(
+  fields: FeishuFieldMetadata[],
+  descriptor: { fieldId?: string | null; fieldName?: string | null } | null | undefined,
+): string {
+  return uniqueMetadataField(fields, descriptor?.fieldId)?.fieldName ?? descriptor?.fieldName ?? "";
+}
+
 function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata[]): FeishuStageConfigMap {
   const status = subject.statusField;
   const statusField = fields.find((field) => field.fieldId === status?.fieldId)
@@ -90,7 +103,11 @@ function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata
       artifactTargetPath: null,
       nameSuffix: `_${PHASE_LABELS[stageId]}`,
     };
-    return [stageId, old ? structuredClone(old) : fallback];
+    if (!old) return [stageId, fallback];
+    const cloned = structuredClone(old);
+    const currentTriggerField = uniqueMetadataField(fields, cloned.trigger.fieldId);
+    if (currentTriggerField) cloned.trigger.fieldName = currentTriggerField.fieldName;
+    return [stageId, cloned];
   })) as FeishuStageConfigMap;
 }
 
@@ -158,13 +175,27 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
     targetPath: subject.upload?.targetPath ?? "",
     uploadConcurrency: String(subject.upload?.uploadConcurrency ?? 1),
     statusFieldId: statusField?.fieldId ?? "",
-    statusFieldName: statusField?.fieldName ?? "",
+    statusFieldName: currentFieldName(fields, statusField),
     documentFieldId: documentField?.fieldId ?? "",
-    documentFieldName: documentField?.fieldName ?? "",
+    documentFieldName: currentFieldName(fields, documentField),
     namingFieldId: namingField?.fieldId ?? "",
-    namingFieldName: namingField?.fieldName ?? "",
-    stages: subject.stages || (statusField || documentField || namingField ? stageDefaults(subject, fields) : null),
+    namingFieldName: currentFieldName(fields, namingField),
+    stages: (subject.stages || statusField || documentField || namingField)
+      ? stageDefaults(subject, fields)
+      : null,
   };
+}
+
+function phasedFieldNamesNeedRefresh(subject: FeishuSubjectConfig): boolean {
+  const fields = subject.metadata?.fields ?? [];
+  const descriptorIsStale = (
+    descriptor: { fieldId?: string | null; fieldName?: string | null } | null | undefined,
+  ) => {
+    const current = uniqueMetadataField(fields, descriptor?.fieldId);
+    return Boolean(current && descriptor?.fieldName !== current.fieldName);
+  };
+  return [subject.statusField, subject.documentField, subject.namingField].some(descriptorIsStale)
+    || Object.values(subject.stages ?? {}).some((stage) => descriptorIsStale(stage.trigger));
 }
 
 function resourceGroupsFrom(value: string): string[] {
@@ -227,7 +258,8 @@ export function FeishuWorkflowPanel({
     },
   ]] : []));
   const subjectFormDirty = Boolean(selected && subjectForm
-    && JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected)));
+    && (JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected))
+      || phasedFieldNamesNeedRefresh(selected)));
   const selectedPackage = packageOptions?.find((item) => item.alias === subjectForm?.packageAlias);
   const visibleSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => subject.displayEnabled);
   const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);

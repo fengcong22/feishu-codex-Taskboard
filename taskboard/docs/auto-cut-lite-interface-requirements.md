@@ -31,7 +31,7 @@ autocut-lite-delivery-<version>/
 
 - 文档版本：`1.1`。
 - 更新日期：`2026-09-11`。
-- Taskboard 基线分支：`codex/dashboard-feature`；已批准实施计划基线为完整 commit `8fab8a7d17178bc4e02c159709683ed64f03bc68`，当前功能与跨端校验实现基线为完整 commit `3da73ab6ab5da41792c1a64cd2fff2b6c9fd29e1`。合同文本自身的修订记录以本文件所在 Git commit 为准。
+- Taskboard 基线分支：`codex/dashboard-feature`；已批准实施计划基线为完整 commit `8fab8a7d17178bc4e02c159709683ed64f03bc68`。当前功能、跨端校验和合同文本的权威实现基线，统一以本文件所在的最终 Git commit 为准，避免后续修订引用过期提交。
 - Taskboard 负责的接口生产者：`taskboard/server/autocut-local-runner.mjs`、`feishu-source-manifest.mjs`、`feishu-run-inputs.mjs`、`app.mjs`、`artifact-service.mjs`、`cli/taskctl.mjs` 和 `shared/codex-environment.mjs`。
 - Auto-Cut Lite 兼容基线：只读核对的源码完整 commit 为 `c950e82bfa1c955f2081e73c5a34cb825f9a2053`，本机已部署包版本为 `1.6.7+codex.20260908133808`，其 `PACKAGE-MANIFEST.json` SHA-256 为 `2bf1d8f766475b2a66faf6d6223f8c7006b397e160cdc04c51c73b34faa13f1c`。该核对未修改、构建或部署 Auto-Cut Lite；本文件描述的 `review-document-run`、Lite ZIP、结果回执和运行时发现契约以此作为 `CURRENT` 兼容参照。
 
@@ -500,7 +500,7 @@ sha256sum <candidate-package>       # Windows 可使用 Get-FileHash -Algorithm 
 
 1. 在 Auto-Cut Lite 源码仓库新分支实现 `REQUIRED`，运行完整测试并提交。
 2. 构建候选包，计算 SHA-256，写中文测试报告和交付说明；不安装到当前生产电脑。
-3. 有 GitHub 权限时先推送分支，并按团队流程或需要创建 PR；无权限时交付本地分支和完整 commit，并明确“尚未推送 GitHub”。
+3. 有 GitHub 权限时先推送分支，并在团队流程要求时创建 PR；无权限时交付本地分支和完整 commit，并明确“尚未推送 GitHub”。
 4. 将候选包、`.sha256`、测试报告、交付说明放入版本化目录；把目录和链接交回 Taskboard 维护任务。
 5. Taskboard 复核源码定位、报告和候选包 hash，先在测试表/示例项目验证三阶段和编号边界。
 6. 只有用户明确要求后，才在目标电脑安装或部署；部署后再做真实飞书事件端到端验证。
