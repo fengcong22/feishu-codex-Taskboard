@@ -13,6 +13,7 @@ import {
   audioDraftFromStage,
   FeishuStageEditor,
   isAttachmentField,
+  isSingleSelectField,
   type FeishuStageAudioDraft,
   type FeishuStageValue,
 } from "./FeishuStageEditor";
@@ -69,7 +70,7 @@ function fieldNameOf(field: FeishuFieldMetadata | undefined): string {
 function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata[]): FeishuStageConfigMap {
   const status = subject.statusField;
   const statusField = fields.find((field) => field.fieldId === status?.fieldId)
-    ?? fields.find((field) => String(field.uiType ?? field.type ?? "").toLowerCase().replace(/[\s_-]/gu, "") === "singleselect");
+    ?? fields.find(isSingleSelectField);
   const options = statusField?.options ?? [];
   const existing = subject.stages;
   return Object.fromEntries(PHASE_IDS.map((stageId, index) => {
@@ -632,10 +633,9 @@ export function FeishuWorkflowPanel({
                 onChange={(event) => selectPhasedField("status", event.target.value)}
               >
                 <option value="">选择单选状态字段</option>
-                {triggerFields.filter((field) => {
-                  const kind = String(field.uiType ?? field.type ?? "").toLowerCase().replace(/[\s_-]/gu, "");
-                  return kind === "singleselect" || kind === "select" || kind === "3";
-                }).map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+                {triggerFields.filter(isSingleSelectField).map((field) => (
+                  <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>
+                ))}
               </select>
             </label>
             <label>

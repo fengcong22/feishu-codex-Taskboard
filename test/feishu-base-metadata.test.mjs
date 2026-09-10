@@ -631,6 +631,46 @@ test("phased metadata requires one unambiguous single-select status field", () =
   }
 });
 
+test("phased metadata reports a stale stage trigger field name", () => {
+  const subject = phasedSubject({
+    stages: {
+      ...phasedSubject().stages,
+      initial: {
+        ...phasedSubject().stages.initial,
+        trigger: {
+          ...phasedSubject().stages.initial.trigger,
+          fieldName: "旧制作进度",
+        },
+      },
+    },
+  });
+  const metadata = phasedMetadata([
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+  ]);
+  const expectedPath = "bases.bas_demo.subjects.tbl_math.stages.initial.trigger.fieldName";
+
+  assert.ok(comparePhasedSubjectMetadata(subject, metadata).some((entry) => (
+    entry.code === "INVALID_FIELD" && entry.path === expectedPath
+  )));
+  assert.throws(
+    () => assertPhasedSubjectMetadata(subject, metadata),
+    (error) => error.code === "INVALID_FIELD"
+      && error.path === "stages.initial.trigger.fieldName",
+  );
+});
+
 test("phased metadata rejects renamed identities and malformed attachment types", () => {
   const baseFields = [
     {

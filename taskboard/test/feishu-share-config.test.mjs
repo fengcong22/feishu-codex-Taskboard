@@ -326,12 +326,12 @@ test("share import diagnoses staged attachment bindings against explicitly empty
   }
 });
 
-test("share import diagnoses staged attachment bindings that resolve to non-attachment fields", async () => {
+test("share import diagnoses staged attachment bindings whose type conflicts with uiType", async () => {
   const fixtureData = await fixture();
   try {
     const metadata = phasedMetadata([
-      { fieldId: "fld_text_video", fieldName: "视频文本", type: 1, uiType: "Text", options: [] },
-      { fieldId: "fld_text_audio", fieldName: "音频文本", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_text_video", fieldName: "视频文本", type: 1, uiType: "Attachment", options: [] },
+      { fieldId: "fld_text_audio", fieldName: "音频文本", type: 17, uiType: "Text", options: [] },
     ]);
     await seedSubject(fixtureData.baseUrl, "bas_wrong_attachment_type", metadata.fields);
     const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");

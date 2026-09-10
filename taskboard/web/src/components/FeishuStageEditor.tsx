@@ -66,10 +66,39 @@ const STAGE_LABELS: Record<FeishuStageId, string> = {
   first_review: "初审修改",
   final_review: "终审修改",
 };
+const ATTACHMENT_UI_TYPES = new Set(["attachment", "attachments"]);
+const SINGLE_SELECT_UI_TYPES = new Set(["singleselect", "select"]);
+
+function normalizedMetadataType(value: StageMetadataField["type"]): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "string" && /^\d+$/u.test(value.trim())) return Number(value.trim());
+  return null;
+}
+
+function normalizedMetadataUiType(value: StageMetadataField["uiType"]): string | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  return value.trim().toLowerCase().replace(/[\s_-]/gu, "");
+}
+
+function hasStrictMetadataType(
+  field: StageMetadataField,
+  numericType: number,
+  uiTypes: ReadonlySet<string>,
+): boolean {
+  const hasType = field.type !== null && field.type !== undefined && field.type !== "";
+  const hasUiType = field.uiType !== null && field.uiType !== undefined && field.uiType !== "";
+  if (!hasType && !hasUiType) return false;
+  if (hasType && normalizedMetadataType(field.type) !== numericType) return false;
+  if (hasUiType && !uiTypes.has(normalizedMetadataUiType(field.uiType) ?? "")) return false;
+  return true;
+}
 
 export function isAttachmentField(field: StageMetadataField): boolean {
-  const uiType = String(field.uiType ?? "").toLowerCase().replace(/[\s_-]/gu, "");
-  return uiType === "attachment" || uiType === "attachments" || String(field.type) === "17";
+  return hasStrictMetadataType(field, 17, ATTACHMENT_UI_TYPES);
+}
+
+export function isSingleSelectField(field: StageMetadataField): boolean {
+  return hasStrictMetadataType(field, 3, SINGLE_SELECT_UI_TYPES);
 }
 
 export function audioDraftFromStage(audio: FeishuStageValue["audio"]): FeishuStageAudioDraft {

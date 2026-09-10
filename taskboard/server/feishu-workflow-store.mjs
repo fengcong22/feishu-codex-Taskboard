@@ -4,6 +4,7 @@ import { ApiError } from "./database.mjs";
 import {
   STAGE_IDS,
   assertPhasedAttachmentBindings,
+  isAttachmentMetadataField,
   isPhasedSubject,
   normalizeStage,
   portablePhasedSubject,
@@ -151,15 +152,6 @@ function safeSourceUrlLabel(value) {
   } catch {
     return null;
   }
-}
-
-function isAttachmentField(field) {
-  if (!field || typeof field !== "object" || Array.isArray(field)) return false;
-  if (field.type === 17 || String(field.type ?? "") === "17") return true;
-  const uiType = String(field.uiType ?? field.ui_type ?? "")
-    .replace(/[\s_-]/gu, "")
-    .toLowerCase();
-  return uiType === "attachment" || uiType === "attachments";
 }
 
 function portableMetadata(metadata) {
@@ -606,7 +598,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 path: diagnosticPath,
                 message: "A configured staged attachment field is not present in the local metadata",
               });
-            } else if (!isAttachmentField(field)) {
+            } else if (!isAttachmentMetadataField(field)) {
               diagnostics.push({
                 code: "FIELD_TYPE_INVALID",
                 severity: "warning",

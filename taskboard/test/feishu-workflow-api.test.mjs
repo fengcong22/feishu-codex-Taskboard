@@ -1246,6 +1246,21 @@ test("default Bridge workflow sync identifies Taskboard with the dedicated clien
 
 test("share import asks the loopback Bridge for live diagnostics and merges local diagnostics", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-bridge-"));
+  const phasedBridgeDiagnosticPaths = [
+    ["bases.bas_share.subjects.tbl_subject.statusField.fieldId", "FIELD_NOT_FOUND"],
+    ["bases.bas_share.subjects.tbl_subject.statusField.fieldName", "INVALID_FIELD"],
+    ["bases.bas_share.subjects.tbl_subject.statusField.options", "FEISHU_METADATA_UNAVAILABLE"],
+    ["bases.bas_share.subjects.tbl_subject.documentField.fieldId", "FIELD_NOT_FOUND"],
+    ["bases.bas_share.subjects.tbl_subject.documentField.fieldName", "INVALID_FIELD"],
+    ["bases.bas_share.subjects.tbl_subject.namingField.fieldId", "FIELD_NOT_FOUND"],
+    ["bases.bas_share.subjects.tbl_subject.namingField.fieldName", "INVALID_FIELD"],
+    ["bases.bas_share.subjects.tbl_subject.stages", "INVALID_FIELD"],
+    ...["initial", "first_review", "final_review"].flatMap((stageId) => [
+      [`bases.bas_share.subjects.tbl_subject.stages.${stageId}.trigger.fieldId`, "INVALID_FIELD"],
+      [`bases.bas_share.subjects.tbl_subject.stages.${stageId}.trigger.fieldName`, "INVALID_FIELD"],
+      [`bases.bas_share.subjects.tbl_subject.stages.${stageId}.trigger.optionId`, "INVALID_FIELD"],
+    ]),
+  ];
   let receivedClient = null;
   let receivedDryRun = null;
   let receivedPath = null;
@@ -1299,7 +1314,12 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
         severity: "warning",
         path: "bases.bas_share.subjects.tbl_subject.stages.initial.audio.source.fieldId.extra",
         message: "Bridge supplied an unregistered staged diagnostic path",
-      }],
+      }, ...phasedBridgeDiagnosticPaths.map(([diagnosticPath, code]) => ({
+        code,
+        severity: "warning",
+        path: diagnosticPath,
+        message: "Bridge supplied a phased workflow diagnostic",
+      }))],
     }));
   });
   await new Promise((resolve, reject) => {
@@ -1410,6 +1430,13 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
       && entry.message === "A configured workflow field or stage trigger no longer matches the live subject table"
     )));
     assert.equal(result.body.diagnostics.some((entry) => entry.path?.endsWith(".extra")), false);
+    assert.deepEqual(
+      result.body.diagnostics
+        .map((entry) => entry.path)
+        .filter((diagnosticPath) => phasedBridgeDiagnosticPaths.some(([expected]) => expected === diagnosticPath))
+        .sort(),
+      phasedBridgeDiagnosticPaths.map(([diagnosticPath]) => diagnosticPath).sort(),
+    );
     assert.deepEqual(
       result.body.diagnostics
         .filter((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE")

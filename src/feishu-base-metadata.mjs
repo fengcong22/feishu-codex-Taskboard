@@ -859,6 +859,11 @@ function phasedSubjectErrors(subject, metadata, table) {
       error.path = `stages.${stageId}.trigger.fieldId`;
       errors.push(error);
     }
+    if (status && trigger.fieldName && trigger.fieldName !== status.fieldName) {
+      const error = configurationChanged(`${stageId}.trigger.fieldName no longer matches Feishu metadata`);
+      error.path = `stages.${stageId}.trigger.fieldName`;
+      errors.push(error);
+    }
     if (seen.has(trigger.optionId)) {
       const error = configurationChanged("enabled stage trigger options must be unique");
       error.path = `stages.${stageId}.trigger.optionId`;

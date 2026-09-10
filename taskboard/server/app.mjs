@@ -147,9 +147,26 @@ function bridgeShareDiagnosticContext(configuration) {
         "", ".fields", ".trigger.fieldId", ".title.fieldId", ".subjectCode.fieldId",
         ".packageRoute", ".upload.artifactSourcePath", ".upload.targetPath",
       ]) paths.add(`${subjectPath}${suffix}`);
+      for (const fieldName of ["statusField", "documentField", "namingField"]) {
+        const field = subject[fieldName];
+        if (!field || typeof field !== "object") continue;
+        paths.add(`${subjectPath}.${fieldName}.fieldId`);
+        paths.add(`${subjectPath}.${fieldName}.fieldName`);
+      }
+      if (subject.statusField && typeof subject.statusField === "object") {
+        paths.add(`${subjectPath}.statusField.options`);
+      }
+      if (subject.stages && typeof subject.stages === "object") {
+        paths.add(`${subjectPath}.stages`);
+      }
       for (const stageId of STAGE_IDS) {
         const stage = subject.stages?.[stageId];
         if (!stage || typeof stage !== "object") continue;
+        if (stage.trigger && typeof stage.trigger === "object") {
+          paths.add(`${subjectPath}.stages.${stageId}.trigger.fieldId`);
+          paths.add(`${subjectPath}.stages.${stageId}.trigger.fieldName`);
+          paths.add(`${subjectPath}.stages.${stageId}.trigger.optionId`);
+        }
         if (stage.videoSource?.kind === "base_attachment") {
           paths.add(`${subjectPath}.stages.${stageId}.videoSource.fieldId`);
         }

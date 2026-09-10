@@ -19,7 +19,7 @@ const fields = [
   {
     fieldId: "fld_status",
     fieldName: "流程状态",
-    type: "single_select",
+    type: 3,
     uiType: "SingleSelect",
     options: [
       { id: "opt_initial", name: "初稿" },
@@ -28,8 +28,12 @@ const fields = [
     ],
   },
   { fieldId: "fld_text", fieldName: "普通文本", type: 1, uiType: "Text", options: [] },
-  { fieldId: "fld_video", fieldName: "视频附件", type: "attachment", uiType: "Attachment", options: [] },
+  { fieldId: "fld_video", fieldName: "视频附件", type: 17, uiType: "Attachment", options: [] },
   { fieldId: "fld_audio", fieldName: "配音附件", type: 17, uiType: null, options: [] },
+  { fieldId: "fld_fake_attachment_type", fieldName: "伪附件类型", type: 1, uiType: "Attachment", options: [] },
+  { fieldId: "fld_fake_attachment_ui", fieldName: "伪附件界面", type: 17, uiType: "Text", options: [] },
+  { fieldId: "fld_fake_status_type", fieldName: "伪状态类型", type: 4, uiType: "SingleSelect", options: [] },
+  { fieldId: "fld_fake_status_ui", fieldName: "伪状态界面", type: 3, uiType: "MultiSelect", options: [] },
 ];
 
 const stage: FeishuStageValue = {
@@ -191,6 +195,8 @@ describe("FeishuStageEditor", () => {
     fireEvent.change(source, { target: { value: "base_attachment" } });
     const attachment = screen.getByRole("combobox", { name: "初稿音频附件字段" }) as HTMLSelectElement;
     expect(within(attachment).queryByRole("option", { name: "普通文本" })).toBeNull();
+    expect(within(attachment).queryByRole("option", { name: "伪附件类型" })).toBeNull();
+    expect(within(attachment).queryByRole("option", { name: "伪附件界面" })).toBeNull();
     expect(within(attachment).getByRole("option", { name: "视频附件" })).toBeTruthy();
     expect(within(attachment).getByRole("option", { name: "配音附件" })).toBeTruthy();
     fireEvent.change(attachment, { target: { value: "fld_audio" } });
@@ -249,6 +255,23 @@ describe("FeishuStageEditor", () => {
 
 describe("FeishuWorkflowPanel audio drafts", () => {
   afterEach(() => cleanup());
+
+  it("shows only metadata fields whose type and uiType both identify a single select", () => {
+    const configured = subject("history", "高中历史");
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="history"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    const status = screen.getByRole("combobox", { name: "状态字段" });
+    expect(within(status).getByRole("option", { name: "流程状态" })).toBeTruthy();
+    expect(within(status).queryByRole("option", { name: "伪状态类型" })).toBeNull();
+    expect(within(status).queryByRole("option", { name: "伪状态界面" })).toBeNull();
+  });
 
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {
     const subjectA = subject("history", "高中历史");

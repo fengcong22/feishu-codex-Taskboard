@@ -5,16 +5,13 @@
 
 ## 这次要交给谁
 
-把两份文件交给**另一台电脑上打开的 Auto-Cut Lite 源码任务**：
-
-1. 本文件：告诉对方如何交付；
-2. `auto-cut-lite-interface-requirements.md`：完整接口、需求和验收标准。
+只把 `auto-cut-lite-interface-requirements.md` 这一份完整合同交给**另一台电脑上打开的 Auto-Cut Lite 源码任务**。本文件只是你在当前电脑上看的操作说明，不需要发给对方。
 
 不要把当前电脑已经安装的 Auto-Cut Lite 覆盖掉，也不要要求对方直接部署。
 
 ## 你只需要复制的提示
 
-先确认另一台电脑打开的是**带 `.git` 的真实 Auto-Cut Lite 源码仓库**，不是名称相似的安装目录。让对方核对并报告 Git remote 仓库地址；如果无法确认，就先停止，不要修改。确认后新建任务，把下面这段话和上面两份 Markdown 文件一起发过去：
+在另一台电脑新建任务，把下面这段话和 `auto-cut-lite-interface-requirements.md` 这一份文件一起发过去。合同本身已经要求对方先核对 `.git` 和 Git remote，无法确认时停止：
 
 > 请先确认当前目录是带 `.git` 的真实 Auto-Cut Lite 源码仓库，而不是安装目录，并报告 Git remote 仓库地址；无法确认时请停止，不要修改。确认后，严格按照 `auto-cut-lite-interface-requirements.md` 实现全部 `REQUIRED` 项，并保留 `CURRENT` 兼容性。请在源码仓库新建独立分支开发、测试和构建候选包；不要安装、覆盖或部署到当前生产电脑。完成后一次性交付：源码分支名、完整 Git commit SHA、是否已推送 GitHub（如已推送则给分支链接，以及按需创建的 PR 链接）、版本化候选包、候选包 SHA-256、中文测试报告和中文交付说明。请把这些文件放在一个版本化交付文件夹中。
 

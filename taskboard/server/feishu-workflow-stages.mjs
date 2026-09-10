@@ -3,6 +3,40 @@ const ABSOLUTE_PATH = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u;
 
 export const STAGE_IDS = Object.freeze(["initial", "first_review", "final_review"]);
 
+const STAGE_KEYS = new Set([
+  "enabled",
+  "trigger",
+  "videoSource",
+  "video_source",
+  "reviewSource",
+  "review_source",
+  "audio",
+  "artifactTargetPath",
+  "artifact_target_path",
+  "nameSuffix",
+  "name_suffix",
+]);
+const TRIGGER_KEYS = new Set([
+  "fieldId",
+  "field_id",
+  "fieldName",
+  "field_name",
+  "optionId",
+  "option_id",
+  "value",
+  "startValue",
+  "start_value",
+]);
+const SOURCE_KEYS = new Set(["kind", "anchorText", "anchor_text", "fieldId", "field_id"]);
+const AUDIO_KEYS = new Set([
+  "mode",
+  "source",
+  "durationToleranceSeconds",
+  "duration_tolerance_seconds",
+]);
+const SINGLE_SELECT_UI_TYPES = new Set(["singleselect", "select"]);
+const ATTACHMENT_UI_TYPES = new Set(["attachment", "attachments"]);
+
 function fail(message, code = "INVALID_FIELD") {
   const error = new Error(message);
   error.code = code;
@@ -32,6 +66,12 @@ function plainObject(value, name) {
   return value;
 }
 
+function assertKnownKeys(value, allowed, name) {
+  plainObject(value, name);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw fail(`${name}.${unknown} is not supported`, "UNKNOWN_FIELD");
+}
+
 function fieldId(field) {
   return field?.fieldId ?? field?.id ?? null;
 }
@@ -49,18 +89,37 @@ function metadataField(metadata, id) {
   return metadataFields(metadata).find((field) => fieldId(field) === id) ?? null;
 }
 
-function isSingleSelect(field) {
-  const uiType = String(field?.uiType ?? field?.type ?? "").toLowerCase().replace(/[\s_-]/gu, "");
-  return uiType === "singleselect" || uiType === "select" || field?.type === 3;
+function normalizedType(value) {
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "string" && /^\d+$/u.test(value.trim())) return Number(value.trim());
+  return null;
 }
 
-function isAttachment(field) {
-  const uiType = String(field?.uiType ?? field?.type ?? "").toLowerCase().replace(/[\s_-]/gu, "");
-  return uiType === "attachment" || uiType === "attachments" || String(field?.type ?? "") === "17";
+function normalizedUiType(value) {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  return value.trim().toLowerCase().replace(/[\s_-]/gu, "");
+}
+
+function strictMetadataType(field, expectedType, expectedUiTypes) {
+  if (!field || typeof field !== "object" || Array.isArray(field)) return false;
+  const hasType = field.type !== null && field.type !== undefined && field.type !== "";
+  const hasUiType = field.uiType !== null && field.uiType !== undefined && field.uiType !== "";
+  if (!hasType && !hasUiType) return false;
+  if (hasType && normalizedType(field.type) !== expectedType) return false;
+  if (hasUiType && !expectedUiTypes.has(normalizedUiType(field.uiType))) return false;
+  return true;
+}
+
+export function isSingleSelectMetadataField(field) {
+  return strictMetadataType(field, 3, SINGLE_SELECT_UI_TYPES);
+}
+
+export function isAttachmentMetadataField(field) {
+  return strictMetadataType(field, 17, ATTACHMENT_UI_TYPES);
 }
 
 function normalizeSource(source, metadata, name, { review = false } = {}) {
-  plainObject(source, name);
+  assertKnownKeys(source, SOURCE_KEYS, name);
   const kind = text(source.kind, `${name}.kind`);
   if (kind === "docx_section") {
     const anchorText = text(source.anchorText ?? source.anchor_text, `${name}.anchorText`);
@@ -74,9 +133,14 @@ function normalizeSource(source, metadata, name, { review = false } = {}) {
 }
 
 function normalizeAudio(audio, metadata, name) {
-  plainObject(audio, name);
+  assertKnownKeys(audio, AUDIO_KEYS, name);
   const mode = text(audio.mode, `${name}.mode`);
-  if (mode === "video_original") return { mode };
+  if (mode === "video_original") {
+    if (audio.source && typeof audio.source === "object" && !Array.isArray(audio.source)) {
+      assertKnownKeys(audio.source, SOURCE_KEYS, `${name}.source`);
+    }
+    return { mode };
+  }
   if (mode !== "replace_original") throw fail(`${name}.mode is invalid`);
   if (audio.source === null || audio.source === undefined) throw fail(`${name} audio source is required`);
   const source = normalizeSource(audio.source, metadata, `${name}.source`);
@@ -97,13 +161,13 @@ function normalizeAudio(audio, metadata, name) {
  * field/source contract without importing either application's internals.
  */
 export function normalizeStage(stage, metadata = null, stageId = "stage") {
-  plainObject(stage, `stages.${stageId}`);
+  assertKnownKeys(stage, STAGE_KEYS, `stages.${stageId}`);
   if (!STAGE_IDS.includes(stageId)) throw fail(`Unknown stage '${stageId}'`);
   const enabled = stage.enabled === undefined ? false : stage.enabled;
   if (typeof enabled !== "boolean") throw fail(`stages.${stageId}.enabled must be boolean`);
 
   const triggerInput = stage.trigger ?? {};
-  plainObject(triggerInput, `stages.${stageId}.trigger`);
+  assertKnownKeys(triggerInput, TRIGGER_KEYS, `stages.${stageId}.trigger`);
   const triggerFieldId = identifier(triggerInput.fieldId ?? triggerInput.field_id, `stages.${stageId}.trigger.fieldId`, { optional: !enabled });
   const optionId = identifier(triggerInput.optionId ?? triggerInput.option_id, `stages.${stageId}.trigger.optionId`, { optional: !enabled });
   const value = text(
@@ -183,7 +247,7 @@ export function assertPhasedAttachmentBindings(value, metadata = value?.metadata
       error.path = path;
       throw error;
     }
-    if (!isAttachment(field)) {
+    if (!isAttachmentMetadataField(field)) {
       const error = fail(`${path} must identify an attachment field`, "FIELD_TYPE_INVALID");
       error.path = path;
       throw error;
@@ -210,7 +274,7 @@ export function assertPhasedAttachmentBindings(value, metadata = value?.metadata
 export function validatePhasedSubjectConfig(value) {
   plainObject(value, "Subject configuration");
   const metadata = value.metadata ?? null;
-  const statusField = validateMetadataField(metadata, value.statusField, "statusField", isSingleSelect);
+  const statusField = validateMetadataField(metadata, value.statusField, "statusField", isSingleSelectMetadataField);
   if (!statusField.fieldId) throw fail("statusField is required");
   const documentField = validateMetadataField(metadata, value.documentField, "documentField", null);
   if (!documentField.fieldId) throw fail("documentField is required");

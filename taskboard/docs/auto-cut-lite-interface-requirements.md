@@ -4,12 +4,12 @@
 
 ## 0. 给源码开发任务的直接说明（请先阅读）
 
-请在 Auto-Cut Lite 源码仓库中新建一个独立分支，实现本文所有标记为 `REQUIRED` 的内容，并保持 `CURRENT` 契约兼容。请勿把变更直接安装、覆盖或部署到用户当前生产电脑；只在源码仓库中开发、测试并构建候选包。不要索要或记录 GitHub 密码、Personal Access Token 或飞书凭据。
+请先确认当前目录是带 `.git` 的真实 Auto-Cut Lite 源码仓库，而不是安装目录，并报告 Git remote 仓库地址；无法确认时请停止，不要修改。确认后新建一个独立分支，实现本文所有标记为 `REQUIRED` 的内容，并保持 `CURRENT` 契约兼容。请勿把变更直接安装、覆盖或部署到用户当前生产电脑；只在源码仓库中开发、测试并构建候选包。不要索要或记录 GitHub 密码、Personal Access Token 或飞书凭据。
 
 完成后必须一次性交付以下内容：
 
 1. 新分支名称和完整的 Git commit SHA（不是缩写 SHA）。
-2. 如果当前环境有 GitHub 推送权限，提供已推送分支或 Pull Request 链接；没有权限时也必须提供本地分支和完整 SHA，并明确写出“尚未推送 GitHub”。Git commit 是源码仓库的版本记录，不等于已经推送 GitHub，也不等于已经部署。
+2. 如果当前环境有 GitHub 推送权限，先推送分支并提供分支链接；如按团队流程创建了 Pull Request，再同时提供 PR 链接。没有权限时也必须提供本地分支和完整 SHA，并明确写出“尚未推送 GitHub”。Git commit 是源码仓库的版本记录，不等于已经推送 GitHub，也不等于已经部署。
 3. 从该提交构建的、可部署但尚未安装到当前生产电脑的候选包，使用包含版本号的清晰文件名。
 4. 候选包的 SHA-256（小写、64 个十六进制字符）。
 5. 一份中文 Markdown 测试报告：逐项列出本文验收矩阵、执行命令、实际通过/失败结果和仍存在的限制，不能只写“已完成”。
@@ -29,11 +29,11 @@ autocut-lite-delivery-<version>/
 
 ## 1. 文档身份与状态标记
 
-- 文档版本：`1.0`。
-- 生成日期：`2026-09-10`。
-- Taskboard 基线分支：`codex/dashboard-feature`；本合同的已批准实施计划基线为完整 commit `8fab8a7d17178bc4e02c159709683ed64f03bc68`。最终交接时还要同时提供包含本文件和功能实现的实际完整 commit SHA。
+- 文档版本：`1.1`。
+- 更新日期：`2026-09-11`。
+- Taskboard 基线分支：`codex/dashboard-feature`；已批准实施计划基线为完整 commit `8fab8a7d17178bc4e02c159709683ed64f03bc68`，当前功能与跨端校验实现基线为完整 commit `3da73ab6ab5da41792c1a64cd2fff2b6c9fd29e1`。合同文本自身的修订记录以本文件所在 Git commit 为准。
 - Taskboard 负责的接口生产者：`taskboard/server/autocut-local-runner.mjs`、`feishu-source-manifest.mjs`、`feishu-run-inputs.mjs`、`app.mjs`、`artifact-service.mjs`、`cli/taskctl.mjs` 和 `shared/codex-environment.mjs`。
-- Auto-Cut Lite 兼容基线：本文件描述的 `review-document-run`、Lite ZIP、结果回执和运行时发现契约；用户当前电脑上已部署的 Auto-Cut Lite 目录不属于本次修改、构建或部署范围。
+- Auto-Cut Lite 兼容基线：只读核对的源码完整 commit 为 `c950e82bfa1c955f2081e73c5a34cb825f9a2053`，本机已部署包版本为 `1.6.7+codex.20260908133808`，其 `PACKAGE-MANIFEST.json` SHA-256 为 `2bf1d8f766475b2a66faf6d6223f8c7006b397e160cdc04c51c73b34faa13f1c`。该核对未修改、构建或部署 Auto-Cut Lite；本文件描述的 `review-document-run`、Lite ZIP、结果回执和运行时发现契约以此作为 `CURRENT` 兼容参照。
 
 每条要求都使用以下标记：
 
@@ -500,7 +500,7 @@ sha256sum <candidate-package>       # Windows 可使用 Get-FileHash -Algorithm 
 
 1. 在 Auto-Cut Lite 源码仓库新分支实现 `REQUIRED`，运行完整测试并提交。
 2. 构建候选包，计算 SHA-256，写中文测试报告和交付说明；不安装到当前生产电脑。
-3. 有 GitHub 权限时推送分支并创建 PR；无权限时交付本地分支和完整 commit，并明确“尚未推送 GitHub”。
+3. 有 GitHub 权限时先推送分支，并按团队流程或需要创建 PR；无权限时交付本地分支和完整 commit，并明确“尚未推送 GitHub”。
 4. 将候选包、`.sha256`、测试报告、交付说明放入版本化目录；把目录和链接交回 Taskboard 维护任务。
 5. Taskboard 复核源码定位、报告和候选包 hash，先在测试表/示例项目验证三阶段和编号边界。
 6. 只有用户明确要求后，才在目标电脑安装或部署；部署后再做真实飞书事件端到端验证。
@@ -518,4 +518,5 @@ sha256sum <candidate-package>       # Windows 可使用 Get-FileHash -Algorithm 
 
 | 版本 | 日期 | 内容 |
 | --- | --- | --- |
+| 1.1 | 2026-09-11 | 补充实际 Taskboard 功能基线、只读核对的 Auto-Cut Lite 兼容基线，并明确源码目录和 GitHub 分支/PR 交付顺序。 |
 | 1.0 | 2026-09-10 | 汇总 Taskboard 当前稳定接口、三阶段音频来源、自动编号兼容要求、完整验收矩阵和源码交付包要求。 |
