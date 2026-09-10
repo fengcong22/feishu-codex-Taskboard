@@ -602,6 +602,36 @@ function phasedField(subject, metadata, descriptor, pathName) {
   return field;
 }
 
+function isAttachmentField(field) {
+  if (!field || typeof field !== "object") return false;
+  if (field.type === 17 || String(field.type ?? "") === "17") return true;
+  const uiType = String(field.uiType ?? field.ui_type ?? "")
+    .replace(/[\s_-]/gu, "")
+    .toLowerCase();
+  return uiType === "attachment" || uiType === "attachments";
+}
+
+function phasedAttachmentField(subject, metadata, source, pathName) {
+  if (!source || source.kind !== "base_attachment") return;
+  const table = metadata.tables?.find((candidate) => candidate.tableId === subject.tableId);
+  const fieldId = source.fieldId ?? source.field_id;
+  const field = table?.fields?.find((candidate) => (
+    candidate?.fieldId === fieldId || candidate?.field_id === fieldId || candidate?.id === fieldId
+  ));
+  if (!field) {
+    const error = configurationChanged(`${pathName} is not present in Feishu metadata`);
+    error.code = "FIELD_NOT_FOUND";
+    error.path = pathName;
+    throw error;
+  }
+  if (!isAttachmentField(field)) {
+    const error = configurationChanged(`${pathName} must identify an attachment field`);
+    error.code = "FIELD_TYPE_INVALID";
+    error.path = pathName;
+    throw error;
+  }
+}
+
 /** Validate the fixed three-stage subject against a live metadata snapshot. */
 export function assertPhasedSubjectMetadata(subject, metadata) {
   if (!metadata || metadata.baseToken !== subject?.baseToken) {
@@ -641,6 +671,24 @@ export function assertPhasedSubjectMetadata(subject, metadata) {
     ));
     if (matches.length !== 1) {
       throw configurationChanged(`${stageId}.trigger option is missing or changed`);
+    }
+  }
+  for (const [stageId, stage] of Object.entries(subject.stages ?? {})) {
+    if (!stage || typeof stage !== "object") continue;
+    phasedAttachmentField(
+      subject,
+      metadata,
+      stage.videoSource ?? stage.video_source,
+      `stages.${stageId}.videoSource.fieldId`,
+    );
+    const audio = stage.audio;
+    if (audio?.mode === "replace_original") {
+      phasedAttachmentField(
+        subject,
+        metadata,
+        audio.source,
+        `stages.${stageId}.audio.source.fieldId`,
+      );
     }
   }
   return true;

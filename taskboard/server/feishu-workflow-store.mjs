@@ -3,13 +3,19 @@ import { createHash } from "node:crypto";
 import { ApiError } from "./database.mjs";
 import {
   STAGE_IDS,
+  assertPhasedAttachmentBindings,
   isPhasedSubject,
   normalizeStage,
   portablePhasedSubject,
   validatePhasedSubjectConfig,
 } from "./feishu-workflow-stages.mjs";
 
-export { STAGE_IDS, normalizeStage, validatePhasedSubjectConfig } from "./feishu-workflow-stages.mjs";
+export {
+  STAGE_IDS,
+  assertPhasedAttachmentBindings,
+  normalizeStage,
+  validatePhasedSubjectConfig,
+} from "./feishu-workflow-stages.mjs";
 
 const now = () => new Date().toISOString();
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -453,6 +459,23 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const normalized = typeof validateConfig === "function" ? validateConfig(value) : value;
     return validateSubjectConfig(normalized);
   };
+
+  function assertStrictPhasedAttachments(subject) {
+    if (!isPhasedSubject(subject)) return;
+    try {
+      assertPhasedAttachmentBindings(subject, subject.metadata);
+    } catch (error) {
+      const code = error?.code === "FIELD_TYPE_INVALID" ? "FIELD_TYPE_INVALID" : "FIELD_NOT_FOUND";
+      throw new ApiError(
+        409,
+        code,
+        code === "FIELD_TYPE_INVALID"
+          ? "A configured phased source is not an attachment field"
+          : "A configured phased attachment field is not present in the latest Base metadata",
+        error?.path ? { path: error.path } : undefined,
+      );
+    }
+  }
   async function assertPackageAlias(alias) {
     if (typeof packageAliases !== "function") return;
     const allowed = await packageAliases();
@@ -864,6 +887,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           lifecycle: "draft",
           configVersion: current.config_version + 1,
         });
+        assertStrictPhasedAttachments(next);
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
           .run(next.configVersion, JSON.stringify(next), next.displayEnabled === false ? 0 : 1, timestamp, key);
         saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
@@ -994,6 +1018,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     }
     const currentConfig = rowSubject(current);
     if (lifecycle === "enabled") {
+      assertStrictPhasedAttachments(currentConfig);
       assertTriggerMetadata(currentConfig);
       await assertPackageAlias(currentConfig.packageRoute.packageAlias);
       if (

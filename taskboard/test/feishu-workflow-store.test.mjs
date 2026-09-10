@@ -41,6 +41,47 @@ function subjectPatch() {
   };
 }
 
+function phasedPreview({ attachmentField = { fieldId: "fld_audio", fieldName: "音频", type: 17, uiType: "Attachment", options: [] } } = {}) {
+  return {
+    ...preview(),
+    tables: [{
+      ...preview().tables[0],
+      fields: [
+        ...preview().tables[0].fields,
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+        attachmentField,
+      ],
+    }],
+  };
+}
+
+function phasedStage(stageId, optionId, value) {
+  return {
+    enabled: true,
+    trigger: { fieldId: "fld_status", fieldName: "待制作", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: "录屏" },
+    reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+    audio: { mode: "replace_original", source: { kind: "base_attachment", fieldId: "fld_audio" } },
+    artifactTargetPath: `C:\\approved\\${stageId}`,
+    nameSuffix: `_${value}`,
+  };
+}
+
+function phasedPatch() {
+  return {
+    ...subjectPatch(),
+    statusField: { fieldId: "fld_status", fieldName: "待制作" },
+    documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+    namingField: { fieldId: "fld_name", fieldName: "命名" },
+    stages: {
+      initial: phasedStage("initial", "opt_ready", "待制作"),
+      first_review: { ...phasedStage("first_review", "opt_review", "初审"), enabled: false, trigger: { fieldId: null, fieldName: null, optionId: null, value: null } },
+      final_review: { ...phasedStage("final_review", "opt_final", "终审"), enabled: false, trigger: { fieldId: null, fieldName: null, optionId: null, value: null } },
+    },
+  };
+}
+
 test("catalog preview creates independent Base/subject rows and deterministic project ids", async () => {
   const { directory, database, store } = await fixture();
   try {
@@ -309,6 +350,61 @@ test("enabling rejects trigger fields and select options missing from refreshed 
     await assert.rejects(
       () => store.enableSubject(missingOption.subjectKey, missingOption.configVersion),
       (error) => error.code === "TRIGGER_OPTION_NOT_FOUND" && error.status === 409,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retains stale phased attachment bindings after refresh but rejects save and enable", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const basePreview = phasedPreview({
+      attachmentField: { fieldId: "fld_audio", fieldName: "音频", type: 17, uiType: "Attachment", options: [] },
+    });
+    await store.upsertBasePreview(basePreview);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+    assert.equal(enabled.lifecycle, "enabled");
+
+    const removed = await store.upsertBasePreview({
+      ...basePreview,
+      metadataRefreshedAt: 1710000002000,
+      tables: [{ ...basePreview.tables[0], fields: basePreview.tables[0].fields.filter((field) => field.fieldId !== "fld_audio") }],
+    });
+    const stale = removed.subjects[0];
+    assert.equal(stale.lifecycle, "draft");
+    assert.equal(stale.stages.initial.audio.source.fieldId, "fld_audio");
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(stale.subjectKey, { expectedVersion: stale.configVersion }),
+      (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
+    );
+    await assert.rejects(
+      () => store.enableSubject(stale.subjectKey, stale.configVersion),
+      (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
+    );
+
+    const changedType = await store.upsertBasePreview({
+      ...basePreview,
+      metadataRefreshedAt: 1710000003000,
+      tables: [{
+        ...basePreview.tables[0],
+        fields: basePreview.tables[0].fields.map((field) => (
+          field.fieldId === "fld_audio" ? { ...field, type: 1, uiType: "Text" } : field
+        )),
+      }],
+    });
+    const wrongType = changedType.subjects[0];
+    assert.equal(wrongType.stages.initial.audio.source.fieldId, "fld_audio");
+    await assert.rejects(
+      () => store.saveSubjectDraft(wrongType.subjectKey, { expectedVersion: wrongType.configVersion }),
+      (error) => error.code === "FIELD_TYPE_INVALID" && error.status === 409,
+    );
+    await assert.rejects(
+      () => store.enableSubject(wrongType.subjectKey, wrongType.configVersion),
+      (error) => error.code === "FIELD_TYPE_INVALID" && error.status === 409,
     );
   } finally {
     database.close();

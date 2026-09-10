@@ -68,8 +68,6 @@ function normalizeSource(source, metadata, name, { review = false } = {}) {
   }
   if (kind === "base_attachment" && !review) {
     const fieldIdValue = identifier(source.fieldId ?? source.field_id, `${name}.fieldId`);
-    const field = metadataField(metadata, fieldIdValue);
-    if (field && !isAttachment(field)) throw fail(`${name}.fieldId must identify an attachment field`);
     return { kind, fieldId: fieldIdValue };
   }
   throw fail(`${name}.kind is invalid`);
@@ -157,6 +155,51 @@ function validateMetadataField(metadata, descriptor, name, predicate = null, { r
   if (metadataFields(metadata).length > 0 && !field) throw fail(`${name}.fieldId is not present in metadata`, "FIELD_NOT_FOUND");
   if (field && predicate && !predicate(field)) throw fail(`${name}.fieldId has an incompatible type`, "FIELD_TYPE_INVALID");
   return { fieldId: id, fieldName: configuredName ?? text(fieldName(field), `${name}.fieldName`) };
+}
+
+/**
+ * Assert that every configured staged Base attachment source still resolves to
+ * an Attachment field in a known metadata snapshot. Structural normalization
+ * intentionally does not call this helper so a stale binding can be retained
+ * and repaired in the editor after metadata refresh.
+ *
+ * When metadata is unavailable (no `fields` array), callers may leave the
+ * default `requireMetadata: false` to defer validation. An explicit empty
+ * fields array is considered known metadata and therefore rejects bindings.
+ */
+export function assertPhasedAttachmentBindings(value, metadata = value?.metadata, { requireMetadata = false } = {}) {
+  const fields = Array.isArray(metadata)
+    ? metadata
+    : (metadata && Array.isArray(metadata.fields) ? metadata.fields : null);
+  if (!fields) {
+    if (requireMetadata) throw fail("Attachment field metadata is unavailable", "METADATA_UNAVAILABLE");
+    return true;
+  }
+  const resolve = (source, path) => {
+    if (!source || source.kind !== "base_attachment") return;
+    const field = fields.find((candidate) => fieldId(candidate) === source.fieldId);
+    if (!field) {
+      const error = fail(`${path} is not present in metadata`, "FIELD_NOT_FOUND");
+      error.path = path;
+      throw error;
+    }
+    if (!isAttachment(field)) {
+      const error = fail(`${path} must identify an attachment field`, "FIELD_TYPE_INVALID");
+      error.path = path;
+      throw error;
+    }
+  };
+
+  for (const stageId of STAGE_IDS) {
+    const stage = value?.stages?.[stageId];
+    if (!stage) continue;
+    resolve(stage.videoSource ?? stage.video_source, `stages.${stageId}.videoSource.fieldId`);
+    const audio = stage.audio;
+    if (audio?.mode === "replace_original") {
+      resolve(audio.source, `stages.${stageId}.audio.source.fieldId`);
+    }
+  }
+  return true;
 }
 
 /**

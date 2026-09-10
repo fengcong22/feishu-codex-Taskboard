@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertPhasedSubjectMetadata,
   createFeishuBaseMetadataReader,
   parseBaseLink,
 } from "../src/feishu-base-metadata.mjs";
@@ -49,6 +50,40 @@ function fakeClient({ app, tables, fields, wikiNode, calls = [] } = {}) {
         },
       },
     },
+  };
+}
+
+function phasedSubject(overrides = {}) {
+  const stage = (optionId, value, stageOverrides = {}) => ({
+    enabled: true,
+    trigger: { fieldId: "fld_status", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: "录屏" },
+    reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+    audio: { mode: "video_original" },
+    ...stageOverrides,
+  });
+  return {
+    baseToken: "bas_demo",
+    baseName: "课程库",
+    tableId: "tbl_math",
+    tableName: "小学数学",
+    statusField: { fieldId: "fld_status", fieldName: "制作进度" },
+    documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+    namingField: { fieldId: "fld_name", fieldName: "命名" },
+    stages: {
+      initial: stage("opt_initial", "初稿"),
+      first_review: stage("opt_review", "初审修改"),
+      final_review: stage("opt_final", "终审修改"),
+    },
+    ...overrides,
+  };
+}
+
+function phasedMetadata(fields = []) {
+  return {
+    baseToken: "bas_demo",
+    baseName: "课程库",
+    tables: [{ tableId: "tbl_math", tableName: "小学数学", fields }],
   };
 }
 
@@ -386,6 +421,81 @@ test("validates an enabled subject against current Base, table, field and option
     ["appTable.list", { path: { app_token: "bas_demo" } }],
     ["appTableField.list", { path: { app_token: "bas_demo", table_id: "tbl_math" } }],
   ]);
+});
+
+test("validates phased video and replacement audio attachment bindings against live metadata", () => {
+  const fields = [
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_video", fieldName: "视频附件", type: 17, uiType: "Attachment", options: [] },
+    { fieldId: "fld_audio", fieldName: "音频附件", type: 17, uiType: "Attachment", options: [] },
+    { fieldId: "fld_text", fieldName: "普通文本", type: 1, uiType: "Text", options: [] },
+  ];
+  const metadata = phasedMetadata(fields);
+
+  const valid = phasedSubject({
+    stages: {
+      initial: {
+        ...phasedSubject().stages.initial,
+        videoSource: { kind: "base_attachment", fieldId: "fld_video" },
+        audio: { mode: "replace_original", source: { kind: "base_attachment", fieldId: "fld_audio" } },
+      },
+      first_review: phasedSubject().stages.first_review,
+      final_review: phasedSubject().stages.final_review,
+    },
+  });
+  assert.equal(assertPhasedSubjectMetadata(valid, metadata), true);
+
+  const missingVideo = structuredClone(valid);
+  missingVideo.stages.initial.videoSource = { kind: "base_attachment", fieldId: "fld_missing" };
+  assert.throws(
+    () => assertPhasedSubjectMetadata(missingVideo, metadata),
+    (error) => error.code === "FIELD_NOT_FOUND"
+      && error.path === "stages.initial.videoSource.fieldId",
+  );
+
+  const wrongVideoType = structuredClone(valid);
+  wrongVideoType.stages.initial.videoSource = { kind: "base_attachment", fieldId: "fld_text" };
+  assert.throws(
+    () => assertPhasedSubjectMetadata(wrongVideoType, metadata),
+    (error) => error.code === "FIELD_TYPE_INVALID"
+      && error.path === "stages.initial.videoSource.fieldId",
+  );
+
+  const missingAudio = structuredClone(valid);
+  missingAudio.stages.initial.audio.source = { kind: "base_attachment", fieldId: "fld_missing" };
+  assert.throws(
+    () => assertPhasedSubjectMetadata(missingAudio, metadata),
+    (error) => error.code === "FIELD_NOT_FOUND"
+      && error.path === "stages.initial.audio.source.fieldId",
+  );
+
+  const wrongAudioType = structuredClone(valid);
+  wrongAudioType.stages.initial.audio.source = { kind: "base_attachment", fieldId: "fld_text" };
+  assert.throws(
+    () => assertPhasedSubjectMetadata(wrongAudioType, metadata),
+    (error) => error.code === "FIELD_TYPE_INVALID"
+      && error.path === "stages.initial.audio.source.fieldId",
+  );
+
+  const docxAndOriginal = structuredClone(valid);
+  docxAndOriginal.stages.initial.videoSource = { kind: "docx_section", anchorText: "视频" };
+  docxAndOriginal.stages.initial.audio = {
+    mode: "video_original",
+    source: { kind: "base_attachment", fieldId: "fld_missing" },
+  };
+  assert.equal(assertPhasedSubjectMetadata(docxAndOriginal, metadata), true);
 });
 
 test("validates every configured field name and subject-code binding during enable", async (t) => {
