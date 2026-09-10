@@ -4,7 +4,7 @@
 
 **Goal:** Make stable Feishu field/option IDs survive metadata renames without stale hidden values, preserve unsaved operator edits during metadata refresh, and block save/enable when a configured option ID is missing or ambiguous.
 
-**Architecture:** Canonicalize metadata-owned display names at the Taskboard store boundary before validating a refreshed snapshot, while retaining unresolved IDs for repair. In React, reconcile only metadata-owned field and option names into the current draft when the same subject receives a new configuration version; keep operator-owned values untouched and validate IDs against unique live metadata entries. Keep the legacy top-level trigger synchronized with the first enabled phased trigger so Bridge compatibility fields cannot drift.
+**Architecture:** Persist refreshed metadata beside the existing configured labels and stable IDs, demote the subject to draft, and use structural validation so stale or unresolved bindings remain repairable without silently accepting them. In React, reconcile only metadata-owned field and option names into the current draft when the same subject receives a metadata-only refresh; keep operator-owned values untouched, but reload genuine persisted configuration changes and validate IDs against unique live metadata entries. On explicit Save, synchronize the legacy top-level trigger with the first enabled phased trigger so Bridge compatibility fields cannot drift.
 
 **Tech Stack:** Node.js test runner, React 19, TypeScript, Vitest/Testing Library, SQLite-backed Taskboard workflow store.
 
@@ -19,7 +19,7 @@
 
 ---
 
-### Task 1: Store-Side Metadata Rename Reconciliation
+### Task 1: Store-Side Repairable Metadata Refresh
 
 **Files:**
 - Modify: `taskboard/test/feishu-workflow-store.test.mjs`
@@ -27,23 +27,23 @@
 
 **Interfaces:**
 - Consumes an existing phased subject plus a new live metadata snapshot.
-- Produces a draft snapshot whose field/option display names are refreshed by stable IDs; unresolved IDs and attachment bindings remain preserved for explicit repair.
+- Produces a draft snapshot with refreshed metadata, the prior configured field/option labels and IDs, and unresolved attachment bindings preserved for explicit repair.
 
 - [ ] **Step 1: Add a store regression test for an option rename with the same option ID.**
 
-  Save and enable a phased subject, refresh metadata with `opt_ready` renamed from `待制作` to `新待制作`, and assert refresh succeeds, demotes to draft, increments the version, updates `statusField.fieldName`, all resolvable stage trigger names/values, and the top-level `trigger` compatibility fields.
+  Save and enable a phased subject, refresh metadata with `opt_ready` renamed from `待制作` to `新待制作`, and assert refresh succeeds, demotes to draft, increments the version, keeps the prior configured labels/IDs, and exposes the renamed value only in `metadata` until the operator saves.
 
 - [ ] **Step 2: Run the focused test and verify RED.**
 
   ```powershell
-  node --test --test-name-pattern="reconciles renamed phased metadata" taskboard/test/feishu-workflow-store.test.mjs
+  node --test --test-name-pattern="keeps renamed phased metadata" taskboard/test/feishu-workflow-store.test.mjs
   ```
 
-  Expected: `TRIGGER_OPTION_NOT_FOUND` from validating the stale name against refreshed metadata.
+  Expected: `TRIGGER_OPTION_NOT_FOUND` from strictly validating the intentionally stale configured name against refreshed metadata.
 
-- [ ] **Step 3: Add the minimal metadata-name reconciliation helper.**
+- [ ] **Step 3: Add a structural metadata-refresh validation path.**
 
-  Resolve fields and options only when an ID has exactly one match. Update field names and matched option values; preserve unresolved IDs/values for the repair UI. Set the legacy top-level trigger from the first enabled stage after reconciliation. Call the helper only on metadata refresh before structural validation.
+  Validate the already-persisted subject structure without enforcing refreshed metadata bindings, then reattach the new metadata. Preserve all configured labels and IDs during refresh. Keep strict metadata and attachment validation on Save and Enable, where the UI submits names derived from unique stable-ID matches.
 
 - [ ] **Step 4: Run the focused store test GREEN, then the entire store suite.**
 
@@ -90,7 +90,7 @@
 
 - [ ] **Step 5: Implement minimal same-subject reconciliation and validation.**
 
-  Track the previous selected subject/version in a ref. On a version change for the same subject, reconcile metadata-owned names into the existing form; on a subject switch, fully initialize from persisted state. Reset audio draft caches only for a true persisted save/reload, and preserve them during metadata-only refresh. Require each enabled stage option ID to resolve exactly once and its value to match before Save or Enable. Serialize the top-level trigger from the first enabled stage for phased subjects.
+  Track the previous subject's editable persisted configuration signature in a ref. When only metadata/lifecycle changes for the same subject, reconcile metadata-owned names into the existing form; on a subject switch or genuine persisted configuration change, fully initialize from persisted state. Reset audio draft caches only for a true persisted save/reload, and preserve them during metadata-only refresh. Require each enabled stage option ID to resolve exactly once and its value to match before Save or Enable. Serialize the top-level trigger from the first enabled stage for phased subjects.
 
 - [ ] **Step 6: Run component tests GREEN plus typecheck.**
 
@@ -132,4 +132,3 @@
   ```
 
 - [ ] **Step 4: Confirm the final branch remains local-only unless the user explicitly requests a push.**
-
