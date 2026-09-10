@@ -98,7 +98,9 @@ const SAFE_FEISHU_PREVIEW_ERRORS = new Map([
 const BRIDGE_DIAGNOSTIC_PATH_PATTERN = /^bases\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
 const BRIDGE_DIAGNOSTIC_MESSAGES = new Map([
   ["BASE_NOT_FOUND", "The configured Base is not available in Feishu"],
+  ["BASE_NAME_MISMATCH", "The configured Base name no longer matches Feishu metadata"],
   ["TABLE_NOT_FOUND", "The configured subject table is not present in this Base"],
+  ["TABLE_NAME_MISMATCH", "The configured subject table name no longer matches Feishu metadata"],
   ["FIELD_NOT_FOUND", "A configured field is not present in the live subject table"],
   ["FIELD_TYPE_INVALID", "A configured field has an incompatible type in the live subject table"],
   ["INVALID_FIELD", "A configured workflow field or stage trigger no longer matches the live subject table"],
@@ -164,6 +166,32 @@ function bridgeShareDiagnosticContext(configuration) {
     }
   }
   return { aliases, paths };
+}
+
+function copyDefinedFields(value, keys) {
+  const result = {};
+  for (const key of keys) {
+    if (value?.[key] !== undefined) result[key] = structuredClone(value[key]);
+  }
+  return result;
+}
+
+function bridgeShareInspectionConfiguration(configuration) {
+  const workflowKeys = ["schemaVersion", "configVersion", "createdAt", "updatedAt"];
+  const baseKeys = ["baseToken", "baseName", "sourceUrlLabel", "metadataRefreshedAt"];
+  const subjectKeys = [
+    "subjectKey", "baseToken", "baseName", "tableId", "tableName", "displayEnabled",
+    "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title",
+    "execution", "packageRoute", "upload", "statusField", "documentField",
+    "namingField", "stages",
+  ];
+  return {
+    ...copyDefinedFields(configuration, workflowKeys),
+    bases: (configuration?.bases ?? []).map((base) => ({
+      ...copyDefinedFields(base, baseKeys),
+      subjects: (base?.subjects ?? []).map((subject) => copyDefinedFields(subject, subjectKeys)),
+    })),
+  };
 }
 
 function normalizeBridgeShareDiagnostics(value, configuration) {
@@ -2947,7 +2975,10 @@ export function createTaskboardServer(options = {}) {
           "content-type": "application/json",
           "x-feishu-bridge-client": "local-operator",
         },
-        body: JSON.stringify({ configuration, dryRun: true }),
+        body: JSON.stringify({
+          configuration: bridgeShareInspectionConfiguration(configuration),
+          dryRun: true,
+        }),
       });
     } catch {
       throw new ApiError(503, "FEISHU_BRIDGE_UNAVAILABLE", "Feishu Bridge is unavailable");

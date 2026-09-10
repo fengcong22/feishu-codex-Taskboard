@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { createBridgeServer } from "../../src/server.mjs";
+import { createWorkflowConfigStore } from "../../src/workflow-config-store.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 
 async function fixture() {
@@ -1425,6 +1427,118 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
   } finally {
     await app.close();
     await new Promise((resolve) => bridge.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import sends a Bridge-compatible DTO through the real Bridge validator", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-real-bridge-"));
+  const metadataFields = [
+    {
+      fieldId: "fld_status",
+      fieldName: "流程",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+  ];
+  const stage = (optionId, value) => ({
+    enabled: true,
+    trigger: { fieldId: "fld_status", fieldName: "流程", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: `${value}录屏` },
+    reviewSource: { kind: "docx_section", anchorText: `${value}意见` },
+    audio: { mode: "video_original" },
+    artifactTargetPath: null,
+    nameSuffix: `_${value}`,
+  });
+  const configuration = {
+    schemaVersion: 1,
+    bases: [{
+      baseToken: "bas_real_share",
+      baseName: "真实共享 Base",
+      subjects: [{
+        subjectKey: "bas_real_share:tbl_subject",
+        baseToken: "bas_real_share",
+        baseName: "真实共享 Base",
+        tableId: "tbl_subject",
+        tableName: "语文",
+        displayEnabled: true,
+        lifecycle: "draft",
+        configVersion: 1,
+        trigger: { fieldId: "fld_status", fieldName: "流程", startValue: "初稿", optionId: "opt_initial" },
+        title: { fieldId: null, fieldName: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+        metadata: { fields: metadataFields },
+        statusField: { fieldId: "fld_status", fieldName: "流程" },
+        documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+        namingField: { fieldId: "fld_name", fieldName: "命名" },
+        stages: {
+          initial: stage("opt_initial", "初稿"),
+          first_review: stage("opt_review", "初审修改"),
+          final_review: stage("opt_final", "终审修改"),
+        },
+      }],
+    }],
+  };
+  const realBridgeStore = createWorkflowConfigStore({
+    filename: path.join(directory, "bridge-workflow.json"),
+    packageAliases: { "Auto-cut-A": { workspacePath: directory } },
+    metadataReader: {
+      preview: async ({ baseToken }) => ({
+        baseToken,
+        baseName: "真实共享 Base",
+        tables: [{ tableId: "tbl_subject", tableName: "语文", fields: metadataFields }],
+      }),
+    },
+  });
+  let bridgeConfiguration = null;
+  const bridge = createBridgeServer({
+    host: "127.0.0.1",
+    port: 0,
+    configSummary: { tables: 0, packages: 1 },
+    workflowStore: {
+      ...realBridgeStore,
+      importShareable: async (value, options) => {
+        bridgeConfiguration = structuredClone(value);
+        return realBridgeStore.importShareable(value, options);
+      },
+    },
+  });
+  const bridgeAddress = await bridge.listen();
+  const app = createTaskboardServer({
+    dataDirectory: path.join(directory, "taskboard"),
+    codexExecutable: process.execPath,
+    feishuBridgeUrl: `http://127.0.0.1:${bridgeAddress.port}`,
+    feishuPackages: {
+      packages: {
+        "Auto-cut-A": { projectId: "auto-cut-a", workspacePath: directory, prompt: "fixture prompt" },
+      },
+    },
+  });
+  try {
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const result = await request(
+      `http://127.0.0.1:${address.port}`,
+      "/api/local/feishu/workflow/share/import",
+      { method: "POST", body: { configuration, dryRun: true } },
+    );
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.diagnosticsOk, true);
+    const [bridgeSubject] = bridgeConfiguration.bases[0].subjects;
+    assert.equal(Object.hasOwn(bridgeSubject, "projectId"), false);
+    assert.equal(Object.hasOwn(bridgeSubject, "metadata"), false);
+  } finally {
+    await app.close();
+    await bridge.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

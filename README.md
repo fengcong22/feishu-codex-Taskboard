@@ -35,7 +35,7 @@ flowchart LR
 | 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
 | 状态文件保护 | 损坏的状态文件、无效租约或不完整快照会安全停留在可诊断状态；读写（包括健康队列统计）使用同一稳定路径校验和操作系统本机互斥锁，写入使用原子替换，崩溃后可安全恢复。状态文件必须是稳定的普通文件，不接受符号链接或硬链接别名。 |
 | Base 元数据预览 | `POST /api/feishu/base-preview` 只接受携带 `x-feishu-bridge-client: taskboard` 和本机共享密钥的 Taskboard 请求；在本机配置飞书凭据后，它仅执行只读 metadata 操作，按 Base 链接读取 Base、子表、字段和单选项元数据。即使长连接监听关闭，预览仍可使用，且不会启用子表或接收事件。 |
-| 工作流共享配置 | `GET /api/feishu/workflow/share/export` 导出脱敏配置；`POST /api/feishu/workflow/share/import` 的 `dryRun` 会在不写入配置的前提下校验实时 Base/子表/字段，并报告本机缺失的包别名、工作区、ZIP 获取和上传路径绑定。导入只创建草稿，不自动启用子表；共享内容和诊断不会回显绝对路径、来源 URL、凭据或 SDK 原始错误。 |
+| 工作流共享配置 | `GET /api/feishu/workflow/share/export` 导出脱敏配置；`POST /api/feishu/workflow/share/import` 的 `dryRun` 会在不写入配置的前提下校验实时 Base/子表/字段，并报告本机缺失的包别名、工作区、ZIP 获取和上传路径绑定。Taskboard 调用 Bridge 检查时只发送 Bridge schema 明确允许的字段，不传 Taskboard 专用项目 ID 或缓存 metadata。实时校验要求 Base/子表名称一致、状态字段为唯一的单选字段，并拒绝重复字段/选项 ID 和互相冲突的字段类型。导入只创建草稿，不自动启用子表；共享内容和诊断不会回显绝对路径、来源 URL、凭据或 SDK 原始错误。 |
 | SDK-managed 监听 | 显式启用官方 SDK 自动重连；健康状态使用 `sdk_managed`，不伪造物理连接确认。 |
 | 健康检查 | 一条命令检查 Node、配置、Taskboard、Bridge、监听器状态和 pending/retry/dead-letter 队列计数。 |
 

@@ -580,6 +580,181 @@ test("phased metadata comparison and assertion fail closed for null metadata ent
   }
 });
 
+test("phased metadata requires one unambiguous single-select status field", () => {
+  const fields = [
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+  ];
+  const scenarios = [
+    {
+      name: "multi-select",
+      metadata: phasedMetadata(fields.map((field) => (
+        field.fieldId === "fld_status" ? { ...field, type: 4, uiType: "MultiSelect" } : field
+      ))),
+    },
+    {
+      name: "conflicting single-select type",
+      metadata: phasedMetadata(fields.map((field) => (
+        field.fieldId === "fld_status" ? { ...field, type: 4, uiType: "SingleSelect" } : field
+      ))),
+    },
+    {
+      name: "duplicate status field id",
+      metadata: phasedMetadata([...fields, { ...fields[0] }]),
+    },
+    {
+      name: "duplicate trigger option id",
+      metadata: phasedMetadata(fields.map((field) => (
+        field.fieldId === "fld_status"
+          ? { ...field, options: [...field.options, { id: "opt_initial", name: "其他初稿" }] }
+          : field
+      ))),
+    },
+  ];
+
+  for (const { name, metadata } of scenarios) {
+    const diagnostics = comparePhasedSubjectMetadata(phasedSubject(), metadata);
+    assert.ok(diagnostics.some((entry) => entry.errorCode === "FEISHU_METADATA_INVALID_RESPONSE"
+      || entry.code === "FIELD_TYPE_INVALID"), name);
+    assert.throws(() => assertPhasedSubjectMetadata(phasedSubject(), metadata), undefined, name);
+  }
+});
+
+test("phased metadata rejects renamed identities and malformed attachment types", () => {
+  const baseFields = [
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+  ];
+  const attachmentSubject = phasedSubject({
+    stages: {
+      ...phasedSubject().stages,
+      initial: {
+        ...phasedSubject().stages.initial,
+        videoSource: { kind: "base_attachment", fieldId: "fld_video" },
+      },
+    },
+  });
+  const scenarios = [
+    {
+      name: "renamed Base",
+      subject: phasedSubject(),
+      metadata: { ...phasedMetadata(baseFields), baseName: "已改名课程库" },
+      expectedCode: "BASE_NAME_MISMATCH",
+    },
+    {
+      name: "renamed table",
+      subject: phasedSubject(),
+      metadata: {
+        ...phasedMetadata(baseFields),
+        tables: [{ ...phasedMetadata(baseFields).tables[0], tableName: "已改名数学" }],
+      },
+      expectedCode: "TABLE_NAME_MISMATCH",
+    },
+    {
+      name: "duplicate attachment field id",
+      subject: attachmentSubject,
+      metadata: phasedMetadata([
+        ...baseFields,
+        { fieldId: "fld_video", fieldName: "视频附件", type: 17, uiType: "Attachment", options: [] },
+        { fieldId: "fld_video", fieldName: "重复视频附件", type: 17, uiType: "Attachment", options: [] },
+      ]),
+      expectedCode: "FEISHU_METADATA_UNAVAILABLE",
+    },
+    {
+      name: "array attachment type",
+      subject: attachmentSubject,
+      metadata: phasedMetadata([
+        ...baseFields,
+        { fieldId: "fld_video", fieldName: "视频附件", type: ["17"], uiType: "Attachment", options: [] },
+      ]),
+      expectedCode: "FIELD_TYPE_INVALID",
+    },
+    {
+      name: "conflicting attachment type",
+      subject: attachmentSubject,
+      metadata: phasedMetadata([
+        ...baseFields,
+        { fieldId: "fld_video", fieldName: "视频附件", type: 1, uiType: "Attachment", options: [] },
+      ]),
+      expectedCode: "FIELD_TYPE_INVALID",
+    },
+  ];
+
+  for (const { name, subject, metadata, expectedCode } of scenarios) {
+    const diagnostics = comparePhasedSubjectMetadata(subject, metadata);
+    assert.ok(diagnostics.some((entry) => entry.code === expectedCode), name);
+    assert.throws(() => assertPhasedSubjectMetadata(subject, metadata), undefined, name);
+  }
+});
+
+test("phased metadata comparison aggregates safe core and attachment diagnostics", () => {
+  const subject = phasedSubject({
+    statusField: { fieldId: "fld_status", fieldName: "已改名进度" },
+    stages: {
+      initial: {
+        ...phasedSubject().stages.initial,
+        videoSource: { kind: "base_attachment", fieldId: "fld_missing_video" },
+      },
+      first_review: {
+        ...phasedSubject().stages.first_review,
+        audio: {
+          mode: "replace_original",
+          source: { kind: "base_attachment", fieldId: "fld_text_audio" },
+          durationToleranceSeconds: 3,
+        },
+      },
+      final_review: phasedSubject().stages.final_review,
+    },
+  });
+  const metadata = phasedMetadata([
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_text_audio", fieldName: "音频文本", type: 1, uiType: "Text", options: [] },
+  ]);
+
+  assert.deepEqual(
+    comparePhasedSubjectMetadata(subject, metadata).map((entry) => [entry.code, entry.path]),
+    [
+      ["INVALID_FIELD", "bases.bas_demo.subjects.tbl_math.statusField.fieldName"],
+      ["FIELD_NOT_FOUND", "bases.bas_demo.subjects.tbl_math.stages.initial.videoSource.fieldId"],
+      ["FIELD_TYPE_INVALID", "bases.bas_demo.subjects.tbl_math.stages.first_review.audio.source.fieldId"],
+    ],
+  );
+});
+
 test("validates every configured field name and subject-code binding during enable", async (t) => {
   const subject = {
     baseToken: "bas_demo",
