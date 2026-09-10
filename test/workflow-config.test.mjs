@@ -11,6 +11,7 @@ import {
   subjectKey,
   validateWorkflowConfig,
 } from "../src/workflow-config.mjs";
+import { validateConfig as validateBridgeConfig } from "../src/config.mjs";
 import { createWorkflowConfigStore } from "../src/workflow-config-store.mjs";
 
 function validSubject(overrides = {}) {
@@ -190,6 +191,14 @@ test("Bridge config round-trip retains three staged audio sources without a sche
     const target = createWorkflowConfigStore({ filename: path.join(directory, "target.json") });
     const imported = await target.importShareable(shared);
     const roundTripped = imported.bases[0].subjects[0];
+    const bridge = validateBridgeConfig({
+      host: "127.0.0.1",
+      port: 47824,
+      taskboardUrl: "http://127.0.0.1:47823",
+      stateFile: path.join(directory, "bridge-state.json"),
+      tables: [JSON.parse(JSON.stringify(roundTripped))],
+    });
+    const bridgeSubject = bridge.tables[0];
 
     assert.equal(shared.schemaVersion, WORKFLOW_SCHEMA_VERSION);
     assert.equal(imported.schemaVersion, WORKFLOW_SCHEMA_VERSION);
@@ -205,6 +214,11 @@ test("Bridge config round-trip retains three staged audio sources without a sche
       source: { kind: "base_attachment", fieldId: "fld_audio" },
       durationToleranceSeconds: 3,
     });
+    assert.deepEqual(Object.keys(bridgeSubject.stages), ["initial", "first_review", "final_review"]);
+    assert.equal(bridgeSubject.stages.first_review.audio.source.kind, "docx_section");
+    assert.equal(bridgeSubject.stages.first_review.audio.source.anchorText, "二、PPT草稿+翻录");
+    assert.equal(bridgeSubject.stages.final_review.audio.source.kind, "base_attachment");
+    assert.equal(bridgeSubject.stages.final_review.audio.source.fieldId, "fld_audio");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

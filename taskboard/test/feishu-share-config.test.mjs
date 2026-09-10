@@ -43,14 +43,14 @@ async function request(baseUrl, route, options = {}) {
   return { response, body };
 }
 
-async function seedSubject(baseUrl, baseToken = "bas_share") {
+async function seedSubject(baseUrl, baseToken = "bas_share", fields = []) {
   const preview = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
     method: "POST",
     body: {
       baseToken,
       baseName: "共享配置 Base",
       sourceUrlLabel: "https://example.test/base/share",
-      tables: [{ tableId: "tbl_chinese", tableName: "语文", fields: [] }],
+      tables: [{ tableId: "tbl_chinese", tableName: "语文", fields }],
     },
   });
   assert.equal(preview.response.status, 201);
@@ -182,6 +182,59 @@ test("automatic phased share configuration imports as a draft without local stag
     });
     assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
     assert.equal(imported.body.configuration.bases[0].subjects[0].lifecycle, "draft");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("phased share export keeps independent active audio sources without UI draft state", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_audio_share", [
+      { fieldId: "fld_status", fieldName: "流程", type: 3, uiType: "SingleSelect", options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ] },
+      { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_audio", fieldName: "配音", type: 17, uiType: "Attachment", options: [] },
+    ]);
+    const initial = phasedStage("initial", "opt_initial", "初稿");
+    const firstReview = phasedStage("first_review", "opt_review", "初审修改");
+    firstReview.audio = {
+      mode: "replace_original",
+      source: { kind: "docx_section", anchorText: "二、PPT草稿+翻录" },
+      durationToleranceSeconds: 1.5,
+    };
+    const finalReview = phasedStage("final_review", "opt_final", "终审修改");
+    finalReview.audio = {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_audio" },
+      durationToleranceSeconds: 3,
+    };
+    const configured = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+      {
+        method: "PATCH",
+        body: {
+          statusField: { fieldId: "fld_status", fieldName: "流程" },
+          documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+          namingField: { fieldId: "fld_name", fieldName: "命名" },
+          stages: { initial, first_review: firstReview, final_review: finalReview },
+        },
+      },
+    );
+    assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
+
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const sharedStages = exported.body.configuration.bases[0].subjects[0].stages;
+    assert.deepEqual(sharedStages.initial.audio, { mode: "video_original" });
+    assert.deepEqual(sharedStages.first_review.audio, firstReview.audio);
+    assert.deepEqual(sharedStages.final_review.audio, finalReview.audio);
+    assert.doesNotMatch(JSON.stringify(exported.body.configuration), /audioDraft|temporary|cache/i);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
