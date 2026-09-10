@@ -253,8 +253,12 @@ function editableSubjectSignature(subject: FeishuSubjectConfig): string {
   });
 }
 
-function metadataSignature(subject: FeishuSubjectConfig): string {
-  return JSON.stringify(subject.metadata ?? null);
+function metadataOwnedSignature(subject: FeishuSubjectConfig): string {
+  return JSON.stringify({
+    baseName: subject.baseName,
+    tableName: subject.tableName,
+    metadata: subject.metadata ?? null,
+  });
 }
 
 function phasedFieldNamesNeedRefresh(subject: FeishuSubjectConfig): boolean {
@@ -327,6 +331,8 @@ export function FeishuWorkflowPanel({
     .find((subject) => subject.subjectKey === selectedSubjectKey)
     ?? scopedCatalog.flatMap((base) => base.subjects)[0]
     ?? null, [scopedCatalog, selectedSubjectKey]);
+  const selectedEditableSignature = selected ? editableSubjectSignature(selected) : null;
+  const selectedMetadataOwnedSignature = selected ? metadataOwnedSignature(selected) : null;
   const [subjectForm, setSubjectForm] = useState<SubjectForm | null>(() => selected ? formForSubject(selected) : null);
   const audioDraftsBySubjectRef = useRef(new Map<string, SubjectAudioDrafts>(selected ? [[
     selected.subjectKey,
@@ -337,9 +343,8 @@ export function FeishuWorkflowPanel({
   ]] : []));
   const previousSelectedRef = useRef(selected ? {
     subjectKey: selected.subjectKey,
-    editableSignature: editableSubjectSignature(selected),
-    configVersion: selected.configVersion,
-    metadataSignature: metadataSignature(selected),
+    editableSignature: selectedEditableSignature,
+    metadataOwnedSignature: selectedMetadataOwnedSignature,
   } : null);
   const subjectFormDirty = Boolean(selected && subjectForm
     && (JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected))
@@ -355,9 +360,6 @@ export function FeishuWorkflowPanel({
     : undefined;
   const statusOptions = selectedStatusField?.options ?? [];
   const metadataFieldOptions = triggerFields;
-  const attachmentFieldIds = useMemo(() => new Set(
-    triggerFields.filter(isAttachmentField).map((field) => field.fieldId),
-  ), [triggerFields]);
   const phasedValidationErrors = useMemo(() => {
     if (!subjectForm?.stages) return [];
     const errors: string[] = [];
@@ -381,7 +383,12 @@ export function FeishuWorkflowPanel({
       if (stage.enabled && stage.trigger.fieldId !== subjectForm.statusFieldId) errors.push(`${phaseLabel}的触发字段与状态字段不一致`);
       if (stage.videoSource.kind === "base_attachment") {
         if (!stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
-        else if (!attachmentFieldIds.has(stage.videoSource.fieldId)) errors.push(`${phaseLabel}的视频附件字段当前不可用`);
+        else {
+          const matches = metadataFieldMatches(triggerFields, stage.videoSource.fieldId);
+          if (matches.length === 0 || (matches.length === 1 && !isAttachmentField(matches[0]))) {
+            errors.push(`${phaseLabel}的视频附件字段当前不可用`);
+          } else if (matches.length > 1) errors.push(`${phaseLabel}的视频附件字段不唯一`);
+        }
       }
       if (!stage.reviewSource.anchorText?.trim()) errors.push(`${phaseLabel}需要剪辑意见目录标题`);
       if (stage.audio.mode === "replace_original") {
@@ -389,7 +396,12 @@ export function FeishuWorkflowPanel({
           if (!stage.audio.source.anchorText?.trim()) errors.push(`${phaseLabel}需要音频目录标题`);
         } else if (stage.audio.source?.kind === "base_attachment") {
           if (!stage.audio.source.fieldId) errors.push(`${phaseLabel}需要音频附件字段`);
-          else if (!attachmentFieldIds.has(stage.audio.source.fieldId)) errors.push(`${phaseLabel}的音频附件字段当前不可用`);
+          else {
+            const matches = metadataFieldMatches(triggerFields, stage.audio.source.fieldId);
+            if (matches.length === 0 || (matches.length === 1 && !isAttachmentField(matches[0]))) {
+              errors.push(`${phaseLabel}的音频附件字段当前不可用`);
+            } else if (matches.length > 1) errors.push(`${phaseLabel}的音频附件字段不唯一`);
+          }
         } else {
           errors.push(`${phaseLabel}需要有效的音频来源`);
         }
@@ -410,7 +422,7 @@ export function FeishuWorkflowPanel({
     else if (metadataFieldMatches(triggerFields, subjectForm.namingFieldId).length === 0) errors.push("命名字段当前不可用");
     else if (metadataFieldMatches(triggerFields, subjectForm.namingFieldId).length > 1) errors.push("命名字段不唯一");
     return [...new Set(errors)];
-  }, [attachmentFieldIds, subjectForm]);
+  }, [subjectForm, triggerFields]);
   const enableBlockedReason = subjectFormDirty
     ? "请先保存草稿"
     : packageOptions === null
@@ -458,10 +470,9 @@ export function FeishuWorkflowPanel({
     const persistedForm = formForSubject(selected);
     const previousSelected = previousSelectedRef.current;
     const sameSubject = previousSelected?.subjectKey === selected.subjectKey;
-    const editableSignature = editableSubjectSignature(selected);
     const metadataOnlyRefresh = sameSubject
-      && previousSelected.editableSignature === editableSignature
-      && previousSelected.metadataSignature !== metadataSignature(selected);
+      && previousSelected.editableSignature === selectedEditableSignature
+      && previousSelected.metadataOwnedSignature !== selectedMetadataOwnedSignature;
     if (metadataOnlyRefresh) {
       metadataRefreshNeedsSaveRef.current.set(selected.subjectKey, selected.configVersion);
       setMetadataRefreshRevision((value) => value + 1);
@@ -469,9 +480,8 @@ export function FeishuWorkflowPanel({
     const preserveCurrentForm = preserveDirtyForm || metadataOnlyRefresh;
     previousSelectedRef.current = {
       subjectKey: selected.subjectKey,
-      editableSignature,
-      configVersion: selected.configVersion,
-      metadataSignature: metadataSignature(selected),
+      editableSignature: selectedEditableSignature,
+      metadataOwnedSignature: selectedMetadataOwnedSignature,
     };
     const cached = audioDraftsBySubjectRef.current.get(selected.subjectKey);
     if (!cached || (!preserveCurrentForm && cached.configVersion !== selected.configVersion)) {
@@ -490,7 +500,12 @@ export function FeishuWorkflowPanel({
         ? reconcileFormMetadata(current, selected.metadata?.fields ?? [])
         : persistedForm
     ));
-  }, [selected?.subjectKey, selected?.configVersion, selected?.metadata]);
+  }, [
+    selected?.subjectKey,
+    selected?.configVersion,
+    selectedEditableSignature,
+    selectedMetadataOwnedSignature,
+  ]);
 
   useEffect(() => {
     let active = true;

@@ -699,7 +699,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     if (!row) throw new ApiError(404, "SUBJECT_NOT_FOUND", `Subject '${subjectKey}' does not exist`);
     return row;
   }
-  function saveVersion(row, snapshot, version, timestamp, { preserveEnabled = false } = {}) {
+  function saveVersion(row, snapshot, version, timestamp) {
     const lifecycle = LIFECYCLES.has(snapshot?.lifecycle) ? snapshot.lifecycle : "draft";
     const timestampMs = Date.parse(timestamp);
     const enabledAt = Number.isSafeInteger(snapshot?.enabledAt)
@@ -708,7 +708,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const closedAt = Number.isSafeInteger(snapshot?.closedAt)
       ? snapshot.closedAt
       : lifecycle === "disabled" && Number.isFinite(timestampMs) ? timestampMs : null;
-    if (lifecycle !== "enabled" && !preserveEnabled) {
+    if (lifecycle === "disabled") {
       db.prepare(`
         UPDATE feishu_subject_versions
         SET closed_at = COALESCE(closed_at, ?)
@@ -902,7 +902,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 SET table_name = ?, metadata_json = ?, lifecycle = ?, config_version = ?, config_json = ?, removed_at = NULL, updated_at = ?
                 WHERE subject_key = ?`)
                 .run(tableName, JSON.stringify(metadata), next.lifecycle, next.configVersion, JSON.stringify(next), timestamp, key);
-              saveVersion({ subject_key: key }, next, next.configVersion, timestamp, { preserveEnabled: existingConfig.lifecycle === "enabled" });
+              saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
             } else if (existing.removed_at !== null) {
               db.prepare("UPDATE feishu_subjects SET removed_at = NULL, updated_at = ? WHERE subject_key = ?")
                 .run(timestamp, key);
@@ -973,7 +973,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         } catch (error) {
           throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
         }
-        const next = validate({
+      const next = validate({
           ...mergeObjects(rowSubject(current), changes),
           subjectKey: key,
           baseToken: current.base_token,
@@ -1154,8 +1154,8 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         tableId: locked.table_id,
         projectId: locked.project_id,
         lifecycle,
-         configVersion: locked.config_version + 1,
-       }, { projectLegacyTrigger: lifecycle === "enabled" });
+        configVersion: locked.config_version + 1,
+      }, { projectLegacyTrigger: lifecycle === "enabled" });
       if (typeof syncSubject === "function") {
         // Keep the local transaction open until Bridge accepts the same
         // validated snapshot.  A failed loopback sync rolls back the local

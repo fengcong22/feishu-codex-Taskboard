@@ -395,6 +395,68 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(patch.stages.initial.nameSuffix).toBe("_用户未保存");
   });
 
+  it("preserves unsaved edits when equivalent same-version catalog objects are reallocated", async () => {
+    const configured = subject("equivalent-refresh", "等价刷新");
+    const common = {
+      configurationBaseToken: "bas_test",
+      selectedSubjectKey: "equivalent-refresh",
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+    };
+    const { rerender } = render(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(configured)}
+    />);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "初稿音频来源" }), { target: { value: "docx_section" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿音频目录标题" }), { target: { value: "等价刷新未保存音频" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿命名后缀" }), { target: { value: "_等价刷新未保存" } });
+
+    rerender(<FeishuWorkflowPanel
+      {...common}
+      catalog={structuredClone(catalog(configured))}
+    />);
+
+    await waitFor(() => {
+      expect((screen.getByRole("textbox", { name: "初稿音频目录标题" }) as HTMLInputElement).value)
+        .toBe("等价刷新未保存音频");
+    });
+    expect((screen.getByRole("textbox", { name: "初稿命名后缀" }) as HTMLInputElement).value)
+      .toBe("_等价刷新未保存");
+  });
+
+  it("preserves unsaved edits and marks Base or table name-only refreshes for save", async () => {
+    const configured = subject("name-refresh", "原表名");
+    const renamed = structuredClone(configured);
+    renamed.baseName = "刷新 Base";
+    renamed.tableName = "刷新表名";
+    renamed.configVersion += 1;
+    const common = {
+      configurationBaseToken: "bas_test",
+      selectedSubjectKey: "name-refresh",
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+    };
+    const { rerender } = render(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(configured)}
+    />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿命名后缀" }), { target: { value: "_名称刷新未保存" } });
+    rerender(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(renamed)}
+    />);
+
+    await waitFor(() => {
+      expect((screen.getByRole("textbox", { name: "初稿命名后缀" }) as HTMLInputElement).value)
+        .toBe("_名称刷新未保存");
+    });
+    expect(screen.getByRole("button", { name: "启用" }).getAttribute("title")).toBe("请先保存草稿");
+  });
+
   it("reloads a same-subject persisted edit instead of keeping an obsolete local draft", async () => {
     const configured = subject("server-update", "服务器更新");
     const updated = structuredClone(configured);
@@ -482,6 +544,32 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     />);
 
     expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("blocks save and enable when configured attachment field ids are ambiguous", () => {
+    const configured = subject("ambiguous-attachments", "歧义附件");
+    configured.stages!.initial.videoSource = { kind: "base_attachment", fieldId: "fld_video" };
+    configured.stages!.initial.audio = {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_video" },
+      durationToleranceSeconds: 3,
+    };
+    configured.metadata = {
+      fields: [...fields, { ...fields[2], fieldName: "重复视频附件" }],
+    };
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="ambiguous-attachments"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect(screen.getByText("初稿的视频附件字段不唯一")).toBeTruthy();
+    expect(screen.getByText("初稿的音频附件字段不唯一")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {

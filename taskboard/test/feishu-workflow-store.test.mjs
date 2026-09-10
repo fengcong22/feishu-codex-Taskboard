@@ -538,27 +538,81 @@ test("metadata refresh preserves an independently stale legacy trigger until rep
   }
 });
 
-test("metadata refresh keeps the previous enabled version routable until re-enable", async () => {
+test("draft mutations keep the previous enabled version routable until an explicit lifecycle transition", async () => {
   const { directory, database, store } = await fixture();
   try {
     const original = phasedPreview();
     await store.upsertBasePreview(original);
     const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
     const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
-    const refreshed = await store.upsertBasePreview({
+
+    const assertEnabledVersionOpen = () => {
+      const versionRow = database.database.prepare(
+        "SELECT enabled_at, closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+      ).get(enabled.subjectKey, enabled.configVersion);
+      assert.equal(versionRow.closed_at, null);
+      const routed = database.resolveFeishuSubjectVersionAt(enabled.subjectKey, versionRow.enabled_at);
+      assert.equal(routed?.configVersion, enabled.configVersion);
+    };
+
+    await store.upsertBasePreview({
       ...original,
       metadataRefreshedAt: 1710000006500,
-      tables: [{ ...original.tables[0], fields: original.tables[0].fields.map((field) => (
-        field.fieldId === "fld_status" ? { ...field, fieldName: "刷新状态" } : field
-      )) }],
+      baseName: "刷新 Base",
     });
-    assert.equal(refreshed.subjects[0].lifecycle, "draft");
-    const versionRow = database.database.prepare(
-      "SELECT enabled_at, closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    assertEnabledVersionOpen();
+
+    const refreshedAgain = await store.upsertBasePreview({
+      ...original,
+      metadataRefreshedAt: 1710000006600,
+      baseName: "刷新 Base",
+      tables: [{
+        ...original.tables[0],
+        tableName: "刷新数学",
+        fields: [
+          ...original.tables[0].fields,
+          { fieldId: "fld_notes", fieldName: "备注", type: 1, uiType: "Text", options: [] },
+        ],
+      }],
+    });
+    assert.equal(refreshedAgain.subjects[0].lifecycle, "draft");
+    assertEnabledVersionOpen();
+
+    const repaired = await store.saveSubjectDraft(enabled.subjectKey, {
+      expectedVersion: refreshedAgain.subjects[0].configVersion,
+      execution: { ...refreshedAgain.subjects[0].execution, concurrencyGroup: "repaired" },
+    });
+    assertEnabledVersionOpen();
+
+    const shared = await store.exportShareable();
+    await store.importShareable(shared);
+    assertEnabledVersionOpen();
+
+    const imported = await store.getSubject(enabled.subjectKey);
+    const reenabled = await store.enableSubject(imported.subjectKey, imported.configVersion);
+    const closedOriginal = database.database.prepare(
+      "SELECT closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
     ).get(enabled.subjectKey, enabled.configVersion);
-    assert.equal(versionRow.closed_at, null);
-    const routed = database.resolveFeishuSubjectVersionAt(enabled.subjectKey, versionRow.enabled_at + 1);
-    assert.equal(routed?.configVersion, enabled.configVersion);
+    assert.equal(Number.isSafeInteger(closedOriginal.closed_at), true);
+
+    const editedAgain = await store.saveSubjectDraft(reenabled.subjectKey, {
+      expectedVersion: reenabled.configVersion,
+      execution: { ...reenabled.execution, concurrencyGroup: "edited-again" },
+    });
+    const reenabledRow = database.database.prepare(
+      "SELECT enabled_at, closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    ).get(reenabled.subjectKey, reenabled.configVersion);
+    assert.equal(reenabledRow.closed_at, null);
+    assert.equal(
+      database.resolveFeishuSubjectVersionAt(reenabled.subjectKey, reenabledRow.enabled_at)?.configVersion,
+      reenabled.configVersion,
+    );
+
+    await store.disableSubject(editedAgain.subjectKey, editedAgain.configVersion);
+    const closedReenabled = database.database.prepare(
+      "SELECT closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    ).get(reenabled.subjectKey, reenabled.configVersion);
+    assert.equal(Number.isSafeInteger(closedReenabled.closed_at), true);
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });
