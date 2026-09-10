@@ -166,7 +166,7 @@ test("workflow share import dry-run returns diagnostics without mutating the cat
 test("automatic phased share configuration imports as a draft without local stage targets", async () => {
   const fixtureData = await fixture();
   try {
-    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_phased_share");
+    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_phased_share", phasedMetadata().fields);
     const configured = await request(
       fixtureData.baseUrl,
       `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,

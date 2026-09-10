@@ -538,6 +538,33 @@ test("metadata refresh preserves an independently stale legacy trigger until rep
   }
 });
 
+test("metadata refresh keeps the previous enabled version routable until re-enable", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+    const refreshed = await store.upsertBasePreview({
+      ...original,
+      metadataRefreshedAt: 1710000006500,
+      tables: [{ ...original.tables[0], fields: original.tables[0].fields.map((field) => (
+        field.fieldId === "fld_status" ? { ...field, fieldName: "刷新状态" } : field
+      )) }],
+    });
+    assert.equal(refreshed.subjects[0].lifecycle, "draft");
+    const versionRow = database.database.prepare(
+      "SELECT enabled_at, closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    ).get(enabled.subjectKey, enabled.configVersion);
+    assert.equal(versionRow.closed_at, null);
+    const routed = database.resolveFeishuSubjectVersionAt(enabled.subjectKey, versionRow.enabled_at + 1);
+    assert.equal(routed?.configVersion, enabled.configVersion);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 
 test("known empty or malformed metadata blocks phased draft saves", async () => {
   const { directory, database, store } = await fixture();
