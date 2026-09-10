@@ -1815,7 +1815,10 @@ test("a different ZIP with the same destination filename is rejected without ove
       json: {
         projectId: subject.projectId,
         title: "冲突测试二",
-        description: automaticFeishuDescription("bas_conflict", "tbl_subject"),
+        description: automaticFeishuDescription("bas_conflict", "tbl_subject", {
+          eventId: "artifact-upload-conflict-second",
+          recordId: "rec_artifact_auto_second",
+        }),
         status: "in_progress",
         priority: "none",
         labels: ["feishu"],
@@ -2184,7 +2187,7 @@ test("an archived task cannot be permanently deleted while its ZIP upload is que
     assert.equal(archived.response.status, 200);
     const deleted = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE", json: { version: archived.body.task.version } });
     assert.equal(deleted.response.status, 409);
-    assert.equal(deleted.body.error.code, "ARTIFACT_UPLOAD_ACTIVE");
+    assert.equal(deleted.body.error.code, "FEISHU_TASK_DELETE_UNAVAILABLE");
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });

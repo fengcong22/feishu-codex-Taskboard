@@ -1279,6 +1279,111 @@ test("does not create a second task when two Bridge instances share a durable st
   assert.equal(created, 1);
 });
 
+test("fences a real automatic registration after a simulated replay downgrades active provenance", async () => {
+  const filename = await stateFilename();
+  const eventId = "evt_active_simulated_replay_fence";
+  const durablePolicy = { ...policy, leaseMs: 1_000 };
+  const timers = fakeIntervals();
+  let now = 0;
+  let releaseFind;
+  const findReleased = new Promise((resolve) => { releaseFind = resolve; });
+  let enteredFind;
+  const findEntered = new Promise((resolve) => { enteredFind = resolve; });
+  let findCalls = 0;
+  let ensureCalls = 0;
+  let registrationCalls = 0;
+  let realCompleteCalls = 0;
+  const taskboard = {
+    findTaskByEventId: async () => {
+      findCalls += 1;
+      enteredFind();
+      await findReleased;
+      return null;
+    },
+    ensureProject: async () => {
+      ensureCalls += 1;
+    },
+    createFeishuTask: async () => {
+      registrationCalls += 1;
+      return { id: "task_fenced", identifier: "AUTO-FENCED" };
+    },
+  };
+  const storeOne = new JsonStateStore(filename);
+  const originalComplete = storeOne.complete.bind(storeOne);
+  storeOne.complete = async (...args) => {
+    realCompleteCalls += 1;
+    return originalComplete(...args);
+  };
+  const bridgeOne = createBridge({
+    config: {
+      ...config,
+      delivery: durablePolicy,
+      tables: [{
+        ...config.tables[0],
+        mode: "automatic",
+        executionMode: "automatic",
+        uploadMode: "automatic",
+      }],
+    },
+    store: storeOne,
+    taskboard,
+    now: () => now,
+    ownerId: "real-feishu-worker",
+    timers,
+  });
+  const bridgeTwo = createBridge({
+    config: {
+      ...config,
+      delivery: durablePolicy,
+      tables: [{
+        ...config.tables[0],
+        mode: "automatic",
+        executionMode: "automatic",
+        uploadMode: "automatic",
+      }],
+    },
+    store: new JsonStateStore(filename),
+    taskboard,
+    now: () => now,
+    ownerId: "simulation-worker",
+    timers: fakeIntervals(),
+  });
+
+  const realResultPromise = bridgeOne.handle({ ...event, eventId });
+  await findEntered;
+  now = 1;
+  const simulatedResult = await bridgeTwo.handle({
+    ...event,
+    eventId,
+    deliverySource: "simulation",
+  });
+
+  assert.deepEqual(simulatedResult, {
+    kind: "pending",
+    deliveryState: "processing",
+    attempts: 1,
+  });
+  const downgraded = await storeOne.get(eventId);
+  assert.deepEqual(downgraded.deliveryProvenance, {
+    version: 1,
+    source: "simulation",
+  });
+  assert.equal(downgraded.event.deliverySource, "simulation");
+
+  releaseFind();
+  const realResult = await realResultPromise;
+  assert.deepEqual(realResult, {
+    kind: "pending",
+    deliveryState: "processing",
+    attempts: 1,
+  });
+  assert.equal(findCalls, 1);
+  assert.equal(ensureCalls, 0);
+  assert.equal(registrationCalls, 0);
+  assert.equal(realCompleteCalls, 0);
+  assert.equal(timers.callbacks.size, 0);
+});
+
 test("serializes an expired same-event delivery across Bridge instances", async () => {
   const filename = await stateFilename();
   let releaseCreate;

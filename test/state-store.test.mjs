@@ -248,6 +248,268 @@ test("a simulated replay cannot retain Feishu provenance while rehydrating", asy
   assert.equal(replay.record.event.deliverySource, "simulation");
 });
 
+test("a simulated replay downgrades an expired complete Feishu claim", async () => {
+  const eventId = "evt_expired_feishu_simulated_replay";
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const original = await store.claimEvent(event(eventId), {
+    ownerId: "feishu-worker",
+    now: 0,
+    leaseMs: 10,
+  });
+  assert.deepEqual(original.record.deliveryProvenance, { version: 1, source: "feishu" });
+
+  const replay = await store.claimEvent({
+    ...event(eventId),
+    deliverySource: "simulation",
+  }, {
+    ownerId: "simulation-worker",
+    now: 10,
+    leaseMs: 1_000,
+  });
+
+  assert.equal(replay.kind, "claimed");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(replay.record.event.deliverySource, "simulation");
+});
+
+test("a deferred simulated replay downgrades Feishu retry provenance before it is due", async () => {
+  const eventId = "evt_deferred_retry_simulated_replay";
+  const store = new JsonStateStore(await stateFilename());
+  const original = await store.claimEvent(event(eventId), {
+    ownerId: "feishu-worker",
+    now: 0,
+    leaseMs: 100,
+  });
+  await store.fail(eventId, {
+    ownerId: "feishu-worker",
+    token: original.record.lease.token,
+    error: { code: "TASKBOARD_UNAVAILABLE" },
+    nextAttemptAt: 1_000,
+    deadLetter: false,
+    now: 1,
+  });
+
+  const replay = await store.claimEvent({
+    ...event(eventId),
+    deliverySource: "simulation",
+  }, {
+    ownerId: "simulation-worker",
+    now: 100,
+    leaseMs: 100,
+  });
+
+  assert.equal(replay.kind, "deferred");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(replay.record.event.deliverySource, "simulation");
+  const persisted = await store.get(eventId);
+  assert.deepEqual(persisted.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(persisted.event.deliverySource, "simulation");
+
+  const due = await store.claimNextDue({
+    ownerId: "retry-worker",
+    now: 1_000,
+    leaseMs: 100,
+  });
+  assert.deepEqual(due.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(due.event.deliverySource, "simulation");
+});
+
+test("a deferred simulated replay downgrades Feishu provenance under an active lease", async () => {
+  const eventId = "evt_active_lease_simulated_replay";
+  const store = new JsonStateStore(await stateFilename());
+  const original = await store.claimEvent(event(eventId), {
+    ownerId: "feishu-worker",
+    now: 0,
+    leaseMs: 1_000,
+  });
+
+  const replay = await store.claimEvent({
+    ...event(eventId),
+    deliverySource: "simulation",
+  }, {
+    ownerId: "simulation-worker",
+    now: 100,
+    leaseMs: 100,
+  });
+
+  assert.equal(replay.kind, "deferred");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(replay.record.event.deliverySource, "simulation");
+  assert.deepEqual(replay.record.lease, original.record.lease);
+  assert.equal(replay.record.attempts, original.record.attempts);
+
+  const persisted = await store.get(eventId);
+  assert.deepEqual(persisted.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(persisted.event.deliverySource, "simulation");
+  assert.deepEqual(persisted.lease, original.record.lease);
+  assert.equal(persisted.attempts, original.record.attempts);
+});
+
+test("a simulated replay does not rewrite a succeeded Feishu record", async () => {
+  const eventId = "evt_succeeded_feishu_simulated_replay";
+  const store = new JsonStateStore(await stateFilename());
+  const claim = await store.claimEvent(event(eventId), {
+    ownerId: "feishu-worker",
+    now: 0,
+    leaseMs: 100,
+  });
+  await store.complete(eventId, {
+    ownerId: "feishu-worker",
+    token: claim.record.lease.token,
+    decision: "ready",
+    outcome: { kind: "ready", taskId: "task_1", taskIdentifier: "AUTO-1" },
+    now: 1,
+  });
+  const beforeReplay = await store.get(eventId);
+
+  const replay = await store.claimEvent({
+    ...event(eventId),
+    deliverySource: "simulation",
+  }, {
+    ownerId: "simulation-worker",
+    now: 2,
+    leaseMs: 100,
+  });
+
+  assert.equal(replay.kind, "terminal");
+  assert.deepEqual(replay.record, beforeReplay);
+  assert.deepEqual(await store.get(eventId), beforeReplay);
+});
+
+test("rehydration preserves simulation provenance from the frozen decision event", async () => {
+  const eventId = "evt_frozen_simulation_rehydrate";
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: null,
+      deliveryProvenance: { version: 1, source: "feishu" },
+      deliveryState: "dead_letter",
+      decision: null,
+      decisionSnapshot: {
+        version: 1,
+        action: "register",
+        kind: "register",
+        subjectKey: "bas_demo:tbl_demo",
+        configVersion: 1,
+        stageId: "initial",
+        event: {
+          ...event(eventId),
+          deliverySource: "simulation",
+        },
+      },
+      attempts: 1,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: { code: "EVENT_SNAPSHOT_MISSING", status: 0, at: 0 },
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+
+  const replay = await (new JsonStateStore(filename)).claimEvent(event(eventId), {
+    ownerId: "replay-worker",
+    now: 100,
+    leaseMs: 1_000,
+  });
+
+  assert.equal(replay.kind, "claimed");
+  assert.deepEqual(replay.record.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(replay.record.event.deliverySource, "simulation");
+});
+
+test("due recovery preserves simulation provenance from the frozen decision event", async () => {
+  const eventId = "evt_due_frozen_simulation";
+  const store = new JsonStateStore(await stateFilename());
+  const claim = await store.claimEvent(event(eventId), {
+    ownerId: "first-worker",
+    now: 0,
+    leaseMs: 100,
+  });
+  await store.saveDecisionSnapshot(eventId, {
+    ownerId: "first-worker",
+    token: claim.record.lease.token,
+    snapshot: {
+      version: 1,
+      action: "register",
+      kind: "register",
+      subjectKey: "bas_demo:tbl_demo",
+      configVersion: 1,
+      stageId: "initial",
+      event: {
+        ...event(eventId),
+        deliverySource: "simulation",
+      },
+    },
+    now: 1,
+  });
+  await store.fail(eventId, {
+    ownerId: "first-worker",
+    token: claim.record.lease.token,
+    error: { code: "TASKBOARD_UNAVAILABLE" },
+    nextAttemptAt: 100,
+    deadLetter: false,
+    now: 2,
+  });
+
+  const normalized = await store.get(eventId);
+  assert.deepEqual(normalized.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(normalized.event.deliverySource, "simulation");
+
+  const recovered = await store.claimNextDue({
+    ownerId: "recovery-worker",
+    now: 100,
+    leaseMs: 1_000,
+  });
+
+  assert.deepEqual(recovered.deliveryProvenance, { version: 1, source: "simulation" });
+  assert.equal(recovered.event.deliverySource, "simulation");
+});
+
+test("fails closed on an unknown delivery source in the frozen decision event", async () => {
+  const eventId = "evt_frozen_unknown_provenance";
+  const filename = await stateFilename();
+  await writeFile(filename, JSON.stringify({
+    [eventId]: {
+      schemaVersion: 2,
+      eventId,
+      event: event(eventId),
+      deliveryProvenance: { version: 1, source: "feishu" },
+      deliveryState: "pending",
+      decision: null,
+      decisionSnapshot: {
+        version: 1,
+        action: "register",
+        kind: "register",
+        subjectKey: "bas_demo:tbl_demo",
+        configVersion: 1,
+        stageId: "initial",
+        event: {
+          ...event(eventId),
+          deliverySource: "future-source",
+        },
+      },
+      attempts: 0,
+      nextAttemptAt: null,
+      lease: null,
+      lastError: null,
+      failureHistory: [],
+      outcome: null,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+  }));
+
+  const record = await (new JsonStateStore(filename)).get(eventId);
+  assert.equal(record.deliveryState, "dead_letter");
+  assert.equal(record.lastError.code, "DECISION_SNAPSHOT_INVALID");
+  assert.deepEqual(record.deliveryProvenance, { version: 1, source: "simulation" });
+});
+
 test("does not upgrade a simulated malformed snapshot during rehydration", async () => {
   const eventId = "evt_simulated_malformed_rehydrate";
   const filename = await stateFilename();

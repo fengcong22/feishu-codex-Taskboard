@@ -143,15 +143,20 @@ function normalizeDeliveryProvenance(value, { legacy = false } = {}) {
 
 function conservativeDeliveryProvenance(record, replayEvent) {
   const storedEvent = record?.event;
+  const decisionEvent = record?.decisionSnapshot?.event;
   const hasStoredSource = storedEvent
     && typeof storedEvent === "object"
     && !Array.isArray(storedEvent)
     && Object.hasOwn(storedEvent, "deliverySource");
+  const hasDecisionSource = decisionEvent
+    && typeof decisionEvent === "object"
+    && !Array.isArray(decisionEvent)
+    && Object.hasOwn(decisionEvent, "deliverySource");
   const hasReplaySource = replayEvent
     && typeof replayEvent === "object"
     && !Array.isArray(replayEvent)
     && Object.hasOwn(replayEvent, "deliverySource");
-  if (hasStoredSource || hasReplaySource) {
+  if (hasStoredSource || hasDecisionSource || hasReplaySource) {
     return { version: DELIVERY_PROVENANCE_VERSION, source: "simulation" };
   }
   return normalizeDeliveryProvenance(record?.deliveryProvenance)
@@ -390,13 +395,17 @@ function normalizePhasedDecisionSnapshot(value) {
       throw snapshotInvalid("snapshot subject identity does not match the binding");
     }
   }
-  const event = value.event === undefined || value.event === null
-    ? null
-    : normalizeEventSnapshot(value.event);
   if (value.event !== undefined && value.event !== null
     && (!value.event || typeof value.event !== "object" || Array.isArray(value.event))) {
     throw snapshotInvalid("snapshot.event must be an object or null");
   }
+  if (value.event && Object.hasOwn(value.event, "deliverySource")
+    && value.event.deliverySource !== "simulation") {
+    throw snapshotInvalid("snapshot.event.deliverySource is invalid");
+  }
+  const event = value.event === undefined || value.event === null
+    ? null
+    : normalizeEventSnapshot(value.event);
   const normalized = {
     version: DECISION_SNAPSHOT_VERSION,
     action,
@@ -670,6 +679,9 @@ function normalizeRecord(eventId, value, now) {
       return invalidRecord(eventId, record, now, "EVENT_RECORD_INVALID");
     }
     if (record.event === undefined) record.event = null;
+    provenance = conservativeDeliveryProvenance(record);
+    record.deliveryProvenance = provenance;
+    record.event = applyDeliveryProvenance(record.event, provenance);
     if (!hasEventSnapshot(record.event)) {
       record.event = null;
       if (record.deliveryState === "pending" || record.deliveryState === "retry_wait") {
@@ -925,6 +937,10 @@ export class JsonStateStore {
       if (TERMINAL_STATES.has(record.deliveryState)) {
         return { kind: "terminal", record: structuredClone(record) };
       }
+
+      const provenance = conservativeDeliveryProvenance(record, event);
+      record.deliveryProvenance = provenance;
+      record.event = applyDeliveryProvenance(record.event, provenance);
       if (validLease(record, currentNow)) {
         return { kind: "deferred", record: structuredClone(record) };
       }
@@ -958,6 +974,9 @@ export class JsonStateStore {
         .sort((left, right) => left.createdAt - right.createdAt)[0];
       if (!due) return null;
 
+      const provenance = conservativeDeliveryProvenance(due);
+      due.deliveryProvenance = provenance;
+      due.event = applyDeliveryProvenance(due.event, provenance);
       due.deliveryState = "processing";
       due.attempts += 1;
       due.nextAttemptAt = null;

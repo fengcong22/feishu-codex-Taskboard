@@ -1301,6 +1301,79 @@ test("concurrent task edits during startup release the claim without losing the 
   }
 });
 
+test("task startup rechecks server-owned provenance after package lookup", async () => {
+  const packageRecord = {
+    alias: "Auto-cut-copyA",
+    name: "Auto-cut-copyA",
+    projectId: "auto-cut-copy-a",
+    workspacePath: null,
+    model: "fixture",
+    reasoningEffort: "low",
+    prompt: "trusted fixture prompt",
+    zipSourceDirectory: null,
+    maxConcurrent: 1,
+    state: "enabled",
+    revision: 1,
+  };
+  let pauseReads = false;
+  let enteredResolve;
+  const entered = new Promise((resolve) => { enteredResolve = resolve; });
+  let continueResolve;
+  const proceed = new Promise((resolve) => { continueResolve = resolve; });
+  const packageStore = {
+    async get(alias) {
+      return alias === packageRecord.alias ? { ...packageRecord } : null;
+    },
+    async read() {
+      if (pauseReads) {
+        enteredResolve();
+        await proceed;
+      }
+      return { [packageRecord.alias]: { ...packageRecord } };
+    },
+    async list() { return [{ ...packageRecord }]; },
+  };
+  const fixture = await createFixture({ feishuPackageStore: packageStore });
+  packageRecord.workspacePath = fixture.workspace;
+  try {
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: FEISHU_PROJECT_ID,
+        title: "Revoked while resolving package",
+        description: feishuDescription(),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+
+    pauseReads = true;
+    const startPromise = request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+    await entered;
+    fixture.app.database.database.prepare(
+      "DELETE FROM feishu_task_origins WHERE task_id = ?",
+    ).run(created.body.task.id);
+    continueResolve();
+
+    const started = await startPromise;
+    assert.equal(started.response.status, 409, JSON.stringify(started.body));
+    assert.equal(started.body.error.code, "TASK_NOT_STARTABLE");
+    assert.equal(fixture.app.database.getTask(created.body.task.id).status, "todo");
+    assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id), null);
+    const threads = await request(fixture.baseUrl, "/api/local/ai/threads");
+    assert.deepEqual(threads.body.threads, []);
+  } finally {
+    continueResolve();
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("startup failure does not release a task that was rebound to another thread", async () => {
   const fixture = await createFixture();
   try {
@@ -1588,14 +1661,14 @@ test("startup recovery releases a claim bound to a thread owned by another task"
       name: "Auto-cut-copyA",
       workspacePath: fixture.workspace,
     });
-    const createTask = (title) => fixture.app.database.createTask({
+    const createTask = (title, eventId) => fixture.app.database.createTask({
       projectId: "auto-cut-copy-a",
       title,
-      description: feishuDescription(),
+      description: feishuDescriptionWith({ eventId }),
       status: "todo",
       priority: "high",
       labels: ["feishu"],
-      feishuOrigin: feishuOrigin(),
+      feishuOrigin: { ...feishuOrigin(), eventId },
       actor,
       assignee: actor,
       workflowId: null,
@@ -1604,8 +1677,8 @@ test("startup recovery releases a claim bound to a thread owned by another task"
       dueDate: null,
       recurrence: null,
     });
-    const claimedTask = createTask("Claimed task");
-    const otherTask = createTask("Other task");
+    const claimedTask = createTask("Claimed task", "fixture-claimed-task");
+    const otherTask = createTask("Other task", "fixture-other-task");
     const thread = await fixture.app.aiChat.createThread({
       projectId: claimedTask.projectId,
       issueId: otherTask.id,
@@ -2450,7 +2523,7 @@ test("the unified execution endpoint starts a Feishu task and drag-to-processing
       body: {
         projectId: "auto-cut-copy-a",
         title: "Drag execution",
-        description: feishuDescription(),
+        description: feishuDescriptionWith({ eventId: "fixture-drag-execution" }),
         status: "todo",
         priority: "high",
         labels: ["feishu"],
@@ -2633,6 +2706,74 @@ test("task execution uses the live package concurrency limit after a snapshot is
     assert.equal(started.response.status, 202);
     assert.ok(requests.length > 0, JSON.stringify(started.body));
     assert.equal(requests.at(-1).maxConcurrent, 2);
+  } finally {
+    await fixture.app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("package disabled during workspace validation is rejected before task claim", async () => {
+  const packageRecord = {
+    alias: "Auto-cut-copyA",
+    name: "Auto-cut-copyA",
+    projectId: "auto-cut-copy-a",
+    workspacePath: null,
+    model: null,
+    reasoningEffort: null,
+    prompt: "trusted fixture prompt",
+    zipSourceDirectory: null,
+    maxConcurrent: 1,
+    state: "enabled",
+    revision: 1,
+  };
+  let starting = false;
+  let startReads = 0;
+  const packageStore = {
+    async get(alias) {
+      return alias === packageRecord.alias ? { ...packageRecord } : null;
+    },
+    async read() {
+      if (starting) {
+        startReads += 1;
+        if (startReads === 2) packageRecord.state = "disabled";
+      }
+      return { [packageRecord.alias]: { ...packageRecord } };
+    },
+    async list() { return [{ ...packageRecord }]; },
+  };
+  const fixture = await createFixture({ feishuPackageStore: packageStore });
+  packageRecord.workspacePath = fixture.workspace;
+  try {
+    const project = await request(fixture.baseUrl, "/api/projects", {
+      method: "POST",
+      body: { id: "auto-cut-copy-a", name: "Auto-cut-copyA", workspacePath: fixture.workspace },
+    });
+    assert.equal(project.response.status, 201);
+    const created = await request(fixture.baseUrl, "/api/tasks", {
+      method: "POST",
+      body: {
+        projectId: "auto-cut-copy-a",
+        title: "Package disabled during startup",
+        description: feishuDescriptionWith({ eventId: "fixture-package-disabled-race" }),
+        status: "todo",
+        priority: "high",
+        labels: ["feishu"],
+      },
+    });
+    assert.equal(created.response.status, 201);
+
+    starting = true;
+    const started = await request(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {
+      method: "POST",
+      body: {},
+    });
+
+    assert.equal(started.response.status, 409, JSON.stringify(started.body));
+    assert.equal(started.body.error.code, "PACKAGE_DISABLED");
+    assert.equal(startReads, 2);
+    assert.equal(fixture.app.database.getTask(created.body.task.id).status, "todo");
+    assert.equal(fixture.app.database.getTask(created.body.task.id).threadId, null);
+    assert.deepEqual(fixture.app.database.listTaskAiStarts(), []);
   } finally {
     await fixture.app.close();
     await rm(fixture.directory, { recursive: true, force: true });

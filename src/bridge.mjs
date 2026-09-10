@@ -324,6 +324,12 @@ export function createBridge({
   // task that could later be mistaken for an Auto-Cut task.
   const allowLegacyTaskCreation = config?.allowLegacyTaskCreation === true;
 
+  function deliverySourceOf(record) {
+    if (record?.deliveryProvenance?.source === "simulation") return "simulation";
+    if (record?.deliveryProvenance?.source === "feishu") return "feishu";
+    return record?.event?.deliverySource === "simulation" ? "simulation" : "feishu";
+  }
+
   function startLeaseHeartbeat(record) {
     const token = record.lease?.token;
     const intervalMs = Math.max(1, Math.floor(delivery.leaseMs / 3));
@@ -338,11 +344,19 @@ export function createBridge({
       if (renewalError) throw renewalError;
     }
 
+    async function assertPersistedLease() {
+      if (!(await currentLeaseIsOwned(record))) {
+        lost = leaseLostError();
+        throw lost;
+      }
+    }
+
     if (typeof store.renewLease !== "function" || !token) {
       return {
         assertActive,
         async ensureActive() {
           assertActive();
+          await assertPersistedLease();
           if (leaseUntil !== null && leaseUntil <= now()) {
             lost = leaseLostError();
             throw lost;
@@ -388,10 +402,12 @@ export function createBridge({
       async ensureActive() {
         if (renewal) await renewal;
         assertActive();
+        await assertPersistedLease();
         if (leaseUntil !== null && leaseUntil - now() <= intervalMs) {
           await renew();
         }
         assertActive();
+        await assertPersistedLease();
         if (leaseUntil !== null && leaseUntil <= now()) {
           lost = leaseLostError();
           throw lost;
@@ -854,6 +870,7 @@ export function createBridge({
       && current.deliveryState === "processing"
       && current.lease?.ownerId === ownerId
       && current.lease?.token === record.lease?.token
+      && deliverySourceOf(current) === deliverySourceOf(record)
       && Number.isFinite(current.lease?.leaseUntil)
     );
   }

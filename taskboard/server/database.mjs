@@ -1043,6 +1043,7 @@ export class TaskboardDatabase {
         config_version INTEGER,
         stage_id TEXT,
         event_id TEXT,
+        registration_event_id TEXT,
         base_token TEXT,
         table_id TEXT,
         record_id TEXT,
@@ -1072,6 +1073,8 @@ export class TaskboardDatabase {
         state TEXT NOT NULL CHECK (state IN ('delayed', 'queued', 'running')),
         mode TEXT NOT NULL CHECK (mode IN ('manual', 'automatic')),
         ready_at INTEGER NOT NULL,
+        pump_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (pump_retry_count >= 0),
+        launch_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (launch_retry_count >= 0),
         package_alias TEXT NOT NULL,
         package_revision INTEGER NOT NULL CHECK (package_revision > 0),
         trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'move', 'automatic', 'retry')),
@@ -1358,7 +1361,8 @@ export class TaskboardDatabase {
 
     const feishuOriginColumns = this.database.prepare("PRAGMA table_info(feishu_task_origins)").all();
     for (const column of [
-      "subject_key", "config_version", "stage_id", "event_id", "base_token", "table_id", "record_id",
+      "subject_key", "config_version", "stage_id", "event_id", "registration_event_id",
+      "base_token", "table_id", "record_id",
       "status_field_id", "before_option_id", "after_option_id", "event_occurred_at",
       "stage_snapshot_json", "controlled_context_json",
     ]) {
@@ -1369,9 +1373,6 @@ export class TaskboardDatabase {
     this.database.exec(`
       CREATE INDEX IF NOT EXISTS feishu_task_origins_binding
         ON feishu_task_origins(base_token, table_id, record_id, status_field_id, stage_id, event_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS feishu_task_origins_event
-        ON feishu_task_origins(base_token, table_id, record_id, status_field_id, stage_id, event_id)
-        WHERE event_id IS NOT NULL AND stage_id IS NOT NULL;
       UPDATE feishu_task_origins
       SET subject_key = COALESCE(subject_key, json_extract(metadata_json, '$.subjectKey')),
           config_version = COALESCE(config_version, json_extract(metadata_json, '$.configVersion')),
@@ -1385,9 +1386,45 @@ export class TaskboardDatabase {
           after_option_id = COALESCE(after_option_id, json_extract(metadata_json, '$.afterOptionId')),
           event_occurred_at = COALESCE(event_occurred_at, json_extract(metadata_json, '$.eventOccurredAt'))
     `);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.exec(`
+        DROP INDEX IF EXISTS feishu_task_origins_event;
+        UPDATE feishu_task_origins AS origin
+        SET registration_event_id = event_id
+        WHERE event_id IS NOT NULL
+          AND registration_event_id IS NULL
+          AND task_id = (
+            SELECT MIN(candidate.task_id)
+            FROM feishu_task_origins AS candidate
+            WHERE candidate.event_id = origin.event_id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM feishu_task_origins AS claimed
+            WHERE claimed.registration_event_id = origin.event_id
+          );
+        CREATE UNIQUE INDEX IF NOT EXISTS feishu_task_origins_event_id_unique
+          ON feishu_task_origins(registration_event_id)
+          WHERE registration_event_id IS NOT NULL;
+        CREATE TRIGGER IF NOT EXISTS feishu_task_origins_reserve_legacy_event_id
+        AFTER INSERT ON feishu_task_origins
+        WHEN NEW.registration_event_id IS NULL AND NEW.event_id IS NOT NULL
+        BEGIN
+          UPDATE feishu_task_origins
+          SET registration_event_id = NEW.event_id
+          WHERE task_id = NEW.task_id;
+        END;
+      `);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
 
     this.#migrateTaskArtifacts();
     this.#migrateFeishuExecutionTriggers();
+    this.#migrateFeishuExecutionRetryCounts();
 
     const feishuBaseColumns = this.database.prepare("PRAGMA table_info(feishu_bases)").all();
     if (!feishuBaseColumns.some((column) => column.name === "removed_at")) {
@@ -4012,15 +4049,17 @@ export class TaskboardDatabase {
         this.database.prepare(`
           INSERT INTO feishu_task_origins (
             task_id, metadata_json, subject_key, config_version, stage_id, event_id,
-            base_token, table_id, record_id, status_field_id, before_option_id, after_option_id,
+            registration_event_id, base_token, table_id, record_id, status_field_id,
+            before_option_id, after_option_id,
             event_occurred_at, stage_snapshot_json, controlled_context_json, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           id,
           JSON.stringify(origin),
           origin.subjectKey ?? null,
           origin.configVersion ?? null,
           origin.stageId ?? null,
+          origin.eventId ?? null,
           origin.eventId ?? null,
           origin.baseToken ?? null,
           origin.tableId ?? null,
@@ -4328,6 +4367,20 @@ export class TaskboardDatabase {
     }
   }
 
+  #migrateFeishuExecutionRetryCounts() {
+    const columns = this.database.prepare("PRAGMA table_info(feishu_task_executions)").all();
+    if (!columns.some((column) => column.name === "pump_retry_count")) {
+      this.database.exec(
+        "ALTER TABLE feishu_task_executions ADD COLUMN pump_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (pump_retry_count >= 0)",
+      );
+    }
+    if (!columns.some((column) => column.name === "launch_retry_count")) {
+      this.database.exec(
+        "ALTER TABLE feishu_task_executions ADD COLUMN launch_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (launch_retry_count >= 0)",
+      );
+    }
+  }
+
   getFeishuSubjectVersion(subjectKey, configVersion) {
     if (typeof subjectKey !== "string" || subjectKey.trim() === "") return null;
     if (!Number.isSafeInteger(configVersion) || configVersion < 1) return null;
@@ -4603,9 +4656,10 @@ export class TaskboardDatabase {
     try {
       this.database.prepare(`
         INSERT INTO feishu_task_executions
-          (task_id, state, mode, ready_at, package_alias, package_revision, trigger,
+          (task_id, state, mode, ready_at, pump_retry_count, launch_retry_count,
+           package_alias, package_revision, trigger,
            lease_id, version, created_at, updated_at, last_error)
-        VALUES (?, 'delayed', ?, ?, ?, ?, ?, NULL, 1, ?, ?, NULL)
+        VALUES (?, 'delayed', ?, ?, 0, 0, ?, ?, ?, NULL, 1, ?, ?, NULL)
       `).run(taskId, input.mode, input.readyAt, packageAlias, input.packageRevision, input.trigger, timestamp, timestamp);
     } catch (error) {
       if (String(error.message).includes("UNIQUE constraint failed")) {
@@ -4623,6 +4677,8 @@ export class TaskboardDatabase {
       state: row.state,
       mode: row.mode,
       readyAt: row.ready_at,
+      pumpRetries: row.pump_retry_count,
+      launchRetries: row.launch_retry_count,
       packageAlias: row.package_alias,
       packageRevision: row.package_revision,
       trigger: row.trigger,
@@ -4644,6 +4700,8 @@ export class TaskboardDatabase {
       state: row.state,
       mode: row.mode,
       readyAt: row.ready_at,
+      pumpRetries: row.pump_retry_count,
+      launchRetries: row.launch_retry_count,
       packageAlias: row.package_alias,
       packageRevision: row.package_revision,
       trigger: row.trigger,
@@ -4659,7 +4717,7 @@ export class TaskboardDatabase {
     if (!['delayed', 'queued', 'running'].includes(state)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid Feishu execution state");
     }
-    const allowed = new Set(['readyAt', 'leaseId', 'lastError']);
+    const allowed = new Set(['readyAt', 'pumpRetries', 'launchRetries', 'leaseId', 'lastError']);
     const unknown = Object.keys(patch).find((key) => !allowed.has(key));
     if (unknown) throw new ApiError(400, "INVALID_FIELD", `Unsupported execution field '${unknown}'`);
     const current = this.getFeishuExecution(taskId);
@@ -4668,13 +4726,18 @@ export class TaskboardDatabase {
     const timestamp = now();
     const result = this.database.prepare(`
       UPDATE feishu_task_executions
-      SET state = ?, ready_at = COALESCE(?, ready_at), lease_id = COALESCE(?, lease_id),
+      SET state = ?, ready_at = COALESCE(?, ready_at),
+          pump_retry_count = COALESCE(?, pump_retry_count),
+          launch_retry_count = COALESCE(?, launch_retry_count),
+          lease_id = COALESCE(?, lease_id),
           last_error = CASE WHEN ? THEN ? ELSE last_error END,
           version = version + 1, updated_at = ?
       WHERE task_id = ? AND version = ?
     `).run(
       state,
       patch.readyAt ?? null,
+      patch.pumpRetries ?? null,
+      patch.launchRetries ?? null,
       patch.leaseId ?? null,
       Object.hasOwn(patch, 'lastError') ? 1 : 0,
       patch.lastError ?? null,
@@ -4816,9 +4879,10 @@ export class TaskboardDatabase {
       JOIN tasks ON tasks.id = feishu_task_origins.task_id
       WHERE feishu_task_origins.event_id = ?
         AND (? IS NULL OR tasks.project_id = ?)
-      ORDER BY tasks.created_at, tasks.id
+      ORDER BY CASE WHEN feishu_task_origins.registration_event_id = ? THEN 0 ELSE 1 END,
+        tasks.created_at, tasks.id
       LIMIT 1
-    `).get(eventId, projectId, projectId);
+    `).get(eventId, projectId, projectId, eventId);
     if (indexed) return this.getTask(indexed.task_id);
     const rows = this.database.prepare(`
       SELECT feishu_task_origins.task_id, feishu_task_origins.metadata_json
@@ -5556,6 +5620,16 @@ export class TaskboardDatabase {
       this.#requireVersion(current, version);
       if (current.archivedAt === null) {
         throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be deleted");
+      }
+      const feishuOrigin = this.database.prepare(
+        "SELECT 1 FROM feishu_task_origins WHERE task_id = ?",
+      ).get(current.id);
+      if (feishuOrigin) {
+        throw new ApiError(
+          409,
+          "FEISHU_TASK_DELETE_UNAVAILABLE",
+          "Server-registered Feishu tasks cannot be permanently deleted",
+        );
       }
       const activeUpload = this.database.prepare(`
         SELECT 1 FROM artifact_uploads

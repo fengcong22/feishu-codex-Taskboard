@@ -218,6 +218,101 @@ test("canonical stage registration still schedules automatic execution internall
   }
 });
 
+test("archiving a canonical stage task cancels its delayed automatic execution", async () => {
+  const fixtureData = await fixture({ allowAutomaticExecution: true });
+  try {
+    const subject = await enableSubject(fixtureData);
+    const registered = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, { event: { eventId: "evt-stage-archive-cancels-execution" } }),
+    );
+    assert.equal(registered.response.status, 201, JSON.stringify(registered.body));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const taskId = registered.body.task.id;
+    const execution = fixtureData.app.database.getFeishuExecution(taskId);
+    assert.equal(execution?.state, "delayed");
+
+    const archived = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/tasks/${encodeURIComponent(taskId)}/archive`,
+      { version: registered.body.task.version },
+    );
+    assert.equal(archived.response.status, 200, JSON.stringify(archived.body));
+    assert.ok(archived.body.task.archivedAt);
+    assert.equal(fixtureData.app.database.getFeishuExecution(taskId), null);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("canonical replay heals a task committed before its automatic reservation", async () => {
+  const fixtureData = await fixture({ allowAutomaticExecution: true });
+  try {
+    const subject = await enableSubject(fixtureData);
+    const payload = registration(subject, {
+      event: { eventId: "evt-stage-automatic-reservation-replay" },
+    });
+    const createExecution = fixtureData.app.database.createFeishuExecution.bind(fixtureData.app.database);
+    fixtureData.app.database.createFeishuExecution = () => {
+      const error = new Error("injected execution reservation failure");
+      error.code = "EXECUTION_RESERVATION_FAILED";
+      throw error;
+    };
+
+    const logged = [];
+    const originalConsoleError = console.error;
+    console.error = (...args) => logged.push(args.map(String).join(" "));
+    let interrupted;
+    try {
+      interrupted = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+    } finally {
+      console.error = originalConsoleError;
+    }
+    assert.equal(interrupted.response.status, 500, JSON.stringify(interrupted.body));
+    assert.deepEqual(logged, ["INTERNAL_ERROR"]);
+    await new Promise((resolve) => setImmediate(resolve));
+    const committed = fixtureData.app.database.findFeishuTaskByRegistration({
+      baseToken: payload.event.baseToken,
+      tableId: payload.event.tableId,
+      recordId: payload.event.recordId,
+      statusFieldId: payload.event.statusFieldId,
+      stageId: payload.binding.stageId,
+      eventId: payload.event.eventId,
+    });
+    assert.ok(committed);
+    assert.equal(fixtureData.app.database.getFeishuExecution(committed.id), null);
+
+    fixtureData.app.database.createFeishuExecution = createExecution;
+    const packageCatalog = await fetch(`${fixtureData.baseUrl}/api/local/autocut/packages`).then(
+      (response) => response.json(),
+    );
+    const packageRecord = packageCatalog.packages.find((entry) => entry.alias === "Auto-cut-lite");
+    const disabled = await fetch(
+      `${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite/disable`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: packageRecord.revision }),
+      },
+    );
+    assert.equal(disabled.status, 200);
+
+    const replay = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.task.id, committed.id);
+    const execution = fixtureData.app.database.getFeishuExecution(committed.id);
+    assert.equal(execution?.trigger, "automatic");
+    assert.equal(execution?.mode, "automatic");
+    assert.equal(execution?.state, "delayed");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
 test("simulated stage registration is never eligible for automatic execution", async () => {
   const fixtureData = await fixture({ allowAutomaticExecution: true });
   try {
@@ -246,6 +341,30 @@ test("simulated stage registration is never eligible for automatic execution", a
   }
 });
 
+test("canonical replay rejects altered controlled context for the same registration identity", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    const payload = registration(subject, { event: { eventId: "evt-stage-context-conflict" } });
+    const first = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(first.response.status, 201, JSON.stringify(first.body));
+
+    const conflict = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, {
+        event: { eventId: payload.event.eventId, occurredAt: payload.event.occurredAt },
+        controlledContext: { namingDisplayValue: "altered-name" },
+      }),
+    );
+    assert.equal(conflict.response.status, 409, JSON.stringify(conflict.body));
+    assert.equal(conflict.body.error.code, "FEISHU_EVENT_BINDING_CONFLICT");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
 test("canonical stage registration rejects an event rebound to another stage", async () => {
   const fixtureData = await fixture();
   try {
@@ -263,6 +382,35 @@ test("canonical stage registration rejects an event rebound to another stage", a
     );
     assert.equal(conflict.response.status, 409, JSON.stringify(conflict.body));
     assert.equal(conflict.body.error.code, "FEISHU_EVENT_BINDING_CONFLICT");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("canonical stage registration rejects an event id rebound to another record", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    const payload = registration(subject, { event: { eventId: "evt-stage-record-rebound" } });
+    const first = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(first.response.status, 201, JSON.stringify(first.body));
+
+    const conflict = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, {
+        event: {
+          eventId: payload.event.eventId,
+          recordId: "rec_2",
+          occurredAt: payload.event.occurredAt,
+        },
+      }),
+    );
+
+    assert.equal(conflict.response.status, 409, JSON.stringify(conflict.body));
+    assert.equal(conflict.body.error.code, "FEISHU_EVENT_BINDING_CONFLICT");
+    assert.equal(fixtureData.app.database.listFeishuTasks().length, 1);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

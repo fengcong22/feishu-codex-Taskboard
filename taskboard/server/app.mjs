@@ -2613,6 +2613,30 @@ export function createTaskboardServer(options = {}) {
     return canonicalJson(left ?? null) === canonicalJson(right ?? null);
   }
 
+  function sameRegistrationEnvelope(existing, registration) {
+    if (!existing) return false;
+    const { event, binding, controlledContext } = registration;
+    const expected = {
+      source: "feishu-base",
+      eventId: event.eventId,
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      statusFieldId: event.statusFieldId,
+      beforeOptionId: event.beforeOptionId,
+      afterOptionId: event.afterOptionId,
+      stageId: binding.stageId,
+      eventOccurredAt: event.occurredAt,
+      deliverySource: event.deliverySource,
+      subjectKey: binding.subjectKey,
+      configVersion: binding.configVersion,
+    };
+    for (const key of Object.keys(expected)) {
+      if (JSON.stringify(existing[key]) !== JSON.stringify(expected[key])) return false;
+    }
+    return sameControlledContext(existing.controlledContext, controlledContext);
+  }
+
   function sameStageRegistration(existing, expected) {
     if (!existing) return false;
     for (const key of [
@@ -2636,6 +2660,23 @@ export function createTaskboardServer(options = {}) {
       || binding.subjectKey.slice(separator + 1) !== event.tableId
     ) {
       throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Stage registration identity does not match its Base/table");
+    }
+
+    const identity = {
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+      statusFieldId: event.statusFieldId,
+      stageId: binding.stageId,
+      eventId: event.eventId,
+    };
+    const existing = database.findFeishuTaskByEventId(event.eventId);
+    if (existing) {
+      const existingOrigin = database.getFeishuTaskOrigin(existing.id);
+      if (!sameRegistrationEnvelope(existingOrigin, registration)) {
+        throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
+      }
+      return { task: existing, created: false };
     }
 
     const subjectVersion = database.getFeishuSubjectVersion(binding.subjectKey, binding.configVersion);
@@ -2711,22 +2752,6 @@ export function createTaskboardServer(options = {}) {
       stageSnapshot: structuredClone(stage),
       controlledContext: structuredClone(controlledContext),
     };
-    const identity = {
-      baseToken: event.baseToken,
-      tableId: event.tableId,
-      recordId: event.recordId,
-      statusFieldId: event.statusFieldId,
-      stageId: binding.stageId,
-      eventId: event.eventId,
-    };
-    const existing = database.findFeishuTaskByRegistration(identity);
-    if (existing) {
-      const existingOrigin = database.getFeishuTaskOrigin(existing.id);
-      if (!sameStageRegistration(existingOrigin, origin)) {
-        throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
-      }
-      return { task: existing, created: false };
-    }
     const eventRows = database.findFeishuTaskByRegistrationEvent(identity);
     if (eventRows.some((entry) => !sameStageRegistration(database.getFeishuTaskOrigin(entry.task.id), origin))) {
       throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different stage");
@@ -2782,7 +2807,7 @@ export function createTaskboardServer(options = {}) {
       return { task, created: true };
     } catch (error) {
       // A concurrent Bridge delivery may have won the unique event index.
-      const winner = database.findFeishuTaskByRegistration(identity);
+      const winner = database.findFeishuTaskByEventId(event.eventId);
       if (winner) {
         const winnerOrigin = database.getFeishuTaskOrigin(winner.id);
         if (sameStageRegistration(winnerOrigin, origin)) return { task: winner, created: false };
@@ -4143,6 +4168,32 @@ export function createTaskboardServer(options = {}) {
     );
   }
 
+  function currentExecutionMetadata(task, trigger) {
+    const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
+    if (!metadata) return null;
+    if (trigger === "automatic" && (
+      Object.hasOwn(metadata, "deliverySource")
+      || executionModeForMetadata(metadata) !== "automatic"
+      || !isPhasedAutoCutOrigin(metadata)
+    )) {
+      return null;
+    }
+    return metadata;
+  }
+
+  function requireCurrentExecutionContext(taskId, trigger) {
+    const task = database.getTask(taskId);
+    const metadata = currentExecutionMetadata(task, trigger);
+    if (!task || !metadata) {
+      throw new ApiError(
+        409,
+        "TASK_NOT_STARTABLE",
+        "Task execution eligibility is no longer valid",
+      );
+    }
+    return { task, metadata };
+  }
+
   function blockedPreparationError(error) {
     const normalized = error instanceof ApiError
       ? error
@@ -4607,6 +4658,7 @@ export function createTaskboardServer(options = {}) {
     assertTaskStartAllowed(signal);
     const packages = await feishuPackages.read();
     assertTaskStartAllowed(signal);
+    ({ task, metadata } = requireCurrentExecutionContext(task.id, trigger));
     const livePackage = packages[metadata.packageAlias];
     if (!livePackage) {
       throw new ApiError(
@@ -4641,6 +4693,29 @@ export function createTaskboardServer(options = {}) {
       );
     }
     assertTaskStartAllowed(signal);
+    const latest = requireCurrentExecutionContext(task.id, trigger);
+    if (latest.metadata.packageAlias !== metadata.packageAlias) {
+      throw new ApiError(409, "TASK_NOT_STARTABLE", "Task execution package changed during startup");
+    }
+    const latestPackages = await feishuPackages.read();
+    assertTaskStartAllowed(signal);
+    const latestPackage = latestPackages[metadata.packageAlias];
+    if (!latestPackage) {
+      throw new ApiError(
+        409,
+        "UNKNOWN_PACKAGE_ALIAS",
+        `Package '${metadata.packageAlias}' is not configured on this Taskboard`,
+      );
+    }
+    if (latestPackage.state && latestPackage.state !== "enabled") {
+      throw new ApiError(409, "PACKAGE_DISABLED", "Auto-Cut package is disabled and cannot start");
+    }
+    const finalContext = requireCurrentExecutionContext(task.id, trigger);
+    if (finalContext.metadata.packageAlias !== metadata.packageAlias) {
+      throw new ApiError(409, "TASK_NOT_STARTABLE", "Task execution package changed during startup");
+    }
+    task = finalContext.task;
+    metadata = finalContext.metadata;
     const startableTask = task.threadId
       ? database.detachFailedPreStartThreadForRetry(task.id, task.version, actor)
       : task;
@@ -4690,6 +4765,7 @@ export function createTaskboardServer(options = {}) {
     packageStore: feishuPackages,
     scheduler: resourceScheduler,
     allowAutomaticExecution,
+    resolveCurrentMetadata: (task, { trigger } = {}) => currentExecutionMetadata(task, trigger),
     onTaskUpdated: (task) => events.emit("task.updated", { task }),
     startClaimedTask: (
       task,
@@ -5686,15 +5762,13 @@ export function createTaskboardServer(options = {}) {
           const result = await createCanonicalFeishuStageTask(registration, actor);
           const task = result.task;
           events.emit(result.created ? "task.created" : "task.updated", { task });
-          if (result.created && allowAutomaticExecution && !closing) {
+          if (allowAutomaticExecution && ["todo", "queued"].includes(task.status)) {
             const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
             if (metadata && executionModeForMetadata(metadata) === "automatic") {
-              void startTrackedTask(task.id, () => executionCoordinator.schedule(
+              assertTaskStartAllowed();
+              await startTrackedTask(task.id, () => executionCoordinator.schedule(
                 task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
-              )).catch((error) => {
-                if (["SERVER_SHUTTING_DOWN", "REQUEST_CANCELLED"].includes(error?.code)) return;
-                console.error(`Automatic execution failed for task '${task.id}': ${error.code ?? "EXECUTION_FAILED"}`);
-              });
+              ));
             }
           }
           return sendJson(response, result.created ? 201 : 200, { task });
@@ -5757,6 +5831,7 @@ export function createTaskboardServer(options = {}) {
         if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
         requireTrustedFeishuTask(task);
         const archived = database.archiveFeishuTask(id, version, actorFromRequest(request));
+        executionCoordinator.cancel(id);
         events.emit("task.archived", { task: archived });
         return sendJson(response, 200, { task: archived });
       }
@@ -6796,6 +6871,7 @@ export function createTaskboardServer(options = {}) {
             threadBinding,
             actorFromRequest(request),
           );
+          executionCoordinator.cancel(id);
           events.emit("task.archived", { task });
           return sendJson(response, 200, { task });
         }
@@ -6846,7 +6922,7 @@ export function createTaskboardServer(options = {}) {
         sendJson(response, error.status, { error: { code: error.code, message: error.message } });
         return;
       }
-      console.error(error);
+      console.error("INTERNAL_ERROR");
       sendJson(response, 500, { error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
     }
   });
