@@ -88,6 +88,33 @@ function phasedStage(id, optionId, value) {
   };
 }
 
+function phasedMetadata(extraFields = []) {
+  return {
+    fields: [
+      { fieldId: "fld_progress", fieldName: "制作进度", type: 3, uiType: "SingleSelect", options: [{ id: "opt_ready", name: "待制作" }] },
+      { fieldId: "fld_title", fieldName: "脚本名称", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_status", fieldName: "流程", type: 3, uiType: "SingleSelect", options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ] },
+      { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ...extraFields,
+    ],
+  };
+}
+
+function applyPhasedConfiguration(subject, stages, metadata) {
+  Object.assign(subject, {
+    statusField: { fieldId: "fld_status", fieldName: "流程" },
+    documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+    namingField: { fieldId: "fld_name", fieldName: "命名" },
+    stages,
+    metadata,
+  });
+}
+
 test("workflow share export is schema-versioned and redacts machine-local paths", async () => {
   const fixtureData = await fixture();
   try {
@@ -235,6 +262,113 @@ test("phased share export keeps independent active audio sources without UI draf
     assert.deepEqual(sharedStages.first_review.audio, firstReview.audio);
     assert.deepEqual(sharedStages.final_review.audio, finalReview.audio);
     assert.doesNotMatch(JSON.stringify(exported.body.configuration), /audioDraft|temporary|cache/i);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("share import diagnoses staged attachment bindings against explicitly empty local metadata", async () => {
+  const fixtureData = await fixture();
+  try {
+    await seedSubject(fixtureData.baseUrl, "bas_empty_attachment_metadata", []);
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const configuration = structuredClone(exported.body.configuration);
+    const subject = configuration.bases[0].subjects[0];
+    const initial = phasedStage("initial", "opt_initial", "初稿");
+    initial.artifactTargetPath = null;
+    initial.videoSource = { kind: "base_attachment", fieldId: "fld_imported_video" };
+    initial.audio = {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_imported_audio" },
+      durationToleranceSeconds: 3,
+    };
+    const firstReview = phasedStage("first_review", "opt_review", "初审修改");
+    firstReview.artifactTargetPath = null;
+    const finalReview = phasedStage("final_review", "opt_final", "终审修改");
+    finalReview.artifactTargetPath = null;
+    applyPhasedConfiguration(subject, {
+      initial,
+      first_review: firstReview,
+      final_review: finalReview,
+    }, phasedMetadata([
+      { fieldId: "fld_imported_video", fieldName: "导入视频", type: 17, uiType: "Attachment", options: [] },
+      { fieldId: "fld_imported_audio", fieldName: "导入音频", type: 17, uiType: "Attachment", options: [] },
+    ]));
+
+    const dryRun = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(dryRun.response.status, 200, JSON.stringify(dryRun.body));
+    assert.deepEqual(
+      dryRun.body.diagnostics
+        .filter((entry) => entry.path?.includes(".stages."))
+        .map((entry) => [entry.code, entry.path]),
+      [
+        ["FIELD_NOT_FOUND", "bases.bas_empty_attachment_metadata.subjects.tbl_chinese.stages.initial.videoSource.fieldId"],
+        ["FIELD_NOT_FOUND", "bases.bas_empty_attachment_metadata.subjects.tbl_chinese.stages.initial.audio.source.fieldId"],
+      ],
+    );
+
+    const committed = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: false },
+    });
+    assert.equal(committed.response.status, 200, JSON.stringify(committed.body));
+    const imported = committed.body.configuration.bases[0].subjects[0];
+    assert.equal(imported.lifecycle, "draft");
+    assert.equal(imported.stages.initial.videoSource.fieldId, "fld_imported_video");
+    assert.equal(imported.stages.initial.audio.source.fieldId, "fld_imported_audio");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("share import diagnoses staged attachment bindings that resolve to non-attachment fields", async () => {
+  const fixtureData = await fixture();
+  try {
+    const metadata = phasedMetadata([
+      { fieldId: "fld_text_video", fieldName: "视频文本", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_text_audio", fieldName: "音频文本", type: 1, uiType: "Text", options: [] },
+    ]);
+    await seedSubject(fixtureData.baseUrl, "bas_wrong_attachment_type", metadata.fields);
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const configuration = structuredClone(exported.body.configuration);
+    const subject = configuration.bases[0].subjects[0];
+    const initial = phasedStage("initial", "opt_initial", "初稿");
+    initial.artifactTargetPath = null;
+    const firstReview = phasedStage("first_review", "opt_review", "初审修改");
+    firstReview.artifactTargetPath = null;
+    firstReview.videoSource = { kind: "base_attachment", fieldId: "fld_text_video" };
+    const finalReview = phasedStage("final_review", "opt_final", "终审修改");
+    finalReview.artifactTargetPath = null;
+    finalReview.audio = {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_text_audio" },
+      durationToleranceSeconds: 3,
+    };
+    applyPhasedConfiguration(subject, {
+      initial,
+      first_review: firstReview,
+      final_review: finalReview,
+    }, metadata);
+
+    const dryRun = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(dryRun.response.status, 200, JSON.stringify(dryRun.body));
+    assert.deepEqual(
+      dryRun.body.diagnostics
+        .filter((entry) => entry.path?.includes(".stages."))
+        .map((entry) => [entry.code, entry.path]),
+      [
+        ["FIELD_TYPE_INVALID", "bases.bas_wrong_attachment_type.subjects.tbl_chinese.stages.first_review.videoSource.fieldId"],
+        ["FIELD_TYPE_INVALID", "bases.bas_wrong_attachment_type.subjects.tbl_chinese.stages.final_review.audio.source.fieldId"],
+      ],
+    );
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

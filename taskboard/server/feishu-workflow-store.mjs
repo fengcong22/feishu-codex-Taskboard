@@ -153,6 +153,15 @@ function safeSourceUrlLabel(value) {
   }
 }
 
+function isAttachmentField(field) {
+  if (!field || typeof field !== "object" || Array.isArray(field)) return false;
+  if (field.type === 17 || String(field.type ?? "") === "17") return true;
+  const uiType = String(field.uiType ?? field.ui_type ?? "")
+    .replace(/[\s_-]/gu, "")
+    .toLowerCase();
+  return uiType === "attachment" || uiType === "attachments";
+}
+
 function portableMetadata(metadata) {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
   if (!Array.isArray(metadata.fields)) return {};
@@ -545,10 +554,15 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           });
         }
         const currentConfig = current ? rowSubject(current) : null;
-        const fields = Array.isArray(currentConfig?.metadata?.fields) && currentConfig.metadata.fields.length > 0
+        // An existing subject's explicit fields array is authoritative, even
+        // when it is empty.  Falling back to metadata embedded in a shared
+        // document would let a stale attachment binding pass a dry-run after
+        // the local table has removed that field.  Only an unavailable local
+        // snapshot may use the portable metadata as a best-effort preview.
+        const fields = Array.isArray(currentConfig?.metadata?.fields)
           ? currentConfig.metadata.fields
           : subject.metadata?.fields;
-        if (Array.isArray(fields) && fields.length > 0) {
+        if (Array.isArray(fields)) {
           const knownIds = new Set(fields.map((field) => field?.fieldId ?? field?.id).filter(Boolean));
           for (const [fieldName, fieldId] of [
             ["trigger", subject.trigger?.fieldId],
@@ -561,6 +575,43 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 severity: "warning",
                 path: `bases.${base.baseToken}.subjects.${subject.tableId}.${fieldName}.fieldId`,
                 message: `Configured ${fieldName} field ${fieldId} is not present in the local metadata`,
+              });
+            }
+          }
+          const fieldById = new Map(fields.map((field) => [field?.fieldId ?? field?.id, field]));
+          const stageSources = [];
+          for (const stageId of STAGE_IDS) {
+            const stage = subject.stages?.[stageId];
+            if (!stage || typeof stage !== "object") continue;
+            if (stage.videoSource?.kind === "base_attachment") {
+              stageSources.push([
+                stage.videoSource.fieldId,
+                `stages.${stageId}.videoSource.fieldId`,
+              ]);
+            }
+            if (stage.audio?.mode === "replace_original" && stage.audio.source?.kind === "base_attachment") {
+              stageSources.push([
+                stage.audio.source.fieldId,
+                `stages.${stageId}.audio.source.fieldId`,
+              ]);
+            }
+          }
+          for (const [fieldId, sourcePath] of stageSources) {
+            const field = fieldById.get(fieldId);
+            const diagnosticPath = `bases.${base.baseToken}.subjects.${subject.tableId}.${sourcePath}`;
+            if (!field) {
+              diagnostics.push({
+                code: "FIELD_NOT_FOUND",
+                severity: "warning",
+                path: diagnosticPath,
+                message: "A configured staged attachment field is not present in the local metadata",
+              });
+            } else if (!isAttachmentField(field)) {
+              diagnostics.push({
+                code: "FIELD_TYPE_INVALID",
+                severity: "warning",
+                path: diagnosticPath,
+                message: "A configured staged source field is not an attachment field",
               });
             }
           }

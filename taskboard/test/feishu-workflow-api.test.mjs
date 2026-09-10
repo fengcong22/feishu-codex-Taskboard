@@ -1277,6 +1277,21 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
         severity: "warning",
         path: "bases.bas_share.subjects.tbl_subject.upload.targetPath",
         message: "Bridge has no Taskboard-local upload target binding",
+      }, {
+        code: "FIELD_NOT_FOUND",
+        severity: "warning",
+        path: "bases.bas_share.subjects.tbl_subject.stages.first_review.videoSource.fieldId",
+        message: "Bridge reports a missing staged video attachment",
+      }, {
+        code: "FIELD_TYPE_INVALID",
+        severity: "warning",
+        path: "bases.bas_share.subjects.tbl_subject.stages.final_review.audio.source.fieldId",
+        message: "Bridge reports a staged audio field with the wrong type",
+      }, {
+        code: "FIELD_NOT_FOUND",
+        severity: "warning",
+        path: "bases.bas_share.subjects.tbl_subject.stages.initial.audio.source.fieldId.extra",
+        message: "Bridge supplied an unregistered staged diagnostic path",
       }],
     }));
   });
@@ -1319,6 +1334,42 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
           branchMap: { B: "Auto-cut-missing-B", C: "Auto-cut-missing-C" },
         },
         upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+        statusField: { fieldId: "fld_status", fieldName: "流程" },
+        documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+        namingField: { fieldId: "fld_name", fieldName: "命名" },
+        stages: {
+          initial: {
+            enabled: true,
+            trigger: { fieldId: "fld_status", fieldName: "流程", optionId: "opt_initial", value: "初稿" },
+            videoSource: { kind: "docx_section", anchorText: "录屏" },
+            reviewSource: { kind: "docx_section", anchorText: "意见" },
+            audio: { mode: "video_original" },
+            artifactTargetPath: null,
+            nameSuffix: "_初稿",
+          },
+          first_review: {
+            enabled: true,
+            trigger: { fieldId: "fld_status", fieldName: "流程", optionId: "opt_review", value: "初审修改" },
+            videoSource: { kind: "base_attachment", fieldId: "fld_video" },
+            reviewSource: { kind: "docx_section", anchorText: "意见" },
+            audio: { mode: "video_original" },
+            artifactTargetPath: null,
+            nameSuffix: "_初审修改",
+          },
+          final_review: {
+            enabled: true,
+            trigger: { fieldId: "fld_status", fieldName: "流程", optionId: "opt_final", value: "终审修改" },
+            videoSource: { kind: "docx_section", anchorText: "录屏" },
+            reviewSource: { kind: "docx_section", anchorText: "意见" },
+            audio: {
+              mode: "replace_original",
+              source: { kind: "base_attachment", fieldId: "fld_audio" },
+              durationToleranceSeconds: 3,
+            },
+            artifactTargetPath: null,
+            nameSuffix: "_终审修改",
+          },
+        },
       }],
     }],
   };
@@ -1338,6 +1389,15 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
     assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE"));
     assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_WORKSPACE_PATH_UNBOUND"));
     assert.equal(result.body.diagnostics.some((entry) => entry.code === "UPLOAD_TARGET_PATH_UNBOUND"), false);
+    assert.ok(result.body.diagnostics.some((entry) => (
+      entry.code === "FIELD_NOT_FOUND"
+      && entry.path === "bases.bas_share.subjects.tbl_subject.stages.first_review.videoSource.fieldId"
+    )));
+    assert.ok(result.body.diagnostics.some((entry) => (
+      entry.code === "FIELD_TYPE_INVALID"
+      && entry.path === "bases.bas_share.subjects.tbl_subject.stages.final_review.audio.source.fieldId"
+    )));
+    assert.equal(result.body.diagnostics.some((entry) => entry.path?.endsWith(".extra")), false);
     assert.deepEqual(
       result.body.diagnostics
         .filter((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE")
@@ -1548,15 +1608,19 @@ test("committed share import returns diagnostics recomputed at commit time", asy
   }
 });
 
-test("workflow sync maps untrusted Bridge error codes to a safe local error", async () => {
+test("workflow sync preserves staged field type errors and maps untrusted Bridge error codes to a safe local error", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-sync-error-"));
+  let requestCount = 0;
   const bridge = createServer(async (incoming, response) => {
     for await (const _chunk of incoming) { /* drain */ }
+    requestCount += 1;
     response.writeHead(409, { "content-type": "application/json" });
     response.end(JSON.stringify({
       error: {
-        code: "FEISHUAPPSECRET_LEAK",
-        message: "secret workspace path should never cross the boundary",
+        code: requestCount === 1 ? "FEISHUAPPSECRET_LEAK" : "FIELD_TYPE_INVALID",
+        message: requestCount === 1
+          ? "secret workspace path should never cross the boundary"
+          : "stages.initial.audio.source.fieldId has an incompatible type",
       },
     }));
   });
@@ -1609,6 +1673,38 @@ test("workflow sync maps untrusted Bridge error codes to a safe local error", as
     assert.equal(enabled.response.status, 409);
     assert.equal(enabled.body.error.code, "FEISHU_WORKFLOW_SYNC_FAILED");
     assert.doesNotMatch(JSON.stringify(enabled.body), /FEISHUAPPSECRET|secret workspace/i);
+
+    const typePreview = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: {
+        baseToken: "bas_sync_type_error",
+        baseName: "同步字段类型错误 Base",
+        tables: [{
+          tableId: "tbl_subject",
+          tableName: "语文",
+          fields: [{ fieldId: "fld_status", fieldName: "进度", type: 1, options: [] }],
+        }],
+      },
+    });
+    assert.equal(typePreview.response.status, 201);
+    const typeKey = encodeURIComponent("bas_sync_type_error:tbl_subject");
+    const typeDraft = await request(baseUrl, `/api/local/feishu/workflow/subjects/${typeKey}`, {
+      method: "PATCH",
+      body: {
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
+        upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+      },
+    });
+    assert.equal(typeDraft.response.status, 200);
+    const typeEnabled = await request(baseUrl, `/api/local/feishu/workflow/subjects/${typeKey}/enable`, {
+      method: "POST",
+      body: { expectedVersion: typeDraft.body.subject.configVersion },
+    });
+    assert.equal(typeEnabled.response.status, 409);
+    assert.equal(typeEnabled.body.error.code, "FIELD_TYPE_INVALID");
+    assert.doesNotMatch(JSON.stringify(typeEnabled.body), /stages\.initial|fieldId|incompatible type/i);
   } finally {
     await app.close();
     await new Promise((resolve) => bridge.close(resolve));
