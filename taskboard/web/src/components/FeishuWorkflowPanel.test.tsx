@@ -318,6 +318,7 @@ describe("FeishuWorkflowPanel audio drafts", () => {
       documentField: { fieldName: string };
       namingField: { fieldName: string };
       stages: FeishuStageConfigMap;
+      trigger: { fieldName: string; optionId: string | null; startValue: string };
     };
     expect(patch.statusField.fieldName).toBe("新状态");
     expect(patch.documentField.fieldName).toBe("新素材文档");
@@ -328,6 +329,136 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(Object.values(patch.stages).map((value) => value.trigger.value)).toEqual([
       "新初稿", "新初审修改", "新终审修改",
     ]);
+    expect(patch.trigger.fieldName).toBe("新状态");
+    expect(patch.trigger.optionId).toBe("opt_initial");
+    expect(patch.trigger.startValue).toBe("新初稿");
+  });
+
+  it("preserves unsaved operator edits while reconciling a same-subject metadata refresh", async () => {
+    const configured = subject("refresh", "刷新学科");
+    const refreshed = structuredClone(configured);
+    refreshed.configVersion = configured.configVersion + 1;
+    refreshed.metadata = {
+      fields: fields.map((field) => field.fieldId === "fld_status"
+        ? {
+          ...field,
+          fieldName: "刷新状态",
+          options: field.options.map((option) => ({ ...option, name: `刷新${option.name}` })),
+        }
+        : field),
+    };
+    const onSaveDraft = vi.fn(async (_subjectKey: string, _patch: unknown) => refreshed);
+    const common = {
+      configurationBaseToken: "bas_test",
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+      onSaveDraft,
+    };
+    const { rerender } = render(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(configured)}
+      selectedSubjectKey="refresh"
+    />);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "初稿音频来源" }), { target: { value: "docx_section" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿音频目录标题" }), { target: { value: "用户未保存音频" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿命名后缀" }), { target: { value: "_用户未保存" } });
+
+    rerender(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(refreshed)}
+      selectedSubjectKey="refresh"
+    />);
+
+    await waitFor(() => {
+      expect((screen.getByRole("textbox", { name: "初稿音频目录标题" }) as HTMLInputElement).value)
+        .toBe("用户未保存音频");
+    });
+    expect((screen.getByRole("textbox", { name: "初稿命名后缀" }) as HTMLInputElement).value).toBe("_用户未保存");
+    expect(within(screen.getByRole("combobox", { name: "状态字段" })).getByRole("option", { name: "刷新状态" })).toBeTruthy();
+    expect(within(screen.getByRole("combobox", { name: "初稿触发选项" })).getByRole("option", { name: "刷新初稿" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+    const [, rawPatch] = onSaveDraft.mock.calls[0];
+    const patch = rawPatch as { stages: FeishuStageConfigMap; statusField: { fieldName: string } };
+    expect(patch.statusField.fieldName).toBe("刷新状态");
+    expect(patch.stages.initial.trigger.value).toBe("刷新初稿");
+    expect(patch.stages.initial.audio).toEqual({
+      mode: "replace_original",
+      source: { kind: "docx_section", anchorText: "用户未保存音频" },
+      durationToleranceSeconds: 3,
+    });
+    expect(patch.stages.initial.nameSuffix).toBe("_用户未保存");
+  });
+
+  it("reloads a same-subject persisted edit instead of keeping an obsolete local draft", async () => {
+    const configured = subject("server-update", "服务器更新");
+    const updated = structuredClone(configured);
+    updated.configVersion = configured.configVersion + 1;
+    updated.stages!.initial.nameSuffix = "_服务器版本";
+    const common = {
+      configurationBaseToken: "bas_test",
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+    };
+    const { rerender } = render(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(configured)}
+      selectedSubjectKey="server-update"
+    />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿命名后缀" }), { target: { value: "_过期本地编辑" } });
+    rerender(<FeishuWorkflowPanel
+      {...common}
+      catalog={catalog(updated)}
+      selectedSubjectKey="server-update"
+    />);
+
+    await waitFor(() => {
+      expect((screen.getByRole("textbox", { name: "初稿命名后缀" }) as HTMLInputElement).value)
+        .toBe("_服务器版本");
+    });
+  });
+
+  it("blocks save and enable when an enabled stage option id is missing from metadata", () => {
+    const configured = subject("missing-option", "缺失选项");
+    configured.stages!.initial.trigger = { ...configured.stages!.initial.trigger, optionId: "opt_deleted", value: "已删除" };
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="missing-option"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect(screen.getByText("初稿的触发选项当前不可用")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("blocks save and enable when an enabled stage option id is ambiguous", () => {
+    const configured = subject("ambiguous-option", "歧义选项");
+    configured.metadata = {
+      fields: fields.map((field) => field.fieldId === "fld_status"
+        ? { ...field, options: [...field.options, { id: "opt_initial", name: "重复初稿" }] }
+        : field),
+    };
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="ambiguous-option"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect(screen.getByText("初稿的触发选项不唯一")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {

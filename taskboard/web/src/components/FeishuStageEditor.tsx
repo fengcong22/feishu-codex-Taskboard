@@ -246,7 +246,7 @@ export function FeishuStageEditor({
             onChange={selectTrigger}
           >
             <option value="">选择状态选项</option>
-            {statusOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+            {statusOptions.map((option, index) => <option key={`${option.id}:${index}`} value={option.id}>{option.name}</option>)}
           </select>
         </label>
         {sourceControl("videoSource", "视频")}

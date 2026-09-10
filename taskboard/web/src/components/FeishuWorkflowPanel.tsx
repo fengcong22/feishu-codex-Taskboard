@@ -166,13 +166,15 @@ function audioDraftsForStages(stages: FeishuStageConfigMap | null): SubjectAudio
 
 function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
   const fields = subject.metadata?.fields ?? [];
+  const triggerField = uniqueMetadataField(fields, subject.trigger?.fieldId);
+  const triggerOption = uniqueMetadataOption(triggerField, subject.trigger?.optionId);
   const statusField = subject.statusField;
   const documentField = subject.documentField;
   const namingField = subject.namingField;
   return {
     triggerFieldId: subject.trigger?.fieldId ?? "",
-    triggerFieldName: subject.trigger?.fieldName ?? "",
-    startValue: subject.trigger?.startValue ?? "",
+    triggerFieldName: triggerField?.fieldName ?? subject.trigger?.fieldName ?? "",
+    startValue: triggerOption?.name ?? subject.trigger?.startValue ?? "",
     optionId: subject.trigger?.optionId ?? null,
     titleFieldId: subject.title?.fieldId ?? "",
     titleFieldName: subject.title?.fieldName ?? "",
@@ -197,6 +199,52 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
       ? stageDefaults(subject, fields)
       : null,
   };
+}
+
+function reconcileFormMetadata(form: SubjectForm, fields: FeishuFieldMetadata[]): SubjectForm {
+  const triggerField = uniqueMetadataField(fields, form.triggerFieldId);
+  const triggerOption = uniqueMetadataOption(triggerField, form.optionId);
+  const statusField = uniqueMetadataField(fields, form.statusFieldId);
+  const documentField = uniqueMetadataField(fields, form.documentFieldId);
+  const namingField = uniqueMetadataField(fields, form.namingFieldId);
+  const stages = form.stages
+    ? Object.fromEntries(PHASE_IDS.map((stageId) => {
+      const stage = form.stages![stageId];
+      const stageField = uniqueMetadataField(fields, stage.trigger.fieldId);
+      const stageOption = uniqueMetadataOption(stageField, stage.trigger.optionId);
+      return [stageId, {
+        ...stage,
+        trigger: {
+          ...stage.trigger,
+          fieldName: stageField?.fieldName ?? stage.trigger.fieldName,
+          value: stageOption?.name ?? stage.trigger.value,
+        },
+      }];
+    })) as FeishuStageConfigMap
+    : null;
+  return {
+    ...form,
+    triggerFieldName: triggerField?.fieldName ?? form.triggerFieldName,
+    startValue: triggerOption?.name ?? form.startValue,
+    statusFieldName: statusField?.fieldName ?? form.statusFieldName,
+    documentFieldName: documentField?.fieldName ?? form.documentFieldName,
+    namingFieldName: namingField?.fieldName ?? form.namingFieldName,
+    stages,
+  };
+}
+
+function editableSubjectSignature(subject: FeishuSubjectConfig): string {
+  return JSON.stringify({
+    trigger: subject.trigger ?? null,
+    title: subject.title ?? null,
+    execution: subject.execution ?? null,
+    packageRoute: subject.packageRoute ?? null,
+    upload: subject.upload ?? null,
+    statusField: subject.statusField ?? null,
+    documentField: subject.documentField ?? null,
+    namingField: subject.namingField ?? null,
+    stages: subject.stages ?? null,
+  });
 }
 
 function phasedFieldNamesNeedRefresh(subject: FeishuSubjectConfig): boolean {
@@ -275,6 +323,10 @@ export function FeishuWorkflowPanel({
       stages: audioDraftsForStages(formForSubject(selected).stages),
     },
   ]] : []));
+  const previousSelectedRef = useRef(selected ? {
+    subjectKey: selected.subjectKey,
+    editableSignature: editableSubjectSignature(selected),
+  } : null);
   const subjectFormDirty = Boolean(selected && subjectForm
     && (JSON.stringify(subjectForm) !== JSON.stringify(formForSubject(selected))
       || phasedFieldNamesNeedRefresh(selected)));
@@ -284,7 +336,7 @@ export function FeishuWorkflowPanel({
   const triggerFields = selected ? selected.metadata?.fields ?? [] : [];
   const phased = Boolean(subjectForm?.stages);
   const selectedStatusField = subjectForm
-    ? triggerFields.find((field) => field.fieldId === subjectForm.statusFieldId)
+    ? uniqueMetadataField(triggerFields, subjectForm.statusFieldId)
     : undefined;
   const statusOptions = selectedStatusField?.options ?? [];
   const metadataFieldOptions = triggerFields;
@@ -305,6 +357,12 @@ export function FeishuWorkflowPanel({
       if (!stage) continue;
       const phaseLabel = PHASE_LABELS[stageId];
       if (stage.enabled && (!stage.trigger.optionId || !stage.trigger.value)) errors.push(`${phaseLabel}需要触发选项`);
+      if (stage.enabled && stage.trigger.optionId) {
+        const matches = statusOptions.filter((option) => option.id === stage.trigger.optionId);
+        if (matches.length === 0) errors.push(`${phaseLabel}的触发选项当前不可用`);
+        else if (matches.length > 1) errors.push(`${phaseLabel}的触发选项不唯一`);
+        else if (stage.trigger.value !== matches[0].name) errors.push(`${phaseLabel}的触发选项名称需要刷新`);
+      }
       if (stage.videoSource.kind === "docx_section" && !stage.videoSource.anchorText?.trim()) errors.push(`${phaseLabel}需要视频目录标题`);
       if (stage.videoSource.kind === "base_attachment" && !stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
       if (!stage.reviewSource.anchorText?.trim()) errors.push(`${phaseLabel}需要剪辑意见目录标题`);
@@ -367,25 +425,41 @@ export function FeishuWorkflowPanel({
     : `existing:${subjectForm?.optionId ?? ""}:${subjectForm?.startValue ?? ""}`;
 
   useEffect(() => {
-    if (selected && preserveDirtyFormForSubjectRef.current === selected.subjectKey) {
-      preserveDirtyFormForSubjectRef.current = null;
-      return;
-    }
+    const preserveDirtyForm = Boolean(selected && preserveDirtyFormForSubjectRef.current === selected.subjectKey);
     preserveDirtyFormForSubjectRef.current = null;
     if (!selected) {
+      previousSelectedRef.current = null;
       setSubjectForm(null);
       return;
     }
     const persistedForm = formForSubject(selected);
+    const previousSelected = previousSelectedRef.current;
+    const sameSubject = previousSelected?.subjectKey === selected.subjectKey;
+    const editableSignature = editableSubjectSignature(selected);
+    const metadataOnlyRefresh = sameSubject && previousSelected.editableSignature === editableSignature;
+    const preserveCurrentForm = preserveDirtyForm || metadataOnlyRefresh;
+    previousSelectedRef.current = {
+      subjectKey: selected.subjectKey,
+      editableSignature,
+    };
     const cached = audioDraftsBySubjectRef.current.get(selected.subjectKey);
-    if (!cached || cached.configVersion !== selected.configVersion) {
+    if (!cached || (!preserveCurrentForm && cached.configVersion !== selected.configVersion)) {
       audioDraftsBySubjectRef.current.set(selected.subjectKey, {
         configVersion: selected.configVersion,
         stages: audioDraftsForStages(persistedForm.stages),
       });
+    } else if (cached.configVersion !== selected.configVersion) {
+      audioDraftsBySubjectRef.current.set(selected.subjectKey, {
+        ...cached,
+        configVersion: selected.configVersion,
+      });
     }
-    setSubjectForm(persistedForm);
-  }, [selected?.subjectKey, selected?.configVersion]);
+    setSubjectForm((current) => (
+      preserveCurrentForm && current
+        ? reconcileFormMetadata(current, selected.metadata?.fields ?? [])
+        : persistedForm
+    ));
+  }, [selected?.subjectKey, selected?.configVersion, selected?.metadata]);
 
   useEffect(() => {
     let active = true;
@@ -510,14 +584,17 @@ export function FeishuWorkflowPanel({
     if (!selected || !subjectForm) return;
     setBusy(true);
     try {
+      const firstEnabledStage = subjectForm.stages
+        ? PHASE_IDS.map((stageId) => subjectForm.stages?.[stageId]).find((stage) => stage?.enabled)
+        : undefined;
       const patch = {
         expectedVersion: selected.configVersion,
         trigger: {
           ...selected.trigger,
-          fieldId: subjectForm.triggerFieldId,
-          fieldName: subjectForm.triggerFieldName,
-          startValue: subjectForm.startValue,
-          optionId: subjectForm.optionId,
+          fieldId: firstEnabledStage?.trigger.fieldId ?? subjectForm.triggerFieldId,
+          fieldName: firstEnabledStage?.trigger.fieldName ?? subjectForm.triggerFieldName,
+          startValue: firstEnabledStage?.trigger.value ?? subjectForm.startValue,
+          optionId: firstEnabledStage?.trigger.optionId ?? subjectForm.optionId,
         },
         title: {
           fieldId: subjectForm.titleFieldId || null,
