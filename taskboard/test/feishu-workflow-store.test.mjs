@@ -538,6 +538,7 @@ test("metadata refresh preserves an independently stale legacy trigger until rep
   }
 });
 
+
 test("known empty or malformed metadata blocks phased draft saves", async () => {
   const { directory, database, store } = await fixture();
   try {
@@ -745,6 +746,27 @@ test("subject draft snake_case phased patch overwrites persisted camelCase value
     assert.equal(updated.stages.initial.artifactTargetPath, "C:\\approved\\updated");
     assert.equal(updated.stages.initial.nameSuffix, "_新阶段");
     assert.doesNotMatch(JSON.stringify(updated), /(?:field_id|field_name|option_id|start_value|video_source|review_source|anchor_text|duration_tolerance_seconds|artifact_target_path|name_suffix)/u);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("subject draft canonicalizes top-level trigger snake_case aliases", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(preview());
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", subjectPatch());
+    const updated = await store.saveSubjectDraft(saved.subjectKey, {
+      expectedVersion: saved.configVersion,
+      trigger: { field_id: "fld_status", field_name: "待制作", start_value: "待制作", option_id: "opt_ready" },
+    });
+    assert.deepEqual(updated.trigger, {
+      fieldId: "fld_status",
+      fieldName: "待制作",
+      startValue: "待制作",
+      optionId: "opt_ready",
+    });
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });

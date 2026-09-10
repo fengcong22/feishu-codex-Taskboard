@@ -113,6 +113,16 @@ function canonicalizeTrigger(trigger, name) {
   }, name);
 }
 
+function canonicalizeLegacyTrigger(trigger, name) {
+  const result = canonicalizeObject(trigger, new Set(["fieldId", "field_id", "fieldName", "field_name", "optionId", "option_id", "startValue", "start_value"]), {
+    fieldId: ["field_id"],
+    fieldName: ["field_name"],
+    optionId: ["option_id"],
+    startValue: ["start_value"],
+  }, name);
+  return result;
+}
+
 function canonicalizeAudio(audio, name) {
   const result = canonicalizeObject(audio, AUDIO_KEYS, {
     durationToleranceSeconds: ["duration_tolerance_seconds"],
@@ -156,6 +166,7 @@ function canonicalizeFieldDescriptor(descriptor, name) {
 export function canonicalizePhasedSubjectPatch(value) {
   plainObject(value, "Subject patch");
   const result = { ...value };
+  if (Object.hasOwn(result, "trigger")) result.trigger = canonicalizeLegacyTrigger(result.trigger, "trigger");
   for (const fieldNameValue of ["statusField", "documentField", "namingField"]) {
     if (Object.hasOwn(result, fieldNameValue)) {
       result[fieldNameValue] = canonicalizeFieldDescriptor(result[fieldNameValue], fieldNameValue);
