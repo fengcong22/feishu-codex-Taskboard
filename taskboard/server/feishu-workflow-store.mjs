@@ -461,6 +461,14 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const normalized = typeof validateConfig === "function" ? validateConfig(value) : value;
     return validateSubjectConfig(normalized);
   };
+  const validateMetadataRefreshDraft = (value) => {
+    const metadata = value.metadata;
+    const structuralInput = { ...value, metadata: null };
+    const normalized = typeof validateConfig === "function" ? validateConfig(structuralInput) : structuralInput;
+    const next = validateSubjectConfig(normalized);
+    next.metadata = metadata;
+    return next;
+  };
 
   function assertStrictPhasedAttachments(subject) {
     if (!isPhasedSubject(subject)) return;
@@ -844,7 +852,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               // A metadata refresh changes the configuration snapshot.  Keep
               // the Bridge's last enabled snapshot active until the operator
               // explicitly validates and re-enables the refreshed draft.
-              const next = validate({
+              const next = validateMetadataRefreshDraft({
                 ...existingConfig,
                 baseName,
                 tableName,
@@ -853,6 +861,9 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 configVersion: existing.config_version + 1,
                 updatedAt: timestamp,
               });
+              // Refresh must retain missing IDs as a repairable draft.  Strict
+              // metadata binding checks remain at save/enable; this pass only
+              // validates the already-persisted configuration structurally.
               db.prepare(`UPDATE feishu_subjects
                 SET table_name = ?, metadata_json = ?, lifecycle = ?, config_version = ?, config_json = ?, removed_at = NULL, updated_at = ?
                 WHERE subject_key = ?`)
