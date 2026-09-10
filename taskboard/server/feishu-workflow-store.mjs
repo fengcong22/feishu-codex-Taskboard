@@ -359,7 +359,7 @@ const SUBJECT_PATCH_KEYS = new Set([
   "statusField", "documentField", "namingField", "stages", "expectedVersion",
 ]);
 
-export function validateSubjectConfig(value) {
+export function validateSubjectConfig(value, { projectLegacyTrigger = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiError(400, "INVALID_BODY", "Subject configuration must be an object");
   }
@@ -446,17 +446,19 @@ export function validateSubjectConfig(value) {
         }
       }
       for (const key of ["statusField", "documentField", "namingField", "stages"]) value[key] = normalized[key];
-      const firstEnabledStage = STAGE_IDS
-        .map((stageId) => normalized.stages[stageId])
-        .find((stage) => stage?.enabled);
-      if (firstEnabledStage) {
-        value.trigger = {
-          ...value.trigger,
-          fieldId: firstEnabledStage.trigger.fieldId,
-          fieldName: firstEnabledStage.trigger.fieldName,
-          startValue: firstEnabledStage.trigger.value,
-          optionId: firstEnabledStage.trigger.optionId,
-        };
+      if (projectLegacyTrigger) {
+        const firstEnabledStage = STAGE_IDS
+          .map((stageId) => normalized.stages[stageId])
+          .find((stage) => stage?.enabled);
+        if (firstEnabledStage) {
+          value.trigger = {
+            ...value.trigger,
+            fieldId: firstEnabledStage.trigger.fieldId,
+            fieldName: firstEnabledStage.trigger.fieldName,
+            startValue: firstEnabledStage.trigger.value,
+            optionId: firstEnabledStage.trigger.optionId,
+          };
+        }
       }
     } catch (error) {
       if (error instanceof ApiError) throw error;
@@ -469,9 +471,9 @@ export function validateSubjectConfig(value) {
 export function createFeishuWorkflowStore({ database, validateConfig = null, packageAliases = null, syncSubject = null } = {}) {
   if (!database?.database) throw new TypeError("database is required");
   const db = database.database;
-  const validate = (value) => {
+  const validate = (value, options = {}) => {
     const normalized = typeof validateConfig === "function" ? validateConfig(value) : value;
-    return validateSubjectConfig(normalized);
+    return validateSubjectConfig(normalized, options);
   };
   const validateMetadataRefreshDraft = (value) => {
     const metadata = value.metadata;
@@ -972,7 +974,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           projectId: current.project_id,
           lifecycle: "draft",
           configVersion: current.config_version + 1,
-        });
+        }, { projectLegacyTrigger: true });
         assertStrictPhasedAttachments(next);
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
           .run(next.configVersion, JSON.stringify(next), next.displayEnabled === false ? 0 : 1, timestamp, key);
@@ -1138,15 +1140,15 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           actualVersion: locked.config_version,
         });
       }
-      const next = validate({
+        const next = validate({
         ...rowSubject(locked),
         subjectKey: key,
         baseToken: locked.base_token,
         tableId: locked.table_id,
         projectId: locked.project_id,
         lifecycle,
-        configVersion: locked.config_version + 1,
-      });
+         configVersion: locked.config_version + 1,
+       }, { projectLegacyTrigger: lifecycle === "enabled" });
       if (typeof syncSubject === "function") {
         // Keep the local transaction open until Bridge accepts the same
         // validated snapshot.  A failed loopback sync rolls back the local

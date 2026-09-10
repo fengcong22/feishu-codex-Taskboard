@@ -189,6 +189,10 @@ function metadataField(metadata, id) {
   return metadataFields(metadata).find((field) => fieldId(field) === id) ?? null;
 }
 
+function hasKnownMetadata(metadata) {
+  return Array.isArray(metadata) || Array.isArray(metadata?.fields);
+}
+
 function metadataFieldMatches(metadata, id) {
   return metadataFields(metadata).filter((field) => fieldId(field) === id);
 }
@@ -322,7 +326,7 @@ function validateMetadataField(metadata, descriptor, name, predicate = null, { r
   const field = metadataField(metadata, id);
   const matches = metadataFieldMatches(metadata, id);
   if (matches.length > 1) throw fail(`${name}.fieldId is not unique in metadata`, "FIELD_NOT_UNIQUE");
-  if (metadataFields(metadata).length > 0 && !field) throw fail(`${name}.fieldId is not present in metadata`, "FIELD_NOT_FOUND");
+  if (hasKnownMetadata(metadata) && !field) throw fail(`${name}.fieldId is not present in metadata`, "FIELD_NOT_FOUND");
   if (field && predicate && !predicate(field)) throw fail(`${name}.fieldId has an incompatible type`, "FIELD_TYPE_INVALID");
   return { fieldId: id, fieldName: configuredName ?? text(fieldName(field), `${name}.fieldName`) };
 }
@@ -413,6 +417,9 @@ export function validatePhasedSubjectConfig(value) {
   const statusFieldMatches = metadataFieldMatches(metadata, statusField.fieldId);
   if (statusFieldMatches.length > 1) {
     throw fail("statusField.fieldId is not unique in metadata", "FIELD_NOT_UNIQUE");
+  }
+  if (field && !Array.isArray(field.options)) {
+    throw fail("status field options are unavailable in metadata", "TRIGGER_OPTION_NOT_FOUND");
   }
   if (field && Array.isArray(field.options)) {
     for (const stageId of enabled) {

@@ -514,6 +514,61 @@ test("derives the legacy trigger from the first enabled phased stage on direct r
   }
 });
 
+test("metadata refresh preserves an independently stale legacy trigger until repair save", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const stale = structuredClone(saved);
+    stale.trigger = { fieldId: "fld_status", fieldName: "旧状态", startValue: "旧值", optionId: "opt_ready" };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(stale), stale.subjectKey);
+
+    const refreshedMetadata = structuredClone(original);
+    refreshedMetadata.metadataRefreshedAt = 1710000006000;
+    refreshedMetadata.tables[0].fields = refreshedMetadata.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status" ? { ...field, fieldName: "刷新状态" } : field
+    ));
+    const refreshed = await store.upsertBasePreview(refreshedMetadata);
+    assert.deepEqual(refreshed.subjects[0].trigger, stale.trigger);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("known empty or malformed metadata blocks phased draft saves", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    for (const [metadataRefreshedAt, fields] of [
+      [1710000007000, []],
+      [1710000008000, [
+        { fieldId: "fld_status", fieldName: "流程", type: 3, uiType: "SingleSelect" },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ]],
+    ]) {
+      const refreshed = await store.upsertBasePreview({
+        ...original,
+        metadataRefreshedAt,
+        tables: [{ ...original.tables[0], fields }],
+      });
+      await assert.rejects(
+        () => store.saveSubjectDraft(refreshed.subjects[0].subjectKey, { expectedVersion: refreshed.subjects[0].configVersion }),
+        (error) => ["FIELD_NOT_FOUND", "TRIGGER_OPTION_NOT_FOUND"].includes(error.code) && error.status === 400,
+      );
+    }
+    assert.equal((await store.getSubject(saved.subjectKey)).lifecycle, "draft");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("database Feishu archive reports a missing task as TASK_NOT_FOUND", async () => {
   const { directory, database } = await fixture();
   try {

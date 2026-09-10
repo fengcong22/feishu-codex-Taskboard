@@ -405,6 +405,7 @@ export function FeishuWorkflowPanel({
     else if (metadataFieldMatches(triggerFields, subjectForm.statusFieldId).length !== 1) errors.push("状态字段当前不可用或不唯一");
     if (!subjectForm.documentFieldId) errors.push("请选择素材文档字段");
     else if (metadataFieldMatches(triggerFields, subjectForm.documentFieldId).length === 0) errors.push("素材文档字段当前不可用");
+    else if (metadataFieldMatches(triggerFields, subjectForm.documentFieldId).length > 1) errors.push("素材文档字段不唯一");
     if (!subjectForm.namingFieldId) errors.push("请选择命名字段");
     else if (metadataFieldMatches(triggerFields, subjectForm.namingFieldId).length === 0) errors.push("命名字段当前不可用");
     else if (metadataFieldMatches(triggerFields, subjectForm.namingFieldId).length > 1) errors.push("命名字段不唯一");
