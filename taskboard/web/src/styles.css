@@ -13363,10 +13363,9 @@ kbd {
 
 .feishu-stage-audio { min-width: 0; margin: 0; padding: 8px; border: var(--border-hairline) solid var(--border); border-radius: 5px; }
 .feishu-stage-audio legend { padding: 0 4px; color: var(--text-secondary); font-size: 9px; font-weight: 600; }
-.feishu-stage-segmented { display: flex; flex-wrap: wrap; gap: 5px; }
-.feishu-stage-segmented button { min-height: 28px; padding: 0 9px; border: var(--border-hairline) solid var(--border-strong); border-radius: 5px; background: var(--surface); color: var(--text-secondary); font-size: 9px; }
-.feishu-stage-segmented button.is-active { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: var(--accent-soft); color: var(--accent); }
 .feishu-stage-audio-fields { display: grid; grid-template-columns: minmax(0, 1fr) 120px; gap: 9px; margin-top: 8px; }
+.feishu-stage-audio input:disabled,
+.feishu-stage-audio select:disabled { background: var(--surface-muted); color: var(--text-tertiary); }
 .feishu-stage-output-grid { grid-template-columns: minmax(0, 1fr) minmax(150px, 0.6fr); }
 .feishu-stage-errors { margin: 0; padding: 7px 9px 7px 24px; border-left: 2px solid var(--danger); color: var(--danger); font-size: 9px; }
 .feishu-stage-source-note { color: var(--text-tertiary); font-size: 9px; overflow-wrap: anywhere; }

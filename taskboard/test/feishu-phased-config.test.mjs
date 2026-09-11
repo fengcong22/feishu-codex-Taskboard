@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
+import * as phasedStageContract from "../server/feishu-workflow-stages.mjs";
 import {
   STAGE_IDS,
   createFeishuWorkflowStore,
@@ -32,6 +33,7 @@ function metadata() {
       { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
       { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
       { fieldId: "fld_audio", fieldName: "音频", type: 17, uiType: "Attachment", options: [] },
+      { fieldId: "fld_text", fieldName: "普通文本", type: 1, uiType: "Text", options: [] },
     ],
   };
 }
@@ -89,6 +91,164 @@ test("normalizes the three fixed phases and rejects duplicate enabled options", 
   assert.throws(() => validateSubjectConfig(duplicate), /enabled stage trigger options must be unique/i);
 });
 
+const unknownStageBoundaryCases = [
+  {
+    path: "stages.initial.command",
+    mutate: (value) => { value.stages.initial.command = "run-anything"; },
+  },
+  {
+    path: "stages.initial.trigger.prompt",
+    mutate: (value) => { value.stages.initial.trigger.prompt = "do not execute"; },
+  },
+  {
+    path: "stages.initial.videoSource.credential",
+    mutate: (value) => { value.stages.initial.videoSource.credential = "secret"; },
+  },
+  {
+    path: "stages.initial.audio.source.credential",
+    mutate: (value) => {
+      value.stages.initial.audio = {
+        mode: "replace_original",
+        source: { kind: "docx_section", anchorText: "配音", credential: "secret" },
+      };
+    },
+  },
+  {
+    path: "stages.initial.audio.source.command",
+    mutate: (value) => {
+      value.stages.initial.audio = {
+        mode: "video_original",
+        source: { kind: "docx_section", anchorText: "不活跃来源", command: "do not execute" },
+        durationToleranceSeconds: -1,
+      };
+    },
+  },
+  {
+    path: "stages.initial.audio.credentials",
+    mutate: (value) => { value.stages.initial.audio.credentials = ["secret"]; },
+  },
+];
+
+for (const { path: unknownPath, mutate } of unknownStageBoundaryCases) {
+  test(`rejects unknown staged field ${unknownPath}`, () => {
+    const value = subject();
+    mutate(value);
+    assert.throws(
+      () => validateSubjectConfig(value),
+      (error) => error?.code === "UNKNOWN_FIELD" && error.message.includes(unknownPath),
+      unknownPath,
+    );
+  });
+}
+
+test("rejects type:4 metadata that claims uiType:SingleSelect", () => {
+  const statusConflict = subject();
+  const statusField = statusConflict.metadata.fields.find((field) => field.fieldId === "fld_status");
+  statusField.type = 4;
+  assert.throws(
+    () => validateSubjectConfig(statusConflict),
+    (error) => error?.code === "FIELD_TYPE_INVALID" && /statusField/i.test(error.message),
+    "type:4 with uiType:SingleSelect",
+  );
+});
+
+test("rejects type:1 metadata that claims uiType:Attachment", () => {
+  const attachmentConflict = subject();
+  const audioField = attachmentConflict.metadata.fields.find((field) => field.fieldId === "fld_audio");
+  audioField.type = 1;
+  attachmentConflict.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  const normalizedConflict = validateSubjectConfig(attachmentConflict);
+  assert.throws(
+    () => phasedStageContract.assertPhasedAttachmentBindings(normalizedConflict),
+    (error) => error?.code === "FIELD_TYPE_INVALID"
+      && error.path === "stages.initial.audio.source.fieldId",
+    "type:1 with uiType:Attachment",
+  );
+});
+
+test("accepts a string attachment type when uiType is missing", () => {
+  const stringTypedAttachment = subject();
+  const stringField = stringTypedAttachment.metadata.fields.find((field) => field.fieldId === "fld_audio");
+  stringField.type = "17";
+  delete stringField.uiType;
+  stringTypedAttachment.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  assert.equal(
+    phasedStageContract.assertPhasedAttachmentBindings(validateSubjectConfig(stringTypedAttachment)),
+    true,
+    "type:'17' without uiType remains accepted",
+  );
+});
+
+test("rejects metadata whose numeric type conflicts with its uiType", () => {
+  const statusConflict = subject();
+  const statusField = statusConflict.metadata.fields.find((field) => field.fieldId === "fld_status");
+  statusField.uiType = "MultiSelect";
+  assert.throws(
+    () => validateSubjectConfig(statusConflict),
+    (error) => error?.code === "FIELD_TYPE_INVALID",
+    "type:3 with uiType:MultiSelect",
+  );
+
+  const attachmentConflict = subject();
+  const audioField = attachmentConflict.metadata.fields.find((field) => field.fieldId === "fld_audio");
+  audioField.uiType = "Text";
+  attachmentConflict.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  assert.throws(
+    () => phasedStageContract.assertPhasedAttachmentBindings(validateSubjectConfig(attachmentConflict)),
+    (error) => error?.code === "FIELD_TYPE_INVALID",
+    "type:17 with uiType:Text",
+  );
+});
+
+test("normalizes every supported snake_case stage alias to camelCase", () => {
+  const normalized = normalizeStage({
+    enabled: true,
+    trigger: {
+      field_id: "fld_status",
+      field_name: "流程",
+      option_id: "opt_initial",
+      start_value: "初稿",
+    },
+    video_source: { kind: "docx_section", anchor_text: " 录屏 " },
+    review_source: { kind: "docx_section", anchor_text: " 修改意见 " },
+    audio: {
+      mode: "replace_original",
+      source: { kind: "base_attachment", field_id: "fld_audio" },
+      duration_tolerance_seconds: 1.5,
+    },
+    artifact_target_path: "C:\\approved\\initial",
+    name_suffix: "_初稿",
+  }, metadata(), "initial");
+
+  assert.deepEqual(normalized, {
+    enabled: true,
+    trigger: {
+      fieldId: "fld_status",
+      fieldName: "流程",
+      optionId: "opt_initial",
+      value: "初稿",
+    },
+    videoSource: { kind: "docx_section", anchorText: "录屏" },
+    reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+    audio: {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_audio" },
+      durationToleranceSeconds: 1.5,
+    },
+    artifactTargetPath: "C:\\approved\\initial",
+    nameSuffix: "_初稿",
+  });
+});
+
 test("requires an audio source only when replacing the video's original audio", () => {
   const value = subject();
   value.stages.initial.audio = {
@@ -100,6 +260,130 @@ test("requires an audio source only when replacing the video's original audio", 
 
   value.stages.initial.audio = { mode: "video_original" };
   assert.equal(validateSubjectConfig(value).stages.initial.audio.mode, "video_original");
+});
+
+test("normalizes Docx and Base attachment replacement audio without changing the wire model", () => {
+  const docx = subject();
+  docx.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "docx_section", anchorText: " 配音 " },
+    durationToleranceSeconds: 1.5,
+  };
+  assert.deepEqual(validateSubjectConfig(docx).stages.initial.audio, {
+    mode: "replace_original",
+    source: { kind: "docx_section", anchorText: "配音" },
+    durationToleranceSeconds: 1.5,
+  });
+
+  const attachment = subject();
+  attachment.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  assert.deepEqual(validateSubjectConfig(attachment).stages.initial.audio, {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+    durationToleranceSeconds: 3,
+  });
+});
+
+test("rejects malformed replacement audio and strips inactive video-original properties", () => {
+  const invalidCases = [
+    {
+      audio: { mode: "replace_original", source: { kind: "docx_section", anchorText: "   " } },
+      pattern: /anchorText is invalid/i,
+    },
+    {
+      audio: { mode: "replace_original", source: { kind: "base_attachment", fieldId: "" } },
+      pattern: /fieldId is required/i,
+    },
+    {
+      audio: { mode: "unsupported" },
+      pattern: /mode is invalid/i,
+    },
+    {
+      audio: { mode: "replace_original", source: { kind: "unsupported" } },
+      pattern: /kind is invalid/i,
+    },
+  ];
+  for (const { audio, pattern } of invalidCases) {
+    const value = subject();
+    value.stages.initial.audio = audio;
+    assert.throws(() => validateSubjectConfig(value), pattern);
+  }
+
+  for (const tolerance of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const value = subject();
+    value.stages.initial.audio = {
+      mode: "replace_original",
+      source: { kind: "docx_section", anchorText: "配音" },
+      durationToleranceSeconds: tolerance,
+    };
+    assert.throws(
+      () => validateSubjectConfig(value),
+      /durationToleranceSeconds must be positive/i,
+    );
+  }
+
+  const original = subject();
+  original.stages.initial.audio = {
+    mode: "video_original",
+    source: { kind: "base_attachment", fieldId: "fld_stale" },
+    duration_tolerance_seconds: -1,
+  };
+  assert.deepEqual(validateSubjectConfig(original).stages.initial.audio, { mode: "video_original" });
+});
+
+test("keeps stale attachment bindings structurally but rejects them at the strict metadata boundary", () => {
+  assert.equal(typeof phasedStageContract.assertPhasedAttachmentBindings, "function");
+
+  const missing = subject();
+  missing.stages.initial.videoSource = { kind: "base_attachment", fieldId: "fld_missing" };
+  const normalizedMissing = validateSubjectConfig(missing);
+  assert.equal(normalizedMissing.stages.initial.videoSource.fieldId, "fld_missing");
+  assert.throws(
+    () => phasedStageContract.assertPhasedAttachmentBindings(normalizedMissing),
+    (error) => error.code === "FIELD_NOT_FOUND"
+      && error.path === "stages.initial.videoSource.fieldId",
+  );
+
+  const wrongType = subject();
+  wrongType.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_text" },
+  };
+  const normalizedWrongType = validateSubjectConfig(wrongType);
+  assert.equal(normalizedWrongType.stages.initial.audio.source.fieldId, "fld_text");
+  assert.throws(
+    () => phasedStageContract.assertPhasedAttachmentBindings(normalizedWrongType),
+    (error) => error.code === "FIELD_TYPE_INVALID"
+      && error.path === "stages.initial.audio.source.fieldId",
+  );
+
+  const knownEmpty = subject();
+  knownEmpty.metadata = { fields: [] };
+  knownEmpty.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  assert.throws(
+    () => phasedStageContract.assertPhasedAttachmentBindings(knownEmpty),
+    (error) => error.code === "FIELD_NOT_FOUND"
+      && error.path === "stages.initial.audio.source.fieldId",
+  );
+
+  const stringTypedAttachment = subject();
+  const audioField = stringTypedAttachment.metadata.fields.find((field) => field.fieldId === "fld_audio");
+  audioField.type = "17";
+  delete audioField.uiType;
+  stringTypedAttachment.stages.initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_audio" },
+  };
+  assert.equal(
+    phasedStageContract.assertPhasedAttachmentBindings(stringTypedAttachment),
+    true,
+  );
 });
 
 test("requires a ZIP destination for every enabled stage in automatic upload mode", () => {

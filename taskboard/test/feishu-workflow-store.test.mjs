@@ -41,6 +41,47 @@ function subjectPatch() {
   };
 }
 
+function phasedPreview({ attachmentField = { fieldId: "fld_audio", fieldName: "音频", type: 17, uiType: "Attachment", options: [] } } = {}) {
+  return {
+    ...preview(),
+    tables: [{
+      ...preview().tables[0],
+      fields: [
+        ...preview().tables[0].fields,
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+        attachmentField,
+      ],
+    }],
+  };
+}
+
+function phasedStage(stageId, optionId, value) {
+  return {
+    enabled: true,
+    trigger: { fieldId: "fld_status", fieldName: "待制作", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: "录屏" },
+    reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+    audio: { mode: "replace_original", source: { kind: "base_attachment", fieldId: "fld_audio" } },
+    artifactTargetPath: `C:\\approved\\${stageId}`,
+    nameSuffix: `_${value}`,
+  };
+}
+
+function phasedPatch() {
+  return {
+    ...subjectPatch(),
+    statusField: { fieldId: "fld_status", fieldName: "待制作" },
+    documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+    namingField: { fieldId: "fld_name", fieldName: "命名" },
+    stages: {
+      initial: phasedStage("initial", "opt_ready", "待制作"),
+      first_review: { ...phasedStage("first_review", "opt_review", "初审"), enabled: false, trigger: { fieldId: null, fieldName: null, optionId: null, value: null } },
+      final_review: { ...phasedStage("final_review", "opt_final", "终审"), enabled: false, trigger: { fieldId: null, fieldName: null, optionId: null, value: null } },
+    },
+  };
+}
+
 test("catalog preview creates independent Base/subject rows and deterministic project ids", async () => {
   const { directory, database, store } = await fixture();
   try {
@@ -204,6 +245,412 @@ test("refreshing an enabled subject demotes it to draft until it is re-enabled",
   }
 });
 
+test("keeps renamed phased metadata separate until an explicit repair patch is saved", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-refresh-renamed-options-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  const store = createFeishuWorkflowStore({
+    database,
+    packageAliases: async () => ["Auto-cut-A"],
+  });
+  try {
+    const original = phasedPreview();
+    original.tables[0].fields = original.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status"
+        ? {
+          ...field,
+          fieldName: "流程状态",
+          options: [
+            { id: "opt_ready", name: "初稿" },
+            { id: "opt_review", name: "初审修改" },
+            { id: "opt_final", name: "终审修改" },
+          ],
+        }
+        : field
+    ));
+    await store.upsertBasePreview(original);
+
+    const patch = phasedPatch();
+    patch.trigger = { fieldId: "fld_status", fieldName: "流程状态", startValue: "初稿", optionId: "opt_ready" };
+    patch.statusField = { fieldId: "fld_status", fieldName: "流程状态" };
+    patch.documentField = { fieldId: "fld_document", fieldName: "素材文档" };
+    patch.namingField = { fieldId: "fld_name", fieldName: "命名" };
+    patch.stages.initial.trigger = { fieldId: "fld_status", fieldName: "流程状态", optionId: "opt_ready", value: "初稿" };
+    patch.stages.initial.nameSuffix = "_自定义后缀";
+    patch.stages.first_review = {
+      ...phasedStage("first_review", "opt_review", "初审修改"),
+      trigger: { fieldId: "fld_status", fieldName: "流程状态", optionId: "opt_review", value: "初审修改" },
+    };
+    patch.stages.final_review = {
+      ...phasedStage("final_review", "opt_final", "终审修改"),
+      trigger: { fieldId: "fld_status", fieldName: "流程状态", optionId: "opt_final", value: "终审修改" },
+    };
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const refreshedMetadata = structuredClone(original);
+    refreshedMetadata.metadataRefreshedAt = 1710000001000;
+    refreshedMetadata.tables[0].fields = refreshedMetadata.tables[0].fields.map((field) => {
+      if (field.fieldId === "fld_status") {
+        return {
+          ...field,
+          fieldName: "新流程状态",
+          options: field.options.map((option) => ({ ...option, name: `新${option.name}` })),
+        };
+      }
+      if (field.fieldId === "fld_document") return { ...field, fieldName: "新素材文档" };
+      if (field.fieldId === "fld_name") return { ...field, fieldName: "新命名" };
+      return field;
+    });
+
+    const refreshed = await store.upsertBasePreview(refreshedMetadata);
+    const subject = refreshed.subjects[0];
+    assert.equal(subject.lifecycle, "draft");
+    assert.equal(subject.configVersion, enabled.configVersion + 1);
+    assert.deepEqual(subject.statusField, { fieldId: "fld_status", fieldName: "流程状态" });
+    assert.deepEqual(subject.documentField, { fieldId: "fld_document", fieldName: "素材文档" });
+    assert.deepEqual(subject.namingField, { fieldId: "fld_name", fieldName: "命名" });
+    assert.deepEqual(Object.values(subject.stages).map((stage) => stage.trigger), [
+      { fieldId: "fld_status", fieldName: "流程状态", optionId: "opt_ready", value: "初稿" },
+      { fieldId: "fld_status", fieldName: "流程状态", optionId: "opt_review", value: "初审修改" },
+      { fieldId: "fld_status", fieldName: "流程状态", optionId: "opt_final", value: "终审修改" },
+    ]);
+    assert.deepEqual(subject.trigger, {
+      fieldId: "fld_status",
+      fieldName: "流程状态",
+      startValue: "初稿",
+      optionId: "opt_ready",
+    });
+    assert.equal(subject.stages.initial.nameSuffix, "_自定义后缀");
+    assert.equal(subject.stages.initial.audio.source.fieldId, "fld_audio");
+    const refreshedStatus = subject.metadata.fields.find((field) => field.fieldId === "fld_status");
+    assert.equal(refreshedStatus.fieldName, "新流程状态");
+    assert.deepEqual(refreshedStatus.options.map((option) => option.name), ["新初稿", "新初审修改", "新终审修改"]);
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(subject.subjectKey, { expectedVersion: subject.configVersion }),
+      (error) => error.code === "TRIGGER_OPTION_NOT_FOUND" && error.status === 400,
+    );
+    await assert.rejects(
+      () => store.enableSubject(subject.subjectKey, subject.configVersion),
+      (error) => error.code === "TRIGGER_OPTION_NOT_FOUND" && error.status === 409,
+    );
+
+    const repairPatch = structuredClone(patch);
+    repairPatch.expectedVersion = subject.configVersion;
+    repairPatch.trigger = { fieldId: "fld_status", fieldName: "新流程状态", startValue: "新初稿", optionId: "opt_ready" };
+    repairPatch.statusField = { fieldId: "fld_status", fieldName: "新流程状态" };
+    repairPatch.documentField = { fieldId: "fld_document", fieldName: "新素材文档" };
+    repairPatch.namingField = { fieldId: "fld_name", fieldName: "新命名" };
+    for (const stage of Object.values(repairPatch.stages)) {
+      stage.trigger.fieldName = "新流程状态";
+      stage.trigger.value = `新${stage.trigger.value}`;
+    }
+    const repaired = await store.saveSubjectDraft(subject.subjectKey, repairPatch);
+    assert.equal(repaired.stages.initial.nameSuffix, "_自定义后缀");
+    assert.equal(repaired.stages.initial.audio.source.fieldId, "fld_audio");
+    const reenabled = await store.enableSubject(repaired.subjectKey, repaired.configVersion);
+    assert.equal(reenabled.lifecycle, "enabled");
+    assert.equal(reenabled.stages.initial.trigger.value, "新初稿");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps unresolved phased option bindings as a blocked repairable draft after metadata refresh", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const refreshedMetadata = structuredClone(original);
+    refreshedMetadata.metadataRefreshedAt = 1710000001000;
+    refreshedMetadata.tables[0].fields = refreshedMetadata.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status" ? { ...field, options: [] } : field
+    ));
+
+    const refreshed = await store.upsertBasePreview(refreshedMetadata);
+    const subject = refreshed.subjects[0];
+    assert.equal(subject.lifecycle, "draft");
+    assert.equal(subject.configVersion, enabled.configVersion + 1);
+    assert.deepEqual(subject.stages.initial.trigger, {
+      fieldId: "fld_status",
+      fieldName: "待制作",
+      optionId: "opt_ready",
+      value: "待制作",
+    });
+    assert.deepEqual(subject.trigger, {
+      fieldId: "fld_status",
+      fieldName: "待制作",
+      startValue: "待制作",
+      optionId: "opt_ready",
+    });
+    assert.deepEqual(
+      subject.metadata.fields.find((field) => field.fieldId === "fld_status").options,
+      [],
+    );
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(subject.subjectKey, { expectedVersion: subject.configVersion }),
+      (error) => error.code === "TRIGGER_OPTION_NOT_FOUND",
+    );
+    await assert.rejects(
+      () => store.enableSubject(subject.subjectKey, subject.configVersion),
+      (error) => error.code === "TRIGGER_OPTION_NOT_FOUND",
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects phased save and enable when a configured metadata option id is duplicated", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const duplicate = structuredClone(original);
+    duplicate.metadataRefreshedAt = 1710000004000;
+    duplicate.tables[0].fields = duplicate.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status"
+        ? { ...field, options: [{ id: "opt_ready", name: "待制作" }, { id: "opt_ready", name: "重复待制作" }] }
+        : field
+    ));
+    const refreshed = await store.upsertBasePreview(duplicate);
+    const draft = refreshed.subjects[0];
+    assert.equal(draft.lifecycle, "draft");
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(draft.subjectKey, { expectedVersion: draft.configVersion }),
+      (error) => error.code === "TRIGGER_OPTION_NOT_UNIQUE" && error.status === 400,
+    );
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "TRIGGER_OPTION_NOT_UNIQUE" && error.status === 409,
+    );
+    assert.equal((await store.getSubject(draft.subjectKey)).configVersion, enabled.configVersion + 1);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects phased save and enable when a configured metadata field id is duplicated", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const duplicate = structuredClone(original);
+    duplicate.metadataRefreshedAt = 1710000004500;
+    duplicate.tables[0].fields.push({
+      ...structuredClone(duplicate.tables[0].fields.find((field) => field.fieldId === "fld_status")),
+      fieldName: "重复流程字段",
+    });
+    const refreshed = await store.upsertBasePreview(duplicate);
+    const draft = refreshed.subjects[0];
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(draft.subjectKey, { expectedVersion: draft.configVersion }),
+      (error) => error.code === "FIELD_NOT_UNIQUE" && error.status === 400,
+    );
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "TRIGGER_FIELD_NOT_UNIQUE" && error.status === 409,
+    );
+    assert.equal((await store.getSubject(draft.subjectKey)).configVersion, enabled.configVersion + 1);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("derives the legacy trigger from the first enabled phased stage on direct repair saves", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const renamed = structuredClone(original);
+    renamed.metadataRefreshedAt = 1710000005000;
+    renamed.tables[0].fields = renamed.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status"
+        ? { ...field, options: [{ id: "opt_ready", name: "新初稿" }] }
+        : field
+    ));
+    const refreshed = await store.upsertBasePreview(renamed);
+    const draft = refreshed.subjects[0];
+    const repaired = await store.saveSubjectDraft(draft.subjectKey, {
+      expectedVersion: draft.configVersion,
+      statusField: { fieldId: "fld_status", fieldName: "待制作" },
+      stages: {
+        initial: {
+          trigger: { fieldId: "fld_status", fieldName: "待制作", optionId: "opt_ready", value: "新初稿" },
+        },
+      },
+    });
+
+    assert.deepEqual(repaired.trigger, {
+      fieldId: "fld_status",
+      fieldName: "待制作",
+      startValue: "新初稿",
+      optionId: "opt_ready",
+    });
+    const reenabled = await store.enableSubject(repaired.subjectKey, repaired.configVersion);
+    assert.equal(reenabled.lifecycle, "enabled");
+    assert.equal(reenabled.configVersion, enabled.configVersion + 3);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("metadata refresh preserves an independently stale legacy trigger until repair save", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const stale = structuredClone(saved);
+    stale.trigger = { fieldId: "fld_status", fieldName: "旧状态", startValue: "旧值", optionId: "opt_ready" };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(stale), stale.subjectKey);
+
+    const refreshedMetadata = structuredClone(original);
+    refreshedMetadata.metadataRefreshedAt = 1710000006000;
+    refreshedMetadata.tables[0].fields = refreshedMetadata.tables[0].fields.map((field) => (
+      field.fieldId === "fld_status" ? { ...field, fieldName: "刷新状态" } : field
+    ));
+    const refreshed = await store.upsertBasePreview(refreshedMetadata);
+    assert.deepEqual(refreshed.subjects[0].trigger, stale.trigger);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("draft mutations keep the previous enabled version routable until an explicit lifecycle transition", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+
+    const assertEnabledVersionOpen = () => {
+      const versionRow = database.database.prepare(
+        "SELECT enabled_at, closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+      ).get(enabled.subjectKey, enabled.configVersion);
+      assert.equal(versionRow.closed_at, null);
+      const routed = database.resolveFeishuSubjectVersionAt(enabled.subjectKey, versionRow.enabled_at);
+      assert.equal(routed?.configVersion, enabled.configVersion);
+    };
+
+    await store.upsertBasePreview({
+      ...original,
+      metadataRefreshedAt: 1710000006500,
+      baseName: "刷新 Base",
+    });
+    assertEnabledVersionOpen();
+
+    const refreshedAgain = await store.upsertBasePreview({
+      ...original,
+      metadataRefreshedAt: 1710000006600,
+      baseName: "刷新 Base",
+      tables: [{
+        ...original.tables[0],
+        tableName: "刷新数学",
+        fields: [
+          ...original.tables[0].fields,
+          { fieldId: "fld_notes", fieldName: "备注", type: 1, uiType: "Text", options: [] },
+        ],
+      }],
+    });
+    assert.equal(refreshedAgain.subjects[0].lifecycle, "draft");
+    assertEnabledVersionOpen();
+
+    const repaired = await store.saveSubjectDraft(enabled.subjectKey, {
+      expectedVersion: refreshedAgain.subjects[0].configVersion,
+      execution: { ...refreshedAgain.subjects[0].execution, concurrencyGroup: "repaired" },
+    });
+    assertEnabledVersionOpen();
+
+    const shared = await store.exportShareable();
+    await store.importShareable(shared);
+    assertEnabledVersionOpen();
+
+    const imported = await store.getSubject(enabled.subjectKey);
+    const reenabled = await store.enableSubject(imported.subjectKey, imported.configVersion);
+    const closedOriginal = database.database.prepare(
+      "SELECT closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    ).get(enabled.subjectKey, enabled.configVersion);
+    assert.equal(Number.isSafeInteger(closedOriginal.closed_at), true);
+
+    const editedAgain = await store.saveSubjectDraft(reenabled.subjectKey, {
+      expectedVersion: reenabled.configVersion,
+      execution: { ...reenabled.execution, concurrencyGroup: "edited-again" },
+    });
+    const reenabledRow = database.database.prepare(
+      "SELECT enabled_at, closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    ).get(reenabled.subjectKey, reenabled.configVersion);
+    assert.equal(reenabledRow.closed_at, null);
+    assert.equal(
+      database.resolveFeishuSubjectVersionAt(reenabled.subjectKey, reenabledRow.enabled_at)?.configVersion,
+      reenabled.configVersion,
+    );
+
+    await store.disableSubject(editedAgain.subjectKey, editedAgain.configVersion);
+    const closedReenabled = database.database.prepare(
+      "SELECT closed_at FROM feishu_subject_versions WHERE subject_key = ? AND version = ?",
+    ).get(reenabled.subjectKey, reenabled.configVersion);
+    assert.equal(Number.isSafeInteger(closedReenabled.closed_at), true);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+
+test("known empty or malformed metadata blocks phased draft saves", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const original = phasedPreview();
+    await store.upsertBasePreview(original);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    for (const [metadataRefreshedAt, fields] of [
+      [1710000007000, []],
+      [1710000008000, [
+        { fieldId: "fld_status", fieldName: "流程", type: 3, uiType: "SingleSelect" },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ]],
+    ]) {
+      const refreshed = await store.upsertBasePreview({
+        ...original,
+        metadataRefreshedAt,
+        tables: [{ ...original.tables[0], fields }],
+      });
+      await assert.rejects(
+        () => store.saveSubjectDraft(refreshed.subjects[0].subjectKey, { expectedVersion: refreshed.subjects[0].configVersion }),
+        (error) => ["FIELD_NOT_FOUND", "TRIGGER_OPTION_NOT_FOUND"].includes(error.code) && error.status === 400,
+      );
+    }
+    assert.equal((await store.getSubject(saved.subjectKey)).lifecycle, "draft");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("database Feishu archive reports a missing task as TASK_NOT_FOUND", async () => {
   const { directory, database } = await fixture();
   try {
@@ -309,6 +756,196 @@ test("enabling rejects trigger fields and select options missing from refreshed 
     await assert.rejects(
       () => store.enableSubject(missingOption.subjectKey, missingOption.configVersion),
       (error) => error.code === "TRIGGER_OPTION_NOT_FOUND" && error.status === 409,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("subject draft snake_case phased patch overwrites persisted camelCase values", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const basePreview = phasedPreview();
+    basePreview.tables[0].fields.push(
+      {
+        fieldId: "fld_status_next",
+        fieldName: "新流程",
+        type: 3,
+        uiType: "SingleSelect",
+        options: [{ id: "opt_next", name: "新阶段" }],
+      },
+      { fieldId: "fld_document_next", fieldName: "新素材文档", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_name_next", fieldName: "新命名", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_audio_next", fieldName: "新音频", type: 17, uiType: "Attachment", options: [] },
+    );
+    await store.upsertBasePreview(basePreview);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+
+    const updated = await store.saveSubjectDraft(saved.subjectKey, {
+      expectedVersion: saved.configVersion,
+      statusField: { field_id: "fld_status_next", field_name: "新流程" },
+      documentField: { field_id: "fld_document_next", field_name: "新素材文档" },
+      namingField: { field_id: "fld_name_next", field_name: "新命名" },
+      stages: {
+        initial: {
+          trigger: {
+            field_id: "fld_status_next",
+            field_name: "新流程",
+            option_id: "opt_next",
+            start_value: "新阶段",
+          },
+          video_source: { kind: "base_attachment", field_id: "fld_audio_next" },
+          review_source: { kind: "docx_section", anchor_text: "新修改意见" },
+          audio: {
+            mode: "replace_original",
+            source: { kind: "base_attachment", field_id: "fld_audio_next" },
+            duration_tolerance_seconds: 1.25,
+          },
+          artifact_target_path: "C:\\approved\\updated",
+          name_suffix: "_新阶段",
+        },
+      },
+    });
+
+    assert.deepEqual(updated.statusField, { fieldId: "fld_status_next", fieldName: "新流程" });
+    assert.deepEqual(updated.documentField, { fieldId: "fld_document_next", fieldName: "新素材文档" });
+    assert.deepEqual(updated.namingField, { fieldId: "fld_name_next", fieldName: "新命名" });
+    assert.deepEqual(updated.stages.initial.trigger, {
+      fieldId: "fld_status_next",
+      fieldName: "新流程",
+      optionId: "opt_next",
+      value: "新阶段",
+    });
+    assert.deepEqual(updated.stages.initial.videoSource, { kind: "base_attachment", fieldId: "fld_audio_next" });
+    assert.deepEqual(updated.stages.initial.reviewSource, { kind: "docx_section", anchorText: "新修改意见" });
+    assert.deepEqual(updated.stages.initial.audio, {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_audio_next" },
+      durationToleranceSeconds: 1.25,
+    });
+    assert.equal(updated.stages.initial.artifactTargetPath, "C:\\approved\\updated");
+    assert.equal(updated.stages.initial.nameSuffix, "_新阶段");
+    assert.doesNotMatch(JSON.stringify(updated), /(?:field_id|field_name|option_id|start_value|video_source|review_source|anchor_text|duration_tolerance_seconds|artifact_target_path|name_suffix)/u);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("subject draft canonicalizes top-level trigger snake_case aliases", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(preview());
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", subjectPatch());
+    const updated = await store.saveSubjectDraft(saved.subjectKey, {
+      expectedVersion: saved.configVersion,
+      trigger: { field_id: "fld_status", field_name: "待制作", start_value: "待制作", option_id: "opt_ready" },
+    });
+    assert.deepEqual(updated.trigger, {
+      fieldId: "fld_status",
+      fieldName: "待制作",
+      startValue: "待制作",
+      optionId: "opt_ready",
+    });
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("subject draft rejects conflicting phased aliases and unknown keys hidden in snake_case patches", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+
+    const rejectedPatches = [
+      {
+        patch: { stages: { initial: { nameSuffix: "_safe", name_suffix: "_conflict" } } },
+        path: "stages.initial.nameSuffix",
+      },
+      {
+        patch: { stages: { initial: { video_source: { kind: "docx_section", anchor_text: "safe", command: "run" } } } },
+        path: "stages.initial.videoSource.command",
+      },
+      {
+        patch: { stages: { initial: { audio: { source: { kind: "base_attachment", field_id: "fld_audio", credential: "secret" } } } } },
+        path: "stages.initial.audio.source.credential",
+      },
+      {
+        patch: { statusField: { fieldId: "fld_status", field_id: "fld_other" } },
+        path: "statusField.fieldId",
+      },
+      { patch: { statusField: { command: "run" } }, path: "statusField.command" },
+      { patch: { documentField: { credential: "secret" } }, path: "documentField.credential" },
+      { patch: { namingField: { executable: "tool.exe" } }, path: "namingField.executable" },
+    ];
+
+    for (const { patch, path: rejectedPath } of rejectedPatches) {
+      await assert.rejects(
+        () => store.saveSubjectDraft(saved.subjectKey, { expectedVersion: saved.configVersion, ...patch }),
+        (error) => ["INVALID_FIELD", "UNKNOWN_FIELD"].includes(error?.code)
+          && error.status === 400
+          && error.message.includes(rejectedPath),
+        rejectedPath,
+      );
+    }
+    assert.equal((await store.getSubject(saved.subjectKey)).configVersion, saved.configVersion);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retains stale phased attachment bindings after refresh but rejects save and enable", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const basePreview = phasedPreview({
+      attachmentField: { fieldId: "fld_audio", fieldName: "音频", type: 17, uiType: "Attachment", options: [] },
+    });
+    await store.upsertBasePreview(basePreview);
+    const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const enabled = await store.enableSubject(saved.subjectKey, saved.configVersion);
+    assert.equal(enabled.lifecycle, "enabled");
+
+    const removed = await store.upsertBasePreview({
+      ...basePreview,
+      metadataRefreshedAt: 1710000002000,
+      tables: [{ ...basePreview.tables[0], fields: basePreview.tables[0].fields.filter((field) => field.fieldId !== "fld_audio") }],
+    });
+    const stale = removed.subjects[0];
+    assert.equal(stale.lifecycle, "draft");
+    assert.equal(stale.stages.initial.audio.source.fieldId, "fld_audio");
+
+    await assert.rejects(
+      () => store.saveSubjectDraft(stale.subjectKey, { expectedVersion: stale.configVersion }),
+      (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
+    );
+    await assert.rejects(
+      () => store.enableSubject(stale.subjectKey, stale.configVersion),
+      (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
+    );
+
+    const changedType = await store.upsertBasePreview({
+      ...basePreview,
+      metadataRefreshedAt: 1710000003000,
+      tables: [{
+        ...basePreview.tables[0],
+        fields: basePreview.tables[0].fields.map((field) => (
+          field.fieldId === "fld_audio" ? { ...field, type: 1, uiType: "Text" } : field
+        )),
+      }],
+    });
+    const wrongType = changedType.subjects[0];
+    assert.equal(wrongType.stages.initial.audio.source.fieldId, "fld_audio");
+    await assert.rejects(
+      () => store.saveSubjectDraft(wrongType.subjectKey, { expectedVersion: wrongType.configVersion }),
+      (error) => error.code === "FIELD_TYPE_INVALID" && error.status === 409,
+    );
+    await assert.rejects(
+      () => store.enableSubject(wrongType.subjectKey, wrongType.configVersion),
+      (error) => error.code === "FIELD_TYPE_INVALID" && error.status === 409,
     );
   } finally {
     database.close();

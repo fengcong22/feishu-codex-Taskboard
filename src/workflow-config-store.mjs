@@ -17,7 +17,10 @@ import {
   subjectKey,
   validateWorkflowConfig,
 } from "./workflow-config.mjs";
-import { compareSubjectMetadata } from "./feishu-base-metadata.mjs";
+import {
+  comparePhasedSubjectMetadata,
+  compareSubjectMetadata,
+} from "./feishu-base-metadata.mjs";
 import { SubjectVersionHistory } from "./subject-version-history.mjs";
 
 function clone(value) {
@@ -298,7 +301,10 @@ async function remoteMetadataDiagnostics(configuration, metadataReader) {
     }
     const seen = new Set();
     for (const subject of base.subjects) {
-      for (const issue of compareSubjectMetadata(subject, preview)) {
+      const issues = subject?.statusField && subject?.stages
+        ? comparePhasedSubjectMetadata(subject, preview)
+        : compareSubjectMetadata(subject, preview);
+      for (const issue of issues) {
         if (issue.code === "BASE_NAME_MISMATCH") continue;
         const key = `${issue.code}:${issue.path}`;
         if (seen.has(key)) continue;

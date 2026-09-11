@@ -157,3 +157,110 @@ test("uses the Auto-Cut filename sanitizer for the frozen artifact name", async 
     }
   }
 });
+
+test("keeps numbered Docx audio anchors exact in every fixed stage manifest", async () => {
+  const cases = [
+    ["initial", "初稿"],
+    ["first_review", "初审修改"],
+    ["final_review", "终审修改"],
+  ];
+
+  for (const [index, [stageId, stageName]] of cases.entries()) {
+    const fixtureData = await fixture();
+    try {
+      const stage = {
+        nameSuffix: `_${stageName}`,
+        videoSource: { kind: "docx_section", anchorText: "录屏" },
+        reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+        audio: {
+          mode: "replace_original",
+          source: { kind: "docx_section", anchorText: "二、PPT草稿+翻录" },
+          durationToleranceSeconds: 1.5,
+        },
+        artifactTargetPath: null,
+      };
+      const request = input(fixtureData, {
+        task: { id: `task-numbered-${index + 1}` },
+        run: { runId: `run-numbered-${index + 1}`, attempt: 1 },
+        origin: {
+          subjectKey: "bas_demo:tbl_math",
+          configVersion: 7,
+          stageId,
+          eventId: `evt-numbered-${index + 1}`,
+          baseToken: "bas_demo",
+          tableId: "tbl_math",
+          recordId: "rec-1",
+        },
+        subjectVersion: {
+          documentField: { fieldId: "fld_document" },
+          stages: { [stageId]: stage },
+        },
+      });
+
+      const result = await prepareFeishuRunInputs(request);
+      const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+      assert.equal(manifest.schema_version, 1);
+      assert.equal(manifest.binding.stage_id, stageId);
+      assert.deepEqual(manifest.sources.audio, {
+        mode: "replace_original",
+        duration_tolerance_seconds: 1.5,
+        source: {
+          kind: "docx_section",
+          anchor_text: "二、PPT草稿+翻录",
+        },
+      });
+    } finally {
+      await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+      await rm(fixtureData.packageRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("keeps Base replacement audio on the schema-v1 replace-original contract", async () => {
+  const fixtureData = await fixture();
+  try {
+    const request = input(fixtureData);
+    request.subjectVersion.stages.initial.audio = {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_audio" },
+      durationToleranceSeconds: 3,
+    };
+
+    const result = await prepareFeishuRunInputs(request);
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    assert.equal(manifest.schema_version, 1);
+    assert.deepEqual(manifest.sources.audio, {
+      mode: "replace_original",
+      duration_tolerance_seconds: 3,
+      source: {
+        kind: "base_attachment",
+        base_token: "bas_demo",
+        table_id: "tbl_math",
+        record_id: "rec-1",
+        field_id: "fld_audio",
+      },
+    });
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("video-original run inputs emit only the audio mode", async () => {
+  const fixtureData = await fixture();
+  try {
+    const request = input(fixtureData);
+    request.subjectVersion.stages.initial.audio = {
+      mode: "video_original",
+      source: { kind: "docx_section", anchorText: "不应写入" },
+      durationToleranceSeconds: 9,
+    };
+
+    const result = await prepareFeishuRunInputs(request);
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    assert.deepEqual(manifest.sources.audio, { mode: "video_original" });
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});

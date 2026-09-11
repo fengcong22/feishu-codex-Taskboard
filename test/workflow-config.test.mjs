@@ -11,6 +11,7 @@ import {
   subjectKey,
   validateWorkflowConfig,
 } from "../src/workflow-config.mjs";
+import { validateConfig as validateBridgeConfig } from "../src/config.mjs";
 import { createWorkflowConfigStore } from "../src/workflow-config-store.mjs";
 
 function validSubject(overrides = {}) {
@@ -131,6 +132,96 @@ test("validateWorkflowConfig rejects duplicate identities and malformed active s
   const badRoute = validConfig();
   badRoute.bases[0].subjects[0].packageRoute.packageAlias = "unknown alias";
   assert.throws(() => validateWorkflowConfig(badRoute), /packageAlias/);
+});
+
+test("Bridge config round-trip retains three staged audio sources without a schema upgrade", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-phased-audio-"));
+  try {
+    const stage = (optionId, value, audio) => ({
+      enabled: true,
+      trigger: {
+        fieldId: "fld_progress",
+        fieldName: "制作进度",
+        optionId,
+        value,
+      },
+      videoSource: { kind: "docx_section", anchorText: `${value}录屏` },
+      reviewSource: { kind: "docx_section", anchorText: `${value}修改意见` },
+      audio,
+      artifactTargetPath: null,
+      nameSuffix: `_${value}`,
+    });
+    const phasedSubject = validSubject({
+      statusField: {
+        fieldId: "fld_progress",
+        fieldName: "制作进度",
+        options: [
+          { optionId: "opt_initial", value: "初稿" },
+          { optionId: "opt_first_review", value: "初审修改" },
+          { optionId: "opt_final_review", value: "终审修改" },
+        ],
+      },
+      documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+      namingField: { fieldId: "fld_title", fieldName: "脚本名称" },
+      stages: {
+        initial: stage("opt_initial", "初稿", { mode: "video_original" }),
+        first_review: stage("opt_first_review", "初审修改", {
+          mode: "replace_original",
+          source: { kind: "docx_section", anchorText: "二、PPT草稿+翻录" },
+          durationToleranceSeconds: 1.5,
+        }),
+        final_review: stage("opt_final_review", "终审修改", {
+          mode: "replace_original",
+          source: { kind: "base_attachment", fieldId: "fld_audio" },
+          durationToleranceSeconds: 3,
+        }),
+      },
+    });
+    const source = createWorkflowConfigStore({
+      filename: path.join(directory, "source.json"),
+      initial: validConfig({
+        bases: [{
+          ...validConfig().bases[0],
+          subjects: [phasedSubject],
+        }],
+      }),
+    });
+
+    const shared = await source.exportShareable();
+    const target = createWorkflowConfigStore({ filename: path.join(directory, "target.json") });
+    const imported = await target.importShareable(shared);
+    const roundTripped = imported.bases[0].subjects[0];
+    const bridge = validateBridgeConfig({
+      host: "127.0.0.1",
+      port: 47824,
+      taskboardUrl: "http://127.0.0.1:47823",
+      stateFile: path.join(directory, "bridge-state.json"),
+      tables: [JSON.parse(JSON.stringify(roundTripped))],
+    });
+    const bridgeSubject = bridge.tables[0];
+
+    assert.equal(shared.schemaVersion, WORKFLOW_SCHEMA_VERSION);
+    assert.equal(imported.schemaVersion, WORKFLOW_SCHEMA_VERSION);
+    assert.deepEqual(Object.keys(roundTripped.stages), ["initial", "first_review", "final_review"]);
+    assert.deepEqual(roundTripped.stages.initial.audio, { mode: "video_original" });
+    assert.deepEqual(roundTripped.stages.first_review.audio, {
+      mode: "replace_original",
+      source: { kind: "docx_section", anchorText: "二、PPT草稿+翻录" },
+      durationToleranceSeconds: 1.5,
+    });
+    assert.deepEqual(roundTripped.stages.final_review.audio, {
+      mode: "replace_original",
+      source: { kind: "base_attachment", fieldId: "fld_audio" },
+      durationToleranceSeconds: 3,
+    });
+    assert.deepEqual(Object.keys(bridgeSubject.stages), ["initial", "first_review", "final_review"]);
+    assert.equal(bridgeSubject.stages.first_review.audio.source.kind, "docx_section");
+    assert.equal(bridgeSubject.stages.first_review.audio.source.anchorText, "二、PPT草稿+翻录");
+    assert.equal(bridgeSubject.stages.final_review.audio.source.kind, "base_attachment");
+    assert.equal(bridgeSubject.stages.final_review.audio.source.fieldId, "fld_audio");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("workflow config store keeps drafts separate from active subjects and versions changes", async () => {
@@ -865,4 +956,85 @@ test("share import dry-run reuses enable metadata comparisons for saved names an
     new Set(["BASE_NAME_MISMATCH", "TABLE_NAME_MISMATCH", "FIELD_NAME_MISMATCH", "OPTION_NOT_FOUND"]),
   );
   assert.equal((await store.activeTables()).length, 0);
+});
+
+test("share import dry-run reports every phased attachment mismatch from live metadata", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-import-phased-attachments-"));
+  const filename = path.join(directory, "workflow.json");
+  const stage = (optionId, value) => ({
+    enabled: true,
+    trigger: { fieldId: "fld_progress", fieldName: "制作进度", optionId, value },
+    videoSource: { kind: "docx_section", anchorText: `${value}录屏` },
+    reviewSource: { kind: "docx_section", anchorText: `${value}修改意见` },
+    audio: { mode: "video_original" },
+    artifactTargetPath: null,
+    nameSuffix: `_${value}`,
+  });
+  const imported = validConfig();
+  Object.assign(imported.bases[0].subjects[0], {
+    statusField: { fieldId: "fld_progress", fieldName: "制作进度" },
+    documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+    namingField: { fieldId: "fld_title", fieldName: "脚本名称" },
+    stages: {
+      initial: {
+        ...stage("opt_initial", "初稿"),
+        videoSource: { kind: "base_attachment", fieldId: "fld_missing_video" },
+      },
+      first_review: {
+        ...stage("opt_first_review", "初审修改"),
+        audio: {
+          mode: "replace_original",
+          source: { kind: "base_attachment", fieldId: "fld_text_audio" },
+          durationToleranceSeconds: 3,
+        },
+      },
+      final_review: stage("opt_final_review", "终审修改"),
+    },
+  });
+  const metadataReader = {
+    async preview({ baseToken }) {
+      return {
+        baseToken,
+        baseName: "课程库",
+        tables: [{
+          tableId: "tbl_math_123",
+          tableName: "数学",
+          fields: [
+            {
+              fieldId: "fld_progress",
+              fieldName: "制作进度",
+              type: 3,
+              options: [
+                { id: "opt_initial", name: "初稿" },
+                { id: "opt_first_review", name: "初审修改" },
+                { id: "opt_final_review", name: "终审修改" },
+              ],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, options: [] },
+            { fieldId: "fld_title", fieldName: "脚本名称", type: 1, options: [] },
+            { fieldId: "fld_text_audio", fieldName: "音频文本", type: 1, options: [] },
+          ],
+        }],
+      };
+    },
+  };
+  const store = createWorkflowConfigStore({
+    filename,
+    metadataReader,
+    packageAliases: { "Auto-cut-copyA": { workspacePath: "D:\\Auto-Cut\\copyA" } },
+  });
+
+  const result = await store.importShareable(imported, { dryRun: true });
+
+  assert.deepEqual(
+    result.diagnostics
+      .filter((entry) => entry.path.includes(".stages."))
+      .map((entry) => [entry.code, entry.path]),
+    [
+      ["FIELD_NOT_FOUND", "bases.bas_demo_123.subjects.tbl_math_123.stages.initial.videoSource.fieldId"],
+      ["FIELD_TYPE_INVALID", "bases.bas_demo_123.subjects.tbl_math_123.stages.first_review.audio.source.fieldId"],
+    ],
+  );
+  assert.equal(result.diagnosticsOk, false);
+  await assert.rejects(() => readFile(filename, "utf8"), (error) => error?.code === "ENOENT");
 });

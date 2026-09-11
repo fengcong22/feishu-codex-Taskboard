@@ -75,6 +75,7 @@ const FEISHU_PREVIEW_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const SAFE_FEISHU_SYNC_ERROR_CODES = new Set([
   "BASE_NOT_FOUND",
   "FIELD_NOT_FOUND",
+  "FIELD_TYPE_INVALID",
   "FEISHU_METADATA_INVALID_RESPONSE",
   "FEISHU_METADATA_READ_FAILED",
   "FEISHU_METADATA_UNAVAILABLE",
@@ -97,9 +98,17 @@ const SAFE_FEISHU_PREVIEW_ERRORS = new Map([
 const BRIDGE_DIAGNOSTIC_PATH_PATTERN = /^bases\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
 const BRIDGE_DIAGNOSTIC_MESSAGES = new Map([
   ["BASE_NOT_FOUND", "The configured Base is not available in Feishu"],
+  ["BASE_NAME_MISMATCH", "The configured Base name no longer matches Feishu metadata"],
   ["TABLE_NOT_FOUND", "The configured subject table is not present in this Base"],
+  ["TABLE_NAME_MISMATCH", "The configured subject table name no longer matches Feishu metadata"],
   ["FIELD_NOT_FOUND", "A configured field is not present in the live subject table"],
+  ["FIELD_TYPE_INVALID", "A configured field has an incompatible type in the live subject table"],
+  ["FIELD_NAME_MISMATCH", "A configured field name no longer matches the live subject table"],
+  ["OPTION_NOT_FOUND", "A configured trigger option is not present in the live subject table"],
+  ["OPTION_AMBIGUOUS", "A configured trigger option is ambiguous in the live subject table"],
+  ["INVALID_FIELD", "A configured workflow field or stage trigger no longer matches the live subject table"],
   ["FEISHU_METADATA_UNAVAILABLE", "Live Feishu metadata could not be verified"],
+  ["FEISHU_METADATA_INVALID_RESPONSE", "Live Feishu metadata could not be safely interpreted"],
   ["PACKAGE_ALIAS_UNAVAILABLE", "The Auto-Cut package alias is not configured for the Bridge"],
   ["PACKAGE_WORKSPACE_PATH_UNBOUND", "The Bridge Auto-Cut package workspace is not bound on this machine"],
   ["ARTIFACT_SOURCE_PATH_UNBOUND", "The ZIP artifact source path is not bound on this machine"],
@@ -139,9 +148,37 @@ function bridgeShareDiagnosticContext(configuration) {
     for (const subject of Array.isArray(base.subjects) ? base.subjects : []) {
       const subjectPath = `${basePath}.subjects.${subject.tableId}`;
       for (const suffix of [
-        "", ".fields", ".trigger.fieldId", ".title.fieldId", ".subjectCode.fieldId",
+        "", ".fields", ".trigger.fieldId", ".trigger.fieldName", ".trigger.optionId", ".trigger.startValue",
+        ".title.fieldId", ".title.fieldName", ".subjectCode.fieldId", ".subjectCode.fieldName",
         ".packageRoute", ".upload.artifactSourcePath", ".upload.targetPath",
       ]) paths.add(`${subjectPath}${suffix}`);
+      for (const fieldName of ["statusField", "documentField", "namingField"]) {
+        const field = subject[fieldName];
+        if (!field || typeof field !== "object") continue;
+        paths.add(`${subjectPath}.${fieldName}.fieldId`);
+        paths.add(`${subjectPath}.${fieldName}.fieldName`);
+      }
+      if (subject.statusField && typeof subject.statusField === "object") {
+        paths.add(`${subjectPath}.statusField.options`);
+      }
+      if (subject.stages && typeof subject.stages === "object") {
+        paths.add(`${subjectPath}.stages`);
+      }
+      for (const stageId of STAGE_IDS) {
+        const stage = subject.stages?.[stageId];
+        if (!stage || typeof stage !== "object") continue;
+        if (stage.trigger && typeof stage.trigger === "object") {
+          paths.add(`${subjectPath}.stages.${stageId}.trigger.fieldId`);
+          paths.add(`${subjectPath}.stages.${stageId}.trigger.fieldName`);
+          paths.add(`${subjectPath}.stages.${stageId}.trigger.optionId`);
+        }
+        if (stage.videoSource?.kind === "base_attachment") {
+          paths.add(`${subjectPath}.stages.${stageId}.videoSource.fieldId`);
+        }
+        if (stage.audio?.mode === "replace_original" && stage.audio.source?.kind === "base_attachment") {
+          paths.add(`${subjectPath}.stages.${stageId}.audio.source.fieldId`);
+        }
+      }
       if (typeof subject.packageRoute?.packageAlias === "string") {
         aliases.add(subject.packageRoute.packageAlias);
       }
@@ -151,6 +188,32 @@ function bridgeShareDiagnosticContext(configuration) {
     }
   }
   return { aliases, paths };
+}
+
+function copyDefinedFields(value, keys) {
+  const result = {};
+  for (const key of keys) {
+    if (value?.[key] !== undefined) result[key] = structuredClone(value[key]);
+  }
+  return result;
+}
+
+function bridgeShareInspectionConfiguration(configuration) {
+  const workflowKeys = ["schemaVersion", "configVersion", "createdAt", "updatedAt"];
+  const baseKeys = ["baseToken", "baseName", "sourceUrlLabel", "metadataRefreshedAt"];
+  const subjectKeys = [
+    "subjectKey", "baseToken", "baseName", "tableId", "tableName", "displayEnabled",
+    "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title",
+    "execution", "packageRoute", "upload", "statusField", "documentField",
+    "namingField", "stages",
+  ];
+  return {
+    ...copyDefinedFields(configuration, workflowKeys),
+    bases: (configuration?.bases ?? []).map((base) => ({
+      ...copyDefinedFields(base, baseKeys),
+      subjects: (base?.subjects ?? []).map((subject) => copyDefinedFields(subject, subjectKeys)),
+    })),
+  };
 }
 
 function normalizeBridgeShareDiagnostics(value, configuration) {
@@ -2934,7 +2997,10 @@ export function createTaskboardServer(options = {}) {
           "content-type": "application/json",
           "x-feishu-bridge-client": "local-operator",
         },
-        body: JSON.stringify({ configuration, dryRun: true }),
+        body: JSON.stringify({
+          configuration: bridgeShareInspectionConfiguration(configuration),
+          dryRun: true,
+        }),
       });
     } catch {
       throw new ApiError(503, "FEISHU_BRIDGE_UNAVAILABLE", "Feishu Bridge is unavailable");

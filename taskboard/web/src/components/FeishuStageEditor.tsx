@@ -3,6 +3,7 @@ import type { ChangeEvent } from "react";
 export type FeishuStageId = "initial" | "first_review" | "final_review";
 export type StageSourceKind = "docx_section" | "base_attachment";
 export type StageAudioMode = "video_original" | "replace_original";
+export type StageAudioSelection = "video_original" | StageSourceKind;
 
 export interface StageFieldOption {
   id: string;
@@ -42,13 +43,21 @@ export interface FeishuStageValue {
   nameSuffix: string;
 }
 
+export interface FeishuStageAudioDraft {
+  docxAnchorText: string;
+  baseAttachmentFieldId: string;
+  durationToleranceSeconds: number;
+}
+
 export interface FeishuStageEditorProps {
   stageId: FeishuStageId;
   value: FeishuStageValue;
   metadataFields: StageMetadataField[];
   statusOptions: StageFieldOption[];
   disabled: boolean;
+  audioDraft: FeishuStageAudioDraft;
   onChange: (value: FeishuStageValue) => void;
+  onAudioChange: (audio: FeishuStageValue["audio"], draft: FeishuStageAudioDraft) => void;
   validationErrors: string[];
 }
 
@@ -57,10 +66,48 @@ const STAGE_LABELS: Record<FeishuStageId, string> = {
   first_review: "初审修改",
   final_review: "终审修改",
 };
+const ATTACHMENT_UI_TYPES = new Set(["attachment", "attachments"]);
+const SINGLE_SELECT_UI_TYPES = new Set(["singleselect", "select"]);
 
-function isAttachmentField(field: StageMetadataField): boolean {
-  const type = String(field.uiType ?? field.type ?? "").toLowerCase().replace(/[\s_-]/gu, "");
-  return type === "attachment" || type === "attachments" || type === "17";
+function normalizedMetadataType(value: StageMetadataField["type"]): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "string" && /^\d+$/u.test(value.trim())) return Number(value.trim());
+  return null;
+}
+
+function normalizedMetadataUiType(value: StageMetadataField["uiType"]): string | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  return value.trim().toLowerCase().replace(/[\s_-]/gu, "");
+}
+
+function hasStrictMetadataType(
+  field: StageMetadataField,
+  numericType: number,
+  uiTypes: ReadonlySet<string>,
+): boolean {
+  const hasType = field.type !== null && field.type !== undefined && field.type !== "";
+  const hasUiType = field.uiType !== null && field.uiType !== undefined && field.uiType !== "";
+  if (!hasType && !hasUiType) return false;
+  if (hasType && normalizedMetadataType(field.type) !== numericType) return false;
+  if (hasUiType && !uiTypes.has(normalizedMetadataUiType(field.uiType) ?? "")) return false;
+  return true;
+}
+
+export function isAttachmentField(field: StageMetadataField): boolean {
+  return hasStrictMetadataType(field, 17, ATTACHMENT_UI_TYPES);
+}
+
+export function isSingleSelectField(field: StageMetadataField): boolean {
+  return hasStrictMetadataType(field, 3, SINGLE_SELECT_UI_TYPES);
+}
+
+export function audioDraftFromStage(audio: FeishuStageValue["audio"]): FeishuStageAudioDraft {
+  const source = audio.mode === "replace_original" ? audio.source : null;
+  return {
+    docxAnchorText: source?.kind === "docx_section" ? source.anchorText ?? "" : "",
+    baseAttachmentFieldId: source?.kind === "base_attachment" ? source.fieldId ?? "" : "",
+    durationToleranceSeconds: audio.durationToleranceSeconds ?? 3,
+  };
 }
 
 function cloneStage(value: FeishuStageValue): FeishuStageValue {
@@ -83,14 +130,32 @@ export function FeishuStageEditor({
   metadataFields,
   statusOptions,
   disabled,
+  audioDraft,
   onChange,
+  onAudioChange,
   validationErrors,
 }: FeishuStageEditorProps) {
   const label = STAGE_LABELS[stageId];
   const attachmentFields = metadataFields.filter(isAttachmentField);
   const update = (patch: Partial<FeishuStageValue>) => onChange({ ...cloneStage(value), ...patch });
   const updateSource = (key: "videoSource" | "reviewSource", source: StageSourceValue) => update({ [key]: source } as Partial<FeishuStageValue>);
-  const updateAudio = (audio: FeishuStageValue["audio"]) => update({ audio });
+  const audioSelection: StageAudioSelection = value.audio.mode === "video_original"
+    ? "video_original"
+    : value.audio.source?.kind ?? "docx_section";
+
+  function emitAudio(selection: StageAudioSelection, draft: FeishuStageAudioDraft) {
+    if (selection === "video_original") {
+      onAudioChange({ mode: "video_original" }, draft);
+      return;
+    }
+    onAudioChange({
+      mode: "replace_original",
+      source: selection === "docx_section"
+        ? { kind: "docx_section", anchorText: draft.docxAnchorText }
+        : { kind: "base_attachment", fieldId: draft.baseAttachmentFieldId },
+      durationToleranceSeconds: draft.durationToleranceSeconds,
+    }, draft);
+  }
 
   function selectTrigger(event: ChangeEvent<HTMLSelectElement>) {
     const option = statusOptions.find((candidate) => candidate.id === event.target.value);
@@ -148,7 +213,7 @@ export function FeishuStageEditor({
             onChange={(event) => updateSource(key, { kind: "base_attachment", fieldId: event.target.value })}
           >
             <option value="">选择附件字段</option>
-            {attachmentFields.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+            {attachmentFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
           </select>
         </label>
       )}
@@ -181,7 +246,7 @@ export function FeishuStageEditor({
             onChange={selectTrigger}
           >
             <option value="">选择状态选项</option>
-            {statusOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+            {statusOptions.map((option, index) => <option key={`${option.id}:${index}`} value={option.id}>{option.name}</option>)}
           </select>
         </label>
         {sourceControl("videoSource", "视频")}
@@ -189,52 +254,76 @@ export function FeishuStageEditor({
       </div>
 
       <fieldset className="feishu-stage-audio" disabled={disabled}>
-        <legend>声音方式</legend>
-        <div className="feishu-stage-segmented" role="group" aria-label={`${label}声音方式`}>
-          <button
-            type="button"
-            className={value.audio.mode === "video_original" ? "is-active" : ""}
-            aria-pressed={value.audio.mode === "video_original"}
-            onClick={() => updateAudio({ mode: "video_original" })}
-          >使用视频原音</button>
-          <button
-            type="button"
-            className={value.audio.mode === "replace_original" ? "is-active" : ""}
-            aria-pressed={value.audio.mode === "replace_original"}
-            onClick={() => updateAudio({
-              mode: "replace_original",
-              source: value.audio.source ?? { kind: "base_attachment", fieldId: attachmentFields[0]?.fieldId ?? "" },
-              durationToleranceSeconds: value.audio.durationToleranceSeconds ?? 3,
-            })}
-          >外部音频替换原音</button>
-        </div>
-        {value.audio.mode === "replace_original" && <div className="feishu-stage-audio-fields">
-          <label>
-            <span>外部音频来源</span>
+        <legend>音频来源</legend>
+        <label>
+          <span>音频来源</span>
+          <select
+            aria-label={`${label}音频来源`}
+            value={audioSelection}
+            onChange={(event) => emitAudio(event.target.value as StageAudioSelection, audioDraft)}
+          >
+            <option value="video_original">视频原音</option>
+            <option value="docx_section">文档目录</option>
+            <option value="base_attachment" disabled={attachmentFields.length === 0}>
+              {attachmentFields.length === 0 ? "Base 字段附件（无可用字段）" : "Base 字段附件"}
+            </option>
+          </select>
+        </label>
+        <div className="feishu-stage-audio-fields">
+          {audioSelection === "video_original" ? <label>
+            <span>音频来源详情</span>
+            <input
+              aria-label={`${label}音频来源详情`}
+              value=""
+              disabled
+              placeholder="视频原音无需设置"
+              readOnly
+            />
+          </label> : audioSelection === "docx_section" ? <label>
+            <span>音频目录标题</span>
+            <input
+              aria-label={`${label}音频目录标题`}
+              value={audioDraft.docxAnchorText}
+              maxLength={512}
+              onChange={(event) => emitAudio(audioSelection, {
+                ...audioDraft,
+                docxAnchorText: event.target.value,
+              })}
+              placeholder="例如：配音"
+            />
+          </label> : <label>
+            <span>音频附件字段</span>
             <select
-              aria-label="外部音频来源"
-              value={value.audio.source?.fieldId ?? ""}
-              onChange={(event) => updateAudio({
-                ...value.audio,
-                source: { kind: "base_attachment", fieldId: event.target.value },
+              aria-label={`${label}音频附件字段`}
+              value={audioDraft.baseAttachmentFieldId}
+              onChange={(event) => emitAudio(audioSelection, {
+                ...audioDraft,
+                baseAttachmentFieldId: event.target.value,
               })}
             >
               <option value="">选择音频附件字段</option>
-              {attachmentFields.map((field) => <option key={field.fieldId} value={field.fieldId}>{field.fieldName}</option>)}
+              {audioDraft.baseAttachmentFieldId
+                && !attachmentFields.some((field) => field.fieldId === audioDraft.baseAttachmentFieldId)
+                && <option value={audioDraft.baseAttachmentFieldId} disabled>已配置字段（当前不可用）</option>}
+              {attachmentFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
             </select>
-          </label>
+          </label>}
           <label>
             <span>时长误差（秒）</span>
             <input
-              aria-label="时长误差（秒）"
+              aria-label={`${label}时长误差（秒）`}
               type="number"
               min="0.1"
               step="0.1"
-              value={value.audio.durationToleranceSeconds ?? 3}
-              onChange={(event) => updateAudio({ ...value.audio, durationToleranceSeconds: Number(event.target.value) })}
+              disabled={audioSelection === "video_original"}
+              value={audioDraft.durationToleranceSeconds}
+              onChange={(event) => emitAudio(audioSelection, {
+                ...audioDraft,
+                durationToleranceSeconds: Number(event.target.value),
+              })}
             />
           </label>
-        </div>}
+        </div>
       </fieldset>
 
       <div className="feishu-stage-grid feishu-stage-output-grid">

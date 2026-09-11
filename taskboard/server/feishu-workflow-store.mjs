@@ -3,13 +3,21 @@ import { createHash } from "node:crypto";
 import { ApiError } from "./database.mjs";
 import {
   STAGE_IDS,
+  assertPhasedAttachmentBindings,
+  canonicalizePhasedSubjectPatch,
+  isAttachmentMetadataField,
   isPhasedSubject,
   normalizeStage,
   portablePhasedSubject,
   validatePhasedSubjectConfig,
 } from "./feishu-workflow-stages.mjs";
 
-export { STAGE_IDS, normalizeStage, validatePhasedSubjectConfig } from "./feishu-workflow-stages.mjs";
+export {
+  STAGE_IDS,
+  assertPhasedAttachmentBindings,
+  normalizeStage,
+  validatePhasedSubjectConfig,
+} from "./feishu-workflow-stages.mjs";
 
 const now = () => new Date().toISOString();
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -167,6 +175,14 @@ function portableMetadata(metadata) {
       return safe;
     }).filter(Boolean),
   };
+}
+
+function localMetadataForShareImport(subject) {
+  const metadata = subject?.metadata;
+  return metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    && Array.isArray(metadata.fields)
+    ? clone(metadata)
+    : { fields: [] };
 }
 
 function shareableSubject(subject, { forceDraft = false } = {}) {
@@ -351,7 +367,7 @@ const SUBJECT_PATCH_KEYS = new Set([
   "statusField", "documentField", "namingField", "stages", "expectedVersion",
 ]);
 
-export function validateSubjectConfig(value) {
+export function validateSubjectConfig(value, { projectLegacyTrigger = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiError(400, "INVALID_BODY", "Subject configuration must be an object");
   }
@@ -438,6 +454,20 @@ export function validateSubjectConfig(value) {
         }
       }
       for (const key of ["statusField", "documentField", "namingField", "stages"]) value[key] = normalized[key];
+      if (projectLegacyTrigger) {
+        const firstEnabledStage = STAGE_IDS
+          .map((stageId) => normalized.stages[stageId])
+          .find((stage) => stage?.enabled);
+        if (firstEnabledStage) {
+          value.trigger = {
+            ...value.trigger,
+            fieldId: firstEnabledStage.trigger.fieldId,
+            fieldName: firstEnabledStage.trigger.fieldName,
+            startValue: firstEnabledStage.trigger.value,
+            optionId: firstEnabledStage.trigger.optionId,
+          };
+        }
+      }
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
@@ -449,10 +479,41 @@ export function validateSubjectConfig(value) {
 export function createFeishuWorkflowStore({ database, validateConfig = null, packageAliases = null, syncSubject = null } = {}) {
   if (!database?.database) throw new TypeError("database is required");
   const db = database.database;
-  const validate = (value) => {
+  const validate = (value, options = {}) => {
     const normalized = typeof validateConfig === "function" ? validateConfig(value) : value;
-    return validateSubjectConfig(normalized);
+    return validateSubjectConfig(normalized, options);
   };
+  const validateMetadataRefreshDraft = (value) => {
+    const metadata = value.metadata;
+    const structuralInput = { ...value, metadata: null };
+    const normalized = typeof validateConfig === "function" ? validateConfig(structuralInput) : structuralInput;
+    const next = validateSubjectConfig(normalized);
+    next.metadata = metadata;
+    return next;
+  };
+
+  function assertStrictPhasedAttachments(subject) {
+    if (!isPhasedSubject(subject)) return;
+    try {
+      assertPhasedAttachmentBindings(subject, subject.metadata);
+    } catch (error) {
+      const code = error?.code === "FIELD_TYPE_INVALID"
+        ? "FIELD_TYPE_INVALID"
+        : error?.code === "FIELD_NOT_UNIQUE"
+          ? "FIELD_NOT_UNIQUE"
+          : "FIELD_NOT_FOUND";
+      throw new ApiError(
+        409,
+        code,
+        code === "FIELD_TYPE_INVALID"
+          ? "A configured phased source is not an attachment field"
+          : code === "FIELD_NOT_UNIQUE"
+            ? "A configured phased field is not unique in the latest Base metadata"
+            : "A configured phased attachment field is not present in the latest Base metadata",
+        error?.path ? { path: error.path } : undefined,
+      );
+    }
+  }
   async function assertPackageAlias(alias) {
     if (typeof packageAliases !== "function") return;
     const allowed = await packageAliases();
@@ -463,29 +524,36 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
 
   function assertTriggerMetadata(subject) {
     const fields = Array.isArray(subject?.metadata?.fields) ? subject.metadata.fields : [];
-    const field = fields.find((candidate) => (
+    const fieldMatches = fields.filter((candidate) => (
       candidate && typeof candidate === "object"
       && (candidate.fieldId ?? candidate.id) === subject.trigger.fieldId
     ));
-    if (!field) {
+    if (fieldMatches.length === 0) {
       throw new ApiError(
         409,
         "TRIGGER_FIELD_NOT_FOUND",
         "The configured trigger field is not present in the latest Base metadata",
       );
     }
+    if (fieldMatches.length > 1) {
+      throw new ApiError(409, "TRIGGER_FIELD_NOT_UNIQUE", "The configured trigger field is not unique in the latest Base metadata");
+    }
+    const field = fieldMatches[0];
     if (subject.trigger.optionId) {
       const options = Array.isArray(field.options) ? field.options : [];
-      const option = options.find((candidate) => (
+      const optionMatches = options.filter((candidate) => (
         candidate && typeof candidate === "object"
         && candidate.id === subject.trigger.optionId
       ));
-      if (!option || option.name !== subject.trigger.startValue) {
+      if (optionMatches.length === 0 || optionMatches.length > 1) {
         throw new ApiError(
           409,
-          "TRIGGER_OPTION_NOT_FOUND",
+          optionMatches.length > 1 ? "TRIGGER_OPTION_NOT_UNIQUE" : "TRIGGER_OPTION_NOT_FOUND",
           "The configured start option is not present in the latest Base metadata",
         );
+      }
+      if (optionMatches[0].name !== subject.trigger.startValue) {
+        throw new ApiError(409, "TRIGGER_OPTION_NOT_FOUND", "The configured start option is not present in the latest Base metadata");
       }
     }
   }
@@ -522,32 +590,61 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           });
         }
         const currentConfig = current ? rowSubject(current) : null;
-        const fields = Array.isArray(currentConfig?.metadata?.fields) && currentConfig.metadata.fields.length > 0
-          ? currentConfig.metadata.fields
-          : subject.metadata?.fields;
-        if (Array.isArray(fields) && fields.length > 0) {
-          const knownIds = new Set(fields.map((field) => field?.fieldId ?? field?.id).filter(Boolean));
-          for (const [fieldName, fieldId] of [
-            ["trigger", subject.trigger?.fieldId],
-            ["title", subject.title?.fieldId],
-            ["subjectCode", subject.packageRoute?.subjectCodeFieldId],
-          ]) {
-            if (fieldId && !knownIds.has(fieldId)) {
-              diagnostics.push({
-                code: "FIELD_NOT_FOUND",
-                severity: "warning",
-                path: `bases.${base.baseToken}.subjects.${subject.tableId}.${fieldName}.fieldId`,
-                message: `Configured ${fieldName} field ${fieldId} is not present in the local metadata`,
-              });
-            }
+        // Shared metadata is only a portable preview. Diagnostics and commit
+        // must use the same local snapshot so an unavailable or stale binding
+        // cannot appear validated before becoming a blocked draft.
+        const fields = localMetadataForShareImport(currentConfig).fields;
+        const knownIds = new Set(fields.map((field) => field?.fieldId ?? field?.id).filter(Boolean));
+        for (const [fieldName, fieldId] of [
+          ["trigger", subject.trigger?.fieldId],
+          ["title", subject.title?.fieldId],
+          ["subjectCode", subject.packageRoute?.subjectCodeFieldId],
+        ]) {
+          if (fieldId && !knownIds.has(fieldId)) {
+            diagnostics.push({
+              code: "FIELD_NOT_FOUND",
+              severity: "warning",
+              path: `bases.${base.baseToken}.subjects.${subject.tableId}.${fieldName}.fieldId`,
+              message: `Configured ${fieldName} field ${fieldId} is not present in the local metadata`,
+            });
           }
-        } else if (current && (subject.trigger?.fieldId || subject.title?.fieldId)) {
-          diagnostics.push({
-            code: "FIELD_METADATA_UNAVAILABLE",
-            severity: "info",
-            path: `bases.${base.baseToken}.subjects.${subject.tableId}.metadata`,
-            message: "Local field metadata is unavailable; verify field IDs before enabling",
-          });
+        }
+        const fieldById = new Map(fields.map((field) => [field?.fieldId ?? field?.id, field]));
+        const stageSources = [];
+        for (const stageId of STAGE_IDS) {
+          const stage = subject.stages?.[stageId];
+          if (!stage || typeof stage !== "object") continue;
+          if (stage.videoSource?.kind === "base_attachment") {
+            stageSources.push([
+              stage.videoSource.fieldId,
+              `stages.${stageId}.videoSource.fieldId`,
+            ]);
+          }
+          if (stage.audio?.mode === "replace_original" && stage.audio.source?.kind === "base_attachment") {
+            stageSources.push([
+              stage.audio.source.fieldId,
+              `stages.${stageId}.audio.source.fieldId`,
+            ]);
+          }
+        }
+        for (const [fieldId, sourcePath] of stageSources) {
+          const field = fieldById.get(fieldId);
+          const diagnosticPath = `bases.${base.baseToken}.subjects.${subject.tableId}.${sourcePath}`;
+          if (!field) {
+            diagnostics.push({
+              code: "FIELD_NOT_FOUND",
+              severity: "warning",
+              path: diagnosticPath,
+              message: "A configured staged attachment field is not present in the local metadata",
+            });
+          } else if (!isAttachmentMetadataField(field)) {
+            diagnostics.push({
+              code: "FIELD_TYPE_INVALID",
+              severity: "warning",
+              path: diagnosticPath,
+              message: "A configured staged source field is not an attachment field",
+            });
+          }
         }
         const aliases = [
           subject.packageRoute?.packageAlias,
@@ -606,12 +703,19 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const closedAt = Number.isSafeInteger(snapshot?.closedAt)
       ? snapshot.closedAt
       : lifecycle === "disabled" && Number.isFinite(timestampMs) ? timestampMs : null;
-    if (lifecycle !== "enabled") {
+    if (lifecycle === "disabled") {
       db.prepare(`
         UPDATE feishu_subject_versions
         SET closed_at = COALESCE(closed_at, ?)
         WHERE subject_key = ? AND lifecycle = 'enabled' AND closed_at IS NULL
       `).run(Number.isFinite(timestampMs) ? timestampMs : null, row.subject_key);
+    }
+    if (lifecycle === "enabled") {
+      db.prepare(`
+        UPDATE feishu_subject_versions
+        SET closed_at = COALESCE(closed_at, ?)
+        WHERE subject_key = ? AND lifecycle = 'enabled' AND version < ? AND closed_at IS NULL
+      `).run(Number.isFinite(timestampMs) ? timestampMs : null, row.subject_key, version);
     }
     db.prepare(`
       INSERT INTO feishu_subject_versions (
@@ -684,6 +788,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       try {
         for (const base of configuration.bases) {
           const existingBase = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ?").get(base.baseToken);
+          const localMetadataRefreshedAt = existingBase?.metadata_refreshed_at ?? null;
           db.prepare(`INSERT INTO feishu_bases
               (base_token, base_name, source_url_label, metadata_refreshed_at, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?)
@@ -692,7 +797,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 metadata_refreshed_at=excluded.metadata_refreshed_at,
                 removed_at=NULL,
                 updated_at=excluded.updated_at`)
-            .run(base.baseToken, base.baseName, base.sourceUrlLabel ?? null, base.metadataRefreshedAt ?? null,
+            .run(base.baseToken, base.baseName, base.sourceUrlLabel ?? null, localMetadataRefreshedAt,
               existingBase?.created_at ?? timestamp, timestamp);
           for (const imported of base.subjects) {
             const existing = db.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(imported.subjectKey);
@@ -713,7 +818,12 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 targetPath: local?.upload?.targetPath ?? null,
               },
             });
-            const metadata = next.metadata && typeof next.metadata === "object" ? next.metadata : {};
+            // A share file's metadata is only a portable preview.  Once this
+            // Taskboard has observed the subject, keep its local snapshot
+            // authoritative so a warned stale field cannot self-validate on
+            // the next Save or Enable action.
+            const metadata = localMetadataForShareImport(local);
+            next.metadata = metadata;
             if (existing) {
               db.prepare(`UPDATE feishu_subjects SET table_name=?, project_id=?, display_enabled=?, lifecycle='draft',
                 config_version=?, config_json=?, metadata_json=?, removed_at=NULL, updated_at=? WHERE subject_key=?`)
@@ -777,7 +887,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               // A metadata refresh changes the configuration snapshot.  Keep
               // the Bridge's last enabled snapshot active until the operator
               // explicitly validates and re-enables the refreshed draft.
-              const next = validate({
+              const next = validateMetadataRefreshDraft({
                 ...existingConfig,
                 baseName,
                 tableName,
@@ -786,6 +896,9 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 configVersion: existing.config_version + 1,
                 updatedAt: timestamp,
               });
+              // Refresh must retain missing IDs as a repairable draft.  Strict
+              // metadata binding checks remain at save/enable; this pass only
+              // validates the already-persisted configuration structurally.
               db.prepare(`UPDATE feishu_subjects
                 SET table_name = ?, metadata_json = ?, lifecycle = ?, config_version = ?, config_json = ?, removed_at = NULL, updated_at = ?
                 WHERE subject_key = ?`)
@@ -854,8 +967,14 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             actualVersion: current.config_version,
           });
         }
-        const { expectedVersion: _expectedVersion, ...changes } = patch;
-        const next = validate({
+        const { expectedVersion: _expectedVersion, ...rawChanges } = patch;
+        let changes;
+        try {
+          changes = canonicalizePhasedSubjectPatch(rawChanges);
+        } catch (error) {
+          throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
+        }
+      const next = validate({
           ...mergeObjects(rowSubject(current), changes),
           subjectKey: key,
           baseToken: current.base_token,
@@ -863,7 +982,8 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           projectId: current.project_id,
           lifecycle: "draft",
           configVersion: current.config_version + 1,
-        });
+        }, { projectLegacyTrigger: true });
+        assertStrictPhasedAttachments(next);
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
           .run(next.configVersion, JSON.stringify(next), next.displayEnabled === false ? 0 : 1, timestamp, key);
         saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
@@ -994,6 +1114,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     }
     const currentConfig = rowSubject(current);
     if (lifecycle === "enabled") {
+      assertStrictPhasedAttachments(currentConfig);
       assertTriggerMetadata(currentConfig);
       await assertPackageAlias(currentConfig.packageRoute.packageAlias);
       if (
@@ -1027,7 +1148,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           actualVersion: locked.config_version,
         });
       }
-      const next = validate({
+        const next = validate({
         ...rowSubject(locked),
         subjectKey: key,
         baseToken: locked.base_token,
@@ -1035,7 +1156,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         projectId: locked.project_id,
         lifecycle,
         configVersion: locked.config_version + 1,
-      });
+      }, { projectLegacyTrigger: lifecycle === "enabled" });
       if (typeof syncSubject === "function") {
         // Keep the local transaction open until Bridge accepts the same
         // validated snapshot.  A failed loopback sync rolls back the local

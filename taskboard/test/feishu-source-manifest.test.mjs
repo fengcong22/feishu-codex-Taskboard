@@ -158,6 +158,47 @@ test("base attachment sources inherit the canonical record identity used by Auto
   assert.equal(created.sha256, "f77a0143746714042bfd0373710ce9141131f483d9672f7f35b923b7b1350b5d");
 });
 
+test("preserves numbered Docx replacement audio on the schema-v1 contract", () => {
+  const created = createSourceManifest(input({
+    sources: {
+      ...input().sources,
+      audio: {
+        mode: "replace_original",
+        duration_tolerance_seconds: 1.5,
+        source: {
+          kind: "docx_section",
+          anchor_text: "二、PPT草稿+翻录",
+        },
+      },
+    },
+  }));
+
+  assert.equal(created.manifest.schema_version, 1);
+  assert.deepEqual(created.manifest.sources.audio, {
+    mode: "replace_original",
+    duration_tolerance_seconds: 1.5,
+    source: {
+      kind: "docx_section",
+      anchor_text: "二、PPT草稿+翻录",
+    },
+  });
+});
+
+test("canonical video-original audio contains no inactive replacement properties", () => {
+  const created = createSourceManifest(input({
+    sources: {
+      ...input().sources,
+      audio: {
+        mode: "video_original",
+        duration_tolerance_seconds: 8,
+        source: { kind: "docx_section", anchor_text: "不应写入" },
+      },
+    },
+  }));
+
+  assert.deepEqual(created.manifest.sources.audio, { mode: "video_original" });
+});
+
 test("rejects a manifest that promotes a local path or command", () => {
   assert.throws(
     () => createSourceManifest({ ...input(), command: "powershell" }),
