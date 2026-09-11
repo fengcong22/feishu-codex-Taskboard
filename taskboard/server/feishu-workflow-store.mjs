@@ -177,6 +177,14 @@ function portableMetadata(metadata) {
   };
 }
 
+function localMetadataForShareImport(subject) {
+  const metadata = subject?.metadata;
+  return metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    && Array.isArray(metadata.fields)
+    ? clone(metadata)
+    : { fields: [] };
+}
+
 function shareableSubject(subject, { forceDraft = false } = {}) {
   const result = {
     subjectKey: subject.subjectKey,
@@ -582,74 +590,61 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           });
         }
         const currentConfig = current ? rowSubject(current) : null;
-        // An existing subject's explicit fields array is authoritative, even
-        // when it is empty.  Falling back to metadata embedded in a shared
-        // document would let a stale attachment binding pass a dry-run after
-        // the local table has removed that field.  Only an unavailable local
-        // snapshot may use the portable metadata as a best-effort preview.
-        const fields = Array.isArray(currentConfig?.metadata?.fields)
-          ? currentConfig.metadata.fields
-          : subject.metadata?.fields;
-        if (Array.isArray(fields)) {
-          const knownIds = new Set(fields.map((field) => field?.fieldId ?? field?.id).filter(Boolean));
-          for (const [fieldName, fieldId] of [
-            ["trigger", subject.trigger?.fieldId],
-            ["title", subject.title?.fieldId],
-            ["subjectCode", subject.packageRoute?.subjectCodeFieldId],
-          ]) {
-            if (fieldId && !knownIds.has(fieldId)) {
-              diagnostics.push({
-                code: "FIELD_NOT_FOUND",
-                severity: "warning",
-                path: `bases.${base.baseToken}.subjects.${subject.tableId}.${fieldName}.fieldId`,
-                message: `Configured ${fieldName} field ${fieldId} is not present in the local metadata`,
-              });
-            }
+        // Shared metadata is only a portable preview. Diagnostics and commit
+        // must use the same local snapshot so an unavailable or stale binding
+        // cannot appear validated before becoming a blocked draft.
+        const fields = localMetadataForShareImport(currentConfig).fields;
+        const knownIds = new Set(fields.map((field) => field?.fieldId ?? field?.id).filter(Boolean));
+        for (const [fieldName, fieldId] of [
+          ["trigger", subject.trigger?.fieldId],
+          ["title", subject.title?.fieldId],
+          ["subjectCode", subject.packageRoute?.subjectCodeFieldId],
+        ]) {
+          if (fieldId && !knownIds.has(fieldId)) {
+            diagnostics.push({
+              code: "FIELD_NOT_FOUND",
+              severity: "warning",
+              path: `bases.${base.baseToken}.subjects.${subject.tableId}.${fieldName}.fieldId`,
+              message: `Configured ${fieldName} field ${fieldId} is not present in the local metadata`,
+            });
           }
-          const fieldById = new Map(fields.map((field) => [field?.fieldId ?? field?.id, field]));
-          const stageSources = [];
-          for (const stageId of STAGE_IDS) {
-            const stage = subject.stages?.[stageId];
-            if (!stage || typeof stage !== "object") continue;
-            if (stage.videoSource?.kind === "base_attachment") {
-              stageSources.push([
-                stage.videoSource.fieldId,
-                `stages.${stageId}.videoSource.fieldId`,
-              ]);
-            }
-            if (stage.audio?.mode === "replace_original" && stage.audio.source?.kind === "base_attachment") {
-              stageSources.push([
-                stage.audio.source.fieldId,
-                `stages.${stageId}.audio.source.fieldId`,
-              ]);
-            }
+        }
+        const fieldById = new Map(fields.map((field) => [field?.fieldId ?? field?.id, field]));
+        const stageSources = [];
+        for (const stageId of STAGE_IDS) {
+          const stage = subject.stages?.[stageId];
+          if (!stage || typeof stage !== "object") continue;
+          if (stage.videoSource?.kind === "base_attachment") {
+            stageSources.push([
+              stage.videoSource.fieldId,
+              `stages.${stageId}.videoSource.fieldId`,
+            ]);
           }
-          for (const [fieldId, sourcePath] of stageSources) {
-            const field = fieldById.get(fieldId);
-            const diagnosticPath = `bases.${base.baseToken}.subjects.${subject.tableId}.${sourcePath}`;
-            if (!field) {
-              diagnostics.push({
-                code: "FIELD_NOT_FOUND",
-                severity: "warning",
-                path: diagnosticPath,
-                message: "A configured staged attachment field is not present in the local metadata",
-              });
-            } else if (!isAttachmentMetadataField(field)) {
-              diagnostics.push({
-                code: "FIELD_TYPE_INVALID",
-                severity: "warning",
-                path: diagnosticPath,
-                message: "A configured staged source field is not an attachment field",
-              });
-            }
+          if (stage.audio?.mode === "replace_original" && stage.audio.source?.kind === "base_attachment") {
+            stageSources.push([
+              stage.audio.source.fieldId,
+              `stages.${stageId}.audio.source.fieldId`,
+            ]);
           }
-        } else if (current && (subject.trigger?.fieldId || subject.title?.fieldId)) {
-          diagnostics.push({
-            code: "FIELD_METADATA_UNAVAILABLE",
-            severity: "info",
-            path: `bases.${base.baseToken}.subjects.${subject.tableId}.metadata`,
-            message: "Local field metadata is unavailable; verify field IDs before enabling",
-          });
+        }
+        for (const [fieldId, sourcePath] of stageSources) {
+          const field = fieldById.get(fieldId);
+          const diagnosticPath = `bases.${base.baseToken}.subjects.${subject.tableId}.${sourcePath}`;
+          if (!field) {
+            diagnostics.push({
+              code: "FIELD_NOT_FOUND",
+              severity: "warning",
+              path: diagnosticPath,
+              message: "A configured staged attachment field is not present in the local metadata",
+            });
+          } else if (!isAttachmentMetadataField(field)) {
+            diagnostics.push({
+              code: "FIELD_TYPE_INVALID",
+              severity: "warning",
+              path: diagnosticPath,
+              message: "A configured staged source field is not an attachment field",
+            });
+          }
         }
         const aliases = [
           subject.packageRoute?.packageAlias,
@@ -793,6 +788,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       try {
         for (const base of configuration.bases) {
           const existingBase = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ?").get(base.baseToken);
+          const localMetadataRefreshedAt = existingBase?.metadata_refreshed_at ?? null;
           db.prepare(`INSERT INTO feishu_bases
               (base_token, base_name, source_url_label, metadata_refreshed_at, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?)
@@ -801,7 +797,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 metadata_refreshed_at=excluded.metadata_refreshed_at,
                 removed_at=NULL,
                 updated_at=excluded.updated_at`)
-            .run(base.baseToken, base.baseName, base.sourceUrlLabel ?? null, base.metadataRefreshedAt ?? null,
+            .run(base.baseToken, base.baseName, base.sourceUrlLabel ?? null, localMetadataRefreshedAt,
               existingBase?.created_at ?? timestamp, timestamp);
           for (const imported of base.subjects) {
             const existing = db.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(imported.subjectKey);
@@ -822,7 +818,12 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 targetPath: local?.upload?.targetPath ?? null,
               },
             });
-            const metadata = next.metadata && typeof next.metadata === "object" ? next.metadata : {};
+            // A share file's metadata is only a portable preview.  Once this
+            // Taskboard has observed the subject, keep its local snapshot
+            // authoritative so a warned stale field cannot self-validate on
+            // the next Save or Enable action.
+            const metadata = localMetadataForShareImport(local);
+            next.metadata = metadata;
             if (existing) {
               db.prepare(`UPDATE feishu_subjects SET table_name=?, project_id=?, display_enabled=?, lifecycle='draft',
                 config_version=?, config_json=?, metadata_json=?, removed_at=NULL, updated_at=? WHERE subject_key=?`)

@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { createTaskboardServer } from "../server/index.mjs";
+import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
 
 async function fixture() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-"));
@@ -113,6 +114,48 @@ function applyPhasedConfiguration(subject, stages, metadata) {
     stages,
     metadata,
   });
+}
+
+async function attachmentShareConfiguration(baseUrl, baseToken) {
+  const metadata = phasedMetadata([
+    { fieldId: "fld_imported_video", fieldName: "导入视频", type: 17, uiType: "Attachment", options: [] },
+    { fieldId: "fld_imported_audio", fieldName: "导入音频", type: 17, uiType: "Attachment", options: [] },
+  ]);
+  const subjectKey = await seedSubject(baseUrl, baseToken, metadata.fields);
+  const initial = phasedStage("initial", "opt_initial", "初稿");
+  initial.videoSource = { kind: "base_attachment", fieldId: "fld_imported_video" };
+  initial.audio = {
+    mode: "replace_original",
+    source: { kind: "base_attachment", fieldId: "fld_imported_audio" },
+    durationToleranceSeconds: 3,
+  };
+  const configured = await request(
+    baseUrl,
+    `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+    {
+      method: "PATCH",
+      body: {
+        statusField: { fieldId: "fld_status", fieldName: "流程" },
+        documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+        namingField: { fieldId: "fld_name", fieldName: "命名" },
+        stages: {
+          initial,
+          first_review: phasedStage("first_review", "opt_review", "初审修改"),
+          final_review: phasedStage("final_review", "opt_final", "终审修改"),
+        },
+      },
+    },
+  );
+  assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
+  const exported = await request(baseUrl, "/api/local/feishu/workflow/share/export");
+  assert.equal(exported.response.status, 200, JSON.stringify(exported.body));
+  return { subjectKey, configuration: structuredClone(exported.body.configuration) };
+}
+
+function stagedFieldDiagnostics(body) {
+  return body.diagnostics
+    .filter((entry) => entry.path?.includes(".stages."))
+    .map((entry) => [entry.code, entry.path]);
 }
 
 test("workflow share export is schema-versioned and redacts machine-local paths", async () => {
@@ -320,11 +363,146 @@ test("share import diagnoses staged attachment bindings against explicitly empty
     assert.equal(imported.lifecycle, "draft");
     assert.equal(imported.stages.initial.videoSource.fieldId, "fld_imported_video");
     assert.equal(imported.stages.initial.audio.source.fieldId, "fld_imported_audio");
+    assert.deepEqual(imported.metadata.fields, []);
+
+    const saved = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(imported.subjectKey)}`,
+      {
+        method: "PATCH",
+        body: { expectedVersion: imported.configVersion },
+      },
+    );
+    assert.equal(saved.response.status, 400, JSON.stringify(saved.body));
+    assert.equal(saved.body.error.code, "FIELD_NOT_FOUND");
+
+    const enabled = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(imported.subjectKey)}/enable`,
+      {
+        method: "POST",
+        body: { expectedVersion: imported.configVersion },
+      },
+    );
+    assert.equal(enabled.response.status, 409, JSON.stringify(enabled.body));
+    assert.equal(enabled.body.error.code, "FIELD_NOT_FOUND");
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
   }
 });
+
+test("share import treats a new subject's portable metadata as unverified", async () => {
+  const fixtureData = await fixture();
+  try {
+    const { configuration } = await attachmentShareConfiguration(
+      fixtureData.baseUrl,
+      "bas_new_subject_source",
+    );
+    const base = configuration.bases[0];
+    const subject = base.subjects[0];
+    base.baseToken = "bas_new_subject_target";
+    base.baseName = "新导入 Base";
+    subject.baseToken = base.baseToken;
+    subject.baseName = base.baseName;
+    subject.subjectKey = `${base.baseToken}:${subject.tableId}`;
+    subject.projectId = subjectProjectId(subject.subjectKey);
+
+    const dryRun = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(dryRun.response.status, 200, JSON.stringify(dryRun.body));
+    assert.deepEqual(stagedFieldDiagnostics(dryRun.body), [
+      ["FIELD_NOT_FOUND", "bases.bas_new_subject_target.subjects.tbl_chinese.stages.initial.videoSource.fieldId"],
+      ["FIELD_NOT_FOUND", "bases.bas_new_subject_target.subjects.tbl_chinese.stages.initial.audio.source.fieldId"],
+    ]);
+
+    const committed = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: false },
+    });
+    assert.equal(committed.response.status, 200, JSON.stringify(committed.body));
+    assert.deepEqual(stagedFieldDiagnostics(committed.body), stagedFieldDiagnostics(dryRun.body));
+    const imported = committed.body.configuration.bases
+      .find((candidate) => candidate.baseToken === base.baseToken)
+      .subjects[0];
+    assert.deepEqual(imported.metadata, { fields: [] });
+
+    const saved = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subject.subjectKey)}`,
+      { method: "PATCH", body: { expectedVersion: imported.configVersion } },
+    );
+    assert.equal(saved.response.status, 400, JSON.stringify(saved.body));
+    assert.equal(saved.body.error.code, "FIELD_NOT_FOUND");
+
+    const enabled = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subject.subjectKey)}/enable`,
+      { method: "POST", body: { expectedVersion: imported.configVersion } },
+    );
+    assert.equal(enabled.response.status, 409, JSON.stringify(enabled.body));
+    assert.equal(enabled.body.error.code, "FIELD_NOT_FOUND");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+for (const [label, metadataJson] of [
+  ["missing fields", "{}"],
+  ["malformed JSON", "{"],
+]) {
+  test(`share import fails closed when local metadata is ${label}`, async () => {
+    const fixtureData = await fixture();
+    try {
+      const baseToken = `bas_unusable_${label === "missing fields" ? "empty" : "malformed"}`;
+      const { subjectKey, configuration } = await attachmentShareConfiguration(fixtureData.baseUrl, baseToken);
+      fixtureData.app.database.database
+        .prepare("UPDATE feishu_subjects SET metadata_json = ? WHERE subject_key = ?")
+        .run(metadataJson, subjectKey);
+
+      const dryRun = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+        method: "POST",
+        body: { configuration, dryRun: true },
+      });
+      assert.equal(dryRun.response.status, 200, JSON.stringify(dryRun.body));
+      assert.deepEqual(stagedFieldDiagnostics(dryRun.body), [
+        ["FIELD_NOT_FOUND", `bases.${baseToken}.subjects.tbl_chinese.stages.initial.videoSource.fieldId`],
+        ["FIELD_NOT_FOUND", `bases.${baseToken}.subjects.tbl_chinese.stages.initial.audio.source.fieldId`],
+      ]);
+
+      const committed = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+        method: "POST",
+        body: { configuration, dryRun: false },
+      });
+      assert.equal(committed.response.status, 200, JSON.stringify(committed.body));
+      assert.deepEqual(stagedFieldDiagnostics(committed.body), stagedFieldDiagnostics(dryRun.body));
+      const imported = committed.body.configuration.bases[0].subjects[0];
+      assert.deepEqual(imported.metadata, { fields: [] });
+
+      const saved = await request(
+        fixtureData.baseUrl,
+        `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+        { method: "PATCH", body: { expectedVersion: imported.configVersion } },
+      );
+      assert.equal(saved.response.status, 400, JSON.stringify(saved.body));
+      assert.equal(saved.body.error.code, "FIELD_NOT_FOUND");
+
+      const enabled = await request(
+        fixtureData.baseUrl,
+        `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}/enable`,
+        { method: "POST", body: { expectedVersion: imported.configVersion } },
+      );
+      assert.equal(enabled.response.status, 409, JSON.stringify(enabled.body));
+      assert.equal(enabled.body.error.code, "FIELD_NOT_FOUND");
+    } finally {
+      await fixtureData.app.close();
+      await rm(fixtureData.directory, { recursive: true, force: true });
+    }
+  });
+}
 
 test("share import diagnoses staged attachment bindings whose type conflicts with uiType", async () => {
   const fixtureData = await fixture();
@@ -417,6 +595,7 @@ test("workflow share routes reject unsupported schemas and strip imported path/r
         baseToken: "bas_untrusted",
         baseName: "不可信 Base",
         sourceUrlLabel: "https://user:secret@example.test/base?token=secret",
+        metadataRefreshedAt: 1710000009000,
         subjects: [{
           subjectKey: "bas_untrusted:tbl_subject",
           baseToken: "bas_untrusted",
@@ -444,6 +623,8 @@ test("workflow share routes reject unsupported schemas and strip imported path/r
     const serialized = JSON.stringify(catalog.body.catalog);
     assert.doesNotMatch(serialized, /secret|workspacePath|claimToken|taskHistory/i);
     assert.equal(catalog.body.catalog[0].sourceUrlLabel, "https://example.test/base");
+    assert.equal(catalog.body.catalog[0].metadataRefreshedAt, null);
+    assert.deepEqual(catalog.body.catalog[0].subjects[0].metadata.fields, []);
     assert.equal(catalog.body.catalog[0].subjects[0].upload.artifactSourcePath, null);
     assert.equal(catalog.body.catalog[0].subjects[0].upload.targetPath, null);
   } finally {
