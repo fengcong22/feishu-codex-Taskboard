@@ -786,13 +786,17 @@ test("local Feishu workflow API persists preview and subject lifecycle", async (
         tables: [{
           tableId: "tbl_a",
           tableName: "语文",
-          fields: [{
-            fieldId: "fld_status",
-            fieldName: "状态",
-            type: 3,
-            uiType: "SingleSelect",
-            options: [{ id: "opt_ready", name: "待剪辑" }],
-          }],
+          fields: [
+            {
+              fieldId: "fld_status",
+              fieldName: "状态",
+              type: 3,
+              uiType: "SingleSelect",
+              options: [{ id: "opt_ready", name: "待剪辑" }],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+            { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+          ],
         }],
       },
     });
@@ -1167,6 +1171,7 @@ test("default Bridge workflow sync identifies Taskboard with the dedicated clien
   let receivedClient = null;
   let receivedExpectedVersion = null;
   let receivedSubjectVersion = null;
+  let receivedSubject = null;
   const bridge = createServer(async (incoming, response) => {
     receivedClient = incoming.headers["x-feishu-bridge-client"] ?? null;
     const chunks = [];
@@ -1179,6 +1184,7 @@ test("default Bridge workflow sync identifies Taskboard with the dedicated clien
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     receivedExpectedVersion = body.expectedVersion;
     receivedSubjectVersion = body.subject?.configVersion;
+    receivedSubject = body.subject;
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ subject: body.subject }));
   });
@@ -1208,17 +1214,24 @@ test("default Bridge workflow sync identifies Taskboard with the dedicated clien
         tables: [{
           tableId: "tbl_subject",
           tableName: "语文",
-          fields: [{
-            fieldId: "fld_status",
-            fieldName: "状态",
-            type: 3,
-            uiType: "SingleSelect",
-            options: [{ id: "opt_ready", name: "待剪辑" }],
-          }],
+          fields: [
+            {
+              fieldId: "fld_status",
+              fieldName: "状态",
+              type: 3,
+              uiType: "SingleSelect",
+              options: [{ id: "opt_ready", name: "待剪辑" }],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+            { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+          ],
         }],
       },
     });
     const subject = catalog.body.catalog[0].subjects[0];
+    const stages = structuredClone(subject.stages);
+    delete stages.initial.artifactTargetPath;
+    stages.initial.artifact_target_path = "D:\\private\\taskboard-sync";
     const key = encodeURIComponent(subject.subjectKey);
     const draft = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
       method: "PATCH",
@@ -1227,6 +1240,7 @@ test("default Bridge workflow sync identifies Taskboard with the dedicated clien
         execution: { mode: "manual", concurrencyGroup: "sync-header", maxConcurrent: 1, resourceGroups: [] },
         packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
         upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+        stages,
       },
     });
     const enabled = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}/enable`, {
@@ -1237,6 +1251,9 @@ test("default Bridge workflow sync identifies Taskboard with the dedicated clien
     assert.equal(receivedClient, "taskboard");
     assert.equal(receivedExpectedVersion, draft.body.subject.configVersion);
     assert.equal(receivedSubjectVersion, draft.body.subject.configVersion + 1);
+    assert.equal(receivedSubject.stages.initial.artifactTargetPath, null);
+    assert.equal(receivedSubject.stages.initial.artifact_target_path, undefined);
+    assert.doesNotMatch(JSON.stringify(receivedSubject), /taskboard-sync/u);
   } finally {
     await app.close();
     await new Promise((resolve) => bridge.close(resolve));
@@ -1708,6 +1725,12 @@ test("share import preserves safe legacy diagnostics from the real Bridge valida
     execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
     packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
     upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+    // Some legacy exports wrote explicit null phased keys. They still carry
+    // only the legacy trigger contract and must retain legacy diagnostics.
+    statusField: null,
+    documentField: null,
+    namingField: null,
+    stages: null,
     ...overrides,
   });
   const configuration = {
@@ -2076,7 +2099,17 @@ test("workflow sync preserves staged field type errors and maps untrusted Bridge
         tables: [{
           tableId: "tbl_subject",
           tableName: "语文",
-          fields: [{ fieldId: "fld_status", fieldName: "进度", type: 1, options: [] }],
+          fields: [
+            {
+              fieldId: "fld_status",
+              fieldName: "进度",
+              type: 3,
+              uiType: "SingleSelect",
+              options: [{ id: "opt_ready", name: "待制作" }],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+            { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+          ],
         }],
       },
     });
@@ -2085,7 +2118,7 @@ test("workflow sync preserves staged field type errors and maps untrusted Bridge
     const draft = await request(baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
       method: "PATCH",
       body: {
-        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: "opt_ready" },
         execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
         packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
         upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
@@ -2108,7 +2141,17 @@ test("workflow sync preserves staged field type errors and maps untrusted Bridge
         tables: [{
           tableId: "tbl_subject",
           tableName: "语文",
-          fields: [{ fieldId: "fld_status", fieldName: "进度", type: 1, options: [] }],
+          fields: [
+            {
+              fieldId: "fld_status",
+              fieldName: "进度",
+              type: 3,
+              uiType: "SingleSelect",
+              options: [{ id: "opt_ready", name: "待制作" }],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+            { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+          ],
         }],
       },
     });
@@ -2117,7 +2160,7 @@ test("workflow sync preserves staged field type errors and maps untrusted Bridge
     const typeDraft = await request(baseUrl, `/api/local/feishu/workflow/subjects/${typeKey}`, {
       method: "PATCH",
       body: {
-        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: null },
+        trigger: { fieldId: "fld_status", fieldName: "进度", startValue: "待制作", optionId: "opt_ready" },
         execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
         packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
         upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },

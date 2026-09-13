@@ -94,27 +94,44 @@ function uniqueMetadataOption(
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+function uniqueMetadataOptionByName(
+  field: FeishuFieldMetadata | undefined,
+  optionName: string | null | undefined,
+) {
+  if (!optionName) return undefined;
+  const matches = (field?.options ?? []).filter((option) => option.name === optionName);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata[]): FeishuStageConfigMap {
   const status = subject.statusField;
-  const statusField = fields.find((field) => field.fieldId === status?.fieldId)
+  const legacyTriggerField = status ? undefined : uniqueMetadataField(fields, subject.trigger?.fieldId);
+  const statusField = uniqueMetadataField(fields, status?.fieldId)
+    ?? (legacyTriggerField && isSingleSelectField(legacyTriggerField) ? legacyTriggerField : undefined)
     ?? fields.find(isSingleSelectField);
   const options = statusField?.options ?? [];
   const existing = subject.stages;
   return Object.fromEntries(PHASE_IDS.map((stageId, index) => {
-    const option = options[index] ?? options[0];
     const old = existing?.[stageId];
+    const projectsLegacyInitial = index === 0 && !old;
+    const legacyInitialOption = projectsLegacyInitial
+      ? subject.trigger?.optionId
+        ? uniqueMetadataOption(statusField, subject.trigger.optionId)
+        : uniqueMetadataOptionByName(statusField, subject.trigger?.startValue)
+      : undefined;
+    const option = projectsLegacyInitial ? legacyInitialOption : options[index] ?? options[0];
     const fallback: FeishuStageConfig = {
       enabled: index === 0,
       trigger: {
         fieldId: statusField?.fieldId ?? subject.trigger?.fieldId ?? null,
         fieldName: statusField?.fieldName ?? subject.trigger?.fieldName ?? null,
-        optionId: option?.id ?? (index === 0 ? subject.trigger?.optionId ?? null : null),
-        value: option?.name ?? (index === 0 ? subject.trigger?.startValue ?? "" : ""),
+        optionId: option?.id ?? (projectsLegacyInitial ? subject.trigger?.optionId ?? null : null),
+        value: option?.name ?? (projectsLegacyInitial ? subject.trigger?.startValue ?? "" : ""),
       },
       videoSource: { kind: "docx_section", anchorText: "录屏" },
       reviewSource: { kind: "docx_section", anchorText: "修改意见" },
       audio: { mode: "video_original" },
-      artifactTargetPath: null,
+      artifactTargetPath: projectsLegacyInitial ? subject.upload?.targetPath ?? null : null,
       nameSuffix: `_${PHASE_LABELS[stageId]}`,
     };
     if (!old) return [stageId, fallback];
@@ -173,7 +190,10 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
   const fields = subject.metadata?.fields ?? [];
   const triggerField = uniqueMetadataField(fields, subject.trigger?.fieldId);
   const triggerOption = uniqueMetadataOption(triggerField, subject.trigger?.optionId);
-  const statusField = subject.statusField;
+  const legacyStatusField = !subject.statusField && triggerField && isSingleSelectField(triggerField)
+    ? { fieldId: triggerField.fieldId, fieldName: triggerField.fieldName }
+    : undefined;
+  const statusField = subject.statusField ?? legacyStatusField;
   const documentField = subject.documentField;
   const namingField = subject.namingField;
   return {
@@ -200,7 +220,7 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
     documentFieldName: currentFieldName(fields, documentField),
     namingFieldId: namingField?.fieldId ?? "",
     namingFieldName: currentFieldName(fields, namingField),
-    stages: (subject.stages || statusField || documentField || namingField)
+    stages: (subject.stages || statusField || documentField || namingField || fields.length > 0)
       ? stageDefaults(subject, fields)
       : null,
   };
@@ -411,7 +431,9 @@ export function FeishuWorkflowPanel({
         }
       }
       if (!stage.nameSuffix.trim()) errors.push(`${phaseLabel}需要命名后缀`);
-      if (subjectForm.enqueueMode === "automatic" && !stage.artifactTargetPath?.trim()) errors.push(`${phaseLabel}需要 ZIP 目标目录`);
+      if (stage.enabled && subjectForm.enqueueMode === "automatic" && !stage.artifactTargetPath?.trim()) {
+        errors.push(`${phaseLabel}需要 ZIP 目标目录`);
+      }
     }
     if (!subjectForm.statusFieldId) errors.push("请选择状态字段");
     else if (metadataFieldMatches(triggerFields, subjectForm.statusFieldId).length !== 1) errors.push("状态字段当前不可用或不唯一");
@@ -437,9 +459,11 @@ export function FeishuWorkflowPanel({
               ? "该 ZIP 获取方式将在后续开放"
               : subjectForm.artifactSourceMode === "driver_report" && !subjectForm.artifactSourcePath.trim()
                 ? "请填写 ZIP 来源根目录"
-                : phased && phasedValidationErrors.length > 0
-                  ? phasedValidationErrors[0]
-                : undefined;
+                : subjectForm.enqueueMode === "automatic" && !subjectForm.targetPath.trim()
+                  ? "请填写上传路径"
+                  : phased && phasedValidationErrors.length > 0
+                    ? phasedValidationErrors[0]
+                    : undefined;
   const selectedTriggerField = subjectForm
     ? triggerFields.find((field) => field.fieldId === subjectForm.triggerFieldId)
     : undefined;

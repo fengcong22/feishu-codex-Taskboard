@@ -137,7 +137,10 @@ function portableWorkflowSubject(value) {
   }
   if (subject.stages && typeof subject.stages === "object" && !Array.isArray(subject.stages)) {
     for (const stage of Object.values(subject.stages)) {
-      if (stage && typeof stage === "object") delete stage.artifactTargetPath;
+      if (stage && typeof stage === "object") {
+        delete stage.artifactTargetPath;
+        delete stage.artifact_target_path;
+      }
     }
   }
   if (subject.packageConfig && typeof subject.packageConfig === "object") {

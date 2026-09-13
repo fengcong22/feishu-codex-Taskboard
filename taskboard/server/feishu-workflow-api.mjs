@@ -199,7 +199,13 @@ export function createFeishuWorkflowApi({ database, store, previewBase = null, i
         }
         const localPreview = await store.importShareable(body.configuration, { dryRun: true });
         const bridgePreview = typeof inspectShareImport === "function"
-          ? await inspectShareImport(localPreview.configuration)
+          // Keep the local result authoritative for the editor, but let the
+          // Bridge know which subjects were legacy in the operator's import.
+          // The app-side inspector uses that hint to preserve legacy
+          // field/option diagnostics after local phased-default expansion.
+          ? await inspectShareImport(localPreview.configuration, {
+            sourceConfiguration: body.configuration,
+          })
           : null;
         const bridgeDiagnostics = Array.isArray(bridgePreview?.diagnostics)
           ? bridgePreview.diagnostics.filter((entry) => (
