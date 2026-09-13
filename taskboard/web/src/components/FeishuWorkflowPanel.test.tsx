@@ -426,24 +426,49 @@ describe("FeishuWorkflowPanel audio drafts", () => {
       .toBe("D:\\legacy-upload-path");
   });
 
-  it("projects a legacy upload path when phased stages already exist without destinations", () => {
-    const configured = subject("legacy-existing-stages", "旧阶段路径");
+  it("keeps an explicitly cleared phased stage destination empty after save and rerender", async () => {
+    const configured = subject("cleared-stage-path", "清空阶段路径");
     if (!configured.upload || !configured.stages) throw new Error("fixture requires phased upload settings");
     configured.upload.enqueueMode = "manual";
-    configured.upload.targetPath = "D:\\legacy-existing-stages";
-    configured.stages.initial.artifactTargetPath = null;
+    configured.upload.targetPath = "D:\\legacy-subject-path";
+    let savedSubject = structuredClone(configured);
+    const onSaveDraft = vi.fn(async (_subjectKey: string, rawPatch: unknown) => {
+      const patch = rawPatch as Partial<FeishuSubjectConfig> & { stages: FeishuStageConfigMap };
+      const persistedStages = structuredClone(patch.stages);
+      persistedStages.initial.artifactTargetPath = patch.stages.initial.artifactTargetPath?.trim() || null;
+      savedSubject = {
+        ...savedSubject,
+        ...patch,
+        stages: persistedStages,
+        configVersion: savedSubject.configVersion + 1,
+      };
+      return savedSubject;
+    });
+    const common = {
+      configurationBaseToken: "bas_test",
+      selectedSubjectKey: "cleared-stage-path",
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+      onSaveDraft,
+    };
+    const { rerender } = render(<FeishuWorkflowPanel {...common} catalog={catalog(configured)} />);
 
-    render(<FeishuWorkflowPanel
-      catalog={catalog(configured)}
-      configurationBaseToken="bas_test"
-      selectedSubjectKey="legacy-existing-stages"
-      onSelectSubject={vi.fn()}
-      onCatalogChange={vi.fn()}
-      onSubjectChange={vi.fn()}
-    />);
+    fireEvent.change(screen.getByRole("textbox", { name: "初稿 ZIP 目标目录" }), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
 
-    expect((screen.getByRole("textbox", { name: "初稿 ZIP 目标目录" }) as HTMLInputElement).value)
-      .toBe("D:\\legacy-existing-stages");
+    const [, rawPatch] = onSaveDraft.mock.calls[0];
+    const patch = rawPatch as { stages: FeishuStageConfigMap };
+    expect(patch.stages.initial.artifactTargetPath).toBe("");
+
+    rerender(<FeishuWorkflowPanel {...common} catalog={catalog(savedSubject)} />);
+    await waitFor(() => {
+      expect((screen.getByRole("textbox", { name: "初稿 ZIP 目标目录" }) as HTMLInputElement).value)
+        .toBe("");
+    });
   });
 
   it("keeps an empty-metadata legacy subject on the legacy save path", async () => {

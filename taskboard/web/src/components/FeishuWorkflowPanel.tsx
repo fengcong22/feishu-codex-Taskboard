@@ -136,18 +136,6 @@ function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata
     };
     if (!old) return [stageId, fallback];
     const cloned = structuredClone(old);
-    const legacyTargetPath = subject.upload?.targetPath;
-    if (
-      cloned.enabled
-      && (typeof cloned.artifactTargetPath !== "string" || cloned.artifactTargetPath.trim() === "")
-      && typeof legacyTargetPath === "string"
-      && legacyTargetPath.trim() !== ""
-    ) {
-      // Older subjects stored one upload destination at the subject level.
-      // Keep that local binding usable when the server has already materialized
-      // a phased skeleton whose stage destination is still empty.
-      cloned.artifactTargetPath = legacyTargetPath;
-    }
     const currentTriggerField = uniqueMetadataField(fields, cloned.trigger.fieldId);
     if (currentTriggerField) {
       cloned.trigger.fieldName = currentTriggerField.fieldName;
