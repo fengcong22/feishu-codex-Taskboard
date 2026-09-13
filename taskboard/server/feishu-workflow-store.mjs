@@ -7,6 +7,7 @@ import {
   canonicalizePhasedSubjectPatch,
   isAttachmentMetadataField,
   isPhasedSubject,
+  isSingleSelectMetadataField,
   normalizeStage,
   portablePhasedSubject,
   validatePhasedSubjectConfig,
@@ -27,6 +28,487 @@ const EXECUTION_MODES = new Set(["manual", "automatic"]);
 const ARTIFACT_SOURCE_MODES = new Set(["manual_select", "watch_directory", "driver_report"]);
 const SUBJECT_PROJECT_HASH_LENGTH = 16;
 export const WORKFLOW_SCHEMA_VERSION = 1;
+const PENDING_IDENTIFIERS = new Set([
+  "pending",
+  "pending_status_field",
+  "pending_document_field",
+  "pending_naming_field",
+  "pending_initial_option",
+]);
+
+const DEFAULT_STAGE_SUFFIXES = Object.freeze(["_初稿", "_初审修改", "_终审修改"]);
+
+function metadataFieldId(field) {
+  return field?.fieldId ?? field?.id ?? null;
+}
+
+function metadataFieldName(field) {
+  return field?.fieldName ?? field?.name ?? null;
+}
+
+function validIdentifier(value) {
+  return typeof value === "string" && ID_PATTERN.test(value.trim()) ? value.trim() : null;
+}
+
+function validRequiredText(value) {
+  return typeof value === "string" && value.trim() !== "" && !value.includes("\0")
+    ? value.trim()
+    : null;
+}
+
+function metadataDescriptor(field, fallbackId, fallbackName = "待配置") {
+  const fieldId = validIdentifier(metadataFieldId(field)) ?? fallbackId;
+  const fieldName = typeof metadataFieldName(field) === "string" && metadataFieldName(field).trim() !== ""
+    ? metadataFieldName(field).trim()
+    : fallbackName;
+  return { fieldId, fieldName };
+}
+
+function metadataOption(field, index) {
+  const option = Array.isArray(field?.options) ? field.options[index] : null;
+  const optionId = validIdentifier(option?.id);
+  const optionName = typeof option?.name === "string" && option.name.trim() !== ""
+    ? option.name.trim()
+    : null;
+  return optionId && optionName ? { id: optionId, name: optionName } : null;
+}
+
+function isPendingIdentifier(value) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return PENDING_IDENTIFIERS.has(normalized);
+}
+
+function isPendingPhasedDefaults(subject) {
+  return [subject?.statusField, subject?.documentField, subject?.namingField]
+    .some((field) => isPendingIdentifier(field?.fieldId))
+    || isPendingIdentifier(subject?.trigger?.fieldId)
+    || isPendingIdentifier(subject?.trigger?.optionId)
+    || STAGE_IDS.some((stageId) => (
+      isPendingIdentifier(subject?.stages?.[stageId]?.trigger?.fieldId)
+      || isPendingIdentifier(subject?.stages?.[stageId]?.trigger?.optionId)
+  ));
+}
+
+function hasUsableStageTrigger(stage, expectedFieldId = null) {
+  const trigger = stage?.trigger;
+  if (!trigger || typeof trigger !== "object" || Array.isArray(trigger)) return false;
+  const fieldId = validIdentifier(trigger.fieldId ?? trigger.field_id);
+  const optionId = validIdentifier(trigger.optionId ?? trigger.option_id);
+  const fieldName = validRequiredText(trigger.fieldName ?? trigger.field_name);
+  const value = validRequiredText(trigger.value ?? trigger.startValue ?? trigger.start_value);
+  return Boolean(
+    fieldId
+    && optionId
+    && fieldName
+    && value
+    && !isPendingIdentifier(fieldId)
+    && !isPendingIdentifier(optionId)
+    && (!expectedFieldId || fieldId === expectedFieldId),
+  );
+}
+
+function hasTriggerIntent(trigger) {
+  if (!trigger || typeof trigger !== "object" || Array.isArray(trigger)) return false;
+  const fieldId = validIdentifier(trigger.fieldId ?? trigger.field_id);
+  const fieldName = validRequiredText(trigger.fieldName ?? trigger.field_name);
+  const value = validRequiredText(trigger.value ?? trigger.startValue ?? trigger.start_value);
+  const rawOptionId = trigger.optionId ?? trigger.option_id;
+  const optionMissing = rawOptionId === undefined || rawOptionId === null || rawOptionId === "";
+  const optionId = optionMissing ? null : validIdentifier(rawOptionId);
+  return Boolean(
+    fieldId
+    && fieldName
+    && value
+    && !isPendingIdentifier(fieldId)
+    && !isPendingIdentifier(value)
+    && (optionMissing || (optionId && !isPendingIdentifier(optionId))),
+  );
+}
+
+function repairStageDefaults(defaultStage, existingStage, stageId) {
+  const source = existingStage && typeof existingStage === "object" && !Array.isArray(existingStage)
+    ? existingStage
+    : {};
+  const aliases = {
+    videoSource: "video_source",
+    reviewSource: "review_source",
+    artifactTargetPath: "artifact_target_path",
+    nameSuffix: "name_suffix",
+  };
+  let repaired = clone(defaultStage);
+  for (const key of [
+    "enabled",
+    "trigger",
+    "videoSource",
+    "reviewSource",
+    "audio",
+    "artifactTargetPath",
+    "nameSuffix",
+  ]) {
+    const sourceKey = Object.hasOwn(source, key)
+      ? key
+      : aliases[key] && Object.hasOwn(source, aliases[key])
+        ? aliases[key]
+        : null;
+    if (!sourceKey) continue;
+    const value = clone(source[sourceKey]);
+    // Placeholders are intentionally replaced by the metadata-derived default
+    // when a later refresh supplies real field/option identifiers.
+    if (key === "trigger"
+      && (isPendingIdentifier(value?.fieldId ?? value?.field_id)
+        || isPendingIdentifier(value?.optionId ?? value?.option_id)
+        || (value?.fieldId ?? value?.field_id) !== defaultStage.trigger.fieldId)) continue;
+    const candidate = { ...repaired, [key]: value };
+    try {
+      const normalized = normalizeStage(candidate, null, stageId);
+      repaired = normalized;
+    } catch {
+      // Keep the default for this malformed property while allowing other
+      // valid custom properties from the same partially persisted stage to
+      // survive the repair.
+    }
+  }
+  return repaired;
+}
+
+function ensureAtLeastOneEnabledStage(stages, defaultStages) {
+  if (STAGE_IDS.some((stageId) => stages[stageId]?.enabled)) return stages;
+  const current = stages.initial && typeof stages.initial === "object" && !Array.isArray(stages.initial)
+    ? stages.initial
+    : {};
+  try {
+    stages.initial = normalizeStage({ ...current, enabled: true }, null, "initial");
+  } catch {
+    // A malformed disabled initial stage must not prevent the table from
+    // opening. Fall back to the metadata-derived default, which always has a
+    // repairable trigger placeholder when no option is available yet.
+    stages.initial = normalizeStage({ ...defaultStages.initial, enabled: true }, null, "initial");
+  }
+  return stages;
+}
+
+function projectLegacyUploadTarget(stages, upload) {
+  const targetPath = typeof upload?.targetPath === "string"
+    && upload.targetPath.trim() !== ""
+    ? upload.targetPath
+    : null;
+  if (!targetPath) return stages;
+  return Object.fromEntries(STAGE_IDS.map((stageId) => {
+    const stage = stages[stageId];
+    return [stageId, stage?.enabled && !stage.artifactTargetPath
+      ? { ...stage, artifactTargetPath: targetPath }
+      : stage];
+  }));
+}
+
+function hasCompletePhasedConfig(subject) {
+  if (!subject || typeof subject !== "object" || Array.isArray(subject)) return false;
+  // Presence checks alone are insufficient here: a persisted object can have
+  // every expected key while carrying null/empty values.  Validate the phased
+  // portion against an unknown metadata snapshot so stale field bindings are
+  // still considered structurally complete, but malformed values force the
+  // repair/default path during the next refresh.
+  try {
+    validatePhasedSubjectConfig({ ...subject, metadata: null });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function phasedDefaultsForSubject({
+  subjectKey,
+  baseToken,
+  baseName,
+  tableId,
+  tableName,
+  projectId,
+  metadata,
+  existing = null,
+  lifecycle = "draft",
+  configVersion,
+  createdAt,
+  updatedAt,
+  validate,
+}) {
+  const fields = Array.isArray(metadata?.fields) ? metadata.fields : [];
+  const existingTrigger = existing?.trigger
+    && typeof existing.trigger === "object"
+    && !Array.isArray(existing.trigger)
+    ? {
+      fieldId: existing.trigger.fieldId ?? existing.trigger.field_id,
+      fieldName: existing.trigger.fieldName ?? existing.trigger.field_name,
+      startValue: existing.trigger.startValue ?? existing.trigger.start_value,
+      optionId: existing.trigger.optionId ?? existing.trigger.option_id,
+    }
+    : null;
+  const hasPersistedPhasedShape = Boolean(
+    existing
+    && ["statusField", "documentField", "namingField", "stages"]
+      .some((key) => existing[key] !== undefined && existing[key] !== null),
+  );
+  const migratingLegacySubject = Boolean(existing && !hasPersistedPhasedShape);
+  const legacyTriggerFieldId = !migratingLegacySubject
+    ? null
+    : validIdentifier(existingTrigger?.fieldId);
+  const legacyStatusMatches = legacyTriggerFieldId
+    ? fields.filter((field) => (
+      isSingleSelectMetadataField(field)
+      && validIdentifier(metadataFieldId(field)) === legacyTriggerFieldId
+    ))
+    : [];
+  const persistedStatusFieldId = !migratingLegacySubject
+    ? validIdentifier(existing?.statusField?.fieldId)
+    : null;
+  const persistedStatusMatches = persistedStatusFieldId && !isPendingIdentifier(persistedStatusFieldId)
+    ? fields.filter((field) => (
+      isSingleSelectMetadataField(field)
+      && validIdentifier(metadataFieldId(field)) === persistedStatusFieldId
+    ))
+    : [];
+  const existingTriggerFieldIds = [
+    existing?.trigger?.fieldId ?? existing?.trigger?.field_id,
+    ...STAGE_IDS.map((stageId) => (
+      existing?.stages?.[stageId]?.trigger?.fieldId
+      ?? existing?.stages?.[stageId]?.trigger?.field_id
+    )),
+  ]
+    .map(validIdentifier)
+    .filter((fieldId) => fieldId && !isPendingIdentifier(fieldId));
+  const uniqueExistingTriggerFieldIds = [...new Set(existingTriggerFieldIds)];
+  const matchedExistingTriggerFields = uniqueExistingTriggerFieldIds
+    .map((fieldId) => fields.filter((field) => (
+      isSingleSelectMetadataField(field)
+      && validIdentifier(metadataFieldId(field)) === fieldId
+    )))
+    .filter((matches) => matches.length > 0);
+  const inferredStatusCandidate = uniqueExistingTriggerFieldIds.length === 1
+    && matchedExistingTriggerFields.length === 1
+    && matchedExistingTriggerFields[0].length === 1
+    ? matchedExistingTriggerFields[0][0]
+    : null;
+  const freshStatusCandidate = fields.find((field) => (
+    isSingleSelectMetadataField(field) && validIdentifier(metadataFieldId(field))
+  ));
+  const statusCandidate = migratingLegacySubject
+    ? (legacyStatusMatches.length === 1 ? legacyStatusMatches[0] : null)
+    : persistedStatusFieldId && !isPendingIdentifier(persistedStatusFieldId)
+      ? (persistedStatusMatches.length === 1 ? persistedStatusMatches[0] : null)
+      : existingTriggerFieldIds.length > 0
+        ? inferredStatusCandidate
+        : !existing || isPendingPhasedDefaults(existing)
+          ? freshStatusCandidate
+          : null;
+  const usableFields = fields.filter((field) => validIdentifier(metadataFieldId(field)));
+  const remainingFields = usableFields.filter((field) => field !== statusCandidate);
+  // Missing document/name columns remain explicit repairable placeholders.
+  // Reusing the status column would make strict enable validation accept a
+  // binding the operator never selected.
+  const documentCandidate = remainingFields[0];
+  const namingCandidate = remainingFields[1] ?? documentCandidate;
+  const defaultStatusField = metadataDescriptor(
+    statusCandidate ?? (migratingLegacySubject ? existingTrigger : null),
+    "pending_status_field",
+  );
+  const defaultDocumentField = metadataDescriptor(documentCandidate, "pending_document_field");
+  const defaultNamingField = metadataDescriptor(namingCandidate, "pending_naming_field");
+  const reusableDescriptor = (value, fallback) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
+    const fieldId = validIdentifier(value.fieldId);
+    const fieldName = validRequiredText(value.fieldName);
+    return fieldId && fieldName && !isPendingIdentifier(fieldId)
+      ? { fieldId, fieldName }
+      : fallback;
+  };
+  const statusField = reusableDescriptor(existing?.statusField, defaultStatusField);
+  const documentField = reusableDescriptor(existing?.documentField, defaultDocumentField);
+  const namingField = reusableDescriptor(existing?.namingField, defaultNamingField);
+  const initialStageHasIntent = Boolean(
+    existing
+    && existing?.stages?.initial?.enabled !== false
+    && hasTriggerIntent(existing?.stages?.initial?.trigger),
+  );
+  const topLevelTriggerHasIntent = Boolean(existing && hasTriggerIntent(existing?.trigger));
+  let initialOptionNeedsRepair = false;
+  const shouldProjectTopLevelInitialTrigger = Boolean(
+    existing && !hasUsableStageTrigger(existing?.stages?.initial, statusField.fieldId),
+  );
+  const defaultStages = Object.fromEntries(STAGE_IDS.map((stageId, index) => {
+    let option = metadataOption(statusCandidate, index);
+    const topLevelTriggerFieldId = validIdentifier(existingTrigger?.fieldId);
+    if (
+      stageId === "initial"
+      && (migratingLegacySubject || shouldProjectTopLevelInitialTrigger)
+    ) {
+      if (topLevelTriggerFieldId === statusField.fieldId) {
+        const legacyOptionId = validIdentifier(existingTrigger?.optionId);
+        const legacyStartValue = validRequiredText(existingTrigger?.startValue);
+        const legacyOptionMatches = Array.isArray(statusCandidate?.options)
+          ? statusCandidate.options.filter((candidate) => (
+            legacyOptionId
+              ? validIdentifier(candidate?.id) === legacyOptionId
+              : legacyStartValue && validRequiredText(candidate?.name) === legacyStartValue
+          ))
+          : [];
+        const matchedOptionId = legacyOptionMatches.length === 1
+          ? validIdentifier(legacyOptionMatches[0]?.id)
+          : null;
+        const matchedOptionName = legacyOptionMatches.length === 1
+          ? validRequiredText(legacyOptionMatches[0]?.name)
+          : null;
+        if (matchedOptionId && matchedOptionName) {
+          option = {
+            id: matchedOptionId,
+            name: matchedOptionName,
+          };
+        } else if (!migratingLegacySubject && (initialStageHasIntent || topLevelTriggerHasIntent)) {
+          // A phased subject already carried an explicit trigger, but neither
+          // the stage nor the legacy projection can be reconciled with the
+          // current status field.  Keep it visibly repairable instead of
+          // silently selecting metadata option 0.
+          initialOptionNeedsRepair = true;
+          option = {
+            id: "pending_initial_option",
+            name: "待配置",
+          };
+        } else if (migratingLegacySubject || initialStageHasIntent || topLevelTriggerHasIntent) {
+          initialOptionNeedsRepair = true;
+          option = {
+            id: legacyOptionId ?? "pending_initial_option",
+            name: legacyStartValue ?? "待配置",
+          };
+        }
+      } else if (!migratingLegacySubject && (initialStageHasIntent || topLevelTriggerHasIntent)) {
+        // A phased subject already carried an explicit trigger, but neither
+        // the stage nor the legacy projection can be reconciled with the
+        // current status field.  Keep it visibly repairable instead of
+        // silently selecting metadata option 0.
+        initialOptionNeedsRepair = true;
+        option = {
+          id: "pending_initial_option",
+          name: "待配置",
+        };
+      } else if (migratingLegacySubject || initialStageHasIntent || topLevelTriggerHasIntent) {
+        initialOptionNeedsRepair = true;
+        const legacyOptionId = validIdentifier(existingTrigger?.optionId);
+        const legacyStartValue = validRequiredText(existingTrigger?.startValue);
+        option = {
+          id: legacyOptionId ?? "pending_initial_option",
+          name: legacyStartValue ?? "待配置",
+        };
+      }
+    }
+    const enabled = index === 0;
+    const trigger = {
+      fieldId: statusField.fieldId,
+      fieldName: statusField.fieldName,
+      optionId: option?.id ?? (enabled ? "pending_initial_option" : null),
+      value: option?.name ?? (enabled ? "待配置" : ""),
+    };
+    return [stageId, {
+      enabled,
+      trigger,
+      videoSource: { kind: "docx_section", anchorText: "录屏" },
+      reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+      audio: { mode: "video_original" },
+      artifactTargetPath: null,
+      nameSuffix: DEFAULT_STAGE_SUFFIXES[index],
+    }];
+  }));
+  let stages = Object.fromEntries(STAGE_IDS.map((stageId) => [
+    stageId,
+    repairStageDefaults(defaultStages[stageId], existing?.stages?.[stageId], stageId),
+  ]));
+  stages = ensureAtLeastOneEnabledStage(stages, defaultStages);
+  // Legacy subjects had one upload destination at the subject level. Preserve
+  // that destination for every enabled phased stage so both manual and
+  // automatic uploads keep their machine-local routing after migration.
+  stages = projectLegacyUploadTarget(stages, existing?.upload);
+  const defaultLegacyStage = STAGE_IDS
+    .map((stageId) => stages[stageId])
+    .find((stage) => stage.enabled) ?? stages.initial;
+  const projectedTrigger = defaultLegacyStage.trigger;
+  const defaultLegacyTrigger = !migratingLegacySubject && initialOptionNeedsRepair
+    ? {
+      fieldId: statusField.fieldId,
+      fieldName: statusField.fieldName,
+      startValue: "待配置",
+      optionId: "pending_initial_option",
+    }
+    : {
+      fieldId: projectedTrigger.fieldId,
+      fieldName: projectedTrigger.fieldName,
+      startValue: projectedTrigger.value,
+      optionId: projectedTrigger.optionId,
+    };
+  const reusableTriggerFieldId = validIdentifier(existingTrigger?.fieldId);
+  const reusableTriggerFieldName = validRequiredText(existingTrigger?.fieldName);
+  const reusableTriggerStartValue = validRequiredText(existingTrigger?.startValue);
+  const optionalTriggerId = existingTrigger?.optionId === null
+    || existingTrigger?.optionId === undefined
+    || existingTrigger?.optionId === "";
+  const reusableTriggerOptionId = optionalTriggerId
+    ? null
+    : validIdentifier(existingTrigger.optionId);
+  const reusableTrigger = reusableTriggerFieldId
+    && reusableTriggerFieldName
+    && reusableTriggerStartValue
+    && !migratingLegacySubject
+    && !isPendingIdentifier(reusableTriggerFieldId)
+    && !isPendingIdentifier(reusableTriggerOptionId)
+    && (optionalTriggerId || reusableTriggerOptionId !== null)
+    && !initialOptionNeedsRepair
+    ? {
+      fieldId: reusableTriggerFieldId,
+      fieldName: reusableTriggerFieldName,
+      startValue: reusableTriggerStartValue,
+      optionId: reusableTriggerOptionId,
+    }
+    : defaultLegacyTrigger;
+  const candidate = {
+    subjectKey,
+    baseToken,
+    baseName,
+    tableId,
+    tableName,
+    projectId,
+    displayEnabled: existing?.displayEnabled ?? false,
+    lifecycle,
+    configVersion,
+    trigger: clone(reusableTrigger),
+    title: clone(existing?.title ?? { fieldId: null, fieldName: null }),
+    execution: clone(existing?.execution ?? {
+      mode: "manual",
+      concurrencyGroup: "default",
+      maxConcurrent: 1,
+      resourceGroups: [],
+    }),
+    packageRoute: clone(existing?.packageRoute ?? {
+      routeMode: "fixed",
+      packageAlias: "Auto-cut-A",
+      subjectCodeFieldId: null,
+      branchMap: null,
+    }),
+    upload: clone(existing?.upload ?? {
+      enqueueMode: "manual",
+      artifactSourceMode: "manual_select",
+      artifactSourcePath: null,
+      targetId: null,
+      targetPath: null,
+      uploadConcurrency: 1,
+    }),
+    statusField,
+    documentField,
+    namingField,
+    stages,
+    metadata: null,
+    createdAt,
+    updatedAt,
+  };
+  const normalized = validate(candidate);
+  normalized.metadata = metadata;
+  return normalized;
+}
 
 export function subjectProjectId(subjectKey) {
   const digest = createHash("sha256")
@@ -202,12 +684,13 @@ function shareableSubject(subject, { forceDraft = false } = {}) {
     ...(subject.stages ? {
       stages: Object.fromEntries(STAGE_IDS.map((stageId) => {
         const stage = subject.stages[stageId];
-        return [stageId, stage ? {
-          ...clone(stage),
-          // Stage destinations are local to the Taskboard machine and never
-          // cross the Bridge/share boundary.
-          artifactTargetPath: null,
-        } : null];
+        if (!stage) return [stageId, null];
+        const portableStage = clone(stage);
+        delete portableStage.artifact_target_path;
+        // Stage destinations are local to the Taskboard machine and never
+        // cross the Bridge/share boundary.
+        portableStage.artifactTargetPath = null;
+        return [stageId, portableStage];
       })),
     } : {}),
     trigger: clone(subject.trigger),
@@ -290,6 +773,8 @@ function validateShareDocument(value) {
       if (subjectUnknown) {
         throw new ApiError(400, "UNKNOWN_FIELD", `configuration.bases[${baseIndex}].subjects[${subjectIndex}].${subjectUnknown} is not supported`);
       }
+      const hasExplicitPhasedShape = ["statusField", "documentField", "namingField", "stages"]
+        .some((keyName) => inputSubject[keyName] !== undefined && inputSubject[keyName] !== null);
       const tableId = identifier(inputSubject.tableId, `configuration.bases[${baseIndex}].subjects[${subjectIndex}].tableId`);
       const key = `${baseToken}:${tableId}`;
       if (inputSubject.subjectKey !== undefined && inputSubject.subjectKey !== key) {
@@ -303,7 +788,7 @@ function validateShareDocument(value) {
       }
       if (seenSubjects.has(key)) throw new ApiError(400, "INVALID_SHARE_CONFIGURATION", `duplicate subjectKey: ${key}`);
       seenSubjects.add(key);
-      const normalized = {
+      let normalized = {
         subjectKey: key,
         baseToken,
         baseName: requireText(inputSubject.baseName ?? baseName, "subject.baseName"),
@@ -322,7 +807,15 @@ function validateShareDocument(value) {
         statusField: clone(inputSubject.statusField),
         documentField: clone(inputSubject.documentField),
         namingField: clone(inputSubject.namingField),
-        stages: clone(inputSubject.stages),
+        stages: inputSubject.stages && typeof inputSubject.stages === "object" && !Array.isArray(inputSubject.stages)
+          ? Object.fromEntries(Object.entries(inputSubject.stages).map(([stageId, stage]) => {
+            if (!stage || typeof stage !== "object" || Array.isArray(stage)) return [stageId, clone(stage)];
+            const portableStage = clone(stage);
+            delete portableStage.artifact_target_path;
+            portableStage.artifactTargetPath = null;
+            return [stageId, portableStage];
+          }))
+          : clone(inputSubject.stages),
       };
       if (typeof normalized.displayEnabled !== "boolean") {
         throw new ApiError(400, "INVALID_SHARE_CONFIGURATION", `${key}.displayEnabled must be boolean`);
@@ -332,11 +825,41 @@ function validateShareDocument(value) {
       normalized.title ??= { fieldId: null, fieldName: null };
       normalized.execution ??= { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] };
       normalized.packageRoute ??= { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null };
+      if (normalized.upload !== undefined && normalized.upload !== null
+        && (typeof normalized.upload !== "object" || Array.isArray(normalized.upload))) {
+        throw new ApiError(
+          400,
+          "INVALID_SHARE_CONFIGURATION",
+          `configuration.bases[${baseIndex}].subjects[${subjectIndex}].upload must be an object`,
+        );
+      }
       normalized.upload ??= { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 };
       normalized.upload.artifactSourcePath = null;
       normalized.upload.targetPath = null;
       try {
-        validateSubjectConfig(normalized);
+        if (!hasExplicitPhasedShape) {
+          normalized = phasedDefaultsForSubject({
+            subjectKey: normalized.subjectKey,
+            baseToken: normalized.baseToken,
+            baseName: normalized.baseName,
+            tableId: normalized.tableId,
+            tableName: normalized.tableName,
+            projectId: normalized.projectId,
+            metadata: normalized.metadata,
+            existing: normalized,
+            lifecycle: "draft",
+            configVersion: normalized.configVersion,
+            validate: validateSubjectConfig,
+          });
+        }
+        // A newly exported subject can carry the complete phased editor
+        // skeleton even when this machine has not observed any field
+        // metadata yet. Validate its shape without pretending pending
+        // bindings are real fields; Save/Enable will still require a repair.
+        const validationInput = isPendingPhasedDefaults(normalized)
+          ? { ...normalized, metadata: null }
+          : normalized;
+        validateSubjectConfig(validationInput);
       } catch (error) {
         if (error instanceof ApiError) {
           throw new ApiError(400, "INVALID_SHARE_CONFIGURATION", error.message);
@@ -490,6 +1013,16 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const next = validateSubjectConfig(normalized);
     next.metadata = metadata;
     return next;
+  };
+  const validateLifecycleSnapshot = (value, options = {}) => {
+    if (!isPendingPhasedDefaults(value)) return validate(value, options);
+    // Pending bindings are deliberately persisted so the editor can repair
+    // them. Lifecycle cleanup must still be able to disable/archive that
+    // draft without pretending the placeholders exist in Base metadata.
+    const structuralInput = { ...value, metadata: null };
+    const normalized = validate(structuralInput, options);
+    normalized.metadata = value.metadata;
+    return normalized;
   };
 
   function assertStrictPhasedAttachments(subject) {
@@ -802,7 +1335,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           for (const imported of base.subjects) {
             const existing = db.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(imported.subjectKey);
             const local = existing ? rowSubject(existing) : null;
-            const next = validateSubjectConfig({
+            const importedSubject = {
               ...imported,
               baseName: base.baseName,
               lifecycle: "draft",
@@ -817,7 +1350,29 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 artifactSourcePath: local?.upload?.artifactSourcePath ?? null,
                 targetPath: local?.upload?.targetPath ?? null,
               },
-            });
+              ...(imported.stages ? {
+                stages: Object.fromEntries(STAGE_IDS.map((stageId) => {
+                  const localStage = local?.stages?.[stageId];
+                  return [stageId, {
+                    ...imported.stages[stageId],
+                    artifactTargetPath: localStage?.artifactTargetPath
+                      ?? localStage?.artifact_target_path
+                      ?? null,
+                  }];
+                })),
+              } : {}),
+            };
+            if (importedSubject.stages) {
+              importedSubject.stages = projectLegacyUploadTarget(
+                importedSubject.stages,
+                importedSubject.upload,
+              );
+            }
+            const next = validateSubjectConfig(
+              isPendingPhasedDefaults(importedSubject)
+                ? { ...importedSubject, metadata: null }
+                : importedSubject,
+            );
             // A share file's metadata is only a portable preview.  Once this
             // Taskboard has observed the subject, keep its local snapshot
             // authoritative so a warned stale field cannot self-validate on
@@ -883,19 +1438,38 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             const existingConfig = rowSubject(existing);
             const namesChanged = existingConfig.baseName !== baseName || existingConfig.tableName !== tableName;
             const metadataChanged = JSON.stringify(existingConfig.metadata ?? {}) !== JSON.stringify(metadata);
-            if (namesChanged || metadataChanged) {
+            const phasedDefaultsNeeded = !hasCompletePhasedConfig(existingConfig)
+              || (isPendingPhasedDefaults(existingConfig) && (namesChanged || metadataChanged));
+            if (namesChanged || metadataChanged || phasedDefaultsNeeded) {
               // A metadata refresh changes the configuration snapshot.  Keep
               // the Bridge's last enabled snapshot active until the operator
               // explicitly validates and re-enables the refreshed draft.
-              const next = validateMetadataRefreshDraft({
-                ...existingConfig,
-                baseName,
-                tableName,
-                metadata,
-                lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
-                configVersion: existing.config_version + 1,
-                updatedAt: timestamp,
-              });
+              const next = phasedDefaultsNeeded
+                ? phasedDefaultsForSubject({
+                  ...existingConfig,
+                  baseToken,
+                  baseName,
+                  tableId,
+                  tableName,
+                  projectId: subjectProjectId(key),
+                  subjectKey: key,
+                  metadata,
+                  existing: existingConfig,
+                  lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
+                  configVersion: existing.config_version + 1,
+                  createdAt: existing.created_at,
+                  updatedAt: timestamp,
+                  validate,
+                })
+                : validateMetadataRefreshDraft({
+                  ...existingConfig,
+                  baseName,
+                  tableName,
+                  metadata,
+                  lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
+                  configVersion: existing.config_version + 1,
+                  updatedAt: timestamp,
+                });
               // Refresh must retain missing IDs as a repairable draft.  Strict
               // metadata binding checks remain at save/enable; this pass only
               // validates the already-persisted configuration structurally.
@@ -913,21 +1487,18 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             database.syncSourceProjectArchived(subjectProjectId(key), false, "feishu", db);
             database.restoreSourceWorkflowState(key, db);
           } else {
-            const initial = validate({
+            const initial = phasedDefaultsForSubject({
               subjectKey: key,
               baseToken,
               baseName,
               tableId,
               tableName,
               projectId: subjectProjectId(key),
-              displayEnabled: false,
-              lifecycle: "draft",
+              metadata,
               configVersion: 1,
-              trigger: { fieldId: "pending", fieldName: "待配置", startValue: "待配置", optionId: null },
-              title: { fieldId: null, fieldName: null },
-              execution: { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] },
-              packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
-              upload: { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 },
+              createdAt: timestamp,
+              updatedAt: timestamp,
+              validate,
             });
             db.prepare(`INSERT INTO feishu_subjects
               (subject_key, base_token, table_id, table_name, project_id, display_enabled, lifecycle, config_version, config_json, metadata_json, created_at, updated_at)
@@ -974,15 +1545,46 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         } catch (error) {
           throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
         }
-      const next = validate({
-          ...mergeObjects(rowSubject(current), changes),
+        const currentConfig = rowSubject(current);
+        const merged = {
+          ...mergeObjects(currentConfig, changes),
           subjectKey: key,
           baseToken: current.base_token,
           tableId: current.table_id,
           projectId: current.project_id,
           lifecycle: "draft",
           configVersion: current.config_version + 1,
-        }, { projectLegacyTrigger: true });
+        };
+        const phasedPatch = ["statusField", "documentField", "namingField", "stages"]
+          .some((field) => Object.hasOwn(rawChanges, field));
+        if (
+          !phasedPatch
+          && Object.hasOwn(rawChanges, "upload")
+          && isPhasedSubject(merged)
+          && typeof merged.upload.targetPath === "string"
+          && merged.upload.targetPath.trim() !== ""
+        ) {
+          // Legacy clients know only one upload destination. Keep that local
+          // path usable by both manual and automatic phased uploads.
+          merged.stages = projectLegacyUploadTarget(merged.stages, merged.upload);
+        }
+        let next;
+        if (isPendingPhasedDefaults(currentConfig) && !phasedPatch) {
+          // A newly imported table with no usable metadata still exposes the
+          // phased editor through its metadata fallback, but legacy callers
+          // may save non-binding fields before selecting phased bindings.
+          const phasedDefaults = {
+            statusField: clone(merged.statusField),
+            documentField: clone(merged.documentField),
+            namingField: clone(merged.namingField),
+            stages: clone(merged.stages),
+          };
+          for (const field of Object.keys(phasedDefaults)) delete merged[field];
+          next = validate(merged, { projectLegacyTrigger: false });
+          Object.assign(next, phasedDefaults);
+        } else {
+          next = validate(merged, { projectLegacyTrigger: Object.hasOwn(rawChanges, "stages") });
+        }
         assertStrictPhasedAttachments(next);
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
           .run(next.configVersion, JSON.stringify(next), next.displayEnabled === false ? 0 : 1, timestamp, key);
@@ -1060,7 +1662,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         }
         if (locked.lifecycle !== "disabled") {
           const expectedVersion = locked.config_version;
-          const disabled = validate({
+          const disabled = validateLifecycleSnapshot({
             ...rowSubject(locked),
             subjectKey: locked.subject_key,
             baseToken: locked.base_token,
@@ -1148,7 +1750,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           actualVersion: locked.config_version,
         });
       }
-        const next = validate({
+      const lifecycleCandidate = {
         ...rowSubject(locked),
         subjectKey: key,
         baseToken: locked.base_token,
@@ -1156,7 +1758,13 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         projectId: locked.project_id,
         lifecycle,
         configVersion: locked.config_version + 1,
-      }, { projectLegacyTrigger: lifecycle === "enabled" });
+      };
+      // Pending sentinels are a draft/cleanup compatibility mechanism only.
+      // Enabling always validates the real metadata snapshot so an unresolved
+      // subject can never become active or reach Bridge synchronization.
+      const next = lifecycle === "enabled"
+        ? validate(lifecycleCandidate, { projectLegacyTrigger: true })
+        : validateLifecycleSnapshot(lifecycleCandidate);
       if (typeof syncSubject === "function") {
         // Keep the local transaction open until Bridge accepts the same
         // validated snapshot.  A failed loopback sync rolls back the local

@@ -5,12 +5,12 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
-import { createFeishuWorkflowStore, subjectProjectId } from "../server/feishu-workflow-store.mjs";
+import { STAGE_IDS, createFeishuWorkflowStore, subjectProjectId } from "../server/feishu-workflow-store.mjs";
 
-async function fixture() {
+async function fixture(storeOptions = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-workflow-"));
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
-  const store = createFeishuWorkflowStore({ database });
+  const store = createFeishuWorkflowStore({ database, ...storeOptions });
   return { directory, database, store };
 }
 
@@ -55,6 +55,1844 @@ function phasedPreview({ attachmentField = { fieldId: "fld_audio", fieldName: "�
     }],
   };
 }
+
+function defaultTable({ tableId, tableName, prefix }) {
+  return {
+    tableId,
+    tableName,
+    fields: [
+      {
+        fieldId: `${prefix}_status`,
+        fieldName: `${tableName}流程状态`,
+        type: 3,
+        uiType: "SingleSelect",
+        options: [
+          { id: `${prefix}_draft`, name: `${prefix}初稿` },
+          { id: `${prefix}_first_review`, name: `${prefix}初审修改` },
+          { id: `${prefix}_final_review`, name: `${prefix}终审修改` },
+        ],
+      },
+      { fieldId: `${prefix}_document`, fieldName: `${tableName}素材文档`, type: 1, uiType: "Text", options: [] },
+      { fieldId: `${prefix}_naming`, fieldName: `${tableName}命名`, type: 1, uiType: "Text", options: [] },
+      { fieldId: `${prefix}_attachment`, fieldName: `${tableName}视频`, type: 17, uiType: "Attachment", options: [] },
+    ],
+  };
+}
+
+test("new tables receive complete phased defaults with independent field and option bindings", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const mathTable = defaultTable({ tableId: "tbl_math", tableName: "数学", prefix: "math" });
+    const historyTable = defaultTable({ tableId: "tbl_history", tableName: "历史", prefix: "history" });
+    const catalog = await store.upsertBasePreview({
+      ...preview(),
+      tables: [mathTable, historyTable],
+    });
+
+    assert.equal(catalog.subjects.length, 2);
+    for (const [subject, table, prefix] of [
+      [catalog.subjects.find((entry) => entry.tableId === "tbl_math"), mathTable, "math"],
+      [catalog.subjects.find((entry) => entry.tableId === "tbl_history"), historyTable, "history"],
+    ]) {
+      assert.equal(subject.lifecycle, "draft");
+      assert.deepEqual(subject.statusField, {
+        fieldId: `${prefix}_status`,
+        fieldName: `${table.tableName}流程状态`,
+      });
+      assert.deepEqual(subject.documentField, {
+        fieldId: `${prefix}_document`,
+        fieldName: `${table.tableName}素材文档`,
+      });
+      assert.deepEqual(subject.namingField, {
+        fieldId: `${prefix}_naming`,
+        fieldName: `${table.tableName}命名`,
+      });
+      assert.deepEqual(Object.keys(subject.stages), ["initial", "first_review", "final_review"]);
+
+      const expectedStages = [
+        ["initial", true, `${prefix}_draft`, `${prefix}初稿`, "_初稿"],
+        ["first_review", false, `${prefix}_first_review`, `${prefix}初审修改`, "_初审修改"],
+        ["final_review", false, `${prefix}_final_review`, `${prefix}终审修改`, "_终审修改"],
+      ];
+      for (const [stageId, enabled, optionId, value, nameSuffix] of expectedStages) {
+        assert.deepEqual(subject.stages[stageId], {
+          enabled,
+          trigger: {
+            fieldId: `${prefix}_status`,
+            fieldName: `${table.tableName}流程状态`,
+            optionId,
+            value,
+          },
+          videoSource: { kind: "docx_section", anchorText: "录屏" },
+          reviewSource: { kind: "docx_section", anchorText: "修改意见" },
+          audio: { mode: "video_original" },
+          artifactTargetPath: null,
+          nameSuffix,
+        });
+      }
+    }
+
+    const mathSubject = catalog.subjects.find((subject) => subject.tableId === "tbl_math");
+    const historySubject = catalog.subjects.find((subject) => subject.tableId === "tbl_history");
+    assert.notEqual(mathSubject.statusField.fieldId, historySubject.statusField.fieldId);
+    assert.notEqual(mathSubject.stages.initial.trigger.optionId, historySubject.stages.initial.trigger.optionId);
+    assert.equal(mathSubject.metadata.fields.some((field) => field.fieldId === "history_status"), false);
+    assert.equal(historySubject.metadata.fields.some((field) => field.fieldId === "math_status"), false);
+    assert.equal(database.database.prepare("SELECT COUNT(*) AS count FROM feishu_subjects").get().count, 2);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("status-only table keeps missing document and naming bindings pending and cannot be enabled", async () => {
+  let syncCalls = 0;
+  const { directory, database, store } = await fixture({
+    syncSubject: async () => { syncCalls += 1; },
+  });
+  try {
+    const catalog = await store.upsertBasePreview(preview());
+    const subject = catalog.subjects[0];
+
+    assert.deepEqual(subject.statusField, { fieldId: "fld_status", fieldName: "待制作" });
+    assert.deepEqual(subject.documentField, { fieldId: "pending_document_field", fieldName: "待配置" });
+    assert.deepEqual(subject.namingField, { fieldId: "pending_naming_field", fieldName: "待配置" });
+    assert.deepEqual(Object.keys(subject.stages), ["initial", "first_review", "final_review"]);
+
+    await assert.rejects(
+      () => store.enableSubject(subject.subjectKey, subject.configVersion),
+      (error) => ["FIELD_NOT_FOUND", "TRIGGER_FIELD_NOT_FOUND"].includes(error.code),
+    );
+    const unchanged = await store.getSubject(subject.subjectKey);
+    assert.equal(unchanged.lifecycle, "draft");
+    assert.equal(unchanged.configVersion, subject.configVersion);
+    assert.equal(syncCalls, 0);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a legacy subject upgrades it to phased defaults while preserving local settings", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_math", tableName: "数学", prefix: "legacy" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const legacyExecution = {
+      mode: "automatic",
+      concurrencyGroup: "legacy-group",
+      maxConcurrent: 3,
+      resourceGroups: ["legacy-cpu"],
+    };
+    const legacyPackageRoute = {
+      routeMode: "fixed",
+      packageAlias: "Legacy-Pack",
+      subjectCodeFieldId: null,
+      branchMap: { legacy: "Legacy-Branch" },
+    };
+    const legacyUpload = {
+      enqueueMode: "automatic",
+      artifactSourceMode: "watch_directory",
+      artifactSourcePath: "C:\\legacy\\input",
+      targetId: "legacy-target",
+      targetPath: "D:\\legacy\\output",
+      uploadConcurrency: 4,
+    };
+    const legacy = {
+      ...initial.subjects[0],
+      displayEnabled: true,
+      trigger: { fieldId: "legacy_status", fieldName: "数学流程状态", startValue: "legacy初稿", optionId: "legacy_draft" },
+      title: { fieldId: "legacy_title", fieldName: "旧标题" },
+      execution: legacyExecution,
+      packageRoute: legacyPackageRoute,
+      upload: legacyUpload,
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET display_enabled = ?, config_json = ? WHERE subject_key = ?")
+      .run(1, JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001000,
+      tables: [{
+        ...table,
+        tableName: "数学（刷新）",
+        fields: [...table.fields, { fieldId: "legacy_extra", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.equal(migrated.lifecycle, "draft");
+    assert.equal(migrated.configVersion, initial.subjects[0].configVersion + 1);
+    assert.equal(migrated.displayEnabled, true);
+    assert.deepEqual(migrated.trigger, legacy.trigger);
+    assert.deepEqual(migrated.title, legacy.title);
+    assert.deepEqual(migrated.execution, legacyExecution);
+    assert.deepEqual(migrated.packageRoute, legacyPackageRoute);
+    assert.deepEqual(migrated.upload, legacyUpload);
+    assert.deepEqual(migrated.statusField, { fieldId: "legacy_status", fieldName: "数学流程状态" });
+    assert.deepEqual(migrated.documentField, { fieldId: "legacy_document", fieldName: "数学素材文档" });
+    assert.deepEqual(migrated.namingField, { fieldId: "legacy_naming", fieldName: "数学命名" });
+    assert.equal(Object.keys(migrated.stages).length, 3);
+    assert.deepEqual(migrated.stages.initial.trigger, {
+      fieldId: "legacy_status",
+      fieldName: "数学流程状态",
+      optionId: "legacy_draft",
+      value: "legacy初稿",
+    });
+    assert.equal(migrated.stages.initial.artifactTargetPath, legacyUpload.targetPath);
+    const reenabled = await store.enableSubject(migrated.subjectKey, migrated.configVersion);
+    assert.equal(reenabled.lifecycle, "enabled");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration projects a retained manual upload target onto the enabled stage", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_manual_upload", tableName: "手动上传", prefix: "manual-upload" });
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const targetPath = "D:\\legacy-manual-upload";
+    const legacy = {
+      ...subject,
+      upload: {
+        ...subject.upload,
+        enqueueMode: "manual",
+        targetId: "legacy-manual-target",
+        targetPath,
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001100,
+      tables: [table],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.equal(migrated.upload.enqueueMode, "manual");
+    assert.equal(migrated.upload.targetPath, targetPath);
+    assert.equal(migrated.stages.initial.enabled, true);
+    assert.equal(migrated.stages.initial.artifactTargetPath, targetPath);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration keeps its uniquely matched trigger field and non-first option when re-enabled", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_legacy_trigger",
+      tableName: "旧触发配置",
+      fields: [
+        {
+          fieldId: "fld_unrelated_status",
+          fieldName: "无关状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [{ id: "opt_unrelated", name: "无关选项" }],
+        },
+        {
+          fieldId: "fld_legacy_status",
+          fieldName: "实际流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_legacy_other", name: "其他" },
+            { id: "opt_legacy_ready", name: "待剪辑" },
+            { id: "opt_legacy_review", name: "待审核" },
+          ],
+        },
+        { fieldId: "fld_legacy_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_legacy_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "fld_legacy_status",
+        fieldName: "实际流程状态",
+        startValue: "待剪辑",
+        optionId: "opt_legacy_ready",
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001250,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "fld_note", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.deepEqual(migrated.statusField, {
+      fieldId: "fld_legacy_status",
+      fieldName: "实际流程状态",
+    });
+    assert.deepEqual(migrated.stages.initial.trigger, {
+      fieldId: "fld_legacy_status",
+      fieldName: "实际流程状态",
+      optionId: "opt_legacy_ready",
+      value: "待剪辑",
+    });
+
+    const reenabled = await store.enableSubject(key, migrated.configVersion);
+    assert.deepEqual(reenabled.trigger, legacy.trigger);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration preserves snake_case trigger bindings", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_legacy_snake_trigger", tableName: "旧蛇形触发", prefix: "legacy-snake" });
+    table.fields[0].options = [
+      { id: "legacy-snake_other", name: "其他" },
+      { id: "legacy-snake_ready", name: "待剪辑" },
+      { id: "legacy-snake_final", name: "终审修改" },
+    ];
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        field_id: "legacy-snake_status",
+        field_name: "旧状态",
+        start_value: "待剪辑",
+        option_id: "legacy-snake_ready",
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001295,
+      tables: [table],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.deepEqual(migrated.statusField, {
+      fieldId: "legacy-snake_status",
+      fieldName: "旧蛇形触发流程状态",
+    });
+    assert.deepEqual(migrated.stages.initial.trigger, {
+      fieldId: "legacy-snake_status",
+      fieldName: "旧蛇形触发流程状态",
+      optionId: "legacy-snake_ready",
+      value: "待剪辑",
+    });
+    const reenabled = await store.enableSubject(key, migrated.configVersion);
+    assert.equal(reenabled.trigger.optionId, "legacy-snake_ready");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration refreshes the label of a uniquely matched option before re-enabling", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_legacy_renamed_option", tableName: "旧选项改名", prefix: "renamed-option" });
+    table.fields[0].options = [
+      { id: "renamed-option_other", name: "其他" },
+      { id: "renamed-option_ready", name: "新待剪辑" },
+      { id: "renamed-option_review", name: "待审核" },
+    ];
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "renamed-option_status",
+        fieldName: "旧状态名称",
+        startValue: "旧待剪辑",
+        optionId: "renamed-option_ready",
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001260,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "fld_rename_note", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.deepEqual(migrated.trigger, {
+      fieldId: "renamed-option_status",
+      fieldName: "旧选项改名流程状态",
+      startValue: "新待剪辑",
+      optionId: "renamed-option_ready",
+    });
+    const reenabled = await store.enableSubject(key, migrated.configVersion);
+    assert.equal(reenabled.lifecycle, "enabled");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration resolves a missing option id by one unique start value", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_legacy_value", tableName: "旧值触发", prefix: "legacy-value" });
+    table.fields[0].options = [
+      { id: "opt_other", name: "其他" },
+      { id: "opt_ready", name: "待剪辑" },
+      { id: "opt_review", name: "待审核" },
+    ];
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "legacy-value_status",
+        fieldName: "旧值触发流程状态",
+        startValue: "待剪辑",
+        optionId: null,
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001275,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "fld_value_note", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.equal(migrated.stages.initial.trigger.optionId, "opt_ready");
+    assert.equal(migrated.stages.initial.trigger.value, "待剪辑");
+    const reenabled = await store.enableSubject(key, migrated.configVersion);
+    assert.equal(reenabled.trigger.optionId, "opt_ready");
+    assert.equal(reenabled.trigger.startValue, "待剪辑");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration keeps an ambiguous start value repairable instead of guessing the first option", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_legacy_ambiguous", tableName: "旧歧义触发", prefix: "legacy-ambiguous" });
+    table.fields[0].options = [
+      { id: "opt_ready_a", name: "待剪辑" },
+      { id: "opt_ready_b", name: "待剪辑" },
+      { id: "opt_review", name: "待审核" },
+    ];
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "legacy-ambiguous_status",
+        fieldName: "旧歧义触发流程状态",
+        startValue: "待剪辑",
+        optionId: null,
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001285,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "fld_ambiguous_note", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.equal(migrated.stages.initial.trigger.optionId, "pending_initial_option");
+    assert.equal(migrated.stages.initial.trigger.value, "待剪辑");
+    assert.equal(migrated.trigger.optionId, "pending_initial_option");
+    await assert.rejects(
+      () => store.enableSubject(key, migrated.configVersion),
+      (error) => error.code === "TRIGGER_OPTION_NOT_FOUND" && error.status === 409,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy migration keeps a missing trigger field repairable instead of selecting another status field", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_legacy_missing", tableName: "旧缺失触发", prefix: "available" });
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "fld_removed_status",
+        fieldName: "已删除流程状态",
+        startValue: "待剪辑",
+        optionId: "opt_removed_ready",
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001290,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "fld_missing_note", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.deepEqual(migrated.statusField, {
+      fieldId: "fld_removed_status",
+      fieldName: "已删除流程状态",
+    });
+    assert.deepEqual(migrated.stages.initial.trigger, {
+      fieldId: "fld_removed_status",
+      fieldName: "已删除流程状态",
+      optionId: "opt_removed_ready",
+      value: "待剪辑",
+    });
+    await assert.rejects(
+      () => store.enableSubject(key, migrated.configVersion),
+      (error) => error.code === "TRIGGER_FIELD_NOT_FOUND" && error.status === 409,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a disabled legacy subject preserves disabled lifecycle while adding phased defaults", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_math", tableName: "数学", prefix: "legacy-disabled" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      lifecycle: "disabled",
+      trigger: { fieldId: "legacy_status", fieldName: "旧状态", startValue: "旧值", optionId: "legacy_draft" },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET lifecycle = ?, config_json = ? WHERE subject_key = ?")
+      .run("disabled", JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001500,
+      tables: [{
+        ...table,
+        tableName: "数学（停用刷新）",
+        fields: [...table.fields, { fieldId: "legacy_disabled_extra", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const migrated = refreshed.subjects[0];
+
+    assert.equal(migrated.lifecycle, "disabled");
+    assert.equal(migrated.configVersion, initial.subjects[0].configVersion + 1);
+    assert.equal(Object.keys(migrated.stages).length, 3);
+    assert.deepEqual(migrated.statusField, { fieldId: "legacy_status", fieldName: "旧状态" });
+    assert.deepEqual(migrated.stages.initial.trigger, {
+      fieldId: "legacy_status",
+      fieldName: "旧状态",
+      optionId: "legacy_draft",
+      value: "旧值",
+    });
+    await assert.rejects(
+      () => store.enableSubject(key, migrated.configVersion),
+      (error) => error.code === "TRIGGER_FIELD_NOT_FOUND" && error.status === 409,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a partial phased subject fills missing bindings without discarding existing stage settings", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_partial", tableName: "部分配置", prefix: "partial" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const partial = {
+      ...initial.subjects[0],
+      statusField: { fieldId: "partial_status", fieldName: "旧状态字段名" },
+      stages: {
+        initial: {
+          ...initial.subjects[0].stages.initial,
+          enabled: true,
+          nameSuffix: "_保留后缀",
+        },
+      },
+    };
+    delete partial.documentField;
+    delete partial.namingField;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ?, metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), JSON.stringify({ fields: table.fields }), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001800,
+      tables: [{
+        ...table,
+        tableName: "部分配置（刷新）",
+        fields: [...table.fields, { fieldId: "partial_notes", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.statusField, partial.statusField);
+    assert.deepEqual(repaired.documentField, { fieldId: "partial_document", fieldName: "部分配置素材文档" });
+    assert.deepEqual(repaired.namingField, { fieldId: "partial_naming", fieldName: "部分配置命名" });
+    assert.equal(Object.keys(repaired.stages).length, 3);
+    assert.equal(repaired.stages.initial.nameSuffix, "_保留后缀");
+    assert.equal(repaired.stages.first_review.trigger.fieldName, "旧状态字段名");
+    assert.equal(repaired.stages.final_review.trigger.fieldName, "旧状态字段名");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a structurally complete but incomplete stage repairs its nested defaults", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_nested_partial", tableName: "嵌套配置", prefix: "nested" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const partial = {
+      ...initial.subjects[0],
+      stages: {
+        ...initial.subjects[0].stages,
+        first_review: {
+          enabled: false,
+        },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ?, metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), JSON.stringify({ fields: table.fields }), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001850,
+      tables: [{
+        ...table,
+        tableName: "嵌套配置（刷新）",
+        fields: [...table.fields, { fieldId: "nested_notes", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.equal(repaired.tableName, "嵌套配置（刷新）");
+    assert.deepEqual(repaired.stages.first_review, {
+      ...initial.subjects[0].stages.first_review,
+      enabled: false,
+    });
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a malformed phased descriptor falls back to metadata defaults", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_malformed_descriptor", tableName: "描述符配置", prefix: "descriptor" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const malformed = {
+      ...initial.subjects[0],
+      statusField: {},
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ?, metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(malformed), JSON.stringify({ fields: table.fields }), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001860,
+      tables: [{ ...table, tableName: "描述符配置（刷新）" }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.statusField, {
+      fieldId: "descriptor_status",
+      fieldName: "描述符配置流程状态",
+    });
+    assert.equal(repaired.tableName, "描述符配置（刷新）");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const [descriptorKey, malformedName] of [
+  ["statusField", ""],
+  ["documentField", null],
+  ["namingField", "   "],
+]) {
+  test(`refreshing ${descriptorKey} with a valid id but missing name rebuilds it from table metadata`, async () => {
+    const { directory, database, store } = await fixture();
+    try {
+      const table = defaultTable({
+        tableId: `tbl_missing_${descriptorKey}`,
+        tableName: "字段名修复",
+        prefix: `missing-${descriptorKey}`,
+      });
+      const initial = await store.upsertBasePreview({
+        ...preview(),
+        tables: [table],
+      });
+      const key = initial.subjects[0].subjectKey;
+      const malformed = {
+        ...initial.subjects[0],
+        [descriptorKey]: {
+          ...initial.subjects[0][descriptorKey],
+          fieldName: malformedName,
+        },
+      };
+      database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+        .run(JSON.stringify(malformed), key);
+
+      const refreshed = await store.upsertBasePreview({
+        ...preview(),
+        metadataRefreshedAt: 1710000001862,
+        tables: [table],
+      });
+      const repaired = refreshed.subjects[0];
+      const expectedFieldId = initial.subjects[0][descriptorKey].fieldId;
+      const metadataField = table.fields.find((field) => (
+        field.fieldId === expectedFieldId
+      ));
+
+      assert.deepEqual(repaired[descriptorKey], {
+        fieldId: expectedFieldId,
+        fieldName: metadataField.fieldName,
+      });
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("refreshing a malformed status descriptor derives it from consistent stage triggers", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_mismatched_trigger", tableName: "状态触发配置", prefix: "mismatch" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const malformed = {
+      ...initial.subjects[0],
+      statusField: { fieldId: "", fieldName: "" },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ?, metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(malformed), JSON.stringify({ fields: table.fields }), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001867,
+      tables: [{ ...table, tableName: "状态触发配置（刷新）" }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    for (const stage of Object.values(repaired.stages)) {
+      assert.equal(stage.trigger.fieldId, "mismatch_status");
+      assert.equal(stage.trigger.fieldName, "状态触发配置流程状态");
+    }
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a superficially complete but invalid phased descriptor repairs its values", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_invalid_descriptor", tableName: "非法描述符", prefix: "invalid" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const malformed = {
+      ...initial.subjects[0],
+      statusField: { fieldId: null, fieldName: null },
+      stages: {
+        ...initial.subjects[0].stages,
+        initial: {
+          ...initial.subjects[0].stages.initial,
+          nameSuffix: "",
+        },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ?, metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(malformed), JSON.stringify({ fields: table.fields }), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001865,
+      tables: [{ ...table, tableName: "非法描述符（刷新）" }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.statusField, {
+      fieldId: "invalid_status",
+      fieldName: "非法描述符流程状态",
+    });
+    assert.equal(repaired.stages.initial.nameSuffix, "_初稿");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a stage missing nested source settings preserves its valid custom fields", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_malformed_stage", tableName: "阶段配置", prefix: "stage" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const malformedStage = { ...initial.subjects[0].stages.first_review };
+    delete malformedStage.videoSource;
+    const malformed = {
+      ...initial.subjects[0],
+      stages: {
+        ...initial.subjects[0].stages,
+        first_review: { ...malformedStage, nameSuffix: "_保留阶段后缀" },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ?, metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(malformed), JSON.stringify({ fields: table.fields }), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001870,
+      tables: [{ ...table, tableName: "阶段配置（刷新）" }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.stages.first_review.videoSource, {
+      kind: "docx_section",
+      anchorText: "录屏",
+    });
+    assert.equal(repaired.stages.first_review.nameSuffix, "_保留阶段后缀");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("tables without a usable status field keep the legacy lifecycle removable and restorable", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [{ tableId: "tbl_empty", tableName: "待配置学科", fields: [] }],
+    });
+    const subject = initial.subjects[0];
+
+    await store.removeSubject(subject.subjectKey);
+    assert.deepEqual((await store.listCatalog())[0].subjects, []);
+
+    const restored = await store.upsertBasePreview({
+      ...preview(),
+      tables: [{ tableId: "tbl_empty", tableName: "待配置学科", fields: [] }],
+    });
+    assert.equal(restored.subjects[0].subjectKey, subject.subjectKey);
+    assert.equal(restored.subjects[0].lifecycle, "disabled");
+    assert.equal(database.getProject(subject.projectId).archivedAt, null);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("pending phased defaults bind to table metadata when a later refresh provides usable fields", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const empty = await store.upsertBasePreview({
+      ...preview(),
+      tables: [{ tableId: "tbl_pending", tableName: "稍后配置", fields: [] }],
+    });
+    const pending = empty.subjects[0];
+    assert.equal(pending.statusField.fieldId, "pending_status_field");
+    assert.equal(pending.stages.initial.trigger.optionId, "pending_initial_option");
+
+    const table = defaultTable({ tableId: "tbl_pending", tableName: "稍后配置", prefix: "later" });
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001900,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.statusField, { fieldId: "later_status", fieldName: "稍后配置流程状态" });
+    assert.deepEqual(repaired.documentField, { fieldId: "later_document", fieldName: "稍后配置素材文档" });
+    assert.deepEqual(repaired.namingField, { fieldId: "later_naming", fieldName: "稍后配置命名" });
+    assert.deepEqual(repaired.stages.initial.trigger, {
+      fieldId: "later_status",
+      fieldName: "稍后配置流程状态",
+      optionId: "later_draft",
+      value: "later初稿",
+    });
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a legacy subject replaces a malformed trigger with the derived initial stage trigger", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_malformed_legacy", tableName: "旧配置修复", prefix: "legacy-repair" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const legacy = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "legacy-repair_status",
+        fieldName: "",
+        startValue: "   ",
+        optionId: "legacy-repair_draft",
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001950,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.trigger, {
+      fieldId: "legacy-repair_status",
+      fieldName: "旧配置修复流程状态",
+      startValue: "legacy-repair初稿",
+      optionId: "legacy-repair_draft",
+    });
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing an old pending trigger derives it from the first enabled stage", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_old_pending", tableName: "旧占位配置", prefix: "old-pending" });
+    const initial = await store.upsertBasePreview({
+      ...preview(),
+      tables: [table],
+    });
+    const key = initial.subjects[0].subjectKey;
+    const pending = {
+      ...initial.subjects[0],
+      trigger: {
+        fieldId: "pending",
+        fieldName: "待配置",
+        startValue: "待配置",
+        optionId: null,
+      },
+      stages: {
+        ...initial.subjects[0].stages,
+        initial: { ...initial.subjects[0].stages.initial, enabled: false },
+        first_review: { ...initial.subjects[0].stages.first_review, enabled: true },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(pending), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000001975,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "old-pending_note", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.equal(repaired.stages.initial.enabled, false);
+    assert.equal(repaired.stages.first_review.enabled, true);
+    assert.deepEqual(repaired.trigger, {
+      fieldId: "old-pending_status",
+      fieldName: "旧占位配置流程状态",
+      startValue: "old-pending初审修改",
+      optionId: "old-pending_first_review",
+    });
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("importing a legacy shared subject creates a complete phased draft on a new machine", async () => {
+  const source = await fixture();
+  const target = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_shared_legacy", tableName: "共享旧配置", prefix: "shared-legacy" });
+    await source.store.upsertBasePreview({
+      ...preview(),
+      baseToken: "bas_shared_legacy",
+      tables: [table],
+    });
+    const configuration = await source.store.exportShareable();
+    const legacy = configuration.bases[0].subjects[0];
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+
+    const dryRun = await target.store.importShareable(configuration, { dryRun: true });
+    const previewSubject = dryRun.configuration.bases[0].subjects[0];
+    assert.deepEqual(Object.keys(previewSubject.stages), ["initial", "first_review", "final_review"]);
+    assert.deepEqual(previewSubject.statusField, {
+      fieldId: "shared-legacy_status",
+      fieldName: "共享旧配置流程状态",
+    });
+
+    const committed = await target.store.importShareable(configuration);
+    const imported = committed.catalog[0].subjects[0];
+    assert.equal(imported.lifecycle, "draft");
+    assert.deepEqual(Object.keys(imported.stages), ["initial", "first_review", "final_review"]);
+    assert.deepEqual(imported.documentField, {
+      fieldId: "shared-legacy_document",
+      fieldName: "共享旧配置素材文档",
+    });
+    assert.deepEqual(imported.namingField, {
+      fieldId: "shared-legacy_naming",
+      fieldName: "共享旧配置命名",
+    });
+  } finally {
+    source.database.close();
+    target.database.close();
+    await rm(source.directory, { recursive: true, force: true });
+    await rm(target.directory, { recursive: true, force: true });
+  }
+});
+
+test("importing a legacy shared subject with null phased keys creates a complete phased draft", async () => {
+  const source = await fixture();
+  const target = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_shared_null_legacy", tableName: "共享空旧配置", prefix: "shared-null" });
+    await source.store.upsertBasePreview({
+      ...preview(),
+      baseToken: "bas_shared_null_legacy",
+      tables: [table],
+    });
+    const configuration = await source.store.exportShareable();
+    const legacy = configuration.bases[0].subjects[0];
+    legacy.statusField = null;
+    legacy.documentField = null;
+    legacy.namingField = null;
+    legacy.stages = null;
+
+    const dryRun = await target.store.importShareable(configuration, { dryRun: true });
+    const previewSubject = dryRun.configuration.bases[0].subjects[0];
+    assert.deepEqual(Object.keys(previewSubject.stages), ["initial", "first_review", "final_review"]);
+    assert.deepEqual(previewSubject.statusField, {
+      fieldId: "shared-null_status",
+      fieldName: "共享空旧配置流程状态",
+    });
+
+    const committed = await target.store.importShareable(configuration);
+    const imported = committed.catalog[0].subjects[0];
+    assert.equal(imported.lifecycle, "draft");
+    assert.deepEqual(Object.keys(imported.stages), ["initial", "first_review", "final_review"]);
+    assert.deepEqual(imported.documentField, {
+      fieldId: "shared-null_document",
+      fieldName: "共享空旧配置素材文档",
+    });
+    assert.deepEqual(imported.namingField, {
+      fieldId: "shared-null_naming",
+      fieldName: "共享空旧配置命名",
+    });
+  } finally {
+    source.database.close();
+    target.database.close();
+    await rm(source.directory, { recursive: true, force: true });
+    await rm(target.directory, { recursive: true, force: true });
+  }
+});
+
+test("explicit phased share rejects an unknown stage instead of silently repairing it", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_strict_share", tableName: "严格共享", prefix: "strict-share" });
+    await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const configuration = await store.exportShareable();
+    configuration.bases[0].subjects[0].stages.unexpected = { enabled: false };
+
+    await assert.rejects(
+      () => store.importShareable(configuration, { dryRun: true }),
+      (error) => error.code === "INVALID_SHARE_CONFIGURATION" && error.status === 400,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy share import preserves a trigger on the second single-select field and a non-first option", async () => {
+  const source = await fixture();
+  const target = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_legacy_trigger",
+      tableName: "旧触发器",
+      fields: [
+        {
+          fieldId: "fld_decoy_status",
+          fieldName: "无关状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [{ id: "opt_decoy", name: "无关选项" }],
+        },
+        {
+          fieldId: "fld_real_status",
+          fieldName: "制作进度",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_other", name: "其他" },
+            { id: "opt_ready", name: "待剪辑" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    await source.store.upsertBasePreview({
+      ...preview(),
+      baseToken: "bas_legacy_trigger",
+      tables: [table],
+    });
+    const configuration = await source.store.exportShareable();
+    const legacy = configuration.bases[0].subjects[0];
+    legacy.trigger = {
+      fieldId: "fld_real_status",
+      fieldName: "制作进度",
+      startValue: "待剪辑",
+      optionId: "opt_ready",
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+
+    const imported = await target.store.importShareable(configuration, { dryRun: true });
+    const subject = imported.configuration.bases[0].subjects[0];
+    assert.deepEqual(subject.statusField, {
+      fieldId: "fld_real_status",
+      fieldName: "制作进度",
+    });
+    assert.deepEqual(subject.stages.initial.trigger, {
+      fieldId: "fld_real_status",
+      fieldName: "制作进度",
+      optionId: "opt_ready",
+      value: "待剪辑",
+    });
+  } finally {
+    source.database.close();
+    target.database.close();
+    await rm(source.directory, { recursive: true, force: true });
+    await rm(target.directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing a partial phased subject derives stage options from its persisted status field", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_partial_status",
+      tableName: "部分阶段配置",
+      fields: [
+        {
+          fieldId: "fld_decoy_status",
+          fieldName: "无关状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_decoy_a", name: "无关 A" },
+            { id: "opt_decoy_b", name: "无关 B" },
+            { id: "opt_decoy_c", name: "无关 C" },
+          ],
+        },
+        {
+          fieldId: "fld_real_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_real_initial", name: "初稿" },
+            { id: "opt_real_review", name: "初审修改" },
+            { id: "opt_real_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const partial = {
+      ...subject,
+      statusField: { fieldId: "fld_real_status", fieldName: "流程状态" },
+      documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+      namingField: { fieldId: "fld_naming", fieldName: "命名" },
+      trigger: {
+        fieldId: "fld_real_status",
+        fieldName: "流程状态",
+        startValue: "初稿",
+        optionId: "opt_real_initial",
+      },
+    };
+    delete partial.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003200,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+    assert.deepEqual(repaired.statusField, { fieldId: "fld_real_status", fieldName: "流程状态" });
+    assert.deepEqual(
+      ["initial", "first_review", "final_review"].map((stageId) => repaired.stages[stageId].trigger.optionId),
+      ["opt_real_initial", "opt_real_review", "opt_real_final"],
+    );
+    assert.ok(Object.values(repaired.stages).every((stage) => stage.trigger.fieldId === "fld_real_status"));
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing missing stages preserves a non-first top-level trigger as the initial phase", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_partial_nonfirst_option",
+      tableName: "部分非首选项",
+      fields: [
+        {
+          fieldId: "fld_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_other", name: "其他" },
+            { id: "opt_ready", name: "待剪辑" },
+            { id: "opt_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const partial = {
+      ...subject,
+      trigger: {
+        fieldId: "fld_status",
+        fieldName: "流程状态",
+        startValue: "待剪辑",
+        optionId: "opt_ready",
+      },
+    };
+    delete partial.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003250,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+    assert.deepEqual(repaired.stages.initial.trigger, {
+      fieldId: "fld_status",
+      fieldName: "流程状态",
+      optionId: "opt_ready",
+      value: "待剪辑",
+    });
+
+    const enabled = await store.enableSubject(repaired.subjectKey, repaired.configVersion);
+    assert.equal(enabled.trigger.optionId, "opt_ready");
+    assert.equal(enabled.trigger.startValue, "待剪辑");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing a partial phased subject derives a missing status field from its existing triggers", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_partial_trigger_status",
+      tableName: "缺少状态绑定",
+      fields: [
+        {
+          fieldId: "fld_decoy_status",
+          fieldName: "无关状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_decoy_initial", name: "无关初稿" },
+            { id: "opt_decoy_review", name: "无关初审" },
+            { id: "opt_decoy_final", name: "无关终审" },
+          ],
+        },
+        {
+          fieldId: "fld_real_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_real_initial", name: "初稿" },
+            { id: "opt_real_review", name: "初审修改" },
+            { id: "opt_real_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const optionByStage = {
+      initial: ["opt_real_initial", "初稿"],
+      first_review: ["opt_real_review", "初审修改"],
+      final_review: ["opt_real_final", "终审修改"],
+    };
+    const partial = {
+      ...subject,
+      trigger: {
+        fieldId: "fld_real_status",
+        fieldName: "流程状态",
+        startValue: "初稿",
+        optionId: "opt_real_initial",
+      },
+      documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+      namingField: { fieldId: "fld_naming", fieldName: "命名" },
+      stages: Object.fromEntries(STAGE_IDS.map((stageId) => [stageId, {
+        ...subject.stages[stageId],
+        trigger: {
+          fieldId: "fld_real_status",
+          fieldName: "流程状态",
+          optionId: optionByStage[stageId][0],
+          value: optionByStage[stageId][1],
+        },
+      }])),
+    };
+    delete partial.statusField;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003300,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.statusField, { fieldId: "fld_real_status", fieldName: "流程状态" });
+    assert.ok(Object.values(repaired.stages).every((stage) => stage.trigger.fieldId === "fld_real_status"));
+    assert.deepEqual(
+      STAGE_IDS.map((stageId) => repaired.stages[stageId].trigger.optionId),
+      ["opt_real_initial", "opt_real_review", "opt_real_final"],
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing a missing status field stays pending when persisted trigger fields disagree", async () => {
+  let syncCalls = 0;
+  const { directory, database, store } = await fixture({
+    syncSubject: async () => { syncCalls += 1; },
+  });
+  try {
+    const table = {
+      tableId: "tbl_conflicting_trigger_fields",
+      tableName: "冲突触发字段",
+      fields: [
+        {
+          fieldId: "fld_live_status",
+          fieldName: "当前流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_live", name: "初稿" },
+            { id: "opt_live_review", name: "初审修改" },
+            { id: "opt_live_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const partial = {
+      ...subject,
+      trigger: {
+        fieldId: "fld_live_status",
+        fieldName: "当前流程状态",
+        startValue: "初稿",
+        optionId: "opt_live",
+      },
+      stages: {
+        ...subject.stages,
+        initial: {
+          ...subject.stages.initial,
+          trigger: {
+            fieldId: "fld_removed_status",
+            fieldName: "已删除流程状态",
+            optionId: "opt_removed",
+            value: "旧初稿",
+          },
+        },
+      },
+    };
+    delete partial.statusField;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003350,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.equal(repaired.statusField.fieldId, "pending_status_field");
+    assert.equal(repaired.stages.initial.trigger.fieldId, "pending_status_field");
+    assert.equal(repaired.stages.initial.trigger.optionId, "pending_initial_option");
+    await assert.rejects(
+      () => store.enableSubject(repaired.subjectKey, repaired.configVersion),
+      (error) => ["FIELD_NOT_FOUND", "TRIGGER_FIELD_NOT_FOUND"].includes(error.code),
+    );
+    assert.equal(syncCalls, 0);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing an initial stage without a usable trigger preserves the top-level trigger", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_partial_initial_trigger",
+      tableName: "缺少初稿触发器",
+      fields: [
+        {
+          fieldId: "fld_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_other", name: "其他" },
+            { id: "opt_ready", name: "待剪辑" },
+            { id: "opt_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const partial = {
+      ...subject,
+      trigger: {
+        fieldId: "fld_status",
+        fieldName: "流程状态",
+        startValue: "待剪辑",
+        optionId: "opt_ready",
+      },
+      stages: {
+        ...subject.stages,
+        initial: { enabled: true },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(partial), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003400,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.stages.initial.trigger, {
+      fieldId: "fld_status",
+      fieldName: "流程状态",
+      optionId: "opt_ready",
+      value: "待剪辑",
+    });
+    const enabled = await store.enableSubject(repaired.subjectKey, repaired.configVersion);
+    assert.equal(enabled.trigger.optionId, "opt_ready");
+    assert.equal(enabled.trigger.startValue, "待剪辑");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing a stale initial trigger does not reroute a valid top-level trigger", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_stale_initial_trigger",
+      tableName: "初稿触发器过期",
+      fields: [
+        {
+          fieldId: "fld_live_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_first", name: "初稿" },
+            { id: "opt_second", name: "待剪辑" },
+            { id: "opt_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const stale = {
+      ...subject,
+      trigger: {
+        fieldId: "fld_live_status",
+        fieldName: "流程状态",
+        startValue: "待剪辑",
+        optionId: "opt_second",
+      },
+      stages: {
+        ...subject.stages,
+        initial: {
+          ...subject.stages.initial,
+          trigger: {
+            fieldId: "fld_removed_status",
+            fieldName: "已删除流程状态",
+            optionId: "opt_removed",
+            value: "旧初稿",
+          },
+        },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(stale), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003450,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.deepEqual(repaired.stages.initial.trigger, {
+      fieldId: "fld_live_status",
+      fieldName: "流程状态",
+      optionId: "opt_second",
+      value: "待剪辑",
+    });
+    const enabled = await store.enableSubject(repaired.subjectKey, repaired.configVersion);
+    assert.equal(enabled.trigger.optionId, "opt_second");
+    assert.equal(enabled.trigger.startValue, "待剪辑");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("repairing stale top-level and initial triggers stays blocked instead of choosing the first option", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_stale_all_triggers",
+      tableName: "全部触发器过期",
+      fields: [
+        {
+          fieldId: "fld_live_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_first", name: "初稿" },
+            { id: "opt_second", name: "待剪辑" },
+            { id: "opt_final", name: "终审修改" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = initial.subjects[0];
+    const stale = {
+      ...subject,
+      trigger: {
+        fieldId: "fld_removed_status",
+        fieldName: "已删除流程状态",
+        startValue: "旧初稿",
+        optionId: "opt_removed",
+      },
+      stages: {
+        ...subject.stages,
+        initial: {
+          ...subject.stages.initial,
+          trigger: {
+            fieldId: "fld_removed_status",
+            fieldName: "已删除流程状态",
+            optionId: "opt_removed",
+            value: "旧初稿",
+          },
+        },
+      },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(stale), subject.subjectKey);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003460,
+      tables: [table],
+    });
+    const repaired = refreshed.subjects[0];
+
+    assert.equal(repaired.stages.initial.trigger.optionId, "pending_initial_option");
+    assert.notEqual(repaired.stages.initial.trigger.optionId, "opt_first");
+    await assert.rejects(
+      () => store.enableSubject(repaired.subjectKey, repaired.configVersion),
+      (error) => error.code === "TRIGGER_OPTION_NOT_FOUND" && error.status === 409,
+    );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("enabling a phased draft with pending bindings fails before Bridge synchronization", async () => {
+  let syncCalls = 0;
+  const { directory, database, store } = await fixture({
+    syncSubject: async () => { syncCalls += 1; },
+  });
+  try {
+    const table = defaultTable({ tableId: "tbl_pending_enable", tableName: "待修复", prefix: "pending-enable" });
+    const catalog = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = catalog.subjects[0];
+    const pending = {
+      ...subject,
+      documentField: { fieldId: "pending_document_field", fieldName: "待配置" },
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(pending), subject.subjectKey);
+
+    await assert.rejects(
+      () => store.enableSubject(subject.subjectKey, subject.configVersion),
+      (error) => {
+        assert.equal(error.code, "FIELD_NOT_FOUND");
+        return true;
+      },
+    );
+    const unchanged = await store.getSubject(subject.subjectKey);
+    assert.equal(unchanged.lifecycle, "draft");
+    assert.equal(unchanged.configVersion, subject.configVersion);
+    assert.equal(syncCalls, 0);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy share import projects the retained local upload target onto enabled stages", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_legacy_upload", tableName: "旧上传配置", prefix: "legacy-upload" });
+    const catalog = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = catalog.subjects[0];
+    const targetPath = "D:\\local\\legacy-upload";
+    const legacy = {
+      ...subject,
+      upload: {
+        ...subject.upload,
+        enqueueMode: "automatic",
+        targetId: "local-target",
+        targetPath,
+      },
+    };
+    delete legacy.statusField;
+    delete legacy.documentField;
+    delete legacy.namingField;
+    delete legacy.stages;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), subject.subjectKey);
+
+    const shared = await store.exportShareable();
+    assert.equal(shared.bases[0].subjects[0].upload.targetPath, null);
+    const committed = await store.importShareable(shared);
+    const imported = committed.catalog[0].subjects[0];
+    assert.equal(imported.upload.targetPath, targetPath);
+    assert.equal(imported.stages.initial.artifactTargetPath, targetPath);
+    const enabled = await store.enableSubject(imported.subjectKey, imported.configVersion);
+    assert.equal(enabled.lifecycle, "enabled");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share export strips legacy snake-case stage destination paths", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_snake_export", tableName: "旧路径键", prefix: "snake-export" });
+    const catalog = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = catalog.subjects[0];
+    const legacy = structuredClone(subject);
+    delete legacy.stages.initial.artifactTargetPath;
+    legacy.stages.initial.artifact_target_path = "D:\\private\\snake-export";
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), subject.subjectKey);
+
+    const exported = await store.exportShareable();
+    const serialized = JSON.stringify(exported);
+    assert.doesNotMatch(serialized, /artifact_target_path/u);
+    assert.doesNotMatch(serialized, /D:\\\\private/u);
+    assert.equal(exported.bases[0].subjects[0].stages.initial.artifactTargetPath, null);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import preserves a legacy snake-case stage destination only on its local subject", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_snake_local", tableName: "本机旧路径", prefix: "snake-local" });
+    const catalog = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const subject = catalog.subjects[0];
+    const targetPath = "D:\\private\\local-stage";
+    const legacy = structuredClone(subject);
+    delete legacy.stages.initial.artifactTargetPath;
+    legacy.stages.initial.artifact_target_path = targetPath;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), subject.subjectKey);
+
+    const shared = await store.exportShareable();
+    assert.doesNotMatch(JSON.stringify(shared), /local-stage/u);
+    const imported = await store.importShareable(shared);
+    assert.equal(imported.catalog[0].subjects[0].stages.initial.artifactTargetPath, targetPath);
+    assert.equal(imported.catalog[0].subjects[0].stages.initial.artifact_target_path, undefined);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 function phasedStage(stageId, optionId, value) {
   return {
@@ -217,7 +2055,7 @@ test("refreshing an enabled subject demotes it to draft until it is re-enabled",
     syncSubject: async (subject, options) => calls.push({ subject, options }),
   });
   try {
-    await store.upsertBasePreview(preview());
+    await store.upsertBasePreview(phasedPreview());
     const draft = await store.saveSubjectDraft("bas_demo:tbl_math", subjectPatch());
     const enabled = await store.enableSubject("bas_demo:tbl_math", draft.configVersion);
     assert.equal(enabled.lifecycle, "enabled");
@@ -667,11 +2505,16 @@ test("database Feishu archive reports a missing task as TASK_NOT_FOUND", async (
 test("subject draft save increments version and enable/disable use optimistic checks", async () => {
   const { directory, database, store } = await fixture();
   try {
-    await store.upsertBasePreview(preview());
+    await store.upsertBasePreview(phasedPreview());
     const key = "bas_demo:tbl_math";
     const draft = await store.saveSubjectDraft(key, subjectPatch());
     assert.equal(draft.lifecycle, "draft");
     assert.equal(draft.configVersion, 2);
+    // A legacy-shaped patch must not make a newly imported table lose its
+    // complete phased editor configuration; those phase keys remain
+    // persisted with bindings derived from this table only.
+    assert.deepEqual(draft.statusField, { fieldId: "fld_status", fieldName: "待制作" });
+    assert.deepEqual(Object.keys(draft.stages), ["initial", "first_review", "final_review"]);
     const enabled = await store.enableSubject(key, draft.configVersion);
     assert.equal(enabled.lifecycle, "enabled");
     assert.equal(enabled.configVersion, 3);
@@ -683,6 +2526,193 @@ test("subject draft save increments version and enable/disable use optimistic ch
     assert.equal(disabled.lifecycle, "disabled");
     assert.equal(disabled.configVersion, 4);
     assert.equal(database.database.prepare("SELECT COUNT(*) AS count FROM feishu_subject_versions").get().count, 4);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy upload patches bind a missing initial stage destination without removing phased config", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const key = "bas_demo:tbl_math";
+    const configured = await store.saveSubjectDraft(key, subjectPatch());
+    const enabled = await store.enableSubject(key, configured.configVersion);
+    const targetPath = "D:\\legacy-upload-target";
+
+    const draft = await store.saveSubjectDraft(key, {
+      expectedVersion: enabled.configVersion,
+      upload: {
+        ...enabled.upload,
+        enqueueMode: "automatic",
+        targetId: "legacy-target",
+        targetPath,
+      },
+    });
+
+    assert.deepEqual(Object.keys(draft.stages), ["initial", "first_review", "final_review"]);
+    assert.equal(draft.stages.initial.artifactTargetPath, targetPath);
+    const reenabled = await store.enableSubject(key, draft.configVersion);
+    assert.equal(reenabled.lifecycle, "enabled");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy manual upload patches bind the subject target to the enabled phase", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const key = "bas_demo:tbl_math";
+    const configured = await store.saveSubjectDraft(key, subjectPatch());
+    const targetPath = "D:\\legacy-manual-target";
+
+    const draft = await store.saveSubjectDraft(key, {
+      expectedVersion: configured.configVersion,
+      upload: {
+        ...configured.upload,
+        enqueueMode: "manual",
+        targetId: "legacy-manual-target",
+        targetPath,
+      },
+    });
+
+    assert.equal(draft.upload.enqueueMode, "manual");
+    assert.equal(draft.stages.initial.artifactTargetPath, targetPath);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy upload patches retain their projected destination through pending refresh", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const empty = await store.upsertBasePreview({
+      ...preview(),
+      tables: [{ tableId: "tbl_pending_upload", tableName: "待配置上传", fields: [] }],
+    });
+    const key = empty.subjects[0].subjectKey;
+    const targetPath = "D:\\pending-upload-target";
+    const draft = await store.saveSubjectDraft(key, {
+      upload: {
+        ...empty.subjects[0].upload,
+        enqueueMode: "automatic",
+        targetId: "pending-target",
+        targetPath,
+      },
+    });
+    assert.equal(draft.stages.initial.artifactTargetPath, targetPath);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      tables: [{
+        tableId: "tbl_pending_upload",
+        tableName: "待配置上传",
+        fields: [
+          { fieldId: "pending_status", fieldName: "流程", type: 3, uiType: "SingleSelect", options: [
+            { id: "pending_initial", name: "初稿" },
+            { id: "pending_review", name: "初审修改" },
+            { id: "pending_final", name: "终审修改" },
+          ] },
+          { fieldId: "pending_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+          { fieldId: "pending_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+        ],
+      }],
+    });
+    assert.equal(refreshed.subjects[0].stages.initial.artifactTargetPath, targetPath);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("metadata refresh preserves real field and option ids that begin with pending", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = {
+      tableId: "tbl_real_pending_ids",
+      tableName: "真实 pending 标识",
+      fields: [
+        {
+          fieldId: "pending_status",
+          fieldName: "流程",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "pending_a", name: "初稿" },
+            { id: "pending_b", name: "待剪辑" },
+            { id: "pending_c", name: "终审" },
+          ],
+        },
+        { fieldId: "pending_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "pending_naming", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const initialStage = {
+      ...initial.subjects[0].stages.initial,
+      trigger: {
+        fieldId: "pending_status",
+        fieldName: "流程",
+        optionId: "pending_b",
+        value: "待剪辑",
+      },
+      nameSuffix: "_用户配置",
+    };
+    const saved = await store.saveSubjectDraft(key, {
+      expectedVersion: initial.subjects[0].configVersion,
+      stages: {
+        ...initial.subjects[0].stages,
+        initial: initialStage,
+      },
+    });
+    assert.equal(saved.stages.initial.trigger.optionId, "pending_b");
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000003100,
+      tables: [{
+        ...table,
+        fields: [...table.fields, { fieldId: "pending_notes", fieldName: "备注", type: 1, uiType: "Text", options: [] }],
+      }],
+    });
+
+    assert.deepEqual(refreshed.subjects[0].stages.initial.trigger, initialStage.trigger);
+    assert.equal(refreshed.subjects[0].stages.initial.nameSuffix, "_用户配置");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a phased subject with no enabled stages repairs the initial stage", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const table = defaultTable({ tableId: "tbl_no_enabled_stages", tableName: "无启用阶段", prefix: "no-stage" });
+    const initial = await store.upsertBasePreview({ ...preview(), tables: [table] });
+    const key = initial.subjects[0].subjectKey;
+    const malformed = {
+      ...initial.subjects[0],
+      stages: Object.fromEntries(Object.entries(initial.subjects[0].stages).map(([stageId, stage]) => [
+        stageId,
+        { ...stage, enabled: false },
+      ])),
+    };
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(malformed), key);
+
+    const refreshed = await store.upsertBasePreview({
+      ...preview(),
+      metadataRefreshedAt: 1710000002999,
+      tables: [table],
+    });
+    assert.equal(refreshed.subjects[0].stages.initial.enabled, true);
+    assert.equal(refreshed.subjects[0].stages.first_review.enabled, false);
+    assert.equal(refreshed.subjects[0].stages.final_review.enabled, false);
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });
@@ -990,7 +3020,7 @@ test("lifecycle transition synchronizes with Bridge before committing locally", 
     },
   });
   try {
-    await store.upsertBasePreview(preview());
+    await store.upsertBasePreview(phasedPreview());
     const draft = await store.saveSubjectDraft("bas_demo:tbl_math", subjectPatch());
     const enabled = await store.enableSubject("bas_demo:tbl_math", draft.configVersion);
     assert.equal(enabled.lifecycle, "enabled");

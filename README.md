@@ -50,6 +50,7 @@ flowchart LR
 首次运行时，`start-local.ps1` 会从 `config/bridge.example.json` 生成被 Git 忽略的 `config/bridge.local.json`，并从 `config/autocut-packages.example.json` 生成独立的 `config/taskboard-feishu-packages.json`。两个文件只在目标不存在时创建，不会覆盖已有配置。示例文件包含占位符，不能直接用于真实飞书或模拟建任务；请先在本机填写测试 Base、表、字段 ID，并在 Auto-Cut 包 registry 中配置包。
 
 - 旧版 `tables` 配置只登记允许接收事件的 Base、表、触发字段、单一可开始值和标题字段。Taskboard 管理的新工作流则保存活动 subject 快照，并分别配置 `initial`、`first_review`、`final_review` 三个阶段；两种配置都不启用飞书状态到 Taskboard 各流程列的通用映射。
+- 每个新导入的子表都会按自己的 `baseToken:tableId` 和当前字段/选项 metadata 创建完整的 phased 草稿，包含字段来源、初稿、初审修改、终审修改、Auto-Cut 路由及 ZIP/上传设置；不同子表不会共享字段或选项绑定。已有 legacy subject 刷新时只补齐缺失的 phased 结构，并保留原有触发、执行、包路由、上传、显示和本机路径设置；已停用的 legacy subject 仍保持停用，只有已启用 subject 才会因元数据刷新降为草稿。
 - 刷新 Base 元数据会把已启用学科降为待确认草稿，但不会覆盖用户尚未保存的音频标题、附件选择、时长误差或命名后缀。字段或状态选项仅改名且稳定 ID 唯一时，面板显示新名称并要求先保存草稿再启用；ID 缺失或重复时，保存和启用都会阻断，不能猜测或静默换绑。元数据刷新、修复保存和共享配置导入等草稿写入不会提前关闭 Bridge 正在使用的已启用版本；只有显式重新启用或禁用才切换或关闭该活动版本。
 - Auto-Cut 包 registry（默认 `config/taskboard-feishu-packages.json`，可由 `CODEX_FEISHU_PACKAGES_PATH` 覆盖）只登记受控的项目包别名，以及固定的 `projectId`、绝对 `workspacePath` 和提示词。只有 `state` 为 `enabled` 的包会被 Bridge 接收；草稿/禁用包仍可由 Taskboard 保存，但不会路由新事件。飞书单元格只能选择别名，不能传路径、命令或提示词。
 - Bridge 到 Taskboard 的任务登记还需要本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。`start-local.ps1` 会在未设置时为本次启动生成随机值，并同时注入两个服务；如果单独启动 Bridge/Taskboard，请在 `.env.local` 中配置同一个随机值。该值不会写入配置导出、任务描述或日志。

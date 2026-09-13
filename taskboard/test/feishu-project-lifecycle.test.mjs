@@ -44,13 +44,17 @@ function baseWithSubjects(ids) {
     tables: ids.map((tableId) => ({
       tableId,
       tableName: `Subject ${tableId}`,
-      fields: [{
-        fieldId: `status-${tableId}`,
-        fieldName: "Status",
-        type: 3,
-        uiType: "SingleSelect",
-        options: [{ id: `ready-${tableId}`, name: "Ready" }],
-      }],
+      fields: [
+        {
+          fieldId: `status-${tableId}`,
+          fieldName: "Status",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [{ id: `ready-${tableId}`, name: "Ready" }],
+        },
+        { fieldId: `document-${tableId}`, fieldName: "Document", type: 1, uiType: "Text", options: [] },
+        { fieldId: `name-${tableId}`, fieldName: "Name", type: 1, uiType: "Text", options: [] },
+      ],
     })),
   };
 }

@@ -231,7 +231,10 @@ function portablePhasedSubject(value) {
   const subject = structuredClone(value);
   delete subject.packageConfig;
   for (const stage of Object.values(subject.stages ?? {})) {
-    if (stage && typeof stage === "object") delete stage.artifactTargetPath;
+    if (stage && typeof stage === "object") {
+      delete stage.artifactTargetPath;
+      delete stage.artifact_target_path;
+    }
   }
   if (subject.upload && typeof subject.upload === "object") {
     subject.upload.artifactSourcePath = null;

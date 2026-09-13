@@ -14,7 +14,7 @@ import {
 import { createBridgeServer } from "../src/server.mjs";
 import { createBridge } from "../src/bridge.mjs";
 import { JsonStateStore } from "../src/state-store.mjs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -539,13 +539,20 @@ test("workflow sync returns a portable subject and never echoes local destinatio
         configVersion: 7,
         baseToken: subject.baseToken,
         tableId: subject.tableId,
-        stages: { initial: { artifactTargetPath: "D:\\private" } },
+        stages: {
+          initial: {
+            artifactTargetPath: "D:\\private\\camel",
+            artifact_target_path: "D:\\private\\snake",
+          },
+        },
       },
     }),
   });
   const body = await response.json();
   assert.equal(response.status, 200);
   assert.equal(body.subject.stages?.initial?.artifactTargetPath, undefined);
+  assert.equal(body.subject.stages?.initial?.artifact_target_path, undefined);
+  assert.doesNotMatch(JSON.stringify(body), /D:\\\\private/u);
 });
 
 test("registers a phased task through the dedicated route after archiving the prior stage", async () => {
@@ -644,6 +651,9 @@ test("archives a previous stage when the new target stage is disabled", async ()
 
 test("retries a phased registration from its persisted subject and context snapshot", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-bridge-"));
+  const filename = path.join(dir, "state.json");
+  const retrySubject = structuredClone(subject);
+  retrySubject.stages.initial.artifact_target_path = "D:\\private\\decision-snapshot";
   let resolveCalls = 0;
   let contextCalls = 0;
   let registerCalls = 0;
@@ -651,12 +661,12 @@ test("retries a phased registration from its persisted subject and context snaps
   const bridge = createBridge({
     config: {
       delivery: { maxAttempts: 3, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 },
-      tables: [subject],
+      tables: [retrySubject],
       packages: { "Auto-cut-lite": { projectId: "p", projectName: "p", workspacePath: "D:\\trusted", prompt: "fixed" } },
     },
-    store: new JsonStateStore(path.join(dir, "state.json")),
+    store: new JsonStateStore(filename),
     workflowStore: {
-      resolveSubjectVersionAt: async () => { resolveCalls += 1; return subject; },
+      resolveSubjectVersionAt: async () => { resolveCalls += 1; return retrySubject; },
     },
     readControlledContext: async () => { contextCalls += 1; return { documentLinks: ["https://guanghe.feishu.cn/docx/one"], namingDisplayValue: "课程001", namingValueUnique: true }; },
     taskboard: {
@@ -671,6 +681,8 @@ test("retries a phased registration from its persisted subject and context snaps
   });
   const first = await bridge.handle(edge("opt_other", "opt_initial", { eventId: "evt-retry" }));
   assert.equal(first.kind, "pending");
+  const persisted = await readFile(filename, "utf8");
+  assert.doesNotMatch(persisted, /artifact_target_path|decision-snapshot/u);
   // The event is due immediately in this fixture; processDue claims the same
   // persisted record without resolving the current workflow again.
   clock = 2000;

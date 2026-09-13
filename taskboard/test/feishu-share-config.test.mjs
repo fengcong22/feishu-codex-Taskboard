@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { createTaskboardServer } from "../server/index.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
 
-async function fixture() {
+async function fixture(overrides = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-"));
   const app = createTaskboardServer({
     dataDirectory: directory,
@@ -28,6 +28,7 @@ async function fixture() {
       diagnosticsOk: true,
       dryRun: true,
     }),
+    ...overrides,
   });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   return { app, baseUrl: `http://127.0.0.1:${address.port}`, directory };
@@ -174,6 +175,54 @@ test("workflow share export is schema-versioned and redacts machine-local paths"
     assert.equal(subject.upload.targetPath, null);
     const serialized = JSON.stringify(exported.body.configuration);
     assert.doesNotMatch(serialized, /Users\\admin|nas\\剪映草稿|workspacePath|appSecret|claimToken|taskHistory|logs/i);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("share import rejects a primitive upload object as a controlled client error", async () => {
+  const fixtureData = await fixture();
+  try {
+    await seedSubject(fixtureData.baseUrl);
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const configuration = structuredClone(exported.body.configuration);
+    configuration.bases[0].subjects[0].upload = "bad";
+
+    const imported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(imported.response.status, 400, JSON.stringify(imported.body));
+    assert.equal(imported.body.error.code, "INVALID_SHARE_CONFIGURATION");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("share inspection never forwards a legacy snake-case stage destination to Bridge", async () => {
+  let inspectedConfiguration = null;
+  const fixtureData = await fixture({
+    feishuWorkflowShareImport: async (configuration) => {
+      inspectedConfiguration = structuredClone(configuration);
+      return { configuration, diagnostics: [], diagnosticsOk: true, dryRun: true };
+    },
+  });
+  try {
+    await seedSubject(fixtureData.baseUrl, "bas_snake_inspection", phasedMetadata().fields);
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const configuration = structuredClone(exported.body.configuration);
+    configuration.bases[0].subjects[0].stages.initial.artifact_target_path = "D:\\private\\bridge-inspection";
+
+    const imported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
+    const serialized = JSON.stringify(inspectedConfiguration);
+    assert.doesNotMatch(serialized, /artifact_target_path/u);
+    assert.doesNotMatch(serialized, /bridge-inspection/u);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
@@ -556,11 +605,43 @@ test("share import diagnoses staged attachment bindings whose type conflicts wit
 test("workflow share import commits only drafts and keeps local path bindings", async () => {
   const fixtureData = await fixture();
   try {
-    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_source");
+    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_source", phasedMetadata().fields);
+    const localStages = {
+      initial: phasedStage("initial", "opt_initial", "初稿"),
+      first_review: phasedStage("first_review", "opt_review", "初审修改"),
+      final_review: phasedStage("final_review", "opt_final", "终审修改"),
+    };
+    const configured = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+      {
+        method: "PATCH",
+        body: {
+          statusField: { fieldId: "fld_status", fieldName: "流程" },
+          documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+          namingField: { fieldId: "fld_name", fieldName: "命名" },
+          stages: localStages,
+        },
+      },
+    );
+    assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
     const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
     const configuration = structuredClone(exported.body.configuration);
     configuration.bases[0].subjects[0].baseToken = "bas_source";
     configuration.bases[0].subjects[0].subjectKey = subjectKey;
+    for (const [index, stageId] of ["initial", "first_review", "final_review"].entries()) {
+      configuration.bases[0].subjects[0].stages[stageId].artifactTargetPath = `D:\\untrusted\\stage-${index}`;
+    }
+    const dryRun = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(dryRun.response.status, 200, JSON.stringify(dryRun.body));
+    assert.deepEqual(
+      Object.values(dryRun.body.configuration.bases[0].subjects[0].stages)
+        .map((stage) => stage.artifactTargetPath),
+      [null, null, null],
+    );
     const imported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
       method: "POST",
       body: { configuration, dryRun: false },
@@ -573,6 +654,11 @@ test("workflow share import commits only drafts and keeps local path bindings", 
     assert.equal(subject.lifecycle, "draft");
     assert.equal(subject.upload.artifactSourcePath, "C:\\Users\\admin\\Desktop\\Auto-Cut-待上传");
     assert.equal(subject.upload.targetPath, "\\\\nas\\剪映草稿\\语文");
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(subject.stages).map(([stageId, stage]) => [stageId, stage.artifactTargetPath])),
+      Object.fromEntries(Object.entries(localStages).map(([stageId, stage]) => [stageId, stage.artifactTargetPath])),
+    );
+    assert.doesNotMatch(JSON.stringify(subject), /D:\\\\untrusted/u);
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });

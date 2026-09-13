@@ -198,7 +198,52 @@ function copyDefinedFields(value, keys) {
   return result;
 }
 
-function bridgeShareInspectionConfiguration(configuration) {
+function hasExplicitPhasedShape(subject) {
+  if (!subject || typeof subject !== "object" || Array.isArray(subject)) return false;
+  return ["statusField", "documentField", "namingField", "stages"]
+    .some((key) => subject[key] !== undefined && subject[key] !== null);
+}
+
+function bridgeShareSourceSubjects(configuration) {
+  const subjects = new Map();
+  for (const base of Array.isArray(configuration?.bases) ? configuration.bases : []) {
+    for (const subject of Array.isArray(base?.subjects) ? base.subjects : []) {
+      if (!subject || typeof subject !== "object" || Array.isArray(subject)) continue;
+      const key = typeof subject.subjectKey === "string" && subject.subjectKey.trim() !== ""
+        ? subject.subjectKey
+        : typeof base?.baseToken === "string" && typeof subject.tableId === "string"
+          ? `${base.baseToken}:${subject.tableId}`
+          : null;
+      if (key) subjects.set(key, subject);
+    }
+  }
+  return subjects;
+}
+
+function safeBridgeUpload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return {
+    ...structuredClone(value),
+    // These bindings belong to the local Taskboard machine and must never
+    // cross the Bridge/share boundary, even when an older import file carries
+    // them explicitly.
+    artifactSourcePath: null,
+    targetPath: null,
+  };
+}
+
+function safeBridgeStages(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([stageId, stage]) => {
+    if (!stage || typeof stage !== "object" || Array.isArray(stage)) return [stageId, stage];
+    const portableStage = structuredClone(stage);
+    delete portableStage.artifact_target_path;
+    portableStage.artifactTargetPath = null;
+    return [stageId, portableStage];
+  }));
+}
+
+function bridgeShareInspectionConfiguration(configuration, sourceConfiguration = null) {
   const workflowKeys = ["schemaVersion", "configVersion", "createdAt", "updatedAt"];
   const baseKeys = ["baseToken", "baseName", "sourceUrlLabel", "metadataRefreshedAt"];
   const subjectKeys = [
@@ -207,11 +252,26 @@ function bridgeShareInspectionConfiguration(configuration) {
     "execution", "packageRoute", "upload", "statusField", "documentField",
     "namingField", "stages",
   ];
+  const sourceSubjects = bridgeShareSourceSubjects(sourceConfiguration);
   return {
     ...copyDefinedFields(configuration, workflowKeys),
     bases: (configuration?.bases ?? []).map((base) => ({
       ...copyDefinedFields(base, baseKeys),
-      subjects: (base?.subjects ?? []).map((subject) => copyDefinedFields(subject, subjectKeys)),
+      subjects: (base?.subjects ?? []).map((subject) => {
+        const source = sourceSubjects.get(subject?.subjectKey);
+        const selected = source && !hasExplicitPhasedShape(source)
+          ? {
+            ...Object.fromEntries(Object.entries(subject ?? {}).filter(([key]) => (
+              !["statusField", "documentField", "namingField", "stages"].includes(key)
+            ))),
+            ...copyDefinedFields(source, ["trigger", "title", "execution", "packageRoute", "upload"]),
+          }
+          : subject;
+        const result = copyDefinedFields(selected, subjectKeys);
+        if (Object.hasOwn(result, "upload")) result.upload = safeBridgeUpload(result.upload);
+        if (Object.hasOwn(result, "stages")) result.stages = safeBridgeStages(result.stages);
+        return result;
+      }),
     })),
   };
 }
@@ -2938,10 +2998,7 @@ export function createTaskboardServer(options = {}) {
       ...(subject.documentField ? { documentField: structuredClone(subject.documentField) } : {}),
       ...(subject.namingField ? { namingField: structuredClone(subject.namingField) } : {}),
       ...(subject.stages ? {
-        stages: Object.fromEntries(Object.entries(subject.stages).map(([stageId, stage]) => [
-          stageId,
-          stage ? { ...structuredClone(stage), artifactTargetPath: null } : stage,
-        ])),
+        stages: safeBridgeStages(subject.stages),
       } : {}),
       trigger: subject.trigger,
       title: subject.title,
@@ -2978,7 +3035,7 @@ export function createTaskboardServer(options = {}) {
     }
     return payload.subject;
   }
-  async function inspectFeishuShareImportWithBridge(configuration) {
+  async function inspectFeishuShareImportWithBridge(configuration, { sourceConfiguration = null } = {}) {
     let bridgeUrl;
     try {
       bridgeUrl = new URL(resolved.feishuBridgeUrl);
@@ -2998,7 +3055,7 @@ export function createTaskboardServer(options = {}) {
           "x-feishu-bridge-client": "local-operator",
         },
         body: JSON.stringify({
-          configuration: bridgeShareInspectionConfiguration(configuration),
+          configuration: bridgeShareInspectionConfiguration(configuration, sourceConfiguration),
           dryRun: true,
         }),
       });

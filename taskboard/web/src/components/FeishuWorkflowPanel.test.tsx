@@ -9,6 +9,7 @@ import {
   type FeishuStageValue,
 } from "./FeishuStageEditor";
 import { FeishuWorkflowPanel } from "./FeishuWorkflowPanel";
+import { listFeishuPackages } from "../api";
 
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
@@ -88,6 +89,18 @@ function subject(subjectKey: string, tableName: string): FeishuSubjectConfig {
     createdAt: "2026-09-10T00:00:00.000Z",
     updatedAt: "2026-09-10T00:00:00.000Z",
   };
+}
+
+function legacySubject(subjectKey: string, tableName: string): FeishuSubjectConfig {
+  const configured = subject(subjectKey, tableName);
+  const {
+    statusField: _statusField,
+    documentField: _documentField,
+    namingField: _namingField,
+    stages: _stages,
+    ...legacy
+  } = configured;
+  return legacy;
 }
 
 function catalog(...subjects: FeishuSubjectConfig[]): FeishuBaseCatalog[] {
@@ -255,6 +268,206 @@ describe("FeishuStageEditor", () => {
 
 describe("FeishuWorkflowPanel audio drafts", () => {
   afterEach(() => cleanup());
+
+  it("shows the phased editor for a legacy subject with table metadata", () => {
+    const configured = legacySubject("legacy-history", "旧高中历史");
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="legacy-history"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect(screen.getByRole("combobox", { name: "状态字段" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "素材文档字段" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "命名字段" })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: "启用初稿" })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: "启用初审修改" })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: "启用终审修改" })).toBeTruthy();
+    expect(within(screen.getByRole("combobox", { name: "状态字段" }))
+      .getByRole("option", { name: "流程状态" })).toBeTruthy();
+  });
+
+  it("preserves a legacy trigger field and non-first option in the phased fallback", async () => {
+    const configured = legacySubject("legacy-trigger", "旧触发配置");
+    configured.metadata = {
+      fields: [
+        {
+          fieldId: "fld_decoy_status",
+          fieldName: "无关状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [{ id: "opt_decoy", name: "无关选项" }],
+        },
+        {
+          fieldId: "fld_real_status",
+          fieldName: "实际流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_other", name: "其他" },
+            { id: "opt_ready", name: "待剪辑" },
+          ],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    configured.trigger = {
+      fieldId: "fld_real_status",
+      fieldName: "实际流程状态",
+      startValue: "待剪辑",
+      optionId: "opt_ready",
+    };
+    const onSaveDraft = vi.fn(async (_subjectKey: string, _patch: unknown) => configured);
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="legacy-trigger"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+      onSaveDraft={onSaveDraft}
+    />);
+
+    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value)
+      .toBe("fld_real_status");
+    expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value)
+      .toBe("opt_ready");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "素材文档字段" }), {
+      target: { value: "fld_document" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "命名字段" }), {
+      target: { value: "fld_name" },
+    });
+    const save = screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+    fireEvent.click(save);
+
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+    const [, patch] = onSaveDraft.mock.calls[0];
+    expect(patch).toMatchObject({
+      trigger: {
+        fieldId: "fld_real_status",
+        fieldName: "实际流程状态",
+        startValue: "待剪辑",
+        optionId: "opt_ready",
+      },
+      statusField: { fieldId: "fld_real_status", fieldName: "实际流程状态" },
+      documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+      namingField: { fieldId: "fld_name", fieldName: "命名" },
+      stages: {
+        initial: {
+          trigger: {
+            fieldId: "fld_real_status",
+            fieldName: "实际流程状态",
+            optionId: "opt_ready",
+            value: "待剪辑",
+          },
+        },
+      },
+    });
+  });
+
+  it("keeps a supplied stale legacy option id blocked instead of rebinding it by name", () => {
+    const configured = legacySubject("legacy-stale-option", "旧失效选项");
+    configured.metadata = {
+      fields: [
+        {
+          fieldId: "fld_status",
+          fieldName: "流程状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [{ id: "opt_recreated", name: "待剪辑" }],
+        },
+        { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+      ],
+    };
+    configured.trigger = {
+      fieldId: "fld_status",
+      fieldName: "流程状态",
+      startValue: "待剪辑",
+      optionId: "opt_deleted",
+    };
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="legacy-stale-option"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value)
+      .toBe("fld_status");
+    expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value)
+      .toBe("");
+    expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("projects a legacy subject upload path into the initial phase fallback", () => {
+    const configured = legacySubject("legacy-upload-path", "旧上传路径");
+    if (!configured.upload) throw new Error("legacy subject fixture requires upload settings");
+    configured.upload.targetPath = "D:\\legacy-upload-path";
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="legacy-upload-path"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect((screen.getByRole("textbox", { name: "初稿 ZIP 目标目录" }) as HTMLInputElement).value)
+      .toBe("D:\\legacy-upload-path");
+  });
+
+  it("projects a legacy upload path when phased stages already exist without destinations", () => {
+    const configured = subject("legacy-existing-stages", "旧阶段路径");
+    if (!configured.upload || !configured.stages) throw new Error("fixture requires phased upload settings");
+    configured.upload.enqueueMode = "manual";
+    configured.upload.targetPath = "D:\\legacy-existing-stages";
+    configured.stages.initial.artifactTargetPath = null;
+
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="legacy-existing-stages"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect((screen.getByRole("textbox", { name: "初稿 ZIP 目标目录" }) as HTMLInputElement).value)
+      .toBe("D:\\legacy-existing-stages");
+  });
+
+  it("keeps an empty-metadata legacy subject on the legacy save path", async () => {
+    const configured = legacySubject("legacy-empty", "空 metadata 学科");
+    configured.metadata = { fields: [] };
+    const onSaveDraft = vi.fn(async (_subjectKey: string, _patch: unknown) => configured);
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="legacy-empty"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+      onSaveDraft={onSaveDraft}
+    />);
+
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+    const [, patch] = onSaveDraft.mock.calls[0];
+    expect(patch).not.toHaveProperty("statusField");
+    expect(patch).not.toHaveProperty("documentField");
+    expect(patch).not.toHaveProperty("namingField");
+    expect(patch).not.toHaveProperty("stages");
+  });
 
   it("shows only metadata fields whose type and uiType both identify a single select", () => {
     const configured = subject("history", "高中历史");
@@ -570,6 +783,86 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(screen.getByText("初稿的音频附件字段不唯一")).toBeTruthy();
     expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("does not require ZIP target paths for disabled review stages in automatic upload mode", () => {
+    const configured = subject("automatic-disabled-reviews", "自动上传迁移学科");
+    configured.upload = {
+      enqueueMode: "automatic",
+      artifactSourceMode: configured.upload?.artifactSourceMode ?? "manual_select",
+      artifactSourcePath: configured.upload?.artifactSourcePath ?? null,
+      targetId: configured.upload?.targetId ?? null,
+      targetPath: "C:\\approved\\upload",
+      uploadConcurrency: configured.upload?.uploadConcurrency ?? 1,
+    };
+    configured.stages!.first_review.artifactTargetPath = null;
+    configured.stages!.final_review.artifactTargetPath = null;
+
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="automatic-disabled-reviews"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    expect(screen.queryByText("初审修改需要 ZIP 目标目录")).toBeNull();
+    expect(screen.queryByText("终审修改需要 ZIP 目标目录")).toBeNull();
+    expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("blocks enable when automatic upload has no subject-level upload path", async () => {
+    vi.mocked(listFeishuPackages).mockResolvedValueOnce([{
+      alias: "Auto-cut-A",
+      name: "Auto-Cut A",
+      projectId: "auto-cut-a",
+      workspacePath: null,
+      model: null,
+      reasoningEffort: null,
+      prompt: null,
+      zipSourceDirectory: null,
+      maxConcurrent: 1,
+      state: "enabled",
+      revision: 1,
+      updatedAt: "2026-09-13T00:00:00.000Z",
+      referenceCount: 0,
+      references: [],
+    }]);
+    const configured = subject("automatic-missing-upload", "缺少上传路径");
+    configured.packageRoute = {
+      routeMode: configured.packageRoute?.routeMode ?? "fixed",
+      packageAlias: "Auto-cut-A",
+      subjectCodeFieldId: configured.packageRoute?.subjectCodeFieldId ?? null,
+      branchMap: configured.packageRoute?.branchMap ?? null,
+    };
+    configured.documentField = { fieldId: "fld_text", fieldName: "普通文本" };
+    configured.namingField = { fieldId: "fld_text", fieldName: "普通文本" };
+    configured.upload = {
+      enqueueMode: "automatic",
+      artifactSourceMode: configured.upload?.artifactSourceMode ?? "manual_select",
+      artifactSourcePath: configured.upload?.artifactSourcePath ?? null,
+      targetId: "local-upload",
+      targetPath: null,
+      uploadConcurrency: configured.upload?.uploadConcurrency ?? 1,
+    };
+    configured.stages!.first_review.artifactTargetPath = null;
+    configured.stages!.final_review.artifactTargetPath = null;
+
+    render(<FeishuWorkflowPanel
+      catalog={catalog(configured)}
+      configurationBaseToken="bas_test"
+      selectedSubjectKey="automatic-missing-upload"
+      onSelectSubject={vi.fn()}
+      onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()}
+    />);
+
+    await waitFor(() => {
+      const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
+      expect(enable.disabled).toBe(true);
+      expect(enable.getAttribute("title")).toBe("请填写上传路径");
+    });
   });
 
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {

@@ -20,6 +20,10 @@ table keeps its own values and metadata bindings.
 - Existing legacy subjects are upgraded only when they still lack the phased
   fields; their existing trigger, execution, package, upload, and display
   settings remain intact.
+- A legacy subject that is already `disabled` stays disabled during this
+  upgrade; only an `enabled` subject is demoted to `draft` after a metadata
+  refresh. Re-adding a previously removed subject likewise does not
+  implicitly re-enable it.
 - Missing or ambiguous metadata leaves a repairable draft with the full stage
   structure visible. Enable/save validation remains strict and blocks invalid
   bindings.

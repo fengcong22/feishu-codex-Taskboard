@@ -337,13 +337,17 @@ async function enableArtifactSource(
       tables: [{
         tableId: "tbl_fixture",
         tableName: "Fixture subject",
-        fields: [{
-          fieldId: "fld_status",
-          fieldName: "Status",
-          type: 3,
-          uiType: "SingleSelect",
-          options: [{ id: "opt_ready", name: "Ready" }],
-        }],
+        fields: [
+          {
+            fieldId: "fld_status",
+            fieldName: "Status",
+            type: 3,
+            uiType: "SingleSelect",
+            options: [{ id: "opt_ready", name: "Ready" }],
+          },
+          { fieldId: "fld_document", fieldName: "Document", type: 1, uiType: "Text", options: [] },
+          { fieldId: "fld_name", fieldName: "Name", type: 1, uiType: "Text", options: [] },
+        ],
       }],
     },
   });
