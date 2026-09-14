@@ -6,7 +6,7 @@
 
 **Architecture:** 保持现有事件处理代码不变，在仓库根目录增加单一 `AGENTS.md` 作为运行规范；用一个 PowerShell 5 兼容的 `check-local.ps1` 调用现有配置加载器和两个 loopback 健康接口。检查脚本只读、不创建任务、不输出凭据，并通过 `-RequireFeishu` 控制是否把长连接状态作为硬性条件。
 
-**Tech Stack:** PowerShell 5+, Node.js >=22.5, native `node:test`, existing Bridge HTTP health endpoints.
+**Tech Stack:** PowerShell 5+, Node.js >=22.13, native `node:test`, existing Bridge HTTP health endpoints.
 
 ## Global Constraints
 
@@ -39,7 +39,7 @@
 
 - [ ] **Step 1: Implement the minimum contract**
 
-  Resolve the repository root, require Node `>=22.5`, load and validate `config/bridge.local.json` through `src/config.mjs`, query Taskboard `/api/meta` and Bridge `/health`, print sanitized statuses, and fail with a non-zero exit code on required-check failures. Treat a disconnected listener as a warning unless `-RequireFeishu` is supplied.
+  Resolve the repository root, require Node `>=22.13`, load and validate `config/bridge.local.json` through `src/config.mjs`, query Taskboard `/api/meta` and Bridge `/health`, print sanitized statuses, and fail with a non-zero exit code on required-check failures. Treat a disconnected listener as a warning unless `-RequireFeishu` is supplied.
 
 - [ ] **Step 2: Run the targeted tests and verify they pass**
 

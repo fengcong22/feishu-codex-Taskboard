@@ -26,6 +26,30 @@ const autoCutWorkflowSpecUrl = new URL(
   "../docs/superpowers/specs/2026-08-21-feishu-autocut-workflow-design.md",
   import.meta.url,
 );
+const operationsDesignUrl = new URL(
+  "../docs/superpowers/specs/2026-08-19-feishu-bridge-operations-design.md",
+  import.meta.url,
+);
+const lifecycleArchivePlanUrl = new URL(
+  "../docs/superpowers/plans/2026-08-20-feishu-task-lifecycle-archive.md",
+  import.meta.url,
+);
+const reliabilityPlanUrl = new URL(
+  "../docs/superpowers/plans/2026-08-19-feishu-bridge-reliability-compensation.md",
+  import.meta.url,
+);
+const operationsHardeningPlanUrl = new URL(
+  "../docs/superpowers/plans/2026-08-19-feishu-bridge-operations-hardening.md",
+  import.meta.url,
+);
+const mvpPlanUrl = new URL(
+  "../docs/superpowers/plans/2026-08-12-feishu-codex-taskboard-mvp.md",
+  import.meta.url,
+);
+const standaloneReleasePlanUrl = new URL(
+  "../taskboard/docs/superpowers/plans/2026-09-04-remote-integration-and-standalone-release.md",
+  import.meta.url,
+);
 const taskboardScreenshotUrl = new URL("../docs/assets/taskboard-kanban-demo.jpg", import.meta.url);
 const rootCheckWorkflowUrl = new URL("../.github/workflows/check.yml", import.meta.url);
 
@@ -64,6 +88,12 @@ test("Node 22.13 floor stays aligned across runtime contracts and user-facing do
     taskboardChineseReadme,
     windowsSourceRunbook,
     checkSource,
+    operationsDesign,
+    lifecycleArchivePlan,
+    reliabilityPlan,
+    operationsHardeningPlan,
+    mvpPlan,
+    standaloneReleasePlan,
   ] = await Promise.all([
     readFile(packageUrl, "utf8").then(JSON.parse),
     readFile(packageLockUrl, "utf8").then(JSON.parse),
@@ -74,6 +104,12 @@ test("Node 22.13 floor stays aligned across runtime contracts and user-facing do
     readFile(taskboardChineseReadmeUrl, "utf8"),
     readFile(windowsSourceRunbookUrl, "utf8"),
     readFile(checkUrl, "utf8"),
+    readFile(operationsDesignUrl, "utf8"),
+    readFile(lifecycleArchivePlanUrl, "utf8"),
+    readFile(reliabilityPlanUrl, "utf8"),
+    readFile(operationsHardeningPlanUrl, "utf8"),
+    readFile(mvpPlanUrl, "utf8"),
+    readFile(standaloneReleasePlanUrl, "utf8"),
   ]);
 
   for (const [label, value] of [
@@ -91,6 +127,12 @@ test("Node 22.13 floor stays aligned across runtime contracts and user-facing do
     ["Taskboard Chinese README", taskboardChineseReadme],
     ["Windows source runbook", windowsSourceRunbook],
     ["health check", checkSource],
+    ["operations design", operationsDesign],
+    ["lifecycle archive plan", lifecycleArchivePlan],
+    ["reliability plan", reliabilityPlan],
+    ["operations hardening plan", operationsHardeningPlan],
+    ["MVP plan", mvpPlan],
+    ["standalone release plan", standaloneReleasePlan],
   ]) {
     assert.match(source, /22\.13/, `${label} must document Node 22.13`);
     assert.doesNotMatch(source, /22\.5/, `${label} must not advertise the obsolete floor`);
@@ -222,6 +264,141 @@ test("Windows source runbook keeps executable inputs and npm installs fail-close
     "phase B must inspect the whole worktree after install and test",
   );
   assert.match(phaseB.slice(statusIndex), /\$LASTEXITCODE -ne 0[\s\S]*\$postInstallStatus\.Count -gt 0/);
+});
+
+test("Windows source runbook recreates reparse-free guards after preparing the clone target", async () => {
+  const source = await readFile(windowsSourceRunbookUrl, "utf8");
+  const cloneStage = source.match(
+    /工具检查通过后，在用户给出的工作目录中执行。[\s\S]*?(?=\n该克隆只接受就绪的本地固定磁盘)/,
+  )?.[0] ?? "";
+
+  assert.match(
+    cloneStage,
+    /function Resolve-ExistingLocalDirectory\([\s\S]*?-PathType Container[\s\S]*?DriveType\]::Fixed[\s\S]*?FileAttributes\]::ReparsePoint/,
+    "the clone stage must validate existing local directories component by component",
+  );
+
+  const workParentCreatedAt = cloneStage.indexOf(
+    "New-Item -ItemType Directory -Force -Path $workParent",
+  );
+  const workParentRevalidatedAt = cloneStage.indexOf(
+    "$workParent = Resolve-ExistingLocalDirectory $workParent 'The clone target parent'",
+  );
+  const emptyGitHomeRevalidatedAt = cloneStage.indexOf(
+    "$emptyGitHome = Resolve-ExistingLocalDirectory $emptyGitHome 'The isolated Git home'",
+  );
+  const emptyGitTemplateRevalidatedAt = cloneStage.indexOf(
+    "$emptyGitTemplate = Resolve-ExistingLocalDirectory $emptyGitTemplate 'The isolated Git template'",
+  );
+  const emptyGitConfigRevalidatedAt = cloneStage.indexOf(
+    "$emptyGitConfig = Resolve-ExistingLocalFile $emptyGitConfig 'The isolated Git config'",
+  );
+  const cloneCommandAt = cloneStage.indexOf("clone --config core.hooksPath=NUL");
+  const lastTargetAbsenceCheckAt = cloneStage.lastIndexOf(
+    "if (Test-Path -LiteralPath $workDirectory)",
+  );
+  const lastWorkParentRevalidatedAt = cloneStage.lastIndexOf(
+    "$workParent = Resolve-ExistingLocalDirectory $workParent 'The clone target parent'",
+  );
+
+  assert.ok(workParentCreatedAt >= 0, "the clone stage must create the selected parent");
+  assert.ok(
+    workParentRevalidatedAt > workParentCreatedAt,
+    "the freshly created clone parent must be revalidated before clone",
+  );
+  assert.ok(
+    emptyGitHomeRevalidatedAt > workParentRevalidatedAt,
+    "the freshly created Git home must be revalidated",
+  );
+  assert.ok(
+    emptyGitTemplateRevalidatedAt > emptyGitHomeRevalidatedAt,
+    "the freshly created Git template must be revalidated",
+  );
+  assert.ok(
+    emptyGitConfigRevalidatedAt > emptyGitTemplateRevalidatedAt,
+    "the freshly created Git config must be revalidated",
+  );
+  assert.ok(
+    lastWorkParentRevalidatedAt > emptyGitConfigRevalidatedAt &&
+      lastWorkParentRevalidatedAt < lastTargetAbsenceCheckAt,
+    "the clone parent must be revalidated again after creating isolated Git paths",
+  );
+  assert.ok(
+    lastTargetAbsenceCheckAt > lastWorkParentRevalidatedAt && lastTargetAbsenceCheckAt < cloneCommandAt,
+    "the clone target must still be absent immediately before git clone",
+  );
+});
+
+test("Windows source runbook revalidates the repository root and .git in every fresh pre-install block", async () => {
+  const source = await readFile(windowsSourceRunbookUrl, "utf8");
+  const blocks = [
+    [
+      "post-clone verification",
+      source.match(/clone 完成后先在一个新的[\s\S]*?(?=\n若发送方给出了批准的 tag)/)?.[0] ?? "",
+      "The fresh clone",
+    ],
+    [
+      "approved-ref verification",
+      source.match(/若发送方给出了批准的 tag[\s\S]*?(?=\n若发送方没有给出批准 ref)/)?.[0] ?? "",
+      "The approved repository",
+    ],
+    [
+      "main-only verification",
+      source.match(/若发送方没有给出批准 ref[\s\S]*?(?=\n上述批准 ref 或规范远端最新 `main`)/)?.[0] ?? "",
+      "The verified main repository",
+    ],
+    [
+      "repository-document read",
+      source.match(/上述批准 ref 或规范远端最新 `main` 二选一的版本门禁通过后[\s\S]*?(?=\n若仓库内 Runbook)/)?.[0] ?? "",
+      "The verified repository",
+    ],
+    [
+      "phase B",
+      source.match(/## 3\. 阶段 B：[\s\S]*?(?=\n## 4\. 阶段 C：)/)?.[0] ?? "",
+      "The verified repository",
+    ],
+  ];
+
+  for (const [label, block, rootLabel] of blocks) {
+    assert.match(
+      block,
+      /function Resolve-ExistingLocalDirectory\([\s\S]*?-PathType Container[\s\S]*?DriveType\]::Fixed[\s\S]*?FileAttributes\]::ReparsePoint/,
+      `${label} must reject non-local or reparse-point directories`,
+    );
+    const rootValidation = `$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' '${rootLabel} root'`;
+    const gitValidation = `$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') '${rootLabel} metadata directory'`;
+    const setLocation = "Set-Location -LiteralPath $repositoryRoot -ErrorAction Stop";
+    const rootValidationAt = block.indexOf(rootValidation);
+    const gitValidationAt = block.indexOf(gitValidation);
+    const setLocationAt = block.indexOf(setLocation);
+    assert.ok(rootValidationAt >= 0, `${label} must validate the selected clone root before entering it`);
+    assert.ok(gitValidationAt >= 0, `${label} must validate the clone's ordinary .git directory`);
+    assert.ok(
+      rootValidationAt < setLocationAt && gitValidationAt < setLocationAt,
+      `${label} must validate the root and .git before entering the repository`,
+    );
+    assert.doesNotMatch(
+      block,
+      /\$repositoryRoot = \(Resolve-Path/,
+      `${label} must not overwrite its checked repository root with an unchecked path`,
+    );
+    assert.doesNotMatch(
+      block,
+      /\$expectedGitDirectory = \(Resolve-Path/,
+      `${label} must not overwrite its checked .git directory with an unchecked path`,
+    );
+  }
+
+  const phaseB = blocks.at(-1)[1];
+  const rootValidationIndex = phaseB.indexOf(
+    "$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' 'The verified repository root'",
+  );
+  const gitValidationIndex = phaseB.indexOf(
+    "$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The verified repository metadata directory'",
+  );
+  const rootInstallIndex = phaseB.indexOf("& $confirmedNodeExecutable $confirmedNpmCli ci");
+  assert.ok(rootValidationIndex >= 0 && rootValidationIndex < rootInstallIndex);
+  assert.ok(gitValidationIndex >= 0 && gitValidationIndex < rootInstallIndex);
 });
 
 test("Windows source runbook is linked once and documents the legacy first acceptance", async () => {

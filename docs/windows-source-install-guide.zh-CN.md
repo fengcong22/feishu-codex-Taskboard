@@ -286,6 +286,47 @@ function Resolve-ExistingLocalFile([string]$Candidate, [string]$Label) {
   }
   [string]$resolved.ProviderPath
 }
+function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or $Candidate -notmatch '^[A-Za-z]:[\\/]') {
+    throw "$Label must be a fully qualified fixed-local-drive path."
+  }
+  try {
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+    $resolved = Resolve-Path -LiteralPath $candidatePath -ErrorAction Stop
+  } catch {
+    throw "$Label could not be resolved."
+  }
+  if ($resolved.Provider.Name -ne 'FileSystem' -or
+      -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    throw "$Label is not an existing local directory."
+  }
+  foreach ($verifiedPath in (@($candidatePath, [string]$resolved.ProviderPath) | Select-Object -Unique)) {
+    $driveRoot = [System.IO.Path]::GetPathRoot($verifiedPath)
+    try {
+      $driveInfo = [System.IO.DriveInfo]::new($driveRoot)
+    } catch {
+      throw "$Label drive could not be inspected."
+    }
+    if (-not $driveInfo.IsReady -or $driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) {
+      throw "$Label must be on a ready fixed local drive."
+    }
+    $pathCursor = $verifiedPath
+    while ($true) {
+      $pathItem = Get-Item -LiteralPath $pathCursor -Force -ErrorAction Stop
+      if (-not $pathItem.PSIsContainer) {
+        throw "$Label path must contain only directories."
+      }
+      if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label path may not contain a symbolic link, junction, or other reparse point."
+      }
+      if ([string]::Equals($pathCursor, $driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        break
+      }
+      $pathCursor = Split-Path -Parent $pathCursor
+    }
+  }
+  [string]$resolved.ProviderPath
+}
 $confirmedGitExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 git.exe 完全限定路径>' 'The confirmed Git executable'
 $workDirectory = '<用户已确认的绝对工作目录>'
 if ([string]::IsNullOrWhiteSpace($workDirectory) -or $workDirectory -notmatch '^[A-Za-z]:[\\/]') {
@@ -328,13 +369,27 @@ while (-not [string]::IsNullOrWhiteSpace($pathCursor)) {
   $pathCursor = $nextCursor
 }
 New-Item -ItemType Directory -Force -Path $workParent | Out-Null
+$workParent = Resolve-ExistingLocalDirectory $workParent 'The clone target parent'
+if (Test-Path -LiteralPath $workDirectory) {
+  throw 'The clone target appeared while its parent was being prepared; stop instead of overwriting it.'
+}
 $emptyGitHome = Join-Path $workParent ('.codex-git-home-' + [Guid]::NewGuid().ToString('N'))
 $emptyGitTemplate = Join-Path $emptyGitHome 'template'
 New-Item -ItemType Directory -Path $emptyGitTemplate | Out-Null
+$emptyGitHome = Resolve-ExistingLocalDirectory $emptyGitHome 'The isolated Git home'
+$emptyGitTemplate = Resolve-ExistingLocalDirectory $emptyGitTemplate 'The isolated Git template'
 $emptyGitConfig = Join-Path $emptyGitHome 'global.gitconfig'
 New-Item -ItemType File -Path $emptyGitConfig | Out-Null
+$emptyGitConfig = Resolve-ExistingLocalFile $emptyGitConfig 'The isolated Git config'
+if ((Get-Item -LiteralPath $emptyGitConfig -Force).Length -ne 0) {
+  throw 'The isolated Git config is no longer empty.'
+}
 $env:GIT_CONFIG_NOSYSTEM = '1'
 $env:GIT_CONFIG_GLOBAL = $emptyGitConfig
+$workParent = Resolve-ExistingLocalDirectory $workParent 'The clone target parent'
+if (Test-Path -LiteralPath $workDirectory) {
+  throw 'The clone target appeared before git clone; stop instead of overwriting it.'
+}
 & $confirmedGitExecutable `
   -c credential.interactive=never `
   -c protocol.allow=never `
@@ -342,10 +397,11 @@ $env:GIT_CONFIG_GLOBAL = $emptyGitConfig
   clone --config core.hooksPath=NUL --template=$emptyGitTemplate --no-local `
   https://github.com/fengcong22/feishu-codex-Taskboard.git $workDirectory
 if ($LASTEXITCODE -ne 0) { throw 'git clone failed.' }
-Set-Location -LiteralPath $workDirectory -ErrorAction Stop
+$repositoryRoot = Resolve-ExistingLocalDirectory $workDirectory 'The fresh clone root'
+$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The fresh clone metadata directory'
 ```
 
-该克隆只接受就绪的本地固定磁盘，并拒绝路径链中的符号链接、junction 和其他重解析点；映射网络盘、UNC、设备路径和可移动盘均不符合条件。克隆使用一个新建的零字节全局 Git 配置文件和空模板目录，隔离系统/全局 Git 配置、模板、hooks 和非 HTTPS transport；不读取用户凭据，也不允许交互式认证。规范仓库是公开仓库，出现认证提示、协议拒绝或 clone 失败时立即停止，不放宽隔离边界。
+该克隆只接受就绪的本地固定磁盘，并拒绝路径链中的符号链接、junction 和其他重解析点；映射网络盘、UNC、设备路径和可移动盘均不符合条件。克隆使用一个新建的零字节全局 Git 配置文件和空模板目录，隔离系统/全局 Git 配置、模板、hooks 和非 HTTPS transport；不读取用户凭据，也不允许交互式认证。规范仓库是公开仓库，出现认证提示、协议拒绝或 clone 失败时立即停止，不放宽隔离边界。目录检查会在创建父目录、临时 Git 路径和 clone 后重新执行，以缩短路径被替换的窗口；这类 PowerShell 检查不是原子 no-follow 句柄保证，若要抵御同机并发恶意写入，必须另行采用 Win32 级别的无跟随句柄设计。
 
 Codex 在自己的部署执行上下文中保留 `$emptyGitConfig` 的完全限定路径。后续信任核对和阶段 B 的最后一次工作树核对只把它作为 `GIT_CONFIG_GLOBAL` 使用；阶段 B 随后会在该克隆被 Git 忽略的固定 `.runtime\bootstrap` 目录中创建日常使用的零字节 Git/npm 配置。这些路径不写入 Git 或对话。只有阶段 B 已成功创建并启用固定隔离配置后，外部 Git 临时目录才不再是本克隆的运行依赖；Runbook 不替用户删除它。
 
@@ -401,9 +457,51 @@ function Resolve-ExistingLocalFile([string]$Candidate, [string]$Label) {
   }
   [string]$resolved.ProviderPath
 }
+function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or $Candidate -notmatch '^[A-Za-z]:[\\/]') {
+    throw "$Label must be a fully qualified fixed-local-drive path."
+  }
+  try {
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+    $resolved = Resolve-Path -LiteralPath $candidatePath -ErrorAction Stop
+  } catch {
+    throw "$Label could not be resolved."
+  }
+  if ($resolved.Provider.Name -ne 'FileSystem' -or
+      -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    throw "$Label is not an existing local directory."
+  }
+  foreach ($verifiedPath in (@($candidatePath, [string]$resolved.ProviderPath) | Select-Object -Unique)) {
+    $driveRoot = [System.IO.Path]::GetPathRoot($verifiedPath)
+    try {
+      $driveInfo = [System.IO.DriveInfo]::new($driveRoot)
+    } catch {
+      throw "$Label drive could not be inspected."
+    }
+    if (-not $driveInfo.IsReady -or $driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) {
+      throw "$Label must be on a ready fixed local drive."
+    }
+    $pathCursor = $verifiedPath
+    while ($true) {
+      $pathItem = Get-Item -LiteralPath $pathCursor -Force -ErrorAction Stop
+      if (-not $pathItem.PSIsContainer) {
+        throw "$Label path must contain only directories."
+      }
+      if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label path may not contain a symbolic link, junction, or other reparse point."
+      }
+      if ([string]::Equals($pathCursor, $driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        break
+      }
+      $pathCursor = Split-Path -Parent $pathCursor
+    }
+  }
+  [string]$resolved.ProviderPath
+}
 $confirmedGitExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 git.exe 完全限定路径>' 'The confirmed Git executable'
-Set-Location -LiteralPath '<工作目录>' -ErrorAction Stop
-$repositoryRoot = (Resolve-Path -LiteralPath . -ErrorAction Stop).ProviderPath
+$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' 'The fresh clone root'
+$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The fresh clone metadata directory'
+Set-Location -LiteralPath $repositoryRoot -ErrorAction Stop
 $emptyGitConfig = Resolve-ExistingLocalFile '<克隆阶段创建的零字节 Git 配置文件完全限定路径>' 'The isolated Git config'
 if ((Get-Item -LiteralPath $emptyGitConfig -Force).Length -ne 0) {
   throw 'The isolated Git config is no longer empty.'
@@ -416,17 +514,20 @@ if ($LASTEXITCODE -ne 0 -or $originUrl -notmatch $canonicalOriginPattern) {
   throw 'origin does not match the canonical GitHub repository; do not print the stored URL.'
 }
 Write-Host 'origin: canonical repository confirmed'
-$repositoryRoot = (Resolve-Path -LiteralPath . -ErrorAction Stop).ProviderPath
 $topLevelText = ([string](& $confirmedGitExecutable rev-parse --show-toplevel 2>$null)).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git worktree root.' }
-$topLevel = (Resolve-Path -LiteralPath $topLevelText -ErrorAction Stop).ProviderPath
+$topLevel = Resolve-ExistingLocalDirectory $topLevelText 'The Git worktree root'
 if (-not [string]::Equals($repositoryRoot, $topLevel, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw 'The selected directory is not the root of this fresh clone.'
 }
 $gitDirectoryText = ([string](& $confirmedGitExecutable rev-parse --git-dir 2>$null)).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git metadata directory.' }
-$gitDirectory = (Resolve-Path -LiteralPath $gitDirectoryText -ErrorAction Stop).ProviderPath
-$expectedGitDirectory = (Resolve-Path -LiteralPath (Join-Path $repositoryRoot '.git') -ErrorAction Stop).ProviderPath
+if ($gitDirectoryText -match '^[A-Za-z]:[\\/]') {
+  $gitDirectoryCandidate = $gitDirectoryText
+} else {
+  $gitDirectoryCandidate = Join-Path $repositoryRoot $gitDirectoryText
+}
+$gitDirectory = Resolve-ExistingLocalDirectory $gitDirectoryCandidate 'The resolved Git metadata directory'
 if (-not [string]::Equals($gitDirectory, $expectedGitDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw 'The fresh clone does not use its standard local .git directory.'
 }
@@ -507,9 +608,51 @@ function Resolve-ExistingLocalFile([string]$Candidate, [string]$Label) {
   }
   [string]$resolved.ProviderPath
 }
+function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or $Candidate -notmatch '^[A-Za-z]:[\\/]') {
+    throw "$Label must be a fully qualified fixed-local-drive path."
+  }
+  try {
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+    $resolved = Resolve-Path -LiteralPath $candidatePath -ErrorAction Stop
+  } catch {
+    throw "$Label could not be resolved."
+  }
+  if ($resolved.Provider.Name -ne 'FileSystem' -or
+      -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    throw "$Label is not an existing local directory."
+  }
+  foreach ($verifiedPath in (@($candidatePath, [string]$resolved.ProviderPath) | Select-Object -Unique)) {
+    $driveRoot = [System.IO.Path]::GetPathRoot($verifiedPath)
+    try {
+      $driveInfo = [System.IO.DriveInfo]::new($driveRoot)
+    } catch {
+      throw "$Label drive could not be inspected."
+    }
+    if (-not $driveInfo.IsReady -or $driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) {
+      throw "$Label must be on a ready fixed local drive."
+    }
+    $pathCursor = $verifiedPath
+    while ($true) {
+      $pathItem = Get-Item -LiteralPath $pathCursor -Force -ErrorAction Stop
+      if (-not $pathItem.PSIsContainer) {
+        throw "$Label path must contain only directories."
+      }
+      if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label path may not contain a symbolic link, junction, or other reparse point."
+      }
+      if ([string]::Equals($pathCursor, $driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        break
+      }
+      $pathCursor = Split-Path -Parent $pathCursor
+    }
+  }
+  [string]$resolved.ProviderPath
+}
 $confirmedGitExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 git.exe 完全限定路径>' 'The confirmed Git executable'
-Set-Location -LiteralPath '<工作目录>' -ErrorAction Stop
-$repositoryRoot = (Resolve-Path -LiteralPath . -ErrorAction Stop).ProviderPath
+$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' 'The approved repository root'
+$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The approved repository metadata directory'
+Set-Location -LiteralPath $repositoryRoot -ErrorAction Stop
 $emptyGitConfig = Resolve-ExistingLocalFile '<克隆阶段创建的零字节 Git 配置文件完全限定路径>' 'The isolated Git config'
 if ((Get-Item -LiteralPath $emptyGitConfig -Force).Length -ne 0) {
   throw 'The isolated Git config is no longer empty.'
@@ -623,6 +766,47 @@ function Resolve-ExistingLocalFile([string]$Candidate, [string]$Label) {
   }
   [string]$resolved.ProviderPath
 }
+function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or $Candidate -notmatch '^[A-Za-z]:[\\/]') {
+    throw "$Label must be a fully qualified fixed-local-drive path."
+  }
+  try {
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+    $resolved = Resolve-Path -LiteralPath $candidatePath -ErrorAction Stop
+  } catch {
+    throw "$Label could not be resolved."
+  }
+  if ($resolved.Provider.Name -ne 'FileSystem' -or
+      -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    throw "$Label is not an existing local directory."
+  }
+  foreach ($verifiedPath in (@($candidatePath, [string]$resolved.ProviderPath) | Select-Object -Unique)) {
+    $driveRoot = [System.IO.Path]::GetPathRoot($verifiedPath)
+    try {
+      $driveInfo = [System.IO.DriveInfo]::new($driveRoot)
+    } catch {
+      throw "$Label drive could not be inspected."
+    }
+    if (-not $driveInfo.IsReady -or $driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) {
+      throw "$Label must be on a ready fixed local drive."
+    }
+    $pathCursor = $verifiedPath
+    while ($true) {
+      $pathItem = Get-Item -LiteralPath $pathCursor -Force -ErrorAction Stop
+      if (-not $pathItem.PSIsContainer) {
+        throw "$Label path must contain only directories."
+      }
+      if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label path may not contain a symbolic link, junction, or other reparse point."
+      }
+      if ([string]::Equals($pathCursor, $driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        break
+      }
+      $pathCursor = Split-Path -Parent $pathCursor
+    }
+  }
+  [string]$resolved.ProviderPath
+}
 $confirmedGitExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 git.exe 完全限定路径>' 'The confirmed Git executable'
 $emptyGitConfig = Resolve-ExistingLocalFile '<克隆阶段创建的零字节 Git 配置文件完全限定路径>' 'The isolated Git config'
 if ((Get-Item -LiteralPath $emptyGitConfig -Force).Length -ne 0) {
@@ -630,7 +814,9 @@ if ((Get-Item -LiteralPath $emptyGitConfig -Force).Length -ne 0) {
 }
 $env:GIT_CONFIG_NOSYSTEM = '1'
 $env:GIT_CONFIG_GLOBAL = $emptyGitConfig
-Set-Location -LiteralPath '<工作目录>' -ErrorAction Stop
+$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' 'The verified main repository root'
+$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The verified main repository metadata directory'
+Set-Location -LiteralPath $repositoryRoot -ErrorAction Stop
 $canonicalRepositoryUrl = 'https://github.com/fengcong22/feishu-codex-Taskboard.git'
 $isolatedGitArguments = @(
   '-c', 'credential.interactive=never',
@@ -660,7 +846,50 @@ if ($commit -ne $fetchedMain) {
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-Set-Location -LiteralPath '<工作目录>' -ErrorAction Stop
+function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or $Candidate -notmatch '^[A-Za-z]:[\\/]') {
+    throw "$Label must be a fully qualified fixed-local-drive path."
+  }
+  try {
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+    $resolved = Resolve-Path -LiteralPath $candidatePath -ErrorAction Stop
+  } catch {
+    throw "$Label could not be resolved."
+  }
+  if ($resolved.Provider.Name -ne 'FileSystem' -or
+      -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    throw "$Label is not an existing local directory."
+  }
+  foreach ($verifiedPath in (@($candidatePath, [string]$resolved.ProviderPath) | Select-Object -Unique)) {
+    $driveRoot = [System.IO.Path]::GetPathRoot($verifiedPath)
+    try {
+      $driveInfo = [System.IO.DriveInfo]::new($driveRoot)
+    } catch {
+      throw "$Label drive could not be inspected."
+    }
+    if (-not $driveInfo.IsReady -or $driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) {
+      throw "$Label must be on a ready fixed local drive."
+    }
+    $pathCursor = $verifiedPath
+    while ($true) {
+      $pathItem = Get-Item -LiteralPath $pathCursor -Force -ErrorAction Stop
+      if (-not $pathItem.PSIsContainer) {
+        throw "$Label path must contain only directories."
+      }
+      if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label path may not contain a symbolic link, junction, or other reparse point."
+      }
+      if ([string]::Equals($pathCursor, $driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        break
+      }
+      $pathCursor = Split-Path -Parent $pathCursor
+    }
+  }
+  [string]$resolved.ProviderPath
+}
+$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' 'The verified repository root'
+$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The verified repository metadata directory'
+Set-Location -LiteralPath $repositoryRoot -ErrorAction Stop
 Get-Content -Raw -Encoding UTF8 .\AGENTS.md
 Get-Content -Raw -Encoding UTF8 .\README.md
 Get-Content -Raw -Encoding UTF8 .\docs\windows-source-install-guide.zh-CN.md
@@ -722,6 +951,47 @@ function Resolve-ExistingLocalFile([string]$Candidate, [string]$Label) {
   }
   [string]$resolved.ProviderPath
 }
+function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or $Candidate -notmatch '^[A-Za-z]:[\\/]') {
+    throw "$Label must be a fully qualified fixed-local-drive path."
+  }
+  try {
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate)
+    $resolved = Resolve-Path -LiteralPath $candidatePath -ErrorAction Stop
+  } catch {
+    throw "$Label could not be resolved."
+  }
+  if ($resolved.Provider.Name -ne 'FileSystem' -or
+      -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    throw "$Label is not an existing local directory."
+  }
+  foreach ($verifiedPath in (@($candidatePath, [string]$resolved.ProviderPath) | Select-Object -Unique)) {
+    $driveRoot = [System.IO.Path]::GetPathRoot($verifiedPath)
+    try {
+      $driveInfo = [System.IO.DriveInfo]::new($driveRoot)
+    } catch {
+      throw "$Label drive could not be inspected."
+    }
+    if (-not $driveInfo.IsReady -or $driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) {
+      throw "$Label must be on a ready fixed local drive."
+    }
+    $pathCursor = $verifiedPath
+    while ($true) {
+      $pathItem = Get-Item -LiteralPath $pathCursor -Force -ErrorAction Stop
+      if (-not $pathItem.PSIsContainer) {
+        throw "$Label path must contain only directories."
+      }
+      if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label path may not contain a symbolic link, junction, or other reparse point."
+      }
+      if ([string]::Equals($pathCursor, $driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        break
+      }
+      $pathCursor = Split-Path -Parent $pathCursor
+    }
+  }
+  [string]$resolved.ProviderPath
+}
 $confirmedGitExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 git.exe 完全限定路径>' 'The confirmed Git executable'
 $confirmedNodeExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 node.exe 完全限定路径>' 'The confirmed Node.js executable'
 $confirmedNpmExecutable = Resolve-ExistingLocalFile '<阶段 A 已验证的 npm.cmd 完全限定路径>' 'The confirmed npm executable'
@@ -757,7 +1027,9 @@ foreach ($tool in @(
     throw "$($tool.Label) no longer resolves to the executable verified in phase A."
   }
 }
-Set-Location -LiteralPath '<工作目录>' -ErrorAction Stop
+$repositoryRoot = Resolve-ExistingLocalDirectory '<工作目录>' 'The verified repository root'
+$expectedGitDirectory = Resolve-ExistingLocalDirectory (Join-Path $repositoryRoot '.git') 'The verified repository metadata directory'
+Set-Location -LiteralPath $repositoryRoot -ErrorAction Stop
 $expectedCommit = '<阶段 A 已验证的完整 commit SHA>'
 if ($expectedCommit -notmatch '^[0-9a-fA-F]{40}$') { throw 'The verified commit SHA is missing.' }
 $currentCommit = ([string](& $confirmedGitExecutable rev-parse --verify HEAD 2>$null)).Trim()
@@ -772,9 +1044,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Git replacement refs.' }
 if ($replacementRefs.Count -gt 0) { throw 'Git replacement refs are not allowed.' }
 $gitDirectoryText = ([string](& $confirmedGitExecutable rev-parse --git-dir 2>$null)).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git metadata directory.' }
-$gitDirectory = (Resolve-Path -LiteralPath $gitDirectoryText -ErrorAction Stop).ProviderPath
-$repositoryRoot = (Resolve-Path -LiteralPath . -ErrorAction Stop).ProviderPath
-$expectedGitDirectory = (Resolve-Path -LiteralPath (Join-Path $repositoryRoot '.git') -ErrorAction Stop).ProviderPath
+if ($gitDirectoryText -match '^[A-Za-z]:[\\/]') {
+  $gitDirectoryCandidate = $gitDirectoryText
+} else {
+  $gitDirectoryCandidate = Join-Path $repositoryRoot $gitDirectoryText
+}
+$gitDirectory = Resolve-ExistingLocalDirectory $gitDirectoryCandidate 'The resolved Git metadata directory'
 if (-not [string]::Equals($gitDirectory, $expectedGitDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw 'The verified checkout no longer uses its standard local .git directory.'
 }

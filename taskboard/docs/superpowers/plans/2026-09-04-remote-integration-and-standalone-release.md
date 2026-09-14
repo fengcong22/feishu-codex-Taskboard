@@ -6,7 +6,7 @@
 
 **Architecture:** The existing Taskboard checkout remains the only working repository. A date-stamped remote tag records the pre-merge commit, `origin/main` is merged into the current branch in place, and a separate named remote points at the empty standalone GitHub repository for the final `main` push. The standalone release adds repository-level Apache 2.0 licensing and bilingual source attribution without changing runtime behavior.
 
-**Tech Stack:** Git, Node.js 22.5+, TypeScript, Vite, Node test runner, React, SQLite-backed local server.
+**Tech Stack:** Git, Node.js 22.13+, TypeScript, Vite, Node test runner, React, SQLite-backed local server.
 
 ## Global Constraints
 

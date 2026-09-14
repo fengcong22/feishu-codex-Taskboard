@@ -6,7 +6,7 @@
 
 **Architecture:** Persist a versioned delivery record for every normalized event, atomically lease it before processing, and retry only classified temporary delivery failures through a single compensation worker. Retain the official Feishu SDK's built-in reconnect behavior rather than adding a competing reconnect loop; expose its lifecycle as `sdk_managed` because this SDK version has no public connection-event or dispose API.
 
-**Tech Stack:** Node.js >= 22.5 ESM, built-in `node:test`, JSON state file with atomic rename and an OS-managed local IPC lock, PowerShell 5-compatible operational scripts, `@larksuiteoapi/node-sdk@1.36.x`.
+**Tech Stack:** Node.js >= 22.13 ESM, built-in `node:test`, JSON state file with atomic rename and an OS-managed local IPC lock, PowerShell 5-compatible operational scripts, `@larksuiteoapi/node-sdk@1.36.x`.
 
 ## Global Constraints
 

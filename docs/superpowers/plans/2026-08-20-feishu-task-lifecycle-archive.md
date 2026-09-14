@@ -6,7 +6,7 @@
 
 **Architecture:** 在现有事件决策中增加一个仅用于“离开触发值”的归档效果；使用任务描述中的服务端元数据匹配 Base、表、记录和触发字段身份。Bridge 在持有事件租约和 heartbeat 的情况下，通过 Taskboard 的活动任务列表、单任务读取和归档接口逐个归档候选；失败沿用现有持久化重试状态机。
 
-**Tech Stack:** Node.js >= 22.5 ESM、内置 node:test、本地 Taskboard HTTP API、JSON 状态文件、PowerShell 5 兼容脚本。
+**Tech Stack:** Node.js >= 22.13 ESM、内置 node:test、本地 Taskboard HTTP API、JSON 状态文件、PowerShell 5 兼容脚本。
 
 ## Global Constraints
 

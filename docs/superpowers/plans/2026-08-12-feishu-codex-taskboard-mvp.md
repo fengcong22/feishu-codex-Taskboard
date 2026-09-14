@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Bind both services to `127.0.0.1`; do not expose a LAN or public listener.
-- Taskboard requires Node.js `>=22.5`; the verified local runtime is Node.js `v24.18.0`.
+- Taskboard requires Node.js `>=22.13`; the verified local runtime is Node.js `v24.18.0`.
 - Each table independently configures mode, trigger field, trigger value, and package field.
 - Create work only on a transition from a value other than `待剪辑` into `待剪辑`.
 - Default to manual execution; automatic mode remains disabled in the MVP.

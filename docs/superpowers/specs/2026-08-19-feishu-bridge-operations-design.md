@@ -27,7 +27,7 @@
 
 `check-local.ps1` must:
 
-1. Fail with a non-zero exit code when Node is missing or below the supported major version (`22.5` minimum), the local config is missing, or either HTTP service is unavailable.
+1. Fail with a non-zero exit code when Node is missing or below the supported major version (`22.13` minimum), the local config is missing, or either HTTP service is unavailable.
 2. Print only non-secret status information: URLs, service status, table/package counts, and the Feishu listener state.
 3. Never print `.env.local`, app secrets, or full request bodies.
 4. Return zero only when all required checks pass; a disconnected Feishu listener is reported as a failure when the script is invoked with `-RequireFeishu` and is allowed when that switch is omitted.
