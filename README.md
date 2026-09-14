@@ -102,7 +102,7 @@ Set-Location ..
 | `检查-Taskboard.bat` | 检查 Node.js、配置、Taskboard、Bridge、飞书长连接和队列状态。 |
 | `停止-Taskboard.bat` | 停止本地 Taskboard 和 Bridge。 |
 
-这些文件使用自身所在目录定位仓库，因此可以从资源管理器直接双击；它们仍复用 `scripts` 下的正式脚本，不会改变 `127.0.0.1` 监听边界。`启动-Taskboard.bat` 默认带 `-EnableFeishu`，会先构建仓库内的 Taskboard 前端，再在打开页面前最多等待 30 秒，直到监听器进入 `sdk_managed`；启动脚本会在 `.runtime` 中记录并核对 PID、进程启动时间、启动器选中的精确 Node 可执行文件、精确脚本路径、健康接口和必要的 IPv4 loopback 监听端口；停止脚本会用同一 PID、启动时间、Node 可执行文件和脚本身份打开绑定的进程句柄后再终止，避免 Windows 重用旧 PID 时误停其他 Node 进程。旧版本留下的纯 PID 标记只有在启动脚本验证脚本、同一 Node 可执行文件、`127.0.0.1` 端口、接口健康和 Bridge 监听模式，并在写入身份文件前再次确认仍是同一进程实例后，才会自动升级；停止脚本不会用纯 PID 标记结束进程，而会提示先启动一次完成安全迁移。无法验证时会保留该进程并给出提示；停止脚本仍会检查另一个服务，随后以失败状态退出，使双击窗口停留显示原因。失败、超时或 Bridge 提前退出时，启动脚本只会清理已捕获精确创建时间的本次进程，并提示查看 `.runtime/logs/bridge.stderr.log`；检测到未标记的冲突 Bridge 时会提示先停止它。浏览器自动打开失败不会停止已经启动的服务。`检查-Taskboard.bat` 会要求监听器处于 `sdk_managed`。首次启动前仍需完成本地配置并安装 Node.js、Codex，以及仓库根目录和 `taskboard` 子目录的 Node 依赖，不要把凭据写入批处理文件。
+这些文件使用自身所在目录定位仓库，因此可以从资源管理器直接双击；它们仍复用 `scripts` 下的正式脚本，不会改变 `127.0.0.1` 监听边界。`启动-Taskboard.bat` 默认带 `-EnableFeishu`，会先构建仓库内的 Taskboard 前端，再在打开页面前最多等待 30 秒，直到监听器进入 `sdk_managed`；启动脚本会在 `.runtime` 中记录并核对 PID、进程启动时间、启动器选中的精确 Node 可执行文件、精确脚本路径、健康接口和必要的 IPv4 loopback 监听端口；停止脚本会用同一 PID、启动时间、Node 可执行文件和脚本身份打开绑定的进程句柄后再终止，避免 Windows 重用旧 PID 时误停其他 Node 进程。旧版本留下的纯 PID 标记只有在启动脚本验证脚本、同一 Node 可执行文件、`127.0.0.1` 端口、接口健康和 Bridge 监听模式，并在写入身份文件前再次确认仍是同一进程实例后，才会自动升级；停止脚本不会用纯 PID 标记结束进程，而会提示先启动一次完成安全迁移。无法验证时会保留该进程并给出提示；停止脚本仍会检查另一个服务，随后以失败状态退出，使双击窗口停留显示原因。失败、超时或 Bridge 提前退出时，启动脚本只会清理已捕获精确创建时间的本次进程，并提示查看 `.runtime/logs/bridge.stderr.log`；检测到未标记的冲突 Bridge 时会提示先停止它。浏览器自动打开失败不会停止已经启动的服务。`检查-Taskboard.bat` 会要求监听器处于 `sdk_managed`。首次启动前仍需完成本地配置，安装 Node.js 和仓库根目录及 `taskboard` 子目录的 Node 依赖，并确保当前电脑上已经可用的 `codex.exe` 能被启动脚本发现；不要把凭据写入批处理文件。
 
 ### 任务生命周期边界
 
@@ -117,6 +117,8 @@ Set-Location ..
 
 ## 团队交接与健康检查
 
+需要让目标电脑上的 Codex 完成 Windows 源码部署，并接入使用者自己的飞书应用，请把 [给 Codex 的 Windows 源码部署 Runbook](./docs/windows-source-install-guide.zh-CN.md) 交给目标电脑上已经可用的 Codex 执行。Runbook 不安装、更新、登录或修复 Codex；源码部署另行要求 Git for Windows 和 Node.js 22.13 或更高版本。它不共享本机凭据、Codex 登录态、路径或运行状态，遇到飞书权限、秘密和真实业务数据时会暂停交还本人。
+
 完整的固定流程和变更规则见根目录 [`AGENTS.md`](./AGENTS.md)。在交给团队或排查问题时，先运行只读检查：
 
 ```powershell
@@ -129,7 +131,7 @@ Set-Location ..
 .\scripts\check-local.ps1 -RequireFeishu
 ```
 
-交接验收标准是：`npm test` 全部通过；模拟事件第一次只创建一个任务；已有成功状态的重放返回 `duplicate` 且不创建第二个任务；Taskboard 对相同 `event_id` 的精确重放返回同一任务，对改绑 Base、表、记录、字段、阶段或受控上下文的请求返回冲突；真实测试表记录改为 `待剪辑` 后能创建一个对应任务。整体链路仍是至少一次处理。`-RequireFeishu` 只证明 SDK 已接管监听（`sdk_managed`），当前 SDK 没有公开的物理 socket 确认或连接回调，必须再用指定测试表事件做端到端验证。
+交接验收标准是：`npm test` 全部通过；只有本机配置与固定测试 fixture 匹配时才执行模拟验收，并确认第一次只创建一个任务、已有成功状态的重放返回同一任务且 `duplicate: true`；Taskboard 对相同 `event_id` 的精确重放返回同一任务，对改绑 Base、表、记录、字段、阶段或受控上下文的请求返回冲突；真实测试表记录进入触发值后只创建一个对应任务；最后用 `examples/harmless-auto-cut` 手动启动一次本轮新任务，确认执行对话成功结束且示例目录仍干净，从而证明 Taskboard 可以调用目标电脑上现有的 Codex。整体链路仍是至少一次处理。`-RequireFeishu` 只证明 SDK 已接管监听（`sdk_managed`），当前 SDK 没有公开的物理 socket 确认或连接回调，必须再用指定测试表事件做端到端验证。
 
 ### Taskboard 故障恢复演练
 
