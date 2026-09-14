@@ -1,12 +1,23 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const checkUrl = new URL("../scripts/check-local.ps1", import.meta.url);
 const agentsUrl = new URL("../AGENTS.md", import.meta.url);
 const readmeUrl = new URL("../README.md", import.meta.url);
 const packageUrl = new URL("../package.json", import.meta.url);
+const packageLockUrl = new URL("../package-lock.json", import.meta.url);
+const taskboardPackageUrl = new URL("../taskboard/package.json", import.meta.url);
+const taskboardPackageLockUrl = new URL("../taskboard/package-lock.json", import.meta.url);
+const taskboardReadmeUrl = new URL("../taskboard/README.md", import.meta.url);
+const taskboardChineseReadmeUrl = new URL("../taskboard/README.zh-CN.md", import.meta.url);
+const windowsSourceRunbookUrl = new URL(
+  "../docs/windows-source-install-guide.zh-CN.md",
+  import.meta.url,
+);
 const reliabilitySpecUrl = new URL(
   "../docs/superpowers/specs/2026-08-19-feishu-bridge-reliability-compensation-design.md",
   import.meta.url,
@@ -25,7 +36,7 @@ function windowsPath(url) {
 test("check script exposes a sanitized, opt-in Feishu health contract", async () => {
   const source = await readFile(checkUrl, "utf8");
   assert.match(source, /\[switch\]\$RequireFeishu/);
-  assert.match(source, /22\.5/);
+  assert.match(source, /22\.13/);
   assert.match(source, /config[\\/]bridge\.local\.json/);
   assert.match(source, /127\.0\.0\.1:47823\/api\/meta/);
   assert.match(source, /127\.0\.0\.1:47824\/health/);
@@ -40,6 +51,240 @@ test("check script exposes a sanitized, opt-in Feishu health contract", async ()
   assert.doesNotMatch(source, /lastError\.message/);
   assert.doesNotMatch(source, /Get-Content[^\r\n]*\.env\.local/i);
   assert.doesNotMatch(source, /FEISHU_APP_SECRET\s*=/i);
+});
+
+test("Node 22.13 floor stays aligned across runtime contracts and user-facing docs", async () => {
+  const [
+    rootPackage,
+    rootLock,
+    taskboardPackage,
+    taskboardLock,
+    rootReadme,
+    taskboardReadme,
+    taskboardChineseReadme,
+    windowsSourceRunbook,
+    checkSource,
+  ] = await Promise.all([
+    readFile(packageUrl, "utf8").then(JSON.parse),
+    readFile(packageLockUrl, "utf8").then(JSON.parse),
+    readFile(taskboardPackageUrl, "utf8").then(JSON.parse),
+    readFile(taskboardPackageLockUrl, "utf8").then(JSON.parse),
+    readFile(readmeUrl, "utf8"),
+    readFile(taskboardReadmeUrl, "utf8"),
+    readFile(taskboardChineseReadmeUrl, "utf8"),
+    readFile(windowsSourceRunbookUrl, "utf8"),
+    readFile(checkUrl, "utf8"),
+  ]);
+
+  for (const [label, value] of [
+    ["root package", rootPackage.engines?.node],
+    ["root lock", rootLock.packages?.[""]?.engines?.node],
+    ["Taskboard package", taskboardPackage.engines?.node],
+    ["Taskboard lock", taskboardLock.packages?.[""]?.engines?.node],
+  ]) {
+    assert.equal(value, ">=22.13", `${label} must declare the shared Node floor`);
+  }
+
+  for (const [label, source] of [
+    ["root README", rootReadme],
+    ["Taskboard README", taskboardReadme],
+    ["Taskboard Chinese README", taskboardChineseReadme],
+    ["Windows source runbook", windowsSourceRunbook],
+    ["health check", checkSource],
+  ]) {
+    assert.match(source, /22\.13/, `${label} must document Node 22.13`);
+    assert.doesNotMatch(source, /22\.5/, `${label} must not advertise the obsolete floor`);
+  }
+  assert.match(
+    checkSource,
+    /-notmatch '\^v\(\\d\+\)\\\.\(\\d\+\)\\\.\(\\d\+\)\$'/,
+    "the health check must reject prerelease or suffixed Node versions",
+  );
+});
+
+test("check script enforces the stable Node 22.13 boundary before reading local config", async () => {
+  const fixtureDirectory = await mkdtemp(join(tmpdir(), "codex-feishu-node-gate-"));
+  const powershell = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const baseEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "path"),
+  );
+  const runWithVersion = async (version) => {
+    await writeFile(
+      join(fixtureDirectory, "node.cmd"),
+      `@echo off\r\necho ${version}\r\nexit /b 0\r\n`,
+      "utf8",
+    );
+    return spawnSync(powershell, ["-NoProfile", "-File", windowsPath(checkUrl)], {
+      encoding: "utf8",
+      env: {
+        ...baseEnvironment,
+        Path: fixtureDirectory,
+        BRIDGE_CONFIG: join(fixtureDirectory, "missing-bridge.json"),
+        CODEX_FEISHU_PACKAGES_PATH: join(fixtureDirectory, "missing-packages.json"),
+      },
+    });
+  };
+
+  try {
+    const belowFloor = await runWithVersion("v22.12.9");
+    assert.notEqual(belowFloor.status, 0);
+    assert.match(belowFloor.stderr, /Node\.js >= 22\.13 is required/);
+
+    const prerelease = await runWithVersion("v22.13.0-rc.1");
+    assert.notEqual(prerelease.status, 0);
+    assert.match(prerelease.stderr, /Could not determine the Node\.js version/);
+
+    const supported = await runWithVersion("v22.13.0");
+    assert.notEqual(supported.status, 0);
+    assert.match(supported.stderr, /Local config is missing/);
+    assert.doesNotMatch(supported.stderr, /Node\.js >= 22\.13|Could not determine/);
+  } finally {
+    await rm(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Windows source runbook keeps executable inputs and npm installs fail-closed", async () => {
+  const source = await readFile(windowsSourceRunbookUrl, "utf8");
+  const blockedPatterns = [...source.matchAll(/\$deploymentBlockedPattern = '([^'\r\n]+)'/g)].map(
+    ([, pattern]) => new RegExp(pattern, "i"),
+  );
+  assert.ok(blockedPatterns.length > 0, "runbook must define inherited-environment gates");
+
+  const blockedVariables = [
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+  ];
+  for (const pattern of blockedPatterns) {
+    for (const variable of blockedVariables) {
+      assert.match(variable, pattern, `${variable} must be rejected by every runbook gate`);
+    }
+    assert.doesNotMatch("CODEX_HOME", pattern, "CODEX_HOME has a separate confirmation flow");
+  }
+
+  const phaseA = source.match(/## 2\. 阶段 A：[\s\S]*?(?=\n## 3\. 阶段 B：)/)?.[0] ?? "";
+  assert.match(
+    phaseA,
+    /\$inheritedCodexExecutable = \[Environment\]::GetEnvironmentVariable\('CODEX_EXECUTABLE', 'Process'\)/,
+  );
+  assert.match(
+    phaseA,
+    /if \(\$null -ne \$inheritedCodexExecutable\) \{\s*throw '[^']+'\s*\}/,
+    "phase A must reject even an empty inherited CODEX_EXECUTABLE",
+  );
+  assert.doesNotMatch(
+    phaseA,
+    /Resolve-ExistingLocalFile \$inheritedCodexExecutable|Set-Item[^\r\n]+\$inheritedCodexExecutable/,
+    "the rejected inherited executable must never become the confirmed executable",
+  );
+
+  const phaseB = source.match(/## 3\. 阶段 B：[\s\S]*?(?=\n## 4\. 阶段 C：)/)?.[0] ?? "";
+  assert.match(phaseB, /Name = 'node\.exe'; Expected = \$confirmedNodeExecutable/);
+  assert.match(phaseB, /Name = 'npm\.cmd'; Expected = \$confirmedNpmExecutable/);
+  assert.match(
+    phaseB,
+    /\[string\]::Equals\(\$confirmedNodeDirectory, \$confirmedNpmDirectory, \[System\.StringComparison\]::OrdinalIgnoreCase\)/,
+  );
+  assert.match(
+    phaseB,
+    /\$confirmedNpmCli = Resolve-ExistingLocalFile \(Join-Path \$confirmedNpmDirectory 'node_modules\\npm\\bin\\npm-cli\.js'\)/,
+  );
+  assert.match(phaseB, /& \$confirmedNodeExecutable \$confirmedNpmCli --version/);
+  assert.doesNotMatch(phaseB, /&\s+\$confirmedNpmExecutable\s+install\b/);
+  assert.equal(
+    [...phaseB.matchAll(/&\s+\$confirmedNodeExecutable\s+\$confirmedNpmCli\s+ci(?:\s|$)/gm)].length,
+    2,
+    "both lockfile-backed workspaces must use npm ci",
+  );
+  const rootInstallIndex = phaseB.indexOf("& $confirmedNodeExecutable $confirmedNpmCli ci");
+  const taskboardInstallIndex = phaseB.indexOf(
+    "& $confirmedNodeExecutable $confirmedNpmCli ci --prefix taskboard",
+  );
+  const testCommandIndex = phaseB.indexOf("& $confirmedNodeExecutable $confirmedNpmCli test");
+  const statusIndex = phaseB.indexOf(
+    "$postInstallStatus = @(& $confirmedGitExecutable status --porcelain=v1 --untracked-files=all)",
+  );
+  assert.ok(rootInstallIndex >= 0 && rootInstallIndex < taskboardInstallIndex);
+  assert.ok(taskboardInstallIndex < testCommandIndex);
+  assert.ok(testCommandIndex >= 0, "phase B must run the complete test gate");
+  assert.ok(
+    testCommandIndex < statusIndex,
+    "phase B must inspect the whole worktree after install and test",
+  );
+  assert.match(phaseB.slice(statusIndex), /\$LASTEXITCODE -ne 0[\s\S]*\$postInstallStatus\.Count -gt 0/);
+});
+
+test("Windows source runbook is linked once and documents the legacy first acceptance", async () => {
+  const [readme, runbook] = await Promise.all([
+    readFile(readmeUrl, "utf8"),
+    readFile(windowsSourceRunbookUrl, "utf8"),
+  ]);
+  assert.equal(
+    readme.split("./docs/windows-source-install-guide.zh-CN.md").length - 1,
+    1,
+    "README must expose one canonical runbook entry",
+  );
+  assert.match(runbook, /首次无害验收[\s\S]{0,200}legacy `tables`/);
+  assert.match(runbook, /不通过 Taskboard UI 新增 Base，也不创建或启用 phased subject/);
+  assert.match(runbook, /scripts[\\/]simulate-ready\.ps1/);
+});
+
+test("every Windows runbook PowerShell block is closed, guarded when needed, and parseable", async () => {
+  const runbook = await readFile(windowsSourceRunbookUrl, "utf8");
+  const openers = runbook.match(/^```powershell[ \t]*\r?$/gm) ?? [];
+  const powershellBlocks = [
+    ...runbook.matchAll(/^```powershell[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gm),
+  ].map(([, block]) => block);
+  assert.equal(
+    powershellBlocks.length,
+    openers.length,
+    "every PowerShell opener must have a matching closing fence",
+  );
+  assert.ok(powershellBlocks.length > 0, "runbook must contain executable PowerShell blocks");
+  const controlledInvocation = /(?:&\s+\$(?:confirmedGitExecutable|confirmedNodeExecutable|confirmedNpmExecutable|confirmedCodexExecutable)|\.\\scripts\\(?:start-local|check-local|stop-local|simulate-ready)\.ps1)/;
+  const parserDirectory = await mkdtemp(join(tmpdir(), "codex-feishu-runbook-parser-"));
+  try {
+    for (const [index, block] of powershellBlocks.entries()) {
+      if (controlledInvocation.test(block)) {
+        assert.match(block, /\$deploymentBlockedPattern = '/, `PowerShell block ${index + 1} needs a gate`);
+        assert.match(block, /GetEnvironmentVariables\(/, `PowerShell block ${index + 1} must inspect process variables`);
+        assert.match(block, /\$blockedProcessVariables\.Count -gt 0[\s\S]*throw/, `PowerShell block ${index + 1} must fail closed`);
+      }
+      const filename = join(parserDirectory, `block-${index + 1}.ps1`);
+      await writeFile(filename, `\ufeff${block}`, "utf8");
+    }
+    const escapedDirectory = parserDirectory.replaceAll("'", "''");
+    const command = [
+      "$failed=$false",
+      `Get-ChildItem -LiteralPath '${escapedDirectory}' -Filter '*.ps1' | ForEach-Object {`,
+      "$tokens=$null",
+      "$errors=$null",
+      "[void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)",
+      "if($errors.Count){$failed=$true;$errors|ForEach-Object{Write-Error $_}}",
+      "}",
+      "if($failed){exit 1}",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(
+      result.status,
+      0,
+      `all PowerShell blocks must parse: ${result.stderr || result.stdout}`,
+    );
+  } finally {
+    await rm(parserDirectory, { recursive: true, force: true });
+  }
 });
 
 test("check script parses in Windows PowerShell 5", async () => {

@@ -12,17 +12,17 @@ $bridgeUrl = 'http://127.0.0.1:47824/health'
 
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 if (-not $nodeCommand) { $nodeCommand = Get-Command node -ErrorAction SilentlyContinue }
-if (-not $nodeCommand) { throw 'Node.js was not found. Install Node.js >= 22.5.' }
+if (-not $nodeCommand) { throw 'Node.js was not found. Install Node.js >= 22.13.' }
 $node = $nodeCommand.Source
 
 $nodeVersionOutput = (& $node --version 2>$null).Trim()
-if ($LASTEXITCODE -ne 0 -or $nodeVersionOutput -notmatch '^v(\d+)\.(\d+)\.(\d+)') {
+if ($LASTEXITCODE -ne 0 -or $nodeVersionOutput -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
   throw 'Could not determine the Node.js version.'
 }
 $nodeMajor = [int]$Matches[1]
 $nodeMinor = [int]$Matches[2]
-if ($nodeMajor -lt 22 -or ($nodeMajor -eq 22 -and $nodeMinor -lt 5)) {
-  throw "Node.js >= 22.5 is required (found $nodeVersionOutput)."
+if ($nodeMajor -lt 22 -or ($nodeMajor -eq 22 -and $nodeMinor -lt 13)) {
+  throw "Node.js >= 22.13 is required (found $nodeVersionOutput)."
 }
 
 if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
