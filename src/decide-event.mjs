@@ -143,6 +143,9 @@ function modernDecision(subject, event) {
   }
   const statusField = subject.statusField ?? {};
   const statusFieldId = statusField.fieldId ?? statusField.field_id;
+  if (statusFieldId && event.fieldId && event.fieldId !== statusFieldId) {
+    return { kind: "ignored", reason: "unrelated_field" };
+  }
   if (!event.beforePresent || !event.afterPresent
     || !Object.hasOwn(event, "beforeOptionId") || !Object.hasOwn(event, "afterOptionId")
     || !event.beforeOptionId || !event.afterOptionId) {

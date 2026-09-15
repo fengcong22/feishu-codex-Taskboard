@@ -555,18 +555,6 @@ export function createBridge({
       }, heartbeat, { requireTaskIdentifier: false });
     }
     if (decision.kind === "ignored") {
-      // A move from an enabled stage into a disabled stage still archives the
-      // old waiting task, but does not register the disabled target.
-      const previous = Object.entries(subject.stages ?? {}).find(([, stage]) => (
-        stage?.trigger?.optionId === record.event.beforeOptionId
-      ));
-      if (previous) {
-        await archiveWaitingFeishuStageTasks(taskboard, {
-          event: record.event,
-          stageId: previous[0],
-          statusFieldId: subject.statusField?.fieldId ?? record.event.statusFieldId,
-        }, { ensureActive: () => heartbeat.ensureActive() });
-      }
       return completePhased(record, "ignored", {
         kind: "ignored",
         reason: decision.reason,
