@@ -58,6 +58,7 @@ const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_ATTACHMENT_LIMIT = 10;
 const AUTOCUT_RESULT_MAX_BYTES = 1024 * 1024;
+const AUTOCUT_ARTIFACT_REPORT_TIMEOUT_MS = 5 * 60 * 1000;
 const AI_CHAT_SKILL_MARKER = "\uFFFC";
 const HOST_RUNTIME_TTL_MS = 3_000;
 const CODEX_PLAN_TAIL_BYTES = 16 * 1024 * 1024;
@@ -2629,9 +2630,18 @@ export function resolveAutomaticExecution(value = process.env.CODEX_TASKBOARD_AL
 
 export function createTaskboardServer(options = {}) {
   const resolved = resolveServerOptions(options);
+  const serviceEnvironment = options.processEnv ?? process.env;
   const codexProcessEnvironment = withoutTaskboardLauncherEnvironment(
-    options.processEnv ?? process.env,
+    serviceEnvironment,
   );
+  const localAutoCutDeadlines = Object.fromEntries([
+    ["environmentTimeoutMs", "CODEX_TASKBOARD_AUTOCUT_ENVIRONMENT_TIMEOUT_MS"],
+    ["preflightTimeoutMs", "CODEX_TASKBOARD_AUTOCUT_PREFLIGHT_TIMEOUT_MS"],
+    ["runTimeoutMs", "CODEX_TASKBOARD_AUTOCUT_RUN_TIMEOUT_MS"],
+  ].flatMap(([name, variable]) => {
+    const value = serviceEnvironment[variable];
+    return value === undefined || value === "" ? [] : [[name, Number(value)]];
+  }));
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const pendingFeishuReconciliations = new Set();
@@ -3913,27 +3923,56 @@ export function createTaskboardServer(options = {}) {
   async function reportLocalAutoCutArtifact(run, claimToken) {
     const result = await readAutoCutResult(run);
     if (result.status === "blocked") return result;
-    const response = await fetch(localArtifactReportUrl(run.taskId, run.runId), {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${claimToken}`,
-        "content-type": "application/json",
-        "x-taskboard-client": "taskctl",
-      },
-      body: JSON.stringify({
-        path: run.packageZipPath,
-        sha256: await sha256File(run.packageZipPath),
-        manifestSha256: run.manifestSha256,
-      }),
-    });
-    let payload = null;
-    try { payload = await response.json(); } catch {}
-    if (!response.ok) {
-      throw new ApiError(
-        response.status,
-        payload?.error?.code ?? "AUTOCUT_ARTIFACT_REPORT_FAILED",
-        payload?.error?.message ?? "Taskboard could not accept the Auto-Cut ZIP",
+    let sha256;
+    try {
+      sha256 = await sha256File(run.packageZipPath);
+    } catch {
+      throw autoCutResultError("AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE", "The bound Auto-Cut ZIP could not be read");
+    }
+    const configuredTimeout = options.localAutoCutArtifactReportTimeoutMs;
+    const timeoutMs = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0
+      ? configuredTimeout
+      : AUTOCUT_ARTIFACT_REPORT_TIMEOUT_MS;
+    const signal = AbortSignal.timeout(timeoutMs);
+    let response;
+    let payload;
+    try {
+      response = await fetch(localArtifactReportUrl(run.taskId, run.runId), {
+        method: "POST",
+        signal,
+        headers: {
+          authorization: `Bearer ${claimToken}`,
+          "content-type": "application/json",
+          "x-taskboard-client": "taskctl",
+        },
+        body: JSON.stringify({ path: run.packageZipPath, sha256, manifestSha256: run.manifestSha256 }),
+      });
+      try { payload = await response.json(); } catch (error) {
+        if (signal.aborted) throw error;
+      }
+    } catch {
+      throw autoCutResultError(
+        signal.aborted ? "AUTOCUT_ARTIFACT_REPORT_TIMEOUT" : "AUTOCUT_ARTIFACT_REPORT_FAILED",
+        signal.aborted ? "Taskboard timed out while registering the Auto-Cut ZIP" : "Taskboard could not register the Auto-Cut ZIP",
       );
+    }
+    if (!response.ok) {
+      throw autoCutResultError("AUTOCUT_ARTIFACT_REPORT_FAILED", `Taskboard rejected the Auto-Cut ZIP (HTTP ${response.status})`);
+    }
+    const artifact = database.getTaskArtifactForRun(run.taskId, run.runId);
+    if (
+      !artifact
+      || payload?.artifact?.id !== artifact.id
+      || payload.artifact.runId !== run.runId
+      || payload.artifact.taskId !== run.taskId
+      || payload.artifact.sha256 !== sha256
+      || payload.artifact.validationStatus !== "verified"
+      || artifact.validationStatus !== "verified"
+      || artifact.sha256 !== sha256
+      || artifact.filename !== path.basename(run.packageZipPath)
+      || database.getFeishuAutoCutRun(run.runId)?.state !== "reported"
+    ) {
+      throw autoCutResultError("AUTOCUT_ARTIFACT_REPORT_INVALID", "Taskboard returned an invalid Auto-Cut artifact registration response");
     }
     return result;
   }
@@ -4741,6 +4780,7 @@ export function createTaskboardServer(options = {}) {
           run: prepared.autoCutRun,
           packageConfig,
           environment: codexProcessEnvironment,
+          ...localAutoCutDeadlines,
           signal: taskStartAbortController.signal,
           ...(trigger === "retry" && autoCutRunConsent ? { autoCutRunConsent } : {}),
         });
@@ -4883,10 +4923,13 @@ export function createTaskboardServer(options = {}) {
     try {
       if (!lease) lease = await resourceScheduler.request(execution);
       assertTaskStartAllowed(signal);
-      const startClaimedTask = trigger === "retry"
-        && autoCutRunConsent?.allowVideoAudioAsr === true
-        && autoCutRunConsent?.allowConfiguredLocalOutput === true
-        && isPhasedAutoCutOrigin(metadata)
+      const useLocalAutoCut = isPhasedAutoCutOrigin(metadata)
+        && (trigger === "automatic" || (
+          trigger === "retry"
+          && autoCutRunConsent?.allowVideoAudioAsr === true
+          && autoCutRunConsent?.allowConfiguredLocalOutput === true
+        ));
+      const startClaimedTask = useLocalAutoCut
         ? startClaimedTaskWithLocalAutoCut
         : startClaimedTaskWithAi;
       return await startClaimedTask(

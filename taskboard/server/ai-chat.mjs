@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
 import { ApiError } from "./database.mjs";
@@ -24,6 +25,8 @@ const ERROR_CONTENT_LIMIT = 65_536;
 const AGENT_DISPATCH_PROTOCOL = "taskboard.agent.v1";
 const SKILL_MARKER = "\uFFFC";
 const ARTIFACT_REPORT_ENVIRONMENT_KEYS = new Set([
+  "CODEX_AUTOCUT_TASKCTL_NODE",
+  "CODEX_AUTOCUT_TASKCTL_PATH",
   "CODEX_AUTOCUT_ARTIFACT_REPORT_URL",
   "CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN",
   "CODEX_AUTOCUT_SOURCE_MANIFEST_PATH",
@@ -666,6 +669,8 @@ export class AiChatService {
               ...this.processEnv,
               CODEX_AUTOCUT_ARTIFACT_REPORT_URL: runContext.artifactReport.url,
               CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN: runContext.artifactReport.token,
+              CODEX_AUTOCUT_TASKCTL_NODE: process.execPath,
+              CODEX_AUTOCUT_TASKCTL_PATH: fileURLToPath(new URL("../cli/taskctl.mjs", import.meta.url)),
               ...(runContext.sourceManifest ? {
                 CODEX_AUTOCUT_SOURCE_MANIFEST_PATH: runContext.sourceManifest.path,
                 CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256: runContext.sourceManifest.sha256,

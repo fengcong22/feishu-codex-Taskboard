@@ -20,6 +20,24 @@ flowchart LR
 
 每个 Base/子表的 Taskboard 隔离项目 ID 固定为 `feishu-` 加上 `sha256(baseToken:tableId)` 的前 16 个十六进制字符；Bridge 和 Taskboard 必须保持这一规则一致。旧项目 ID 不会自动改写，新投递统一使用 16 位规则。
 
+## Auto-Cut 执行环境与制品登记
+
+通过所有自动执行门禁的 phased 任务（包含重启恢复的预约）直接使用 Taskboard 已有的本机 Auto-Cut runner。runner 读取当前 Windows 用户 `%LOCALAPPDATA%/Auto-Cut/auto-cut-lite/deployment-report.json`，核对 `workspace_root` 与白名单项目包相符，使用报告内固定 Python 和 runtime 中的 `scripts/jy_wrapper.py`。已有双项授权重试也使用该 runner；手动启动和未携带授权的重试仍走原 Codex 流程。
+
+启动前检查在与 runner 相同的 Windows 账号、环境和访问权限下执行，默认最多 30 秒：
+
+- `components.lark_cli.path` 必须是可读的绝对 CLI 文件路径。Windows 当前支持已安装包的 npm shim 布局（`.ps1/.cmd/.bat`），还须能读取同目录的 `lark-cli.cmd` 及 `node_modules/@larksuite/cli/scripts/run.js`；Taskboard 使用固定 Node 运行入口，并向 Auto-Cut 注入该 CLI 和 Node 所在目录。若 CLI 同目录存在另一个 `node.exe`，或报告指定原生 EXE/JS 等无法保证与 Python 自动发现一致的入口，检查会阻断，需修正本机安装布局。
+- 该账号必须可访问 CLI 已有的用户配置/认证目录与其使用的系统凭据存储。继承该账号的 `HOME`、`USERPROFILE`、`APPDATA` 等定位环境，以 `whoami` 返回 `available: true`、`identity: user`、`defaultAs/default_as: user` 为可用条件；不复制凭据、不自动登录、不输出身份回执或 CLI 原始错误。此检查不代替具体飞书文档权限校验。
+- readiness 默认是 `%LOCALAPPDATA%/Auto-Cut/auto-cut-lite/runtime-readiness.json`，可用服务环境变量 `AUTOCUT_LITE_READINESS_PATH` 指定绝对路径。已有文件必须可读写，父目录必须允许创建、写入和删除临时文件；本次检查不改写 readiness 内容。当前 run 的 job、drafts 和 ZIP 父目录须具备相同临时文件访问条件。
+
+配置缺失或访问失败会以 `AUTOCUT_RUNTIME_UNAVAILABLE`、`AUTOCUT_LARK_CLI_UNAVAILABLE`、`AUTOCUT_LARK_IDENTITY_UNAVAILABLE`、`AUTOCUT_READINESS_UNAVAILABLE`、`AUTOCUT_OUTPUT_UNAVAILABLE` 等明确原因阻断。环境探测、Auto-Cut 预检及完整运行的默认期限依次为 30 秒、120 秒、2 小时，可通过 `CODEX_TASKBOARD_AUTOCUT_ENVIRONMENT_TIMEOUT_MS`、`CODEX_TASKBOARD_AUTOCUT_PREFLIGHT_TIMEOUT_MS`、`CODEX_TASKBOARD_AUTOCUT_RUN_TIMEOUT_MS` 设置正整数毫秒值（最大 2147483647）；服务重启后生效。预检完成信号从 Auto-Cut 的 stderr JSON 进度读取，超时会终止该次子进程树并记录对应 `*_TIMEOUT`，不持续显示无解释的“处理中”。
+
+剪辑完成后 Taskboard 读取该 run 的结果回执，计算精确 ZIP 的 SHA-256，经已有本机接口用专用 claim 凭据登记，再核对已入库的 verified 制品和任务/run 绑定后完成任务。登记请求及响应正文限时 5 分钟，失败记录 `AUTOCUT_ARTIFACT_REPORT_FAILED/TIMEOUT/INVALID` 并释放执行占用；从关闭服务开始计算的总时间还包括当前 ZIP 文件 IO。该路径不依赖 `taskctl` 的 PATH。保留的 Codex 路径使用服务注入的 `CODEX_AUTOCUT_TASKCTL_NODE` 与 `CODEX_AUTOCUT_TASKCTL_PATH`，无需 AI 查找命令。全部流程保留专用凭据、ZIP 哈希、结果回执校验以及来源、白名单、loopback 和自动执行开关边界。
+
+验证使用临时数据库、独立任务和受控 runtime/CLI fixture，覆盖启动、模拟剪辑产物、真实 ZIP 校验登记到 Taskboard 完成，以及 CLI/认证/readiness/超时和登记失败。它不代表真实媒体剪辑验收；须待 Auto-cut-lite 预检修复包可用后，在独立测试学科/示例项目验证同一全链路。模拟 Bridge 事件仍没有自动执行资格。
+
+本轮源码交付不改变运行中的服务。部署时先完成代码评审和 `npm test`，待现有任务与上传结束，在维护窗口停止服务并备份现有 `.env.local`、本地配置、Taskboard 数据目录和 Bridge 状态；合入已评审源码，保留所有现有配置、凭据及状态，以原账号、原开关和原配置运行 `scripts/start-local.ps1`，再运行 `scripts/check-local.ps1`（真实长连接用 `-RequireFeishu`）。先做模拟投递安全回归，再用独立测试表的真实事件验证更新后的 Auto-cut-lite：启动 → 剪辑 → ZIP 校验登记 → `done`。不要重放已完成的 FEI-29，也不要删除状态或锁文件。
+
 ## 当前已支持
 
 | 能力 | 说明 |

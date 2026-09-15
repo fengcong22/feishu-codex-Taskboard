@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -29,18 +29,28 @@ async function fixture(scriptBody) {
     mkdir(path.join(localAppData, "Auto-Cut", "auto-cut-lite"), { recursive: true }),
   ]);
   await writeFile(script, scriptBody, "utf8");
+  const larkDirectory = path.join(root, "user npm");
+  const larkScript = path.join(larkDirectory, "node_modules", "@larksuite", "cli", "scripts", "run.js");
+  await mkdir(path.dirname(larkScript), { recursive: true });
+  await writeFile(path.join(larkDirectory, "lark-cli.cmd"), "fixture shim");
+  await writeFile(larkScript, 'console.log(JSON.stringify({available:true,identity:"user",defaultAs:"user"}));');
   await writeFile(
     path.join(localAppData, "Auto-Cut", "auto-cut-lite", "deployment-report.json"),
     JSON.stringify({
       deployment_status: "installed",
       workspace_root: workspacePath,
       runtime_root: runtimeRoot,
-      components: { python: { runtime_path: process.execPath } },
+      components: {
+        python: { runtime_path: process.execPath },
+        lark_cli: { path: path.join(larkDirectory, "lark-cli.cmd") },
+      },
     }),
     "utf8",
   );
   const jobRoot = path.join(root, "job");
   const outputRoot = path.join(root, "output");
+  await mkdir(path.join(jobRoot, "drafts"), { recursive: true });
+  await mkdir(outputRoot);
   const run = {
     taskId: "task-fixed",
     runId: "run-fixed",
@@ -60,6 +70,7 @@ async function fixture(scriptBody) {
     localAppData,
     runtimeRoot,
     workspacePath,
+    larkScript,
     run,
     packageConfig: { workspacePath },
   };
@@ -127,6 +138,145 @@ process.stdout.write("fixture complete");
     await rm(current.root, { recursive: true, force: true });
   }
 });
+
+for (const scenario of ["missing-cli", "denied-auth", "invalid-readiness", "whoami-timeout"]) {
+  test(`fails promptly before running Auto-Cut: ${scenario}`, async () => {
+    const current = await fixture('require("node:fs").writeFileSync(process.env.UNEXPECTED_RUN, "started");');
+    const capture = path.join(current.root, "unexpected-run");
+    const environment = { ...process.env, LOCALAPPDATA: current.localAppData, UNEXPECTED_RUN: capture };
+    let code;
+    if (scenario === "missing-cli") {
+      await rm(current.larkScript);
+      code = "AUTOCUT_LARK_CLI_UNAVAILABLE";
+    } else if (scenario === "denied-auth") {
+      await writeFile(current.larkScript, 'console.error("Access denied credential=must-stay-private"); process.exit(1);');
+      code = "AUTOCUT_LARK_IDENTITY_UNAVAILABLE";
+    } else if (scenario === "invalid-readiness") {
+      const parent = path.join(current.root, "not-a-directory");
+      await writeFile(parent, "file");
+      environment.AUTOCUT_LITE_READINESS_PATH = path.join(parent, "runtime-readiness.json");
+      code = "AUTOCUT_READINESS_UNAVAILABLE";
+    } else {
+      await writeFile(current.larkScript, 'setInterval(() => {}, 1000);');
+      code = "AUTOCUT_ENVIRONMENT_TIMEOUT";
+    }
+    try {
+      await assert.rejects(runLocalAutoCut({
+        run: current.run, packageConfig: current.packageConfig, environment,
+        environmentTimeoutMs: scenario === "whoami-timeout" ? 800 : 5_000,
+      }), (error) => error.code === code && !error.message.includes("must-stay-private"));
+      await assert.rejects(readFile(capture), { code: "ENOENT" });
+    } finally {
+      await rm(current.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("uses the configured Lark entrypoint with no taskctl or lark-cli on PATH and preserves readiness", async () => {
+  const current = await fixture('process.stdout.write("complete");');
+  const readinessPath = path.join(current.localAppData, "Auto-Cut", "auto-cut-lite", "runtime-readiness.json");
+  const readiness = '{"lark":{"status":"verified"},"asr":{"status":"verified"}}';
+  await writeFile(readinessPath, readiness);
+  try {
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== "path"));
+    const result = await runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...environment, PATH: "", LOCALAPPDATA: current.localAppData },
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(await readFile(readinessPath, "utf8"), readiness);
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+test("bounds a runtime stuck in preflight and suppresses raw runtime errors", async () => {
+  const current = await fixture('console.log(JSON.stringify({type:"progress",event:"phase",phase:"preflight",status:"started"})); setInterval(() => {}, 1000);');
+  try {
+    await assert.rejects(runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+      preflightTimeoutMs: 500,
+    }), { code: "AUTOCUT_PREFLIGHT_TIMEOUT" });
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+test("runtime failure does not expose arbitrary stdout or stderr", async () => {
+  const current = await fixture('console.error("credential=must-stay-private"); process.exit(1);');
+  try {
+    await assert.rejects(runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+    }), (error) => error.code === "autocut_process_failed" && !error.message.includes("must-stay-private"));
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+test("stops a stuck post-preflight run at its overall deadline", async () => {
+  const current = await fixture('console.error(JSON.stringify({type:"progress",event:"phase",phase:"preflight",status:"complete"})); setInterval(() => {}, 1000);');
+  try {
+    await assert.rejects(runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+      preflightTimeoutMs: 2_000, runTimeoutMs: 3_000,
+    }), { code: "AUTOCUT_RUN_TIMEOUT" });
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+test("rejects a read-only readiness file before editing on Windows", { skip: process.platform !== "win32" }, async () => {
+  const current = await fixture('require("node:fs").writeFileSync(process.env.UNEXPECTED_RUN, "started");');
+  const readinessPath = path.join(current.localAppData, "Auto-Cut", "auto-cut-lite", "runtime-readiness.json");
+  const capture = path.join(current.root, "unexpected-run");
+  await writeFile(readinessPath, '{"status":"existing"}');
+  await chmod(readinessPath, 0o444);
+  try {
+    await assert.rejects(runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData, UNEXPECTED_RUN: capture },
+    }), { code: "AUTOCUT_READINESS_UNAVAILABLE" });
+    await assert.rejects(readFile(capture), { code: "ENOENT" });
+    assert.equal(await readFile(readinessPath, "utf8"), '{"status":"existing"}');
+  } finally {
+    await chmod(readinessPath, 0o666);
+    await rm(current.root, { recursive: true, force: true });
+  }
+});
+
+test("rejects non-user authentication and malformed whoami output without exposing it", async () => {
+  const current = await fixture('throw new Error("runtime must not start");');
+  try {
+    for (const output of ['{ "available":true, "identity":"bot", "defaultAs":"bot" }', 'credential=must-stay-private']) {
+      await writeFile(current.larkScript, `console.log(${JSON.stringify(output)});`);
+      await assert.rejects(runLocalAutoCut({
+        run: current.run, packageConfig: current.packageConfig,
+        environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+      }), { code: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE" });
+    }
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+for (const scenario of ["js-entrypoint", "native-exe-with-old-cmd", "different-adjacent-node"]) {
+  test(`rejects Windows CLI resolution that could differ from the runtime: ${scenario}`, { skip: process.platform !== "win32" }, async () => {
+    const current = await fixture('require("node:fs").writeFileSync(process.env.UNEXPECTED_RUN, "started");');
+    const capture = path.join(current.root, "unexpected-run");
+    try {
+      if (scenario !== "different-adjacent-node") {
+        const reportPath = path.join(current.localAppData, "Auto-Cut", "auto-cut-lite", "deployment-report.json");
+        const report = JSON.parse(await readFile(reportPath, "utf8"));
+        report.components.lark_cli.path = scenario === "js-entrypoint" ? current.larkScript : process.execPath;
+        await writeFile(reportPath, JSON.stringify(report));
+      } else {
+        await writeFile(path.join(current.root, "user npm", "node.exe"), "different Node binary");
+      }
+      await assert.rejects(runLocalAutoCut({
+        run: current.run, packageConfig: current.packageConfig,
+        environment: {
+          ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== "path")),
+          LOCALAPPDATA: current.localAppData, UNEXPECTED_RUN: capture,
+          PATH: path.join(current.root, "user npm"),
+        },
+      }), { code: "AUTOCUT_LARK_CLI_UNAVAILABLE" });
+      await assert.rejects(readFile(capture), { code: "ENOENT" });
+    } finally { await rm(current.root, { recursive: true, force: true }); }
+  });
+}
 
 test("terminates the local Auto-Cut process when Taskboard shuts down", async () => {
   const readyPath = path.join(os.tmpdir(), `taskboard-runner-ready-${process.pid}-${Date.now()}.json`);

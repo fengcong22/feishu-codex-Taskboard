@@ -105,6 +105,8 @@ async function createFixture({
   turnDelayMs = 0,
   allowAutomaticExecution = false,
   autoCutRunner = undefined,
+  localAutoCutArtifactReportTimeoutMs = undefined,
+  processEnvironmentOverrides = {},
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-autocut-lifecycle-"));
   const workspacePath = path.join(directory, "workspace");
@@ -161,12 +163,12 @@ if (args[0] === "debug") {
 `);
   await chmod(codexExecutable, 0o755);
   const bridge = await createBridge(controlledContext, bridgeStatus);
-  const app = createTaskboardServer({
+  const serverOptions = {
     dataDirectory: directory,
     codexExecutable,
     feishuBridgeUrl: bridge.url,
     feishuBridgeSecret: SECRET,
-    processEnv: { ...process.env, CODEX_FEISHU_BRIDGE_SECRET: SECRET },
+    processEnv: { ...process.env, ...processEnvironmentOverrides, CODEX_FEISHU_BRIDGE_SECRET: SECRET },
     feishuPackages: {
       packages: {
         "Auto-cut-lite": {
@@ -185,7 +187,9 @@ if (args[0] === "debug") {
     feishuWorkflowSync: async () => ({ ok: true }),
     allowAutomaticExecution,
     autoCutRunner,
-  });
+    localAutoCutArtifactReportTimeoutMs,
+  };
+  const app = createTaskboardServer(serverOptions);
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   return {
     app,
@@ -196,6 +200,7 @@ if (args[0] === "debug") {
     directory,
     workspacePath,
     zipSourceDirectory,
+    serverOptions,
   };
 }
 
@@ -359,6 +364,231 @@ async function reportRunArtifact(fixture, run, overrides = {}) {
   );
 }
 
+test("an initial automatic phased run completes locally without Codex or taskctl on PATH", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/automatic-local-runner"],
+    namingDisplayValue: "自动本机执行",
+    namingValueUnique: true,
+  };
+  const invocations = [];
+  const fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    processEnvironmentOverrides: { PATH: "", Path: "" },
+    autoCutRunner: async ({ run }) => {
+      invocations.push(run.runId);
+      await writePassingRunResult(run);
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
+    const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
+    assert.deepEqual(invocations, [run.runId]);
+    assert.equal(run.state, "completed");
+    assert.equal(fixture.app.database.getAiChatThread(task.threadId).model, "local-autocut");
+    const artifact = fixture.app.database.getTaskArtifactForRun(task.id, run.runId);
+    assert.equal(artifact.validationStatus, "verified");
+    assert.equal(artifact.filename, path.basename(run.packageZipPath));
+    assert.equal(fixture.app.database.getTaskAiStartForArtifactReport(task.id, run.runId), null);
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("initial automatic preflight failure blocks the attempt and releases its claim", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/automatic-preflight-failure"],
+    namingDisplayValue: "自动预检失败",
+    namingValueUnique: true,
+  };
+  const fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    autoCutRunner: async () => {
+      const error = new Error("Auto-Cut Lark CLI is unavailable");
+      error.code = "AUTOCUT_LARK_CLI_UNAVAILABLE";
+      throw error;
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 8_000);
+    const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
+    assert.equal(run.state, "blocked");
+    assert.equal(run.errorCode, "AUTOCUT_LARK_CLI_UNAVAILABLE");
+    assert.equal(fixture.app.database.getAiChatRun(run.runId).status, "failed");
+    assert.equal(fixture.app.database.getTaskAiStartForArtifactReport(task.id, run.runId), null);
+    assert.equal(fixture.app.database.getFeishuExecution(task.id), null);
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a recovered automatic phased reservation runs locally after policy revalidation", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/recovered-automatic-runner"],
+    namingDisplayValue: "恢复自动本机执行",
+    namingValueUnique: true,
+  };
+  const invocations = [];
+  const fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    autoCutRunner: async ({ run }) => {
+      invocations.push(run.runId);
+      await writePassingRunResult(run);
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id)?.state, "delayed");
+    await fixture.app.close();
+    fixture.app = createTaskboardServer(fixture.serverOptions);
+    await fixture.app.listen({ host: "127.0.0.1", port: 0 });
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
+    const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
+    assert.deepEqual(invocations, [run.runId]);
+    assert.equal(run.state, "completed");
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+for (const [scenario, allowAutomaticExecution, simulation] of [
+  ["disabled local automatic execution", false, false],
+  ["simulated delivery", true, true],
+]) {
+  test(`${scenario} cannot invoke the local Auto-Cut runner`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/automatic-policy"],
+      namingDisplayValue: "自动策略边界",
+      namingValueUnique: true,
+    };
+    let invocations = 0;
+    const fixture = await createFixture({
+      controlledContext,
+      allowAutomaticExecution,
+      autoCutRunner: async () => { invocations += 1; },
+    });
+    try {
+      const subject = await registerSubject(fixture, { executionMode: "automatic" });
+      const body = registration(subject, controlledContext);
+      if (simulation) body.event.deliverySource = "simulation";
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", body);
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      assert.equal(created.body.task.status, "todo");
+      assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id), null);
+      assert.deepEqual(fixture.app.database.listFeishuAutoCutRuns(created.body.task.id), []);
+      assert.equal(invocations, 0);
+      await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const [failure, expectedCode] of [
+  ["http-error", "AUTOCUT_ARTIFACT_REPORT_FAILED"],
+  ["connection-error", "AUTOCUT_ARTIFACT_REPORT_FAILED"],
+  ["timeout", "AUTOCUT_ARTIFACT_REPORT_TIMEOUT"],
+  ["body-timeout", "AUTOCUT_ARTIFACT_REPORT_TIMEOUT"],
+  ["invalid-success", "AUTOCUT_ARTIFACT_REPORT_INVALID"],
+]) {
+  test(`local artifact report ${failure} blocks the attempt and releases its claim`, async (t) => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/local-report-failure"],
+      namingDisplayValue: "本机制品登记失败",
+      namingValueUnique: true,
+    };
+    const fixture = await createFixture({
+      controlledContext,
+      localAutoCutArtifactReportTimeoutMs: 40,
+      autoCutRunner: async ({ run }) => {
+        await writePassingRunResult(run);
+        return { exitCode: 0 };
+      },
+    });
+    let reportRequests = 0;
+    try {
+      const subject = await registerSubject(fixture);
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+      await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+      const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+      const originalFetch = globalThis.fetch;
+      t.mock.method(globalThis, "fetch", async (input, init) => {
+        if (init?.headers?.["x-taskboard-client"] !== "taskctl") return originalFetch(input, init);
+        reportRequests += 1;
+        if (failure === "http-error") {
+          return new Response(JSON.stringify({ error: { message: "private-path-and-secret" } }), { status: 503 });
+        }
+        if (failure === "connection-error") throw new TypeError("private-path-and-secret");
+        if (failure === "body-timeout") {
+          return new Response(new ReadableStream({
+            start(controller) {
+              const timer = setTimeout(() => {
+                controller.enqueue(new TextEncoder().encode("{}"));
+                controller.close();
+              }, 200);
+              init?.signal?.addEventListener("abort", () => {
+                clearTimeout(timer);
+                controller.error(init.signal.reason);
+              }, { once: true });
+            },
+          }));
+        }
+        if (failure === "timeout") {
+          return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => resolve(new Response("{}", { status: 200 })), 200);
+            init?.signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(init.signal.reason);
+            }, { once: true });
+          });
+        }
+        return new Response(JSON.stringify({ artifact: { id: "foreign-artifact" } }), { status: 200 });
+      });
+      const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+        version: blocked.version,
+        runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+      });
+      assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+      await waitForTaskStatus(fixture.app, blocked.id, "blocked");
+      const run = fixture.app.database.listFeishuAutoCutRuns(blocked.id)[1];
+      assert.equal(reportRequests, 1);
+      assert.equal(run.errorCode, expectedCode);
+      assert.doesNotMatch(run.errorMessage, /private-path-and-secret/);
+      assert.equal(fixture.app.database.getAiChatRun(run.runId).status, "failed");
+      assert.equal(fixture.app.database.getTaskArtifactForRun(blocked.id, run.runId), null);
+      assert.equal(fixture.app.database.getTaskAiStartForArtifactReport(blocked.id, run.runId), null);
+      assert.equal(fixture.app.database.getFeishuExecution(blocked.id), null);
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
 test("an authorized phased retry runs locally without starting another Codex turn", async () => {
   const controlledContext = {
     documentLinks: ["https://guanghe.feishu.cn/docx/taskboard-owned-runner"],
@@ -421,6 +651,82 @@ test("an authorized phased retry runs locally without starting another Codex tur
     assert.equal(artifact?.validationStatus, "verified");
     assert.equal(fixture.app.database.listTaskArtifactUploads(created.body.task.id).length, 1);
     assert.equal(fixture.app.database.listAiChatRuns(firstStart.body.thread.id).length, 1);
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("local runner receives deadline options without inheriting Taskboard launcher variables", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/local-runner-deadlines"],
+    namingDisplayValue: "运行期限",
+    namingValueUnique: true,
+  };
+  let invocation;
+  const fixture = await createFixture({
+    controlledContext,
+    processEnvironmentOverrides: {
+      CODEX_TASKBOARD_AUTOCUT_ENVIRONMENT_TIMEOUT_MS: "45000",
+      CODEX_TASKBOARD_AUTOCUT_PREFLIGHT_TIMEOUT_MS: "180000",
+      CODEX_TASKBOARD_AUTOCUT_RUN_TIMEOUT_MS: "10800000",
+      CODEX_TASKBOARD_INSTANCE_SECRET: "private-launcher-secret",
+    },
+    autoCutRunner: async (options) => {
+      invocation = options;
+      await writePassingRunResult(options.run);
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture);
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+    const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+      version: blocked.version,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+    });
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    await waitForTaskStatus(fixture.app, blocked.id, "in_review");
+    assert.equal(invocation.environmentTimeoutMs, 45000);
+    assert.equal(invocation.preflightTimeoutMs, 180000);
+    assert.equal(invocation.runTimeoutMs, 10800000);
+    assert.deepEqual(Object.keys(invocation.environment).filter((key) => key.startsWith("CODEX_TASKBOARD_")), []);
+    assert.equal(invocation.environment.CODEX_FEISHU_BRIDGE_SECRET, undefined);
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("a consent-free phased retry retains the Codex path", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/consent-free-retry"],
+    namingDisplayValue: "无授权重试",
+    namingValueUnique: true,
+  };
+  let localInvocations = 0;
+  const fixture = await createFixture({
+    controlledContext,
+    autoCutRunner: async () => { localInvocations += 1; },
+  });
+  try {
+    const subject = await registerSubject(fixture);
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+    const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+      version: blocked.version,
+    });
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    await waitForTaskStatus(fixture.app, blocked.id, "blocked");
+    assert.equal(fixture.app.database.listFeishuAutoCutRuns(blocked.id).length, 2);
+    assert.equal(localInvocations, 0);
+    assert.notEqual(fixture.app.database.getAiChatThread(retried.body.thread.id).model, "local-autocut");
+    assert.match(await readFile(fixture.promptCapturePath, "utf8"), /trusted package prompt/);
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();

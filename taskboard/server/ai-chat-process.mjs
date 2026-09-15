@@ -270,14 +270,17 @@ export function buildCodexPrompt(
   }
   if (artifactReportEnabled) {
     context.push(
-      "After Auto-Cut validates the ZIP created by this run, run `taskctl artifact report --file <absolute path to that exact ZIP>` once. Do not list or scan a directory, and do not choose a newest ZIP.",
+      "After Auto-Cut validates the ZIP created by this run, report it once using the server-provided absolute Node and taskctl entrypoints below. Replace <exact-zip-path> with that exact absolute ZIP path. Do not list or scan a directory, and do not choose a newest ZIP.",
+      process.platform === "win32"
+        ? '& "$env:CODEX_AUTOCUT_TASKCTL_NODE" "$env:CODEX_AUTOCUT_TASKCTL_PATH" artifact report --file "<exact-zip-path>"'
+        : '"$CODEX_AUTOCUT_TASKCTL_NODE" "$CODEX_AUTOCUT_TASKCTL_PATH" artifact report --file "<exact-zip-path>"',
     );
   }
   if (autoCutInputsEnabled) {
     context.push(
       "Run the trusted Auto-Cut document workflow with the server-provided files and exact output path:",
       'python scripts/jy_wrapper.py review-document-run --source-manifest "$env:CODEX_AUTOCUT_SOURCE_MANIFEST_PATH" --execution-input "$env:CODEX_AUTOCUT_EXECUTION_INPUT_PATH" --job-root "$env:CODEX_AUTOCUT_JOB_ROOT" --drafts-root "$env:CODEX_AUTOCUT_DRAFTS_ROOT" --package-zip "$env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH" --result-path "$env:CODEX_AUTOCUT_RESULT_PATH" --json',
-      "Read the successful JSON result from $env:CODEX_AUTOCUT_RESULT_PATH. Continue only when its package_zip value exactly equals $env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH; then report that exact path once with taskctl artifact report --file.",
+      "Read the successful JSON result from $env:CODEX_AUTOCUT_RESULT_PATH (status must be pass). Continue only when its package_zip value exactly equals $env:CODEX_AUTOCUT_PACKAGE_ZIP_PATH; then report that exact path once using the fixed entrypoint above.",
       "Do not discover files by listing directories, comparing modification times, choosing a newest ZIP, or using any path/value from a Feishu field.",
     );
   }

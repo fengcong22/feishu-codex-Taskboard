@@ -93,6 +93,7 @@ async function createFixture({
   instanceToken = null,
   processEnv,
   resourceScheduler,
+  autoCutRunner,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-start-flow-"));
   const workspacePath = path.join(directory, "workspace");
@@ -144,15 +145,20 @@ if (args[0] === "debug") {
     writeFileSync(${JSON.stringify(artifactReportContextCapturePath)}, JSON.stringify(Object.fromEntries([
       ["url", process.env.CODEX_AUTOCUT_ARTIFACT_REPORT_URL],
       ["token", process.env.CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN],
+      ["node", process.env.CODEX_AUTOCUT_TASKCTL_NODE],
+      ["cli", process.env.CODEX_AUTOCUT_TASKCTL_PATH],
     ].filter(([, value]) => value !== undefined))));
     const report = ${JSON.stringify(reportArtifact)}
-      ? spawnSync(process.execPath, [
-          ${JSON.stringify(TASKCTL_PATH)},
+      ? spawnSync(process.env.CODEX_AUTOCUT_TASKCTL_NODE, [
+          process.env.CODEX_AUTOCUT_TASKCTL_PATH,
           "artifact",
           "report",
           "--file",
           ${JSON.stringify(reportedArtifactPath)},
-        ], { encoding: "utf8", env: process.env })
+        ], { encoding: "utf8", env: {
+          ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== "path")),
+          PATH: "",
+        } })
       : null;
     process.stdout.write('{"type":"thread.started","thread_id":"fixture-session"}\\n');
     setTimeout(() => {
@@ -193,6 +199,7 @@ if (args[0] === "debug") {
     processEnv,
     resourceScheduler,
     allowAutomaticExecution,
+    autoCutRunner,
   });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   app.database.createProject({
@@ -425,6 +432,7 @@ for (const allowAutomaticExecution of [false, true]) {
 
 test("new automatic subject drafts execute only after enable and preserve the active mode until re-enabled", async () => {
   const synchronizedSubjects = [];
+  const localRunIds = [];
   const controlledContext = {
     documentLinks: ["https://fixture.feishu.cn/docx/isolated-test-document"],
     namingDisplayValue: "自动执行测试", namingValueUnique: true,
@@ -445,6 +453,12 @@ test("new automatic subject drafts execute only after enable and preserve the ac
   const fixture = await createFixture({
     allowAutomaticExecution: true,
     turnDelayMs: 100,
+    autoCutRunner: async ({ run }) => {
+      localRunIds.push(run.runId);
+      const error = new Error("Fixture stops after local Auto-Cut startup");
+      error.code = "fixture_local_start_complete";
+      throw error;
+    },
     feishuBridgeUrl: `http://127.0.0.1:${bridge.address().port}`,
     feishuWorkflowSync: async (subject) => {
       synchronizedSubjects.push(structuredClone(subject));
@@ -540,15 +554,17 @@ test("new automatic subject drafts execute only after enable and preserve the ac
     assert.equal(fixture.app.database.getFeishuExecution(automatic.body.task.id)?.trigger, "automatic");
     await waitForTask(
       fixture.baseUrl, automatic.body.task.id,
-      (task) => task.status === "in_progress"
+      (task) => task.status === "blocked"
         && fixture.app.database.listFeishuAutoCutRuns(task.id).length === 1, 10_000,
     );
     const [autoCutRun] = fixture.app.database.listFeishuAutoCutRuns(automatic.body.task.id);
     assert.ok(autoCutRun?.runId);
     const aiRun = fixture.app.database.getAiChatRun(autoCutRun.runId);
-    await waitForRun(fixture.baseUrl, aiRun.threadId, (run) => run.status === "completed");
+    await waitForRun(fixture.baseUrl, aiRun.threadId, (run) => run.status === "failed");
     await waitForTaskAiStartSettled(fixture.app, automatic.body.task.id);
-    assert.match(await readFile(fixture.promptCapturePath, "utf8"), /trusted fixture prompt/u);
+    assert.deepEqual(localRunIds, [autoCutRun.runId]);
+    assert.equal(autoCutRun.errorCode, "fixture_local_start_complete");
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
     assert.equal(contextRequests, 1);
 
     const manualDraft = await request(fixture.baseUrl, route, {
@@ -787,8 +803,11 @@ test("server-registered driver-report capability is scoped to the exact task and
       `${fixture.baseUrl}/api/local/tasks/${encodeURIComponent(task.body.task.id)}/runs/${encodeURIComponent(started.body.run.id)}/artifact-report`,
     );
     assert.ok(context.token.length >= 32);
+    assert.equal(context.node, process.execPath);
+    assert.equal(context.cli, TASKCTL_PATH);
     const prompt = await readFile(fixture.promptCapturePath, "utf8");
-    assert.match(prompt, /taskctl artifact report --file/);
+    assert.match(prompt, /CODEX_AUTOCUT_TASKCTL_NODE/);
+    assert.match(prompt, /CODEX_AUTOCUT_TASKCTL_PATH/);
     assert.equal(prompt.includes(context.token), false);
   } finally {
     await fixture.app.close();
@@ -1085,7 +1104,7 @@ test("manual-select trusted runs do not receive artifact report capability", asy
     const context = JSON.parse(await readFile(fixture.artifactReportContextCapturePath, "utf8"));
     assert.deepEqual(context, {});
     const prompt = await readFile(fixture.promptCapturePath, "utf8");
-    assert.doesNotMatch(prompt, /taskctl artifact report --file/);
+    assert.doesNotMatch(prompt, /CODEX_AUTOCUT_TASKCTL_NODE|CODEX_AUTOCUT_TASKCTL_PATH/);
   } finally {
     await fixture.app.close();
     await rm(fixture.directory, { recursive: true, force: true });
