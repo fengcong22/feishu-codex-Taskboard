@@ -25,7 +25,7 @@ import { AiChatService } from "./ai-chat.mjs";
 import { discoverAiCatalog, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
-import { createFeishuPackageStore } from "./feishu-package-config.mjs";
+import { createFeishuPackageStore, PackageConfigError } from "./feishu-package-config.mjs";
 import { createFeishuPackageApi } from "./feishu-package-api.mjs";
 import {
   CloudProxyError,
@@ -7007,20 +7007,35 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { task });
         }
         if (action === "restore" && request.method === "POST") {
+          const { version, threadId, threadBinding } = resolveInputThreadBinding(
+            parseArchive(await readJson(request)),
+          );
           const current = database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
           }
-          const { version, threadId, threadBinding } = resolveInputThreadBinding(
-            parseArchive(await readJson(request)),
-          );
-          const task = database.restoreTask(
+          const restore = () => database.restoreTask(
             id,
             version,
             threadId,
             threadBinding,
             actorFromRequest(request),
           );
+          // Use the registered origin, never a description marker or label.
+          // Preserve the database's missing/version/archive errors first.
+          const origin = current?.archivedAt != null && current.version === version
+            ? database.getFeishuTaskOrigin(id) : null;
+          let task;
+          try {
+            task = origin?.packageAlias
+              ? await feishuPackages.withEnabledPackage(origin.packageAlias, restore)
+              : restore();
+          } catch (error) {
+            if (error instanceof PackageConfigError) {
+              throw new ApiError(error.status, error.code, error.message, error.details);
+            }
+            throw error;
+          }
           events.emit("task.restored", { task });
           return sendJson(response, 200, { task });
         }

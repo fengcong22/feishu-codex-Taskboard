@@ -284,3 +284,59 @@ test("store saveDraft rejects server-managed fields", async () => {
     (error) => error instanceof PackageConfigError && error.code === "PACKAGE_INVALID",
   );
 });
+
+test("enabled-package operations serialize with deletion in either order", async () => {
+  const alias = "Auto-cut-restore-race";
+  let referenced = false;
+  const store = createFeishuPackageStore({
+    packages: { [alias]: { projectId: "restore-race", state: "enabled" } },
+    listReferences: () => referenced ? [{ type: "task", taskId: "restored" }] : [],
+  });
+  assert.equal(typeof store.withEnabledPackage, "function");
+  const restoreFirst = await Promise.allSettled([
+    store.withEnabledPackage(alias, () => { referenced = true; return "restored"; }),
+    store.remove(alias, 1),
+  ]);
+  assert.equal(restoreFirst[0].value, "restored");
+  assert.equal(restoreFirst[1].reason.code, "PACKAGE_IN_USE");
+  referenced = false;
+  const deleteFirst = await Promise.allSettled([
+    store.remove(alias, 1),
+    store.withEnabledPackage(alias, () => { referenced = true; }),
+  ]);
+  assert.equal(deleteFirst[0].status, "fulfilled");
+  assert.equal(deleteFirst[1].reason.code, "PACKAGE_NOT_FOUND");
+  assert.equal(referenced, false);
+});
+
+test("enabled-package operations share the mutation queue across stores on one registry", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-restore-race-"));
+  const filename = path.join(directory, "packages.json");
+  const alias = "Auto-cut-shared-restore";
+  try {
+    await writeFile(filename, JSON.stringify({ [alias]: { projectId: "shared-restore", state: "enabled" } }));
+    let enterCheck;
+    let releaseCheck;
+    const checking = new Promise((resolve) => { enterCheck = resolve; });
+    const resume = new Promise((resolve) => { releaseCheck = resolve; });
+    const first = createFeishuPackageStore({ filename, listReferences: async () => {
+      enterCheck();
+      await resume;
+      return [];
+    } });
+    const second = createFeishuPackageStore({ filename });
+    assert.equal(typeof second.withEnabledPackage, "function");
+    let restored = false;
+    const deleting = first.remove(alias, 1);
+    await checking;
+    const restoring = second.withEnabledPackage(alias, () => { restored = true; });
+    const results = Promise.allSettled([deleting, restoring]);
+    releaseCheck();
+    const settled = await results;
+    assert.equal(settled[0].status, "fulfilled");
+    assert.equal(settled[1].reason.code, "PACKAGE_NOT_FOUND");
+    assert.equal(restored, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
