@@ -327,3 +327,121 @@ test("reports an unavailable local runner when its installed script is missing",
     await rm(current.root, { recursive: true, force: true });
   }
 });
+
+test("publishes only bounded phase and status progress from streamed stderr", async () => {
+  const expected = [
+    { phase: "preflight", status: "running" },
+    { phase: "preflight", status: "complete" },
+    { phase: "document_fetch", status: "resumed" },
+    { phase: "asset_download", status: "retrying" },
+    { phase: "input_compile", status: "skipped" },
+    { phase: "source_hash", status: "complete" },
+    { phase: "source_asr", status: "running" },
+    { phase: "classification", status: "failed" },
+    { phase: "reverse_asr", status: "complete" },
+    { phase: "draft_write_validate", status: "running" },
+    { phase: "package_publish", status: "complete" },
+  ];
+  const progressLine = (value) => JSON.stringify({ type: "progress", event: "phase", ...value });
+  const valid = expected.map((value, index) => progressLine({
+    ...value,
+    status: index === 0 ? "started" : index === 8 ? "completed" : value.status,
+    error: "credential=must-stay-private", path: "private-directory", attempt: 2,
+  }));
+  const chunks = [
+    "credential=must-stay-private\nnot json\nnull\n",
+    `${progressLine({ phase: "unknown-phase", status: "running" })}\n`,
+    `${progressLine({ phase: "preflight", status: "unknown-status" })}\n`,
+    `${JSON.stringify({ type: "log", event: "phase", phase: "preflight", status: "running" })}\n`,
+    `${JSON.stringify({ type: "progress", event: "other", phase: "preflight", status: "running" })}\n`,
+    `${progressLine({ phase: "preflight", status: "running", padding: "x".repeat(70_000) })}\n`,
+    valid[0].slice(0, 21),
+    `${valid[0].slice(21)}\r\n${valid.slice(1, -1).join("\n")}\n`,
+    valid.at(-1),
+  ];
+  const current = await fixture(`
+const chunks = ${JSON.stringify(chunks)};
+process.stdout.write(${JSON.stringify(`${progressLine({ phase: "document_fetch", status: "failed" })}\n`)});
+const next = () => {
+  if (!chunks.length) return;
+  process.stderr.write(chunks.shift());
+  setTimeout(next, 10);
+};
+next();
+`);
+  const events = [];
+  try {
+    await runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+      onProgress: (event) => events.push(event),
+    });
+    assert.deepEqual(events, [
+      { phase: "environment_check", status: "running" },
+      { phase: "environment_check", status: "complete" },
+      ...expected,
+    ]);
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+for (const failure of ["throw", "reject"]) {
+  test(`progress callbacks cannot interrupt a run when they ${failure}`, async () => {
+    const current = await fixture('console.error(JSON.stringify({type:"progress",event:"phase",phase:"preflight",status:"complete"}));');
+    const events = [];
+    try {
+      const result = await runLocalAutoCut({
+        run: current.run, packageConfig: current.packageConfig,
+        environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+        onProgress: (event) => {
+          events.push(event);
+          const error = new Error("callback failure must not affect execution");
+          if (failure === "throw") throw error;
+          return Promise.reject(error);
+        },
+      });
+      assert.equal(result.exitCode, 0);
+      assert.deepEqual(events, [
+        { phase: "environment_check", status: "running" },
+        { phase: "environment_check", status: "complete" },
+        { phase: "preflight", status: "complete" },
+      ]);
+    } finally { await rm(current.root, { recursive: true, force: true }); }
+  });
+}
+
+test("an environment failure never publishes environment completion", async () => {
+  const current = await fixture('throw new Error("runtime must not start");');
+  const events = [];
+  await writeFile(current.larkScript, 'process.exit(1);');
+  try {
+    await assert.rejects(runLocalAutoCut({
+      run: current.run, packageConfig: current.packageConfig,
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+      onProgress: (event) => events.push(event),
+    }), { code: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE" });
+    assert.deepEqual(events, [{ phase: "environment_check", status: "running" }]);
+  } finally { await rm(current.root, { recursive: true, force: true }); }
+});
+
+for (const status of ["completed", "resumed"]) {
+  test(`streamed preflight ${status} clears its watchdog while publishing progress`, async () => {
+    const current = await fixture(`
+process.stderr.write('{"type":"progress","event":"phase","phase":"preflight",');
+setTimeout(() => process.stderr.write('"status":"${status}"}\\n'), 20);
+setTimeout(() => {}, 900);
+`);
+    const events = [];
+    try {
+      const result = await runLocalAutoCut({
+        run: current.run, packageConfig: current.packageConfig,
+        environment: { ...process.env, LOCALAPPDATA: current.localAppData },
+        preflightTimeoutMs: 600, runTimeoutMs: 3_000,
+        onProgress: (event) => events.push(event),
+      });
+      assert.equal(result.exitCode, 0);
+      assert.deepEqual(events.at(-1), {
+        phase: "preflight", status: status === "completed" ? "complete" : status,
+      });
+    } finally { await rm(current.root, { recursive: true, force: true }); }
+  });
+}

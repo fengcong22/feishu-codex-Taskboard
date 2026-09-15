@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
 import { ApiError } from "./database.mjs";
+import { normalizeAutoCutProgress } from "./autocut-progress.mjs";
 import {
   ComposerCatalog,
   discoverAppServerAiCatalog,
@@ -248,8 +249,19 @@ export class AiChatService {
     return {
       thread,
       events: this.database.listAiChatEvents(threadId),
-      runs: this.database.listAiChatRuns(threadId),
+      runs: this.database.listAiChatRuns(threadId).map((run) => (
+        thread.model === "local-autocut" ? this.#localRunSnapshot(run) : run
+      )),
     };
+  }
+
+  #localRunSnapshot(run) {
+    const attempt = this.database.getFeishuAutoCutRun(run.id);
+    // Older runners used process exit status even when the bound receipt was
+    // blocked. Project the verified task result without rewriting history.
+    return run.status === "completed" && attempt?.state === "blocked"
+      ? { ...run, status: "failed", error: attempt.errorMessage || "Auto-Cut execution was blocked" }
+      : run;
   }
 
   composerCatalogForThread(thread) {
@@ -275,6 +287,32 @@ export class AiChatService {
       listeners.delete(listener);
       if (listeners.size === 0) this.listeners.delete(threadId);
     };
+  }
+
+  // In-process lifecycle bridge for Taskboard-owned runs; no HTTP write API.
+  publishLocalRun(runId) {
+    const run = this.getRun(runId);
+    if (this.getThread(run.threadId).model !== "local-autocut") return;
+    this.#emit(run.threadId, { type: "ai.run", run: this.#localRunSnapshot(run) });
+  }
+
+  recordLocalProgress(runId, value) {
+    const progress = normalizeAutoCutProgress(value);
+    if (!progress) return;
+    const run = this.getRun(runId);
+    if (run.status !== "running" || this.getThread(run.threadId).model !== "local-autocut") return;
+    // A phase/status pair is recorded once. The closed vocabulary bounds history
+    // even if a runtime repeatedly emits the same progress notification.
+    if (this.database.listAiChatEvents(run.threadId).some((event) => (
+      event.runId === runId && event.type === "autocut_progress"
+      && event.data?.phase === progress.phase && event.data?.status === progress.status
+    ))) return;
+    const event = this.database.insertAiChatEvent({
+      threadId: run.threadId, runId, type: "autocut_progress", role: "activity",
+      content: progress.content, data: { phase: progress.phase, status: progress.status },
+    });
+    this.#emit(run.threadId, { type: "ai.event", event });
+    return event;
   }
 
   async #catalogForWorkspace(workspacePath) {

@@ -646,7 +646,9 @@ test("an authorized phased retry runs locally without starting another Codex tur
     assert.notEqual(run.runId, firstRun.runId);
     await waitForTaskStatus(fixture.app, created.body.task.id, "done");
     assert.deepEqual(invocations, [run.runId]);
-    assert.deepEqual(fixture.app.database.listAiChatEvents(retried.body.thread.id), []);
+    assert.ok(fixture.app.database.listAiChatEvents(retried.body.thread.id).some(
+      (event) => event.type === "autocut_progress" && event.data.phase === "artifact_report" && event.data.status === "complete",
+    ));
     const artifact = fixture.app.database.getTaskArtifactForRun(created.body.task.id, run.runId);
     assert.equal(artifact?.validationStatus, "verified");
     assert.equal(fixture.app.database.listTaskArtifactUploads(created.body.task.id).length, 1);
@@ -696,6 +698,119 @@ test("local runner receives deadline options without inheriting Taskboard launch
     assert.deepEqual(Object.keys(invocation.environment).filter((key) => key.startsWith("CODEX_TASKBOARD_")), []);
     assert.equal(invocation.environment.CODEX_FEISHU_BRIDGE_SECRET, undefined);
   } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+for (const outcome of ["success", "environment-failure", "interrupted", "blocked-receipt", "registration-failure"]) {
+  test(`local execution publishes safe progress and a terminal notification: ${outcome}`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/progress-fixture"],
+      namingDisplayValue: "阶段通知测试", namingValueUnique: true,
+    };
+    const notifications = [];
+    let lateProgress;
+    let unsubscribe;
+    let fixture;
+    fixture = await createFixture({
+      controlledContext,
+      autoCutRunner: async ({ run, onProgress }) => {
+        const threadId = fixture.app.database.getAiChatRun(run.runId).threadId;
+        unsubscribe = fixture.app.aiChat.subscribe(threadId, (event) => notifications.push(event));
+        lateProgress = onProgress;
+        onProgress({ phase: "preflight", status: "running", message: "private-secret", path: "private-path" });
+        onProgress({ phase: "preflight", status: "running" });
+        onProgress({ phase: "unknown-private-secret", status: "running" });
+        onProgress({ phase: "preflight", status: "private-secret" });
+        if (outcome === "environment-failure" || outcome === "interrupted") {
+          const error = new Error(outcome === "interrupted" ? "Auto-Cut was interrupted" : "Configured CLI cannot be accessed");
+          error.code = outcome === "interrupted" ? "AUTOCUT_RUN_INTERRUPTED" : "AUTOCUT_LARK_CLI_UNAVAILABLE";
+          throw error;
+        }
+        onProgress({ phase: "preflight", status: "complete" });
+        if (outcome === "blocked-receipt") {
+          await writeFile(run.resultPath, JSON.stringify({
+            schema_version: 1, binding: runBinding(run), manifest_sha256: run.manifestSha256,
+            status: "blocked", error: { code: "fixture_preflight_failed", message: "Preflight blocked" },
+          }));
+        } else {
+          await writePassingRunResult(run, { includePackageReceipt: outcome !== "registration-failure" });
+        }
+      },
+    });
+    try {
+      const subject = await registerSubject(fixture);
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+      await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+      const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+      const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+        version: blocked.version, runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+      });
+      assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+      await waitForTaskStatus(fixture.app, blocked.id, outcome === "success" ? "in_review" : "blocked");
+      const snapshot = fixture.app.aiChat.getThreadSnapshot(retried.body.thread.id);
+      const expectedStatus = outcome === "success" ? "completed" : outcome === "interrupted" ? "interrupted" : "failed";
+      assert.equal(snapshot.runs[0].status, expectedStatus);
+      assert.notEqual(snapshot.thread.status, "running");
+      assert.ok(notifications.some((event) => event.type === "ai.run" && event.run.status === expectedStatus));
+      const progress = snapshot.events.filter((event) => event.type === "autocut_progress");
+      assert.equal(progress.filter((event) => event.data.phase === "preflight" && event.data.status === "running").length, 1);
+      assert.ok(progress.every((event) => event.runId === retried.body.run.id && event.threadId === retried.body.thread.id));
+      assert.ok(notifications.some((event) => event.type === "ai.event" && event.event.type === "autocut_progress"));
+      assert.doesNotMatch(JSON.stringify(progress), /private-secret|private-path/);
+      const eventCount = snapshot.events.length;
+      lateProgress({ phase: "source_asr", status: "running" });
+      assert.equal(fixture.app.aiChat.getThreadSnapshot(retried.body.thread.id).events.length, eventCount);
+      if (outcome === "blocked-receipt") {
+        // Pre-fix local runners stored exit-0 blocked results as AI completed.
+        fixture.app.database.updateAiChatRun(retried.body.run.id, { status: "completed", exitCode: 0, error: null });
+        const legacySnapshot = fixture.app.aiChat.getThreadSnapshot(retried.body.thread.id);
+        assert.equal(legacySnapshot.runs[0].status, "failed");
+        assert.equal(legacySnapshot.runs[0].error, "Preflight blocked");
+        assert.equal(fixture.app.database.getAiChatRun(retried.body.run.id).status, "completed", "display must not rewrite history");
+      }
+    } finally {
+      unsubscribe?.();
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("local preparation failure publishes a terminal thread notification", async (t) => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/progress-prepare"],
+    namingDisplayValue: "准备失败通知", namingValueUnique: true,
+  };
+  const fixture = await createFixture({ controlledContext, autoCutRunner: async () => assert.fail("runner must not start") });
+  const notifications = [];
+  let unsubscribe;
+  try {
+    const subject = await registerSubject(fixture);
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked");
+    const createRun = fixture.app.database.createAiChatRun.bind(fixture.app.database);
+    t.mock.method(fixture.app.database, "createAiChatRun", (input) => {
+      const run = createRun(input);
+      unsubscribe = fixture.app.aiChat.subscribe(run.threadId, (event) => notifications.push(event));
+      return run;
+    });
+    fixture.bridge.setResponse("controlled_context_unavailable", 503);
+    const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+      version: blocked.version, runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+    });
+    assert.ok(retried.response.status >= 400);
+    const run = fixture.app.database.listFeishuAutoCutRuns(blocked.id)[1];
+    assert.equal(fixture.app.database.getAiChatRun(run.runId).status, "failed");
+    assert.ok(notifications.some((event) => event.type === "ai.run" && event.run.status === "running"));
+    assert.ok(notifications.some((event) => event.type === "ai.run" && event.run.status === "failed"));
+    assert.ok(notifications.some((event) => event.type === "ai.event" && event.event.data?.status === "failed"));
+  } finally {
+    unsubscribe?.();
     await fixture.app.close();
     await fixture.bridge.close();
     await rm(fixture.directory, { recursive: true, force: true });

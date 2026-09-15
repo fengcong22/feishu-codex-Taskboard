@@ -4664,6 +4664,8 @@ export function createTaskboardServer(options = {}) {
     );
     events.emit("task.updated", { task: boundTask });
     const run = database.createAiChatRun({ threadId: thread.id });
+    aiChat.publishLocalRun(run.id);
+    aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "running" });
     database.bindTaskAiStartRun(
       boundTask.id,
       claimedTask.claimToken,
@@ -4716,6 +4718,7 @@ export function createTaskboardServer(options = {}) {
         packageSnapshot,
         controlledContext,
       });
+      aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "complete" });
       return {
         task: database.getTask(boundTask.id),
         thread,
@@ -4725,12 +4728,14 @@ export function createTaskboardServer(options = {}) {
     } catch (error) {
       const failure = blockedPreparationError(error);
       database.markFeishuAutoCutRunBlocked(run.id, failure);
+      aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "failed" });
       database.updateAiChatRun(run.id, {
         status: "failed",
         exitCode: 1,
         error: failure.message.slice(0, 65_536),
         finishedAt: new Date().toISOString(),
       });
+      aiChat.publishLocalRun(run.id);
       const blockedTask = database.settleTaskAiStart(
         boundTask.id,
         claimedTask.claimToken,
@@ -4775,16 +4780,29 @@ export function createTaskboardServer(options = {}) {
     let operation;
     operation = (async () => {
       let terminalRun;
+      let activePhase = "environment_check";
+      const onProgress = (progress) => {
+        const event = aiChat.recordLocalProgress(prepared.run.id, progress);
+        // Only accepted, persisted events may change the failure stage.
+        if (event) activePhase = event.data.phase;
+      };
       try {
+        onProgress({ phase: "environment_check", status: "running" });
         await autoCutRunner({
           run: prepared.autoCutRun,
           packageConfig,
           environment: codexProcessEnvironment,
           ...localAutoCutDeadlines,
           signal: taskStartAbortController.signal,
+          onProgress,
           ...(trigger === "retry" && autoCutRunConsent ? { autoCutRunConsent } : {}),
         });
-        await reportLocalAutoCutArtifact(prepared.autoCutRun, claimedTask.claimToken);
+        onProgress({ phase: "artifact_report", status: "running" });
+        const result = await reportLocalAutoCutArtifact(prepared.autoCutRun, claimedTask.claimToken);
+        if (result.status === "blocked") {
+          throw autoCutResultError(result.error.code, result.error.message);
+        }
+        onProgress({ phase: "artifact_report", status: "complete" });
         terminalRun = database.updateAiChatRun(prepared.run.id, {
           status: "completed",
           exitCode: 0,
@@ -4793,6 +4811,7 @@ export function createTaskboardServer(options = {}) {
         });
       } catch (error) {
         database.markFeishuAutoCutRunBlocked(prepared.run.id, error);
+        onProgress({ phase: activePhase, status: "failed" });
         terminalRun = database.updateAiChatRun(prepared.run.id, {
           status: error?.name === "AbortError" || error?.code === "AUTOCUT_RUN_INTERRUPTED"
             ? "interrupted"
@@ -4802,6 +4821,7 @@ export function createTaskboardServer(options = {}) {
           finishedAt: new Date().toISOString(),
         });
       }
+      aiChat.publishLocalRun(prepared.run.id);
       await scheduleFeishuTaskReconciliation(
         prepared.task.id,
         prepared.thread.id,

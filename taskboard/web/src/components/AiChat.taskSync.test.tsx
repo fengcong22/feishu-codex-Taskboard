@@ -12,6 +12,8 @@ const api = vi.hoisted(() => ({
   getThread: vi.fn(),
   subscribeThread: vi.fn(),
   getCatalog: vi.fn(),
+  createThread: vi.fn(),
+  startTurn: vi.fn(),
 }));
 
 vi.mock("../api", async (importOriginal) => ({
@@ -20,6 +22,8 @@ vi.mock("../api", async (importOriginal) => ({
   getAiChatThread: api.getThread,
   subscribeAiChatThread: api.subscribeThread,
   getAiChatCatalog: api.getCatalog,
+  createAiChatThread: api.createThread,
+  startAiChatTurn: api.startTurn,
 }));
 
 const STARTED_AT = "2026-09-15T03:00:00.000Z";
@@ -395,5 +399,117 @@ describe("AiChat task execution synchronization", () => {
     expect(taskboardStorage.getItem("taskboard.aiChat.lastThreadId")).toBe(TASK_THREAD_ID);
     expect(within(panel).getByText("Task execution")).toBeTruthy();
     expect(editor.textContent).toBe("Keep this task draft");
+  });
+
+  it.each([
+    ["completed", "Auto-Cut completed"],
+    ["failed", "Auto-Cut failed"],
+    ["interrupted", "Auto-Cut interrupted"],
+  ] as const)("shows a truthful read-only summary for a local %s run with no events", async (status, label) => {
+    const local = thread(TASK_THREAD_ID, { model: "local-autocut", codexThreadId: null });
+    snapshots.set(local.id, {
+      thread: local,
+      events: [],
+      runs: [{ id: "local-run", threadId: local.id, status, startedAt: STARTED_AT, finishedAt: new Date(NOW).toISOString(),
+        ...(status === "failed" ? { error: "Auto-Cut preflight timed out" } : {}) }],
+    });
+    api.listThreads.mockResolvedValue([local]);
+    render(<Harness taskThreadIds={[TASK_THREAD_ID]} />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Open AI chat" }));
+    const panel = screen.getByRole("region", { name: "Auto-Cut execution" });
+    expect(within(panel).getByText(label)).toBeTruthy();
+    expect(within(panel).queryByText("Codex is working")).toBeNull();
+    expect(within(panel).queryByRole("textbox", { name: "Message to Codex" })).toBeNull();
+    expect(within(panel).queryByRole("button", { name: "Send message" })).toBeNull();
+    expect(within(panel).queryByRole("button", { name: "Stop generating" })).toBeNull();
+    expect(within(panel).queryByText("local-autocut")).toBeNull();
+    if (status === "failed") expect(within(panel).getByText("Auto-Cut preflight timed out")).toBeTruthy();
+  });
+
+  it("refreshes the selected running local execution when its terminal event is missed", async () => {
+    const running = { ...runningThread(), model: "local-autocut", codexThreadId: null };
+    snapshots.set(running.id, snapshot(running));
+    api.listThreads.mockResolvedValue([running]);
+    render(<Harness taskThreadIds={[TASK_THREAD_ID]} />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Open AI chat" }));
+    expect(screen.getByText("Auto-Cut is working")).toBeTruthy();
+    const completedRun = { ...running.currentRun!, status: "completed" as const, finishedAt: new Date(NOW + 1_000).toISOString() };
+    snapshots.set(running.id, {
+      thread: { ...running, status: "idle", currentRun: null },
+      events: [],
+      runs: [completedRun],
+    });
+    await advance(2_000);
+    expect(screen.getByText("Auto-Cut completed")).toBeTruthy();
+    expect(screen.queryByText("Auto-Cut is working")).toBeNull();
+    const requestsAfterCompletion = api.getThread.mock.calls.length;
+    await advance(6_000);
+    expect(api.getThread).toHaveBeenCalledTimes(requestsAfterCompletion);
+  });
+
+  it("renders controlled Auto-Cut phase events without presenting reasoning", async () => {
+    const local = thread(TASK_THREAD_ID, { model: "local-autocut", codexThreadId: null });
+    snapshots.set(local.id, {
+      thread: local,
+      runs: [{ id: "local-run", threadId: local.id, status: "completed" }],
+      events: [{
+        id: "phase-1", runId: "local-run", type: "autocut_progress", role: "activity",
+        content: "素材下载已完成", data: { phase: "download", status: "complete" },
+      }],
+    });
+    api.listThreads.mockResolvedValue([local]);
+    render(<Harness taskThreadIds={[TASK_THREAD_ID]} />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Open AI chat" }));
+    const timeline = screen.getByRole("list", { name: "Auto-Cut progress" });
+    expect(within(timeline).getByText("素材下载已完成")).toBeTruthy();
+    expect(screen.queryByText(/Thought|Thinking/)).toBeNull();
+    expect(screen.getByText("Auto-Cut completed")).toBeTruthy();
+  });
+
+  it("ignores a late running snapshot after switching to a completed local execution", async () => {
+    const first = { ...runningThread(), model: "local-autocut", codexThreadId: null };
+    const second = thread("completed-local", { model: "local-autocut", codexThreadId: null, title: "Completed edit" });
+    snapshots.set(first.id, snapshot(first));
+    snapshots.set(second.id, { thread: second, events: [], runs: [{ id: "done-run", threadId: second.id, status: "completed" }] });
+    api.listThreads.mockResolvedValue([first, second]);
+    render(<Harness taskThreadIds={[TASK_THREAD_ID]} />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Open AI chat" }));
+    const pending = deferred<AiChatThreadSnapshot>();
+    const nextSelection = deferred<AiChatThreadSnapshot>();
+    api.getThread.mockImplementationOnce(() => pending.promise).mockImplementationOnce(() => nextSelection.promise);
+    await advance(6_000);
+    fireEvent.click(screen.getByRole("button", { name: "Chat history" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Completed edit/ }));
+    await settle();
+    await act(async () => pending.resolve(snapshot(first)));
+    await act(async () => nextSelection.resolve(snapshots.get(second.id)!));
+    expect(screen.getByText("Auto-Cut completed")).toBeTruthy();
+    expect(screen.queryByText("Auto-Cut is working")).toBeNull();
+  });
+
+  it("does not inherit the synthetic Auto-Cut model when opening a new Codex chat", async () => {
+    const local = thread(TASK_THREAD_ID, { model: "local-autocut", codexThreadId: null });
+    snapshots.set(local.id, { thread: local, events: [], runs: [{ id: "done-run", threadId: local.id, status: "completed" }] });
+    api.listThreads.mockResolvedValue([local]);
+    render(<Harness taskThreadIds={[TASK_THREAD_ID]} />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Open AI chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    await settle();
+    expect(screen.queryByText("local-autocut")).toBeNull();
+    const created = thread("new-conversation");
+    api.createThread.mockResolvedValue(created);
+    api.startTurn.mockResolvedValue({ id: "new-run", threadId: created.id, status: "running" });
+    const editor = screen.getByRole("textbox", { name: "Message to Codex" });
+    editor.textContent = "Explain the result";
+    fireEvent.input(editor);
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await settle();
+    expect(api.createThread).toHaveBeenCalledOnce();
+    expect(api.createThread.mock.calls[0][0].model).not.toBe("local-autocut");
   });
 });

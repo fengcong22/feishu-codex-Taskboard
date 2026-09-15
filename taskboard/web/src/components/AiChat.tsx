@@ -1300,6 +1300,49 @@ function OptionMenu({
   );
 }
 
+function AutoCutExecution({ snapshot }: { snapshot: AiChatThreadSnapshot }) {
+  const { text } = useTaskboardI18n();
+  const latestRun = snapshot.runs.at(-1) ?? snapshot.thread.currentRun;
+  const status = latestRun?.status ?? (snapshot.thread.status === "running" ? "running" : null);
+  const progress = snapshot.events.filter((event) => event.type === "autocut_progress");
+  const label = status === "completed"
+    ? text("Auto-Cut 已完成", "Auto-Cut completed")
+    : status === "failed"
+      ? text("Auto-Cut 执行失败", "Auto-Cut failed")
+      : status === "interrupted"
+        ? text("Auto-Cut 已中断", "Auto-Cut interrupted")
+        : status === "running"
+          ? text("Auto-Cut 正在处理", "Auto-Cut is working")
+          : text("Auto-Cut 等待执行", "Auto-Cut is waiting");
+  return (
+    <>
+      {progress.length > 0 && (
+        <ol className="ai-chat-autocut-progress" aria-label={text("Auto-Cut 执行进度", "Auto-Cut progress")}>
+          {progress.map((event) => (
+            <li key={event.id}>
+              <span className="ai-chat-autocut-progress-mark" aria-hidden="true">
+                {["complete", "resumed"].includes(String(event.data?.status)) ? "✓"
+                  : event.data?.status === "failed" ? "!" : "·"}
+              </span>
+              <span>{event.content}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+      <div className="ai-chat-autocut-summary" role="status">
+        {status === "running" && <span className="ai-chat-spinner" />}
+        {label}
+      </div>
+      {status === "failed" || status === "interrupted" ? (
+        <div className="ai-chat-autocut-error">
+          {latestRun?.error && <p>{latestRun.error}</p>}
+          <p>{text("请在任务详情中查看原因并重试。", "Open task details to inspect the reason and retry.")}</p>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 export function AiChat({
   available,
   projectId,
@@ -1539,6 +1582,7 @@ export function AiChat({
   }, []);
 
   const loadSnapshot = useCallback(async (threadId: string, quiet = false) => {
+    if (selectedThreadRef.current !== threadId) return;
     const requestId = ++snapshotRequestRef.current;
     if (!quiet) {
       snapshotLoadingRequestRef.current = requestId;
@@ -1644,7 +1688,7 @@ export function AiChat({
 
   useEffect(() => {
     setSnapshot(null);
-    if (!selectedThreadId) return;
+    if (!available || !selectedThreadId) return;
     let initialPending = true;
     let refreshQueued = false;
     let disposed = false;
@@ -1663,9 +1707,10 @@ export function AiChat({
     );
     return () => {
       disposed = true;
+      snapshotRequestRef.current += 1;
       unsubscribe();
     };
-  }, [loadSnapshot, selectedHintRefreshQueue, selectedThreadId]);
+  }, [available, loadSnapshot, selectedHintRefreshQueue, selectedThreadId]);
 
   const backgroundRunningThreadIds = threads
     .filter((thread) => thread.id !== selectedThreadId
@@ -1699,6 +1744,16 @@ export function AiChat({
   ]);
 
   const selectedThreadSummary = threads.find((thread) => thread.id === selectedThreadId) ?? null;
+  const localAutoCut = (snapshot?.thread ?? selectedThreadSummary)?.model === "local-autocut";
+  const selectedRun = snapshot?.runs.at(-1) ?? snapshot?.thread.currentRun;
+  const selectedRunning = selectedRun ? selectedRun.status === "running" : snapshot?.thread.status === "running";
+  useEffect(() => {
+    if (!available || !panelOpen || !selectedThreadId || !selectedRunning) return;
+    const timer = window.setInterval(() => {
+      void selectedHintRefreshQueue.request(selectedThreadId);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [available, panelOpen, selectedHintRefreshQueue, selectedRunning, selectedThreadId]);
   const catalogProjectId = snapshot?.thread.origin.projectId
     ?? selectedThreadSummary?.origin.projectId
     ?? draftOrigin?.projectId
@@ -1722,7 +1777,7 @@ export function AiChat({
         : null;
   const activeCatalog = catalogLoadedProjectId === catalogProjectId ? catalog : null;
   useEffect(() => {
-    if (!available || !catalogProjectId) {
+    if (!available || !catalogProjectId || localAutoCut) {
       setCatalog(null);
       setCatalogLoadedProjectId(null);
       setCatalogError(null);
@@ -1751,6 +1806,7 @@ export function AiChat({
     return () => controller.abort();
   }, [
     available,
+    localAutoCut,
     catalogProjectId,
     catalogCodexProjectIdentity?.codexHostId,
     catalogCodexProjectIdentity?.codexProjectId,
@@ -1810,6 +1866,7 @@ export function AiChat({
   ]);
 
   const restoreDraftSettings = useCallback((thread: AiChatThread) => {
+    if (thread.model === "local-autocut") return;
     setDraftModel(thread.model);
     setDraftEffort(thread.reasoningEffort);
     setDraftSandbox(thread.sandbox);
@@ -1872,7 +1929,7 @@ export function AiChat({
   const visibleError = error ?? catalogError;
   const composerBlocked = Boolean(
     selectedThreadId && deletingThreadId === selectedThreadId,
-  ) || composerRebindBlocked;
+  ) || composerRebindBlocked || localAutoCut;
   const sendBlocked = loading
     || settingsSaving
     || composerBlocked
@@ -2905,7 +2962,7 @@ export function AiChat({
   }
 
   async function stopRun(run: AiChatRun | null) {
-    if (!run) return;
+    if (!run || localAutoCut) return;
     try {
       await interruptAiChatRun(run.id);
       if (selectedThreadRef.current === run.threadId) {
@@ -2981,8 +3038,8 @@ export function AiChat({
           ref={panelRef}
           className={`ai-chat-panel${panelResizeEdge ? ` is-resizing-${panelResizeEdge}` : ""}`}
           style={panelGeometry ?? undefined}
-          aria-label={text("Codex AI 对话", "Codex AI chat")}
-          data-screen-label={text("Codex AI 对话", "Codex AI chat")}
+          aria-label={localAutoCut ? text("Auto-Cut 执行", "Auto-Cut execution") : text("Codex AI 对话", "Codex AI chat")}
+          data-screen-label={localAutoCut ? text("Auto-Cut 执行", "Auto-Cut execution") : text("Codex AI 对话", "Codex AI chat")}
         >
           <div
             className="ai-chat-resize-handle is-top"
@@ -3097,18 +3154,18 @@ export function AiChat({
               </div>
             ) : snapshot ? (
               <>
-                <MessageTimeline
+                {localAutoCut ? <AutoCutExecution snapshot={snapshot} /> : <MessageTimeline
                   activeRunId={currentRun?.id ?? null}
                   events={snapshot.events}
                   skills={activeCatalog?.skills ?? []}
-                />
-                {snapshot.thread.status === "running" && (
+                />}
+                {!localAutoCut && snapshot.thread.status === "running" && (
                   <div className="ai-chat-running" role="status">
                     <span className="ai-chat-spinner" />
                     {text("Codex 正在处理", "Codex is working")}
                   </div>
                 )}
-                {retryableUserEvent && (
+                {!localAutoCut && retryableUserEvent && (
                   <button
                     className="ai-chat-retry"
                     type="button"
@@ -3152,7 +3209,7 @@ export function AiChat({
             </div>
           )}
 
-          <div
+          {!localAutoCut && <div
             className={`ai-chat-composer${attachmentDragActive ? " is-attachment-drag-active" : ""}`}
             onDragEnter={handleAttachmentDragEnter}
             onDragOver={handleAttachmentDragOver}
@@ -3555,9 +3612,9 @@ export function AiChat({
                 </button>
               )}
             </div>
-          </div>
+          </div>}
 
-          {dangerConfirmOpen && (
+          {!localAutoCut && dangerConfirmOpen && (
             <div className="ai-chat-confirm-backdrop">
               <div className="ai-chat-confirm" role="alertdialog" aria-modal="true" aria-labelledby="ai-chat-confirm-title">
                 <strong id="ai-chat-confirm-title">{text("允许完全访问？", "Allow full access?")}</strong>

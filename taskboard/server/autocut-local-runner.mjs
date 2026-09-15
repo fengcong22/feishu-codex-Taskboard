@@ -7,6 +7,12 @@ import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment
 import { signalProcessTree } from "../shared/process-tree.mjs";
 
 const PROBE_PATH = fileURLToPath(new URL("./autocut-environment-probe.mjs", import.meta.url));
+const PROGRESS_PHASES = new Set([
+  "preflight", "document_fetch", "asset_download", "input_compile", "source_hash",
+  "source_asr", "classification", "reverse_asr", "draft_write_validate", "package_publish",
+]);
+const PROGRESS_STATUSES = new Set(["running", "complete", "resumed", "failed", "skipped", "retrying"]);
+const MAX_PROGRESS_LINE_LENGTH = 65_536;
 const ENVIRONMENT_ERRORS = {
   AUTOCUT_LARK_CLI_UNAVAILABLE: "Auto-Cut cannot access the configured Lark CLI; check the deployment and Taskboard account permissions",
   AUTOCUT_LARK_IDENTITY_UNAVAILABLE: "Auto-Cut cannot read a strict Lark user identity; check the Taskboard account's existing CLI authentication",
@@ -40,6 +46,49 @@ function collect(stream) {
     stream?.on("end", () => resolve(value));
     stream?.on("close", () => resolve(value));
     if (!stream) resolve(value);
+  });
+}
+
+function notifyProgress(onProgress, event) {
+  if (typeof onProgress !== "function") return;
+  try {
+    Promise.resolve(onProgress(event)).catch(() => {});
+  } catch {}
+}
+
+function readProgress(stream, onProgress) {
+  let buffer = "";
+  let discardLine = false;
+  const publish = (line) => {
+    let event;
+    try { event = JSON.parse(line); } catch { return; }
+    if (event?.type !== "progress" || event.event !== "phase" || !PROGRESS_PHASES.has(event.phase)) return;
+    const status = event.status === "started" ? "running"
+      : event.status === "completed" ? "complete" : event.status;
+    if (PROGRESS_STATUSES.has(status)) onProgress({ phase: event.phase, status });
+  };
+  // Keep complete records across chunks, and drop oversized lines through their
+  // newline so a truncated stderr suffix cannot become a new progress event.
+  stream?.on("data", (chunk) => {
+    let offset = 0;
+    while (offset < chunk.length) {
+      const end = chunk.indexOf("\n", offset);
+      const fragment = chunk.slice(offset, end < 0 ? undefined : end);
+      if (!discardLine) {
+        if (buffer.length + fragment.length > MAX_PROGRESS_LINE_LENGTH) {
+          buffer = "";
+          discardLine = true;
+        } else buffer += fragment;
+      }
+      if (end < 0) break;
+      if (!discardLine) publish(buffer);
+      buffer = "";
+      discardLine = false;
+      offset = end + 1;
+    }
+  });
+  stream?.once("end", () => {
+    if (buffer && !discardLine) publish(buffer);
   });
 }
 
@@ -114,7 +163,7 @@ async function resolveInstalledRuntime(workspacePath, environment) {
   return { runtimeRoot, python, script, larkCli, readinessPath };
 }
 
-async function runProcess(command, args, options, { signal, timeoutMs, timeoutCode, preflightTimeoutMs } = {}) {
+async function runProcess(command, args, options, { signal, timeoutMs, timeoutCode, preflightTimeoutMs, onProgress } = {}) {
   if (signal?.aborted) throw runnerError("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted");
   const child = spawn(command, args, {
     ...options,
@@ -137,23 +186,14 @@ async function runProcess(command, args, options, { signal, timeoutMs, timeoutCo
   let preflightDeadline;
   if (preflightTimeoutMs) {
     preflightDeadline = setTimeout(() => terminate("AUTOCUT_PREFLIGHT_TIMEOUT", "Auto-Cut preflight stopped making progress; check CLI and readiness access"), preflightTimeoutMs);
-    let buffer = "";
+  }
+  if (preflightTimeoutMs || onProgress) {
     // Auto-cut-lite emits progress JSON on stderr; stdout is its final result.
-    child.stderr?.on("data", (chunk) => {
-      buffer += chunk;
-      if (buffer.length > 65_536) buffer = buffer.slice(-65_536);
-      let index;
-      while ((index = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, index);
-        buffer = buffer.slice(index + 1);
-        try {
-          const event = JSON.parse(line);
-          if (event.type === "progress" && event.event === "phase"
-            && event.phase === "preflight" && ["complete", "completed", "resumed"].includes(event.status)) {
-            clearTimeout(preflightDeadline);
-          }
-        } catch {}
+    readProgress(child.stderr, (event) => {
+      if (event.phase === "preflight" && ["complete", "resumed"].includes(event.status)) {
+        clearTimeout(preflightDeadline);
       }
+      notifyProgress(onProgress, event);
     });
   }
   let exitCode;
@@ -172,7 +212,7 @@ async function runProcess(command, args, options, { signal, timeoutMs, timeoutCo
 }
 
 export async function runLocalAutoCut({
-  run, packageConfig, environment = process.env, signal,
+  run, packageConfig, environment = process.env, signal, onProgress,
   environmentTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_ENVIRONMENT_TIMEOUT_MS,
   preflightTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_PREFLIGHT_TIMEOUT_MS,
   runTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_RUN_TIMEOUT_MS,
@@ -180,6 +220,7 @@ export async function runLocalAutoCut({
   environmentTimeoutMs = timeoutSetting(environmentTimeoutMs, 30_000);
   preflightTimeoutMs = timeoutSetting(preflightTimeoutMs, 120_000);
   runTimeoutMs = timeoutSetting(runTimeoutMs, 2 * 60 * 60 * 1_000);
+  notifyProgress(onProgress, { phase: "environment_check", status: "running" });
   const { runtimeRoot, python, script, larkCli, readinessPath } = await resolveInstalledRuntime(
     packageConfig.workspacePath,
     environment,
@@ -204,6 +245,7 @@ export async function runLocalAutoCut({
     const code = Object.hasOwn(ENVIRONMENT_ERRORS, receipt?.code) ? receipt.code : "AUTOCUT_ENVIRONMENT_UNAVAILABLE";
     throw runnerError(code, ENVIRONMENT_ERRORS[code]);
   }
+  notifyProgress(onProgress, { phase: "environment_check", status: "complete" });
   const args = [
     script,
     "review-document-run",
@@ -218,7 +260,7 @@ export async function runLocalAutoCut({
   const result = await runProcess(python, args, {
     cwd: runtimeRoot,
     env: runtimeEnv,
-  }, { signal, timeoutMs: runTimeoutMs, timeoutCode: "AUTOCUT_RUN_TIMEOUT", preflightTimeoutMs });
+  }, { signal, timeoutMs: runTimeoutMs, timeoutCode: "AUTOCUT_RUN_TIMEOUT", preflightTimeoutMs, onProgress });
   if (signal?.aborted) {
     throw runnerError("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted because Taskboard is shutting down");
   }
