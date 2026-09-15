@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -86,6 +87,8 @@ async function createFixture({
   reportArtifact = false,
   turnDelayMs = 0,
   allowAutomaticExecution = false,
+  feishuWorkflowSync = async () => ({ ok: true }),
+  feishuBridgeUrl,
   feishuPackageStore,
   instanceToken = null,
   processEnv,
@@ -182,7 +185,8 @@ if (args[0] === "debug") {
     skillPath: path.join(directory, "AGENTS.md"),
     feishuPackagesPath: packagesPath,
     feishuPackageStore,
-    feishuWorkflowSync: async () => ({ ok: true }),
+    feishuWorkflowSync,
+    feishuBridgeUrl,
     ...(instanceToken
       ? { instanceToken, instanceSecret: "a".repeat(64) }
       : {}),
@@ -389,6 +393,211 @@ async function enableArtifactSource(
   assert.equal(enabled.response.status, expectedEnableStatus);
   return expectedEnableStatus === 200 ? enabled.body.subject : enabled;
 }
+
+for (const allowAutomaticExecution of [false, true]) {
+  test(`metadata reports effective automatic execution policy ${allowAutomaticExecution}`, async (t) => {
+    const previousPolicy = process.env.CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION;
+    process.env.CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION = allowAutomaticExecution ? "false" : "true";
+    t.after(() => {
+      if (previousPolicy === undefined) delete process.env.CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION;
+      else process.env.CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION = previousPolicy;
+    });
+    const fixture = await createFixture({ allowAutomaticExecution });
+    try {
+      const metadata = await request(fixture.baseUrl, "/api/meta");
+      assert.equal(metadata.response.status, 200);
+      assert.equal(metadata.body.capabilities.automaticExecution, allowAutomaticExecution);
+      assert.equal(metadata.body.capabilities.localAiChat, true);
+
+      const update = await request(fixture.baseUrl, "/api/meta", {
+        method: "POST",
+        body: { capabilities: { automaticExecution: !allowAutomaticExecution } },
+      });
+      assert.equal(update.response.status, 405);
+      const unchanged = await request(fixture.baseUrl, "/api/meta");
+      assert.equal(unchanged.body.capabilities.automaticExecution, allowAutomaticExecution);
+    } finally {
+      await fixture.app.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("new automatic subject drafts execute only after enable and preserve the active mode until re-enabled", async () => {
+  const synchronizedSubjects = [];
+  const controlledContext = {
+    documentLinks: ["https://fixture.feishu.cn/docx/isolated-test-document"],
+    namingDisplayValue: "自动执行测试", namingValueUnique: true,
+  };
+  let contextRequests = 0;
+  const bridge = createServer(async (incoming, response) => {
+    if (incoming.method !== "POST" || incoming.url !== "/api/feishu/workflow/controlled-context"
+      || incoming.headers["x-feishu-bridge-secret"] !== TEST_FEISHU_BRIDGE_SECRET) {
+      response.writeHead(403).end();
+      return;
+    }
+    for await (const chunk of incoming) void chunk;
+    contextRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ controlledContext }));
+  });
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  const fixture = await createFixture({
+    allowAutomaticExecution: true,
+    turnDelayMs: 100,
+    feishuBridgeUrl: `http://127.0.0.1:${bridge.address().port}`,
+    feishuWorkflowSync: async (subject) => {
+      synchronizedSubjects.push(structuredClone(subject));
+      return { ok: true };
+    },
+  });
+  try {
+    const packages = JSON.parse(await readFile(fixture.packagesPath, "utf8"));
+    packages.packages["Auto-cut-copyA"].zipSourceDirectory = fixture.workspace;
+    await writeFile(fixture.packagesPath, JSON.stringify(packages));
+    const catalog = await request(fixture.baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: {
+        baseToken: "bas_fixture",
+        baseName: "Isolated integration Base",
+        tables: [{
+          tableId: "tbl_fixture",
+          tableName: "高中历史副本测试",
+          fields: [
+            {
+              fieldId: "fld_status", fieldName: "流程", type: 3, uiType: "SingleSelect",
+              options: [{ id: "opt_initial", name: "初稿" }, { id: "opt_other", name: "其他" }],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text" },
+            { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text" },
+          ],
+        }],
+      },
+    });
+    assert.equal(catalog.response.status, 201);
+    const discovered = catalog.body.catalog[0].subjects[0];
+    assert.equal(discovered.lifecycle, "draft");
+    assert.equal(discovered.execution.mode, "automatic");
+    assert.equal(synchronizedSubjects.length, 0);
+    assert.equal(fixture.app.database.resolveFeishuSubjectVersionAt(FEISHU_SUBJECT_KEY, Date.now()), null);
+    assert.equal(fixture.app.database.listTasks({}).length, 0);
+
+    const route = `/api/local/feishu/workflow/subjects/${encodeURIComponent(FEISHU_SUBJECT_KEY)}`;
+    const saved = await request(fixture.baseUrl, route, {
+      method: "PATCH",
+      body: {
+        expectedVersion: discovered.configVersion,
+        statusField: { fieldId: "fld_status", fieldName: "流程" },
+        documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+        namingField: { fieldId: "fld_name", fieldName: "命名" },
+        stages: { initial: { artifactTargetPath: path.join(fixture.directory, "initial-output") } },
+        packageRoute: { packageAlias: "Auto-cut-copyA" },
+        upload: { artifactSourceMode: "driver_report", artifactSourcePath: fixture.workspace },
+      },
+    });
+    assert.equal(saved.response.status, 200, JSON.stringify(saved.body));
+    assert.equal(saved.body.subject.lifecycle, "draft");
+    assert.equal(saved.body.subject.execution.mode, "automatic");
+    assert.equal(saved.body.subject.upload.enqueueMode, "manual");
+    assert.equal(synchronizedSubjects.length, 0);
+    assert.equal(fixture.app.database.resolveFeishuSubjectVersionAt(FEISHU_SUBJECT_KEY, Date.now()), null);
+    assert.equal(fixture.app.database.listTasks({}).length, 0);
+    assert.equal(contextRequests, 0);
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+
+    const register = (subject, eventId) => request(fixture.baseUrl, "/api/local/feishu/tasks", {
+      method: "POST",
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": TEST_FEISHU_BRIDGE_SECRET,
+      },
+      body: {
+        event: {
+          eventId, baseToken: "bas_fixture", tableId: "tbl_fixture", recordId: `rec_${eventId}`,
+          statusFieldId: "fld_status", beforeOptionId: "opt_other", afterOptionId: "opt_initial",
+          occurredAt: Date.now(),
+        },
+        binding: { subjectKey: FEISHU_SUBJECT_KEY, configVersion: subject.configVersion, stageId: "initial" },
+        controlledContext,
+      },
+    });
+    const premature = await register(saved.body.subject, "before_enable");
+    assert.equal(premature.response.status, 409);
+    assert.equal(premature.body.error.code, "STALE_STAGE_EVENT");
+    assert.equal(fixture.app.database.listTasks({}).length, 0);
+
+    const enabled = await request(fixture.baseUrl, `${route}/enable`, {
+      method: "POST", body: { expectedVersion: saved.body.subject.configVersion },
+    });
+    assert.equal(enabled.response.status, 200, JSON.stringify(enabled.body));
+    assert.equal(enabled.body.subject.execution.mode, "automatic");
+    assert.deepEqual(synchronizedSubjects.map((subject) => subject.execution.mode), ["automatic"]);
+    assert.equal(fixture.app.database.listTasks({}).length, 0);
+
+    const automatic = await register(enabled.body.subject, "automatic_enabled");
+    assert.equal(automatic.response.status, 201, JSON.stringify(automatic.body));
+    assert.equal(automatic.body.task.feishuOrigin.executionMode, "automatic");
+    assert.equal(fixture.app.database.getFeishuExecution(automatic.body.task.id)?.trigger, "automatic");
+    await waitForTask(
+      fixture.baseUrl, automatic.body.task.id,
+      (task) => task.status === "in_progress"
+        && fixture.app.database.listFeishuAutoCutRuns(task.id).length === 1, 10_000,
+    );
+    const [autoCutRun] = fixture.app.database.listFeishuAutoCutRuns(automatic.body.task.id);
+    assert.ok(autoCutRun?.runId);
+    const aiRun = fixture.app.database.getAiChatRun(autoCutRun.runId);
+    await waitForRun(fixture.baseUrl, aiRun.threadId, (run) => run.status === "completed");
+    await waitForTaskAiStartSettled(fixture.app, automatic.body.task.id);
+    assert.match(await readFile(fixture.promptCapturePath, "utf8"), /trusted fixture prompt/u);
+    assert.equal(contextRequests, 1);
+
+    const manualDraft = await request(fixture.baseUrl, route, {
+      method: "PATCH",
+      body: { expectedVersion: enabled.body.subject.configVersion, execution: { mode: "manual" } },
+    });
+    assert.equal(manualDraft.response.status, 200);
+    assert.equal(manualDraft.body.subject.lifecycle, "draft");
+    assert.equal(manualDraft.body.subject.execution.mode, "manual");
+    assert.deepEqual(synchronizedSubjects.map((subject) => subject.execution.mode), ["automatic"]);
+    const activeWhileDraft = fixture.app.database.resolveFeishuSubjectVersionAt(FEISHU_SUBJECT_KEY, Date.now());
+    assert.equal(activeWhileDraft.execution.mode, "automatic");
+    assert.equal(activeWhileDraft.configVersion, enabled.body.subject.configVersion);
+
+    const manualEnabled = await request(fixture.baseUrl, `${route}/enable`, {
+      method: "POST", body: { expectedVersion: manualDraft.body.subject.configVersion },
+    });
+    assert.equal(manualEnabled.response.status, 200);
+    assert.deepEqual(synchronizedSubjects.map((subject) => subject.execution.mode), ["automatic", "manual"]);
+    const manual = await register(manualEnabled.body.subject, "manual_enabled");
+    assert.equal(manual.response.status, 201, JSON.stringify(manual.body));
+    assert.equal(manual.body.task.feishuOrigin.executionMode, "manual");
+    assert.equal(manual.body.task.status, "todo");
+    assert.equal(fixture.app.database.getFeishuExecution(manual.body.task.id), null);
+    assert.equal(fixture.app.database.getTask(manual.body.task.id).threadId, null);
+
+    const automaticDraft = await request(fixture.baseUrl, route, {
+      method: "PATCH",
+      body: { expectedVersion: manualEnabled.body.subject.configVersion, execution: { mode: "automatic" } },
+    });
+    assert.equal(automaticDraft.response.status, 200);
+    assert.equal(fixture.app.database.resolveFeishuSubjectVersionAt(FEISHU_SUBJECT_KEY, Date.now()).execution.mode, "manual");
+    const automaticReenabled = await request(fixture.baseUrl, `${route}/enable`, {
+      method: "POST", body: { expectedVersion: automaticDraft.body.subject.configVersion },
+    });
+    assert.equal(automaticReenabled.response.status, 200);
+    assert.deepEqual(synchronizedSubjects.map((subject) => subject.execution.mode), ["automatic", "manual", "automatic"]);
+    assert.equal(fixture.app.database.getTask(manual.body.task.id).status, "todo");
+    assert.equal(fixture.app.database.getTask(manual.body.task.id).threadId, null);
+    assert.equal(fixture.app.database.getFeishuExecution(manual.body.task.id), null);
+    assert.equal(fixture.app.database.getFeishuTaskOrigin(manual.body.task.id).executionMode, "manual");
+    assert.equal(fixture.app.database.listFeishuAutoCutRuns(automatic.body.task.id).length, 1);
+    assert.equal(fixture.app.database.listTasks({}).length, 2);
+  } finally {
+    await fixture.app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(fixture.directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
 
 test("manual start creates and runs a task-linked local Codex thread", async () => {
   const fixture = await createFixture();

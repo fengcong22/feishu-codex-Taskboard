@@ -79,6 +79,125 @@ function defaultTable({ tableId, tableName, prefix }) {
   };
 }
 
+for (const fieldsAvailable of [true, false]) {
+  test(`newly discovered subjects default to automatic drafts with ${fieldsAvailable ? "complete" : "missing"} metadata`, async () => {
+    let syncCalls = 0;
+    const { directory, database, store } = await fixture({
+      syncSubject: async () => { syncCalls += 1; },
+    });
+    try {
+      const metadata = phasedPreview();
+      if (!fieldsAvailable) metadata.tables[0].fields = [];
+      const catalog = await store.upsertBasePreview(metadata);
+      const subject = catalog.subjects[0];
+
+      assert.deepEqual(subject.execution, {
+        mode: "automatic",
+        concurrencyGroup: "default",
+        maxConcurrent: 1,
+        resourceGroups: [],
+      });
+      assert.equal(subject.lifecycle, "draft");
+      assert.equal(subject.displayEnabled, false);
+      assert.equal(subject.upload.enqueueMode, "manual");
+      assert.equal(syncCalls, 0);
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const mode of ["manual", "automatic"]) {
+  test(`metadata refresh and restoration preserve an existing ${mode} subject's execution settings`, async () => {
+    const { directory, database, store } = await fixture();
+    try {
+      const metadata = phasedPreview();
+      const catalog = await store.upsertBasePreview(metadata);
+      const subject = catalog.subjects[0];
+      const execution = { mode, concurrencyGroup: "existing", maxConcurrent: 2, resourceGroups: ["cpu"] };
+      await store.saveSubjectDraft(subject.subjectKey, {
+        expectedVersion: subject.configVersion,
+        execution,
+      });
+
+      const unchanged = await store.upsertBasePreview(metadata);
+      assert.deepEqual(unchanged.subjects[0].execution, execution);
+      const changedMetadata = {
+        ...metadata,
+        tables: [{ ...metadata.tables[0], tableName: "数学（已刷新）" }],
+      };
+      const refreshed = await store.upsertBasePreview(changedMetadata);
+      assert.deepEqual(refreshed.subjects[0].execution, execution);
+
+      await store.removeSubject(subject.subjectKey);
+      const restored = await store.upsertBasePreview(changedMetadata);
+      assert.deepEqual(restored.subjects[0].execution, execution);
+      assert.equal(restored.subjects[0].lifecycle, "disabled");
+
+      await store.removeSubject(subject.subjectKey);
+      const restoredWithChanges = await store.upsertBasePreview(metadata);
+      assert.deepEqual(restoredWithChanges.subjects[0].execution, execution);
+      assert.equal(restoredWithChanges.subjects[0].lifecycle, "disabled");
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const removed of [false, true]) {
+  test(`refreshing a ${removed ? "removed" : "persisted"} legacy subject without execution keeps the manual fallback`, async () => {
+    const { directory, database, store } = await fixture();
+    try {
+      const metadata = phasedPreview();
+      const catalog = await store.upsertBasePreview(metadata);
+      const subject = catalog.subjects[0];
+      if (removed) await store.removeSubject(subject.subjectKey);
+      const legacy = { ...subject };
+      for (const field of ["execution", "statusField", "documentField", "namingField", "stages"]) {
+        delete legacy[field];
+      }
+      database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+        .run(JSON.stringify(legacy), subject.subjectKey);
+
+      const refreshed = await store.upsertBasePreview(metadata);
+      assert.equal(refreshed.subjects[0].execution.mode, "manual");
+      assert.equal(refreshed.subjects[0].lifecycle, removed ? "disabled" : "draft");
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const legacyShape of [false, true]) {
+  test(`a shared ${legacyShape ? "legacy" : "phased"} configuration without execution imports as a manual draft`, async () => {
+    const source = await fixture();
+    const target = await fixture();
+    try {
+      await source.store.upsertBasePreview(phasedPreview());
+      const configuration = await source.store.exportShareable();
+      const sharedSubject = configuration.bases[0].subjects[0];
+      delete sharedSubject.execution;
+      if (legacyShape) {
+        for (const field of ["statusField", "documentField", "namingField", "stages"]) delete sharedSubject[field];
+      }
+
+      const dryRun = await target.store.importShareable(configuration, { dryRun: true });
+      assert.equal(dryRun.configuration.bases[0].subjects[0].execution.mode, "manual");
+      const imported = await target.store.importShareable(configuration);
+      assert.equal(imported.catalog[0].subjects[0].execution.mode, "manual");
+      assert.equal(imported.catalog[0].subjects[0].lifecycle, "draft");
+    } finally {
+      source.database.close();
+      target.database.close();
+      await rm(source.directory, { recursive: true, force: true });
+      await rm(target.directory, { recursive: true, force: true });
+    }
+  });
+}
+
 test("new tables receive complete phased defaults with independent field and option bindings", async () => {
   const { directory, database, store } = await fixture();
   try {

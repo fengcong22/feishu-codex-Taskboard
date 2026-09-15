@@ -62,6 +62,7 @@ export interface TaskboardMetadata {
 
 export interface TaskboardCapabilities {
   localAiChat: boolean;
+  automaticExecution?: boolean;
 }
 
 export type AiChatSandbox = "read-only" | "workspace-write" | "danger-full-access";

@@ -266,6 +266,121 @@ describe("FeishuStageEditor", () => {
   });
 });
 
+describe("FeishuWorkflowPanel shared execution mode", () => {
+  afterEach(() => cleanup());
+
+  function panelProps(configured: FeishuSubjectConfig) {
+    return {
+      catalog: catalog(configured),
+      configurationBaseToken: "bas_test",
+      selectedSubjectKey: configured.subjectKey,
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+    };
+  }
+
+  it.each(["phased", "metadata fallback", "legacy"])("shows one shared mode above stage settings for %s subjects", (kind) => {
+    const configured = kind === "phased" ? subject("history", "高中历史") : legacySubject("history", "高中历史");
+    if (kind === "legacy") configured.metadata = { fields: [] };
+    render(<FeishuWorkflowPanel {...panelProps(configured)} />);
+
+    const common = screen.getByRole("group", { name: "通用执行设置" });
+    expect(screen.getAllByRole("combobox", { name: "剪辑模式" })).toHaveLength(1);
+    expect((within(common).getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("manual");
+    expect(within(common).getByRole("textbox", { name: "并发组" })).toBeTruthy();
+    expect(within(common).getByRole("spinbutton", { name: "并发数" })).toBeTruthy();
+    expect(within(common).getByRole("textbox", { name: "资源组" })).toBeTruthy();
+    if (kind !== "legacy") {
+      const phases = screen.getByRole("region", { name: "分阶段素材配置" });
+      expect(within(phases).queryByRole("combobox", { name: "剪辑模式" })).toBeNull();
+      expect(common.compareDocumentPosition(phases) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it.each(["manual", "automatic"] as const)("saves a change from %s without publishing until explicit enable", async (originalMode) => {
+    vi.mocked(listFeishuPackages).mockResolvedValueOnce([{
+      alias: "Auto-cut-A", name: "Auto-Cut A", projectId: "auto-cut-a", workspacePath: null,
+      model: null, reasoningEffort: null, prompt: null, zipSourceDirectory: null,
+      maxConcurrent: 1, state: "enabled", revision: 1, updatedAt: "2026-09-15T00:00:00.000Z",
+      referenceCount: 0, references: [],
+    }]);
+    const configured = subject("history", "高中历史");
+    configured.lifecycle = "enabled";
+    configured.execution = { mode: originalMode, concurrencyGroup: "history", maxConcurrent: 2, resourceGroups: ["editor", "gpu"] };
+    configured.packageRoute!.packageAlias = "Auto-cut-A";
+    configured.documentField!.fieldName = "普通文本";
+    configured.namingField!.fieldName = "普通文本";
+    const nextMode = originalMode === "manual" ? "automatic" : "manual";
+    const onEnable = vi.fn(async (saved: FeishuSubjectConfig) => ({ ...saved, lifecycle: "enabled" as const }));
+    const onSaveDraft = vi.fn(async (_subjectKey: string, rawPatch: unknown) => ({
+      ...configured, ...(rawPatch as Partial<FeishuSubjectConfig>),
+      configVersion: 2, lifecycle: "draft" as const,
+    }));
+    function SavedPanel() {
+      const [current, setCurrent] = useState(configured);
+      return <FeishuWorkflowPanel {...panelProps(current)} onSubjectChange={setCurrent} onSaveDraft={onSaveDraft} onEnable={onEnable} />;
+    }
+    render(<SavedPanel />);
+
+    const control = screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement;
+    expect(control.value).toBe(originalMode);
+    fireEvent.change(control, { target: { value: nextMode } });
+    expect(control.value).toBe(nextMode);
+    expect(onSaveDraft).not.toHaveBeenCalled();
+    expect(onEnable).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+    const [subjectKey, patch] = onSaveDraft.mock.calls[0];
+    expect(subjectKey).toBe(configured.subjectKey);
+    expect(patch).toMatchObject({
+      expectedVersion: 1,
+      execution: { ...configured.execution, mode: nextMode },
+      stages: configured.stages,
+      upload: configured.upload,
+      packageRoute: configured.packageRoute,
+    });
+    expect(onEnable).not.toHaveBeenCalled();
+    await waitFor(() => expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "启用" }));
+    await waitFor(() => expect(onEnable).toHaveBeenCalledTimes(1));
+    expect(onEnable).toHaveBeenCalledWith(expect.objectContaining({
+      subjectKey: configured.subjectKey, configVersion: 2, lifecycle: "draft",
+      execution: { ...configured.execution, mode: nextMode },
+    }));
+  });
+
+  it("loads each subject's saved mode when switching subjects", () => {
+    const manual = subject("history", "高中历史");
+    const automatic = subject("history-copy", "高中历史副本");
+    automatic.execution!.mode = "automatic";
+    const props = { ...panelProps(manual), catalog: catalog(manual, automatic) };
+    const { rerender } = render(<FeishuWorkflowPanel {...props} />);
+    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("manual");
+    rerender(<FeishuWorkflowPanel {...props} selectedSubjectKey={automatic.subjectKey} />);
+    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
+    rerender(<FeishuWorkflowPanel {...props} />);
+    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("manual");
+  });
+
+  it("reports unknown, off and on machine policy without changing the subject mode", () => {
+    const configured = subject("history", "高中历史");
+    configured.execution!.mode = "automatic";
+    const props = panelProps(configured);
+    const { rerender } = render(<FeishuWorkflowPanel {...props} />);
+    const status = () => screen.getByRole("status", { name: "本机自动执行总开关" });
+    expect(status().textContent).toContain("状态未知");
+    rerender(<FeishuWorkflowPanel {...props} allowAutomaticExecution={false} />);
+    expect(status().textContent).toContain("已关闭");
+    expect(status().textContent).toContain("不会自动启动任务");
+    rerender(<FeishuWorkflowPanel {...props} allowAutomaticExecution />);
+    expect(status().textContent).toContain("已开启");
+    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
+    expect(props.onSubjectChange).not.toHaveBeenCalled();
+  });
+});
+
 describe("FeishuWorkflowPanel audio drafts", () => {
   afterEach(() => cleanup());
 

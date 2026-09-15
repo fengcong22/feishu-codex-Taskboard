@@ -5445,6 +5445,7 @@ export function createTaskboardServer(options = {}) {
           capabilities: {
             localAiChat: !configuredTrustedRequest
               && isLoopbackAddress(request.socket.remoteAddress),
+            automaticExecution: allowAutomaticExecution,
           },
           ...(capabilityCloudConfig?.remoteUrl
             ? {

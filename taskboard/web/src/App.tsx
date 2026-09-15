@@ -2171,6 +2171,7 @@ export function App() {
         && JSON.stringify(current.realtime) === JSON.stringify(metadata.realtime)
         && current.manageTaskboardSkillPath === metadata.manageTaskboardSkillPath
         && current.localCapabilities?.available === metadata.localCapabilities?.available
+        && current.capabilities?.automaticExecution === metadata.capabilities?.automaticExecution
           ? current
           : metadata
       ));
@@ -5264,6 +5265,7 @@ export function App() {
               catalog={feishuCatalog}
               configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
+              allowAutomaticExecution={taskboardMetadata?.capabilities?.automaticExecution}
               onSelectSubject={(subjectKey, openProject = true) => {
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (!subject) return;

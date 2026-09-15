@@ -478,7 +478,9 @@ function phasedDefaultsForSubject({
     trigger: clone(reusableTrigger),
     title: clone(existing?.title ?? { fieldId: null, fieldName: null }),
     execution: clone(existing?.execution ?? {
-      mode: "manual",
+      // Only first discovery opts into automatic execution. Legacy repair and
+      // restoration retain their conservative fallback when execution is absent.
+      mode: existing ? "manual" : "automatic",
       concurrencyGroup: "default",
       maxConcurrent: 1,
       resourceGroups: [],

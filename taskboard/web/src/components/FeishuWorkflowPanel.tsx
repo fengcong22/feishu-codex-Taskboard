@@ -32,6 +32,7 @@ export interface FeishuWorkflowPanelProps {
   catalog: FeishuBaseCatalog[];
   configurationBaseToken: string | null;
   selectedSubjectKey: string | null;
+  allowAutomaticExecution?: boolean;
   /** Select a subject; the second flag controls whether to open its task board. */
   onSelectSubject: (subjectKey: string, openProject?: boolean) => void;
   onCatalogChange: (catalog: FeishuBaseCatalog[]) => void;
@@ -321,6 +322,7 @@ export function FeishuWorkflowPanel({
   catalog,
   configurationBaseToken,
   selectedSubjectKey,
+  allowAutomaticExecution,
   onSelectSubject,
   onCatalogChange,
   onSubjectChange,
@@ -822,6 +824,23 @@ export function FeishuWorkflowPanel({
         </div>
         <small>配置版本 {selected.configVersion}</small>
       </header>
+      <fieldset disabled={busy}>
+        <legend>通用执行设置</legend>
+        <div className="feishu-settings-grid">
+          <label>剪辑模式<select value={subjectForm.executionMode} onChange={(event) => setSubjectForm({ ...subjectForm, executionMode: event.target.value as SubjectForm["executionMode"] })}><option value="manual">手动</option><option value="automatic">自动</option></select></label>
+          <label>并发组<input value={subjectForm.concurrencyGroup} onChange={(event) => setSubjectForm({ ...subjectForm, concurrencyGroup: event.target.value })} /></label>
+          <label>并发数<input type="number" min={1} step={1} value={subjectForm.maxConcurrent} onChange={(event) => setSubjectForm({ ...subjectForm, maxConcurrent: event.target.value })} /></label>
+          <label>资源组<input value={subjectForm.resourceGroups} onChange={(event) => setSubjectForm({ ...subjectForm, resourceGroups: event.target.value })} /></label>
+        </div>
+        <p className="feishu-execution-help">剪辑模式适用于当前学科{phased ? "的初稿、初审修改和终审修改三个阶段" : ""}。修改后先保存草稿，再点击启用生效；上传入队单独设置。</p>
+        <p className="feishu-execution-help" role="status" aria-label="本机自动执行总开关">
+          {allowAutomaticExecution === true
+            ? "本机自动执行总开关：已开启。学科启用后，新触发的合格任务可按自动模式执行。"
+            : allowAutomaticExecution === false
+              ? "本机自动执行总开关：已关闭。即使选择自动，也不会自动启动任务，需手动开始。"
+              : "本机自动执行总开关：状态未知。暂时无法确认是否允许自动启动任务。"}
+        </p>
+      </fieldset>
       {phased && subjectForm.stages && <section className="feishu-phased-settings" aria-label="分阶段素材配置">
         <fieldset disabled={busy}>
           <legend>字段来源</legend>
@@ -880,7 +899,7 @@ export function FeishuWorkflowPanel({
         </div>
       </section>}
       {!phased && <fieldset disabled={busy}>
-        <legend>触发与执行</legend>
+        <legend>触发配置</legend>
         <div className="feishu-settings-grid">
           <label>触发字段<select value={subjectForm.triggerFieldId} onChange={(event) => selectTriggerField(event.target.value)}>
             {!hasConfiguredTriggerField && <option value={subjectForm.triggerFieldId}>{subjectForm.triggerFieldName}（已有配置）</option>}
@@ -899,10 +918,6 @@ export function FeishuWorkflowPanel({
               && <option value={subjectForm.titleFieldId}>{subjectForm.titleFieldName}（已有配置）</option>}
             {triggerFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
           </select></label>
-          <label>剪辑模式<select value={subjectForm.executionMode} onChange={(event) => setSubjectForm({ ...subjectForm, executionMode: event.target.value as SubjectForm["executionMode"] })}><option value="manual">手动</option><option value="automatic">自动</option></select></label>
-          <label>并发组<input value={subjectForm.concurrencyGroup} onChange={(event) => setSubjectForm({ ...subjectForm, concurrencyGroup: event.target.value })} /></label>
-          <label>并发数<input type="number" min={1} step={1} value={subjectForm.maxConcurrent} onChange={(event) => setSubjectForm({ ...subjectForm, maxConcurrent: event.target.value })} /></label>
-          <label>资源组<input value={subjectForm.resourceGroups} onChange={(event) => setSubjectForm({ ...subjectForm, resourceGroups: event.target.value })} /></label>
         </div>
       </fieldset>}
       <fieldset disabled={busy}>
