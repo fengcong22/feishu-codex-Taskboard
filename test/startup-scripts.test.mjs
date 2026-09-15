@@ -37,8 +37,13 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /taskboard\.stderr\.log/);
   assert.match(source, /@openai\\codex-win32-/);
   assert.match(source, /vendor\\x86_64-pc-windows-msvc\\bin\\codex\.exe/);
+  assert.match(source, /vendor\\aarch64-pc-windows-msvc\\bin\\codex\.exe/);
+  assert.match(source, /function Get-CodexVendorCandidates/);
+  assert.match(source, /PROCESSOR_ARCHITEW6432/);
   assert.match(source, /Get-Command codex\.exe/);
-  assert.match(source, /Test-Path -LiteralPath \$candidate/);
+  assert.match(source, /Get-Item -LiteralPath \$Path/);
+  assert.match(source, /PSProvider\.Name -ne 'FileSystem'/);
+  assert.match(source, /\[System\.IO\.Path\]::GetFullPath/);
   assert.match(source, /CODEX_EXECUTABLE/);
   assert.match(source, /CODEX_FEISHU_PACKAGES_PATH/);
   assert.match(source, /CODEX_FEISHU_PACKAGES_PATH\s*=\s*\$packageRegistry/);
@@ -58,6 +63,235 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /function Build-TaskboardWeb/);
   assert.match(source, /Build-TaskboardWeb \$taskboardRoot/);
   assert.match(source, /run 'build:web'/);
+});
+
+test("startup Codex resolution prefers a valid explicit executable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-explicit-resolution-"));
+  const explicitExecutable = join(directory, "explicit-codex.exe");
+  const pathExecutable = join(directory, "codex.exe");
+  const discoveredExecutable = join(directory, "discovered-codex.exe");
+  const helper = fileURLToPath(files.start);
+  try {
+    await Promise.all([
+      writeFile(explicitExecutable, "", "utf8"),
+      writeFile(pathExecutable, "", "utf8"),
+      writeFile(discoveredExecutable, "", "utf8"),
+    ]);
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-CodexExecutable' }, $true)",
+      "if (-not $definition) { throw 'Resolve-CodexExecutable is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      `$env:PATH = ${powershellLiteral(directory)} + [System.IO.Path]::PathSeparator + $env:PATH`,
+      "$warnings = @()",
+      `$resolved = Resolve-CodexExecutable ${powershellLiteral(explicitExecutable)} @(${powershellLiteral(discoveredExecutable)}) -WarningVariable +warnings`,
+      `if ($resolved -ne ${powershellLiteral(explicitExecutable)}) { throw 'valid explicit Codex executable did not win' }`,
+      "if ($warnings.Count -ne 0) { throw 'valid explicit Codex executable produced a warning' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup Codex resolution normalizes a relative filesystem override", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-relative-resolution-"));
+  const explicitExecutable = join(directory, "relative-codex.exe");
+  const helper = fileURLToPath(files.start);
+  try {
+    await writeFile(explicitExecutable, "", "utf8");
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-CodexExecutable' }, $true)",
+      "if (-not $definition) { throw 'Resolve-CodexExecutable is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      `Push-Location -LiteralPath ${powershellLiteral(directory)}`,
+      "try { $resolved = Resolve-CodexExecutable '.\\relative-codex.exe' @() } finally { Pop-Location }",
+      `if ($resolved -ne ${powershellLiteral(explicitExecutable)}) { throw 'relative override was not normalized to its absolute filesystem path' }`,
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup Codex resolution rejects provider overrides and falls back to PATH", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-provider-resolution-"));
+  const pathExecutable = join(directory, "codex.exe");
+  const helper = fileURLToPath(files.start);
+  try {
+    await writeFile(pathExecutable, "", "utf8");
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-CodexExecutable' }, $true)",
+      "if (-not $definition) { throw 'Resolve-CodexExecutable is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      `$env:PATH = ${powershellLiteral(directory)}`,
+      "$env:CODEX_TEST_PROVIDER_VALUE = 'not-a-filesystem-executable'",
+      "$warnings = @()",
+      "$resolved = Resolve-CodexExecutable 'Env:CODEX_TEST_PROVIDER_VALUE' @() -WarningVariable +warnings",
+      `if ($resolved -ne ${powershellLiteral(pathExecutable)}) { throw 'provider override did not fall back to the PATH executable' }`,
+      "if ($warnings.Count -ne 1) { throw 'provider override warning was not emitted exactly once' }",
+      "if ([string]$warnings[0] -ne 'Configured CODEX_EXECUTABLE was not found; continuing with automatic Codex discovery.') { throw 'provider override warning leaked path details or used unexpected guidance' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup Codex resolution warns and falls back when the override is stale", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-stale-resolution-"));
+  const staleExecutable = join(directory, "deleted-version", "codex.exe");
+  const pathExecutable = join(directory, "codex.exe");
+  const helper = fileURLToPath(files.start);
+  try {
+    await writeFile(pathExecutable, "", "utf8");
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-CodexExecutable' }, $true)",
+      "if (-not $definition) { throw 'Resolve-CodexExecutable is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      `$env:PATH = ${powershellLiteral(directory)} + [System.IO.Path]::PathSeparator + $env:PATH`,
+      "$warnings = @()",
+      `$resolved = Resolve-CodexExecutable ${powershellLiteral(staleExecutable)} @() -WarningVariable +warnings`,
+      `if ($resolved -ne ${powershellLiteral(pathExecutable)}) { throw 'stale override did not fall back to the first PATH Codex executable' }`,
+      "if ($warnings.Count -ne 1 -or [string]$warnings[0] -notmatch 'CODEX_EXECUTABLE') { throw 'stale override warning was not emitted' }",
+      "if ([string]$warnings[0] -ne 'Configured CODEX_EXECUTABLE was not found; continuing with automatic Codex discovery.') { throw 'stale override warning leaked path details or used unexpected guidance' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup Codex resolution returns no executable when every source is unavailable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-missing-resolution-"));
+  const staleExecutable = join(directory, "deleted-version", "codex.exe");
+  const missingCandidate = join(directory, "missing-vendor", "codex.exe");
+  const helper = fileURLToPath(files.start);
+  try {
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-CodexExecutable' }, $true)",
+      "if (-not $definition) { throw 'Resolve-CodexExecutable is missing' }",
+      "Invoke-Expression $definition.Extent.Text",
+      `$env:PATH = ${powershellLiteral(directory)}`,
+      "$warnings = @()",
+      `$resolved = Resolve-CodexExecutable ${powershellLiteral(staleExecutable)} @(${powershellLiteral(missingCandidate)}) -WarningVariable +warnings`,
+      "if ($null -ne $resolved) { throw 'missing Codex sources unexpectedly resolved' }",
+      "if ($warnings.Count -ne 1) { throw 'stale override warning was not emitted exactly once' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+
+    const source = await readFile(files.start, "utf8");
+    assert.match(
+      source,
+      /if \(\[string\]::IsNullOrWhiteSpace\(\$codexExecutable\)[\s\S]*?throw 'Codex executable was not found\./,
+      "startup must fail only after Codex discovery returns no executable",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup Codex vendor discovery selects only the native Windows architecture", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-architecture-resolution-"));
+  const npmRoot = join(directory, "npm-root");
+  const x64Executable = join(
+    npmRoot,
+    "@openai",
+    "codex-win32-x64",
+    "vendor",
+    "x86_64-pc-windows-msvc",
+    "bin",
+    "codex.exe",
+  );
+  const arm64Executable = join(
+    npmRoot,
+    "@openai",
+    "codex-win32-arm64",
+    "vendor",
+    "aarch64-pc-windows-msvc",
+    "bin",
+    "codex.exe",
+  );
+  const helper = fileURLToPath(files.start);
+  try {
+    await Promise.all([
+      mkdir(join(npmRoot, "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin"), { recursive: true }),
+      mkdir(join(npmRoot, "@openai", "codex-win32-arm64", "vendor", "aarch64-pc-windows-msvc", "bin"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(x64Executable, "", "utf8"),
+      writeFile(arm64Executable, "", "utf8"),
+    ]);
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(helper)} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "foreach ($name in @('Get-CodexVendorCandidates', 'Resolve-CodexExecutable')) { $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true); if (-not $definition) { throw \"$name is missing\" }; Invoke-Expression $definition.Extent.Text }",
+      `$env:PATH = ${powershellLiteral(join(directory, "empty-path"))}`,
+      `$x64Candidates = @(Get-CodexVendorCandidates -NpmRoot ${powershellLiteral(npmRoot)} -Architecture 'x64')`,
+      `$arm64Candidates = @(Get-CodexVendorCandidates -NpmRoot ${powershellLiteral(npmRoot)} -Architecture 'arm64')`,
+      `if ($x64Candidates.Count -ne 1 -or $x64Candidates[0] -ne ${powershellLiteral(x64Executable)}) { throw \"x64 discovery mismatch: count=$($x64Candidates.Count), actual=$($x64Candidates -join '|')\" }`,
+      `if ($arm64Candidates.Count -ne 1 -or $arm64Candidates[0] -ne ${powershellLiteral(arm64Executable)}) { throw \"ARM64 discovery mismatch: count=$($arm64Candidates.Count), actual=$($arm64Candidates -join '|')\" }`,
+      `$x64Resolved = Resolve-CodexExecutable $null $x64Candidates`,
+      `$arm64Resolved = Resolve-CodexExecutable $null $arm64Candidates`,
+      `if ($x64Resolved -ne ${powershellLiteral(x64Executable)} -or $arm64Resolved -ne ${powershellLiteral(arm64Executable)}) { throw 'native vendor binaries were not resolved' }`,
+      `Remove-Item -LiteralPath ${powershellLiteral(x64Executable)} -Force`,
+      `$x64Missing = Resolve-CodexExecutable $null $x64Candidates`,
+      "if ($null -ne $x64Missing) { throw 'x64 resolution incorrectly fell back to an ARM64 vendor binary' }",
+      `$env:PROCESSOR_ARCHITECTURE = 'AMD64'`,
+      `$env:PROCESSOR_ARCHITEW6432 = 'ARM64'`,
+      `$mixedX64 = @(Get-CodexVendorCandidates -NpmRoot ${powershellLiteral(npmRoot)})`,
+      "if ($mixedX64.Count -ne 1 -or $mixedX64[0] -notmatch 'codex-win32-x64') { throw 'x64 process on ARM64 OS selected the wrong vendor architecture' }",
+      `$env:PROCESSOR_ARCHITECTURE = 'x86'`,
+      `$mixedArm64 = @(Get-CodexVendorCandidates -NpmRoot ${powershellLiteral(npmRoot)})`,
+      "if ($mixedArm64.Count -ne 1 -or $mixedArm64[0] -notmatch 'codex-win32-arm64') { throw 'x86 WOW64 process did not select the native ARM64 vendor architecture' }",
+      `$env:PROCESSOR_ARCHITECTURE = 'mips64'`,
+      `$env:PROCESSOR_ARCHITEW6432 = $null`,
+      `$unknown = @(Get-CodexVendorCandidates -NpmRoot ${powershellLiteral(npmRoot)})`,
+      "if ($unknown.Count -ne 0) { throw 'unknown process architecture unexpectedly selected a vendor binary' }",
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("startup and stop default only to the bundled Taskboard", async () => {

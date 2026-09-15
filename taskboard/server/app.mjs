@@ -2343,26 +2343,33 @@ async function parseWorktrees(output) {
   return contexts;
 }
 
-async function scanDevelopmentContexts(workspacePath, processEnv = process.env) {
+export async function scanDevelopmentContexts(
+  workspacePath,
+  processEnv = process.env,
+  executeFile = execFileAsync,
+) {
   if (!workspacePath) return { workspacePath: null, contexts: [] };
   const environment = withoutTaskboardLauncherEnvironment(processEnv);
   try {
-    const rootResult = await execFileAsync("git", ["-C", workspacePath, "rev-parse", "--show-toplevel"], {
+    const rootResult = await executeFile("git", ["-C", workspacePath, "rev-parse", "--show-toplevel"], {
       env: environment,
       timeout: 4_000,
       maxBuffer: 1024 * 1024,
+      windowsHide: true,
     });
     const root = rootResult.stdout.trim();
     const [branchesResult, worktreesResult] = await Promise.all([
-      execFileAsync("git", ["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], {
+      executeFile("git", ["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], {
         env: environment,
         timeout: 4_000,
         maxBuffer: 1024 * 1024,
+        windowsHide: true,
       }),
-      execFileAsync("git", ["-C", root, "worktree", "list", "--porcelain"], {
+      executeFile("git", ["-C", root, "worktree", "list", "--porcelain"], {
         env: environment,
         timeout: 4_000,
         maxBuffer: 1024 * 1024,
+        windowsHide: true,
       }),
     ]);
     const branches = branchesResult.stdout.split("\n").map((branch) => branch.trim()).filter(Boolean);

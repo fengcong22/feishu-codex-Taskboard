@@ -9,6 +9,7 @@ import { afterEach, test } from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { createTaskboardServer, resolveServerOptions } from "../server/index.mjs";
+import { scanDevelopmentContexts } from "../server/app.mjs";
 
 const runningApps = [];
 
@@ -455,6 +456,29 @@ test("development context scan resolves the current Codex conversation workspace
   );
   assert.equal(deviceResult.response.status, 200);
   assert.equal(deviceResult.body.workspacePath, deviceWorkspace);
+});
+
+test("development context Git scans hide Windows child-process windows", async () => {
+  const calls = [];
+  const executeGit = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args.includes("rev-parse")) return { stdout: "C:\\workspace\n" };
+    if (args.includes("for-each-ref")) return { stdout: "main\nfeature/right-click\n" };
+    return { stdout: "" };
+  };
+
+  const result = await scanDevelopmentContexts(
+    "C:\\workspace",
+    { PATH: process.env.PATH },
+    executeGit,
+  );
+
+  assert.equal(result.workspacePath, "C:\\workspace");
+  assert.deepEqual(calls.map(({ args }) => args[2]), ["rev-parse", "for-each-ref", "worktree"]);
+  for (const { command, args, options } of calls) {
+    assert.equal(command, "git");
+    assert.equal(options.windowsHide, true, `${args[2]} must hide its Windows child-process window`);
+  }
 });
 
 test("device workspaces come from this machine's Codex project roots", async () => {
