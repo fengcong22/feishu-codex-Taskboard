@@ -3110,6 +3110,11 @@ export function App() {
   const activeFilterCount = taskFilterCount(filters);
   const hasActiveTaskFilters = Boolean(search.trim()) || activeFilterCount > 0;
 
+  const activeTaskAiThreadIds = useMemo(() => [...new Set(tasks
+    .filter((task) => task.status === "in_progress" && !task.threadBinding)
+    .map((task) => task.threadId)
+    .filter((threadId): threadId is string => Boolean(threadId)))].sort(), [tasks]);
+
   const taskCodexThreadIds = useMemo(() => new Map(
     aiThreads
       .filter((thread) => thread.origin.issueId && thread.codexThreadId)
@@ -5730,6 +5735,7 @@ export function App() {
             projectId={selectedProjectId || null}
             issueId={detailTaskId}
             codexProjectIdentity={selectedCodexProjectIdentity}
+            taskThreadIds={activeTaskAiThreadIds}
             onThreadsChange={setAiThreads}
             openThreadRequest={aiOpenThreadRequest}
             onOpenThreadRequestHandled={handleAiOpenThreadRequestHandled}

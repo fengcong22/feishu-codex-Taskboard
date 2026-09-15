@@ -113,6 +113,7 @@ interface AiChatProps {
   projectId: string | null;
   issueId: string | null;
   codexProjectIdentity: CodexProjectIdentity | null;
+  taskThreadIds?: string[];
   onThreadsChange?: (threads: AiChatThread[]) => void;
   openThreadRequest?: AiChatOpenThreadRequest | null;
   onOpenThreadRequestHandled: (requestId: number) => void;
@@ -1304,6 +1305,7 @@ export function AiChat({
   projectId,
   issueId,
   codexProjectIdentity,
+  taskThreadIds = [],
   onThreadsChange,
   openThreadRequest,
   onOpenThreadRequestHandled,
@@ -1363,6 +1365,7 @@ export function AiChat({
   const panelRef = useRef<HTMLElement>(null);
   const panelResizeSessionRef = useRef<PanelResizeSession | null>(null);
   const selectedThreadRef = useRef(selectedThreadId);
+  const threadSelectionRevisionRef = useRef(0);
   const handledOpenThreadRequestRef = useRef<number | null>(null);
   const draftReturnThreadIdRef = useRef<string | null>(null);
   const taskComposerDraftOriginRef = useRef<DraftThreadOrigin | null>(null);
@@ -1376,6 +1379,7 @@ export function AiChat({
     : null;
 
   const selectThread = useCallback((threadId: string | null) => {
+    threadSelectionRevisionRef.current += 1;
     selectedThreadRef.current = threadId;
     setSelectedThreadId(threadId);
   }, []);
@@ -1564,10 +1568,23 @@ export function AiChat({
   );
   useEffect(() => () => selectedHintRefreshQueue.clear(), [selectedHintRefreshQueue]);
 
-  const loadThreads = useCallback(async () => {
+  const addDiscoveredThreads = useCallback((discovered: AiChatThread[]) => {
+    setThreads((current) => {
+      const knownIds = new Set(current.map((thread) => thread.id));
+      const additions = discovered.filter((thread) => !knownIds.has(thread.id));
+      if (additions.length === 0) return current;
+      // A delayed list must not replace a newer per-thread snapshot.
+      return [...current, ...additions].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    });
+  }, []);
+
+  const loadThreads = useCallback(async (signal: AbortSignal) => {
+    const selectionRevision = threadSelectionRevisionRef.current;
     try {
-      const next = await listAiChatThreads();
-      setThreads(next);
+      const next = await listAiChatThreads(signal);
+      if (signal.aborted) return;
+      addDiscoveredThreads(next);
+      if (selectionRevision !== threadSelectionRevisionRef.current) return;
       if (next.length === 0) setHistoryOpen(false);
       setSelectedThreadId((current) => {
         const selected = current && next.some((thread) => thread.id === current)
@@ -1577,9 +1594,9 @@ export function AiChat({
         return selected;
       });
     } catch (nextError) {
-      setError(messageFor(nextError));
+      if (!signal.aborted) setError(messageFor(nextError));
     }
-  }, []);
+  }, [addDiscoveredThreads]);
 
   useEffect(() => {
     if (!available) {
@@ -1587,8 +1604,39 @@ export function AiChat({
       setThreads([]);
       return;
     }
-    void loadThreads();
+    const controller = new AbortController();
+    void loadThreads(controller.signal);
+    return () => controller.abort();
   }, [available, loadThreads]);
+
+  const missingTaskThreadIdsKey = JSON.stringify([...new Set(taskThreadIds)]
+    .filter((id) => !threads.some((thread) => thread.id === id)).sort());
+  useEffect(() => {
+    const missingIds = new Set<string>(JSON.parse(missingTaskThreadIdsKey));
+    if (!available || missingIds.size === 0) return;
+    const controller = new AbortController();
+    let pending = false;
+    const discover = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const next = await listAiChatThreads(controller.signal);
+        if (!controller.signal.aborted) {
+          addDiscoveredThreads(next.filter((thread) => missingIds.has(thread.id)));
+        }
+      } catch {
+        // Task binding can precede thread creation; retry discovery quietly.
+      } finally {
+        pending = false;
+      }
+    };
+    void discover();
+    const timer = window.setInterval(discover, 2_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [addDiscoveredThreads, available, missingTaskThreadIdsKey]);
 
   useEffect(() => {
     onThreadsChange?.(available ? threads : []);
@@ -1620,7 +1668,8 @@ export function AiChat({
   }, [loadSnapshot, selectedHintRefreshQueue, selectedThreadId]);
 
   const backgroundRunningThreadIds = threads
-    .filter((thread) => thread.status === "running" && thread.id !== selectedThreadId)
+    .filter((thread) => thread.id !== selectedThreadId
+      && (thread.status === "running" || taskThreadIds.includes(thread.id)))
     .map((thread) => thread.id);
   useEffect(() => {
     if (!available || backgroundRunningThreadIds.length === 0) return;
