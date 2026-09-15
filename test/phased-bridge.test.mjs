@@ -649,6 +649,63 @@ test("archives a previous stage when the new target stage is disabled", async ()
   assert.deepEqual(order, ["archive"]);
 });
 
+const [unrelatedFieldEvent] = normalizeBitableRecordChanged({
+  header: { event_id: "evt-unrelated-field" },
+  event: {
+    file_token: "bas_demo",
+    table_id: "tbl_math",
+    record_id: "rec-1",
+    create_time: 1788652800000,
+    action_list: [{
+      action: "record_edited",
+      field_name: "备注",
+      before_value: [{ field_id: "fld_notes", field_value: JSON.stringify("旧备注") }],
+      after_value: [{ field_id: "fld_notes", field_value: JSON.stringify("新备注") }],
+    }],
+  },
+}, {
+  ...subject,
+  triggerField: "制作进度",
+  triggerFieldId: "fld_status",
+  triggerValue: "待初稿",
+  triggerOptionId: "opt_initial",
+});
+
+for (const [name, event, expected] of [
+  ["the record remains in the same stage", edge("opt_initial", "opt_initial", {
+    eventId: "evt-same-stage",
+  }), { kind: "ignored", reason: "already_at_trigger" }],
+  ["an unrelated field changes", unrelatedFieldEvent, {
+    kind: "ignored",
+    reason: "unrelated_field",
+  }],
+]) {
+  test(`does not archive a waiting phased task when ${name}`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-noop-"));
+    let taskboardCalls = 0;
+    const bridge = createBridge({
+      config: {
+        delivery: { maxAttempts: 2, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 },
+        tables: [subject],
+        packages: { "Auto-cut-lite": { projectId: "p", projectName: "p", workspacePath: "D:\\trusted", prompt: "fixed" } },
+      },
+      store: new JsonStateStore(path.join(dir, "state.json")),
+      workflowStore: { resolveSubjectVersionAt: async () => subject },
+      taskboard: {
+        listFeishuTasks: async () => { taskboardCalls += 1; return []; },
+        getTask: async () => { taskboardCalls += 1; return null; },
+        archiveFeishuTask: async () => { taskboardCalls += 1; return null; },
+        registerFeishuStageTask: async () => { taskboardCalls += 1; return null; },
+      },
+    });
+
+    const result = await bridge.handle(event);
+
+    assert.deepEqual(result, expected);
+    assert.equal(taskboardCalls, 0);
+  });
+}
+
 test("retries a phased registration from its persisted subject and context snapshot", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-bridge-"));
   const filename = path.join(dir, "state.json");
