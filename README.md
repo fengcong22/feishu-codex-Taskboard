@@ -153,7 +153,7 @@ Set-Location ..
 
 待修复通过测试、示例项目验证和代码评审后，在目标电脑等待活动任务结束，运行 `.\scripts\stop-local.ps1`，再更新包含修复的源码。保留目标电脑的 `.env.local`、`config/*.local.json`、包 registry（包括 `CODEX_FEISHU_PACKAGES_PATH` 指定的文件）和 `.runtime/`，不要用另一台电脑的配置或运行数据覆盖。
 
-如依赖尚未安装或发生变化，先运行 `npm install` 和 `npm --prefix taskboard install`；随后运行 `npm test`、`.\scripts\start-local.ps1` 和 `.\scripts\check-local.ps1`，加载并检查新版本。启动时沿用目标电脑原有的真实监听设置；需要确认真实长连接时再加做 `check-local.ps1 -RequireFeishu`。在示例任务上确认归档后引用解除、活动执行和配置仍阻止删除、原包不可用时恢复被阻止，再处理实际包。不要清空历史任务、数据库或 Bridge 状态来解除占用。
+如依赖尚未安装或发生变化，先运行 `npm install` 和 `npm --prefix taskboard install`，随后运行 `npm test`。原先接收真实飞书事件的电脑，必须用 `.\scripts\start-local.ps1 -EnableFeishu` 启动，并运行 `.\scripts\check-local.ps1 -RequireFeishu` 检查；仅在原先就是关闭监听的模拟环境时，使用不带这两个开关的启动和检查命令。启动脚本不会自动恢复上次的 `-EnableFeishu` 设置。在示例任务上确认归档后引用解除、活动执行和配置仍阻止删除、原包不可用时恢复被阻止，再处理实际包。不要清空历史任务、数据库或 Bridge 状态来解除占用。
 
 ### Taskboard 故障恢复演练
 
