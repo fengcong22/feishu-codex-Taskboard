@@ -14,7 +14,7 @@ import {
 import { createBridgeServer } from "../src/server.mjs";
 import { createBridge } from "../src/bridge.mjs";
 import { JsonStateStore } from "../src/state-store.mjs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -576,6 +576,70 @@ test("registers a phased task through the dedicated route after archiving the pr
   assert.equal(result.kind, "register");
   assert.deepEqual(order, ["register:first_review"]);
 });
+
+test("permanently deleted phased registrations remain ignored after replay and restart", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-deleted-phased-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, "state.json");
+  const deletedEvent = edge("opt_other", "opt_initial", { eventId: "evt-deleted-phased" });
+  let registrations = 0;
+  const settings = {
+    config: {
+      delivery: { maxAttempts: 2, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 },
+      tables: [subject],
+      packages: { "Auto-cut-lite": { projectId: "p", projectName: "p", workspacePath: "D:\\trusted", prompt: "fixed" } },
+    },
+    workflowStore: { resolveSubjectVersionAt: async () => subject },
+    readControlledContext: async () => ({ documentLinks: ["https://guanghe.feishu.cn/docx/one"], namingDisplayValue: "课程001", namingValueUnique: true }),
+    taskboard: {
+      registerFeishuStageTask: async () => {
+        registrations += 1;
+        throw Object.assign(new Error("Task was permanently deleted"), { code: "FEISHU_TASK_DELETED", status: 410 });
+      },
+    },
+  };
+  const store = new JsonStateStore(filename);
+  const bridge = createBridge({ ...settings, store });
+  const outcome = { kind: "ignored", reason: "task_permanently_deleted" };
+  assert.deepEqual(await bridge.handle(deletedEvent), outcome);
+  const record = await store.get(deletedEvent.eventId);
+  assert.equal(record.deliveryState, "succeeded");
+  assert.equal(record.decision, "ignored");
+  assert.deepEqual(record.outcome, outcome);
+  assert.equal(record.lastError, null);
+  assert.deepEqual(await bridge.handle(deletedEvent), { ...outcome, duplicate: true });
+  const restarted = createBridge({ ...settings, store: new JsonStateStore(filename) });
+  assert.deepEqual(await restarted.handle(deletedEvent), { ...outcome, duplicate: true });
+  assert.equal(registrations, 1);
+});
+
+for (const [status, code, expectedState] of [
+  [503, "FEISHU_TASK_DELETED", "retry_wait"],
+  [410, "NOT_FOUND", "dead_letter"],
+]) {
+  test(`phased registration does not ignore HTTP ${status} ${code}`, async (t) => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-deleted-phased-error-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const store = new JsonStateStore(path.join(directory, "state.json"));
+    const bridge = createBridge({
+      config: {
+        delivery: { maxAttempts: 2, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 },
+        tables: [subject],
+        packages: { "Auto-cut-lite": { projectId: "p", projectName: "p", workspacePath: "D:\\trusted", prompt: "fixed" } },
+      },
+      store,
+      workflowStore: { resolveSubjectVersionAt: async () => subject },
+      readControlledContext: async () => ({ documentLinks: ["https://guanghe.feishu.cn/docx/one"], namingDisplayValue: "课程001", namingValueUnique: true }),
+      taskboard: {
+        registerFeishuStageTask: async () => { throw Object.assign(new Error("registration failed"), { status, code }); },
+      },
+    });
+    const failedEvent = edge("opt_other", "opt_initial", { eventId: "evt-phased-error" });
+    const result = await bridge.handle(failedEvent);
+    assert.equal(result.kind, expectedState === "retry_wait" ? "pending" : "dead_letter");
+    assert.equal((await store.get(failedEvent.eventId)).deliveryState, expectedState);
+  });
+}
 
 test("blocks a phased event when no active configuration version can be proven", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-missing-version-"));

@@ -48,6 +48,7 @@ import { createArtifactUploadWorker } from "./upload-worker.mjs";
 import { readCurrentControlledContext } from "./feishu-controlled-context-client.mjs";
 import { prepareFeishuRunInputs } from "./feishu-run-inputs.mjs";
 import { canonicalJson } from "./feishu-source-manifest.mjs";
+import { stageRegistrationOrigin } from "./feishu-deleted-event.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -2810,6 +2811,7 @@ export function createTaskboardServer(options = {}) {
       stageId: binding.stageId,
       eventId: event.eventId,
     };
+    database.assertFeishuEventNotDeleted(stageRegistrationOrigin(registration), { registration: true });
     const existing = database.findFeishuTaskByEventId(event.eventId);
     if (existing) {
       const existingOrigin = database.getFeishuTaskOrigin(existing.id);
@@ -5996,6 +5998,7 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task description does not contain valid workflow metadata");
         }
         validateFeishuTaskRegistration(input, metadata);
+        database.assertFeishuEventNotDeleted(metadata);
         let packageSnapshot;
         if (metadata.packageAlias) {
           const packageRecord = typeof feishuPackages.get === "function"

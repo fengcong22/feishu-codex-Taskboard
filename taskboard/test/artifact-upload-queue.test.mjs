@@ -1141,6 +1141,47 @@ test("a manual Feishu task copies a verified Jianying ZIP through the local uplo
     const currentTask = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`);
     assert.equal(currentTask.response.status, 200);
     assert.equal(currentTask.body.task.status, "done");
+
+    // Permanent deletion removes Taskboard-owned copies, not source or published output.
+    const sourcePath = path.join(directory, "original-workspace.zip");
+    await writeFile(sourcePath, zip);
+    const comment = await request(baseUrl, `/api/tasks/${task.id}/comments`, {
+      method: "POST", json: { body: "Temporary review note" },
+    });
+    assert.equal(comment.response.status, 201);
+    const attachmentPaths = [];
+    for (const route of [`/api/tasks/${task.id}/attachments`, `/api/comments/${comment.body.comment.id}/attachments`]) {
+      const attachment = await request(baseUrl, route, {
+        method: "POST", headers: { "content-type": "text/plain", "x-taskboard-filename": "review.txt", "x-taskboard-attachment-kind": "attachment" },
+        body: "Temporary attachment",
+      });
+      assert.equal(attachment.response.status, 201);
+      attachmentPaths.push(path.join(app.options.attachmentsDirectory, attachment.body.attachment.id));
+    }
+    const artifactPaths = (await readdir(path.join(directory, "artifacts")))
+      .map((name) => path.join(directory, "artifacts", name));
+    assert.ok(artifactPaths.length > 0);
+    const archived = await request(baseUrl, `/api/tasks/${task.id}/archive`, {
+      method: "POST", json: { version: currentTask.body.task.version },
+    });
+    assert.equal(archived.response.status, 200);
+    const deleted = await request(baseUrl, `/api/tasks/${task.id}`, {
+      method: "DELETE", json: { version: archived.body.task.version },
+    });
+    assert.equal(deleted.response.status, 204, JSON.stringify(deleted.body));
+    for (const ownedPath of [...attachmentPaths, ...artifactPaths]) {
+      await assert.rejects(access(ownedPath), { code: "ENOENT" });
+    }
+    assert.equal(app.database.getTask(task.id), null);
+    assert.equal(app.database.database.prepare("SELECT 1 FROM comments WHERE id = ?").get(comment.body.comment.id), undefined);
+    assert.equal(app.database.database.prepare("SELECT 1 FROM artifact_uploads WHERE task_id = ?").get(task.id), undefined);
+    assert.deepEqual(await readFile(sourcePath), zip);
+    assert.deepEqual(await readFile(path.join(destinationDirectory, artifact.filename)), zip);
+    const replay = await request(baseUrl, "/api/tasks", {
+      method: "POST", json: { projectId: subject.projectId, title: "Replay", description: manualFeishuDescription("bas_artifact", "tbl_chinese"), status: "todo", labels: ["feishu"] },
+    });
+    assert.equal(replay.response.status, 410);
+    assert.equal(replay.body.error.code, "FEISHU_TASK_DELETED");
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });
@@ -2187,7 +2228,7 @@ test("an archived task cannot be permanently deleted while its ZIP upload is que
     assert.equal(archived.response.status, 200);
     const deleted = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE", json: { version: archived.body.task.version } });
     assert.equal(deleted.response.status, 409);
-    assert.equal(deleted.body.error.code, "FEISHU_TASK_DELETE_UNAVAILABLE");
+    assert.equal(deleted.body.error.code, "ARTIFACT_UPLOAD_ACTIVE");
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });

@@ -268,7 +268,7 @@ test("older Taskboard inserts reserve the global Feishu event id", async () => {
   }
 });
 
-test("registered Feishu tasks retain their event reservation after deletion attempts", async () => {
+test("registered Feishu tasks retain their event reservation after permanent deletion", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-delete-guard-"));
   const filename = path.join(directory, "taskboard.sqlite");
   const database = new TaskboardDatabase(filename);
@@ -302,11 +302,12 @@ test("registered Feishu tasks retain their event reservation after deletion atte
     });
     const archived = database.archiveTask(task.id, task.version, null, null, actor);
 
-    assert.throws(
-      () => database.deleteArchivedTask(task.id, archived.version),
-      (error) => error?.status === 409 && error?.code === "FEISHU_TASK_DELETE_UNAVAILABLE",
-    );
-    assert.equal(database.findFeishuTaskByEventId(eventId).id, task.id);
+    const origin = database.getFeishuTaskOrigin(task.id);
+    database.deleteArchivedTask(task.id, archived.version);
+    assert.equal(database.findFeishuTaskByEventId(eventId), null);
+    assert.throws(() => database.assertFeishuEventNotDeleted(origin), {
+      status: 410, code: "FEISHU_TASK_DELETED",
+    });
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });

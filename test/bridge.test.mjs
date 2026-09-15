@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -59,6 +59,55 @@ const event = {
 };
 
 const retryEvent = { ...event, eventId: "evt_retry" };
+
+test("permanently deleted legacy registrations remain ignored after replay and restart", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-deleted-legacy-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, "state.json");
+  const deletedEvent = { ...event, eventId: "evt_deleted_legacy" };
+  let registrations = 0;
+  const taskboard = {
+    ensureProject: async () => {},
+    createFeishuTask: async () => {
+      registrations += 1;
+      throw Object.assign(new Error("Task was permanently deleted"), { code: "FEISHU_TASK_DELETED", status: 410 });
+    },
+  };
+  const settings = { config: { ...config, delivery: { ...policy, leaseMs: 1000 } }, taskboard };
+  const store = new JsonStateStore(filename);
+  const bridge = createBridge({ ...settings, store });
+  const outcome = { kind: "ignored", reason: "task_permanently_deleted" };
+  assert.deepEqual(await bridge.handle(deletedEvent), outcome);
+  const record = await store.get(deletedEvent.eventId);
+  assert.equal(record.deliveryState, "succeeded");
+  assert.equal(record.decision, "ignored");
+  assert.deepEqual(record.outcome, outcome);
+  assert.equal(record.lastError, null);
+  assert.deepEqual(await bridge.handle(deletedEvent), { ...outcome, duplicate: true });
+  const restarted = createBridge({ ...settings, store: new JsonStateStore(filename) });
+  assert.deepEqual(await restarted.handle(deletedEvent), { ...outcome, duplicate: true });
+  assert.equal(registrations, 1);
+});
+
+for (const [status, code, expectedState] of [
+  [503, "FEISHU_TASK_DELETED", "retry_wait"],
+  [410, "NOT_FOUND", "dead_letter"],
+]) {
+  test(`legacy registration does not ignore HTTP ${status} ${code}`, async () => {
+    const store = memoryStore();
+    const bridge = createBridge({
+      config: { ...config, delivery: { ...policy, leaseMs: 1000 } },
+      store,
+      taskboard: {
+        ensureProject: async () => {},
+        createFeishuTask: async () => { throw Object.assign(new Error("registration failed"), { status, code }); },
+      },
+    });
+    const result = await bridge.handle(event);
+    assert.equal(result.kind, expectedState === "retry_wait" ? "pending" : "dead_letter");
+    assert.equal((await store.get(event.eventId)).deliveryState, expectedState);
+  });
+}
 
 function metadataMarker(overrides = {}) {
   const metadata = {

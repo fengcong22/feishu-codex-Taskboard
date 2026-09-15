@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import * as api from "./api";
@@ -14,6 +14,7 @@ vi.mock("./api", async (importOriginal) => ({
   getJiraConnection: vi.fn(),
   listTasks: vi.fn(),
   listArchivedTasks: vi.fn(),
+  deleteArchivedTask: vi.fn(),
   listArtifactUploads: vi.fn(),
   listTaskArtifactSummaries: vi.fn(),
   getWorkflowWorkspace: vi.fn(),
@@ -320,5 +321,48 @@ describe("App project navigation", () => {
 
     expect(screen.getByText(SECOND_TASK.title)).toBeTruthy();
     expect(screen.queryByText(FIRST_TASK.title)).toBeNull();
+  });
+
+  it.each([
+    ["TASK_EXECUTION_ACTIVE", "This issue still has a pending or running execution. Wait for it to finish or stop it before deleting."],
+    ["ARTIFACT_UPLOAD_ACTIVE", "This issue has a queued or running ZIP upload. Wait for the upload to finish before deleting."],
+    ["FEISHU_DELETE_ORIGIN_INVALID", "The stored Feishu source identity is invalid. Ask a maintainer to repair it before deleting."],
+  ])("explains %s in the archived task deletion dialog", async (code, message) => {
+    const archived = { ...FIRST_TASK, archivedAt: NOW };
+    vi.mocked(api.listTasks).mockResolvedValue([]);
+    vi.mocked(api.listArchivedTasks).mockResolvedValue([archived]);
+    vi.mocked(api.deleteArchivedTask).mockRejectedValue(new api.ApiError(409, {
+      error: { code, message: "Internal technical rejection" },
+    }));
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Open other issues" }));
+    fireEvent.click(await screen.findByRole("tab", { name: /Archived/ }));
+    fireEvent.click(await screen.findByRole("button", { name: `Permanently delete ${archived.identifier}` }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(api.deleteArchivedTask).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete permanently" }));
+
+    expect(await within(dialog).findByText(message)).toBeTruthy();
+    expect(screen.getByText(archived.title)).toBeTruthy();
+    expect(api.deleteArchivedTask).toHaveBeenCalledWith(archived);
+  });
+
+  it("deletes an archived Feishu card only after confirmation", async () => {
+    const archived = { ...FIRST_TASK, archivedAt: NOW };
+    vi.mocked(api.listTasks).mockResolvedValue([]);
+    vi.mocked(api.listArchivedTasks).mockResolvedValue([archived]);
+    vi.mocked(api.deleteArchivedTask).mockResolvedValue(undefined);
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Open other issues" }));
+    fireEvent.click(await screen.findByRole("tab", { name: /Archived/ }));
+    fireEvent.click(await screen.findByRole("button", { name: `Permanently delete ${archived.identifier}` }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getByText(/Workspace source files and files already uploaded will be kept/)).toBeTruthy();
+    expect(api.deleteArchivedTask).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete permanently" }));
+
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(screen.queryByText(archived.title)).toBeNull();
+    expect(api.deleteArchivedTask).toHaveBeenCalledOnce();
   });
 });

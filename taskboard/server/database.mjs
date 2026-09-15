@@ -11,6 +11,7 @@ import {
 } from "./artifact-upload-lease.mjs";
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 import { UNIFIED_WORKFLOW_STAGES } from "../shared/unified-workflow-stages.mjs";
+import { originFingerprint, registrationFingerprint } from "./feishu-deleted-event.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -1057,6 +1058,13 @@ export class TaskboardDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS feishu_task_deletions (
+        event_id TEXT PRIMARY KEY,
+        origin_sha256 TEXT NOT NULL,
+        registration_sha256 TEXT NOT NULL,
+        deleted_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS feishu_task_package_snapshots (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
         package_alias TEXT NOT NULL,
@@ -1414,6 +1422,16 @@ export class TaskboardDatabase {
           UPDATE feishu_task_origins
           SET registration_event_id = NEW.event_id
           WHERE task_id = NEW.task_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS feishu_task_origins_reject_deleted_event
+        BEFORE INSERT ON feishu_task_origins
+        WHEN EXISTS (
+          SELECT 1 FROM feishu_task_deletions
+          WHERE event_id = NEW.event_id OR event_id = NEW.registration_event_id
+            OR event_id = json_extract(NEW.metadata_json, '$.eventId')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'FEISHU_TASK_DELETED');
         END;
       `);
       this.database.exec("COMMIT");
@@ -3952,6 +3970,7 @@ export class TaskboardDatabase {
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (input.feishuOrigin) this.assertFeishuEventNotDeleted(input.feishuOrigin);
       const project = this.database.prepare(`
         SELECT
           projects.id,
@@ -4872,6 +4891,19 @@ export class TaskboardDatabase {
     return this.getTask(taskId);
   }
 
+  assertFeishuEventNotDeleted(origin, { registration = false } = {}) {
+    const normalized = registration ? origin : normalizeFeishuTaskOrigin(origin);
+    const deletion = this.database.prepare("SELECT * FROM feishu_task_deletions WHERE event_id = ?")
+      .get(normalized.eventId);
+    if (!deletion) return;
+    const expected = registration ? deletion.registration_sha256 : deletion.origin_sha256;
+    const actual = registration ? registrationFingerprint(normalized) : originFingerprint(normalized);
+    if (expected !== actual) {
+      throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is bound to a different deleted task registration");
+    }
+    throw new ApiError(410, "FEISHU_TASK_DELETED", "The task for this Feishu event was permanently deleted");
+  }
+
   findFeishuTaskByEventId(eventId, projectId = null) {
     const indexed = this.database.prepare(`
       SELECT feishu_task_origins.task_id
@@ -5654,14 +5686,19 @@ export class TaskboardDatabase {
       if (current.archivedAt === null) {
         throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be deleted");
       }
-      const feishuOrigin = this.database.prepare(
-        "SELECT 1 FROM feishu_task_origins WHERE task_id = ?",
-      ).get(current.id);
-      if (feishuOrigin) {
+      const activeExecution = this.database.prepare(`
+        SELECT 1 FROM task_ai_starts WHERE task_id = ?
+        UNION ALL SELECT 1 FROM feishu_task_executions WHERE task_id = ?
+        UNION ALL SELECT 1 FROM ai_chat_runs AS run
+          JOIN ai_chat_threads AS thread ON thread.id = run.thread_id
+          WHERE run.status = 'running' AND (thread.id = ? OR thread.origin_issue_id = ? OR thread.origin_issue_identifier = ?)
+        LIMIT 1
+      `).get(current.id, current.id, current.threadId, current.id, current.identifier);
+      if (activeExecution) {
         throw new ApiError(
           409,
-          "FEISHU_TASK_DELETE_UNAVAILABLE",
-          "Server-registered Feishu tasks cannot be permanently deleted",
+          "TASK_EXECUTION_ACTIVE",
+          "The task cannot be deleted while execution is queued or running",
         );
       }
       const activeUpload = this.database.prepare(`
@@ -5682,6 +5719,32 @@ export class TaskboardDatabase {
       const artifactStorageKeys = this.database.prepare(
         "SELECT storage_key FROM task_artifacts WHERE task_id = ? ORDER BY created_at, id",
       ).all(current.id).map((artifact) => artifact.storage_key);
+      const storedOrigin = this.database.prepare("SELECT * FROM feishu_task_origins WHERE task_id = ?").get(current.id);
+      if (storedOrigin) {
+        let metadata;
+        try {
+          metadata = normalizeFeishuTaskOrigin(this.getFeishuTaskOrigin(current.id));
+          const rawMetadata = normalizeFeishuTaskOrigin(JSON.parse(storedOrigin.metadata_json));
+          if (rawMetadata.eventId !== metadata.eventId
+            || (storedOrigin.registration_event_id && storedOrigin.registration_event_id !== metadata.eventId)) {
+            throw new Error("inconsistent event identity");
+          }
+        } catch {
+          throw new ApiError(409, "FEISHU_DELETE_ORIGIN_INVALID", "The stored Feishu event identity must be repaired before permanent deletion");
+        }
+        const eventOwner = this.database.prepare(
+          "SELECT task_id FROM feishu_task_origins WHERE registration_event_id = ?",
+        ).get(metadata.eventId);
+        // Historical duplicates must not replace a live canonical owner's identity.
+        // That owner continues reserving the event until its own deletion. Once
+        // deleted, its FK-free digests survive all later duplicate deletions.
+        if (!eventOwner || eventOwner.task_id === current.id) {
+          this.database.prepare(`INSERT INTO feishu_task_deletions
+            (event_id, origin_sha256, registration_sha256, deleted_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING`)
+            .run(metadata.eventId, originFingerprint(metadata), registrationFingerprint(metadata), now());
+        }
+      }
       const result = this.database.prepare(
         "DELETE FROM tasks WHERE id = ? AND version = ? AND archived_at IS NOT NULL",
       ).run(current.id, version);

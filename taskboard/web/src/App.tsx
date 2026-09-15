@@ -3851,6 +3851,11 @@ export function App() {
     }
   }
 
+  function requestArchivedTaskDelete(task: Task) {
+    setActionError(null);
+    setPendingArchivedTaskDelete(task);
+  }
+
   async function deletePendingArchivedTask() {
     if (!pendingArchivedTaskDelete || deletingArchivedTaskId) return;
     const task = pendingArchivedTaskDelete;
@@ -3865,12 +3870,29 @@ export function App() {
         `${task.identifier} was permanently deleted.`,
       ));
     } catch (error) {
-      setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
-        ? text(
+      if (error instanceof ApiError && error.code === "TASK_EXECUTION_ACTIVE") {
+        setActionError(text(
+          "该任务仍有待执行或运行中的操作，请等待执行结束或先停止执行，再删除任务。",
+          "This issue still has a pending or running execution. Wait for it to finish or stop it before deleting.",
+        ));
+      } else if (error instanceof ApiError && error.code === "ARTIFACT_UPLOAD_ACTIVE") {
+        setActionError(text(
+          "该任务的 ZIP 正在排队上传或上传中，请等待上传结束后再删除任务。",
+          "This issue has a queued or running ZIP upload. Wait for the upload to finish before deleting.",
+        ));
+      } else if (error instanceof ApiError && error.code === "FEISHU_DELETE_ORIGIN_INVALID") {
+        setActionError(text(
+          "该任务保存的飞书来源身份异常，请联系维护人员修复后再删除任务。",
+          "The stored Feishu source identity is invalid. Ask a maintainer to repair it before deleting.",
+        ));
+      } else if (error instanceof ApiError && error.code === "VERSION_CONFLICT") {
+        setActionError(text(
           "该议题已在其他位置更新，看板已重新同步。",
           "This issue changed elsewhere. The board has been synced.",
-        )
-        : errorMessage(error));
+        ));
+      } else {
+        setActionError(errorMessage(error));
+      }
       if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
     } finally {
       setDeletingArchivedTaskId(null);
@@ -5211,7 +5233,7 @@ export function App() {
                 onTabChange={setOtherTasksTab}
                 onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
                 onRestore={(task) => void restoreArchivedTask(task)}
-                onDelete={setPendingArchivedTaskDelete}
+                onDelete={requestArchivedTaskDelete}
                 onEdit={openTaskDetail}
                 onUpdate={updateTaskProperties}
                 onContextMenu={(task, position) => setContextMenu({ taskId: task.id, ...position })}
@@ -5363,7 +5385,7 @@ export function App() {
                         restoringTaskId={restoringTaskId}
                         deletingTaskId={deletingArchivedTaskId}
                         onRestore={(task) => void restoreArchivedTask(task)}
-                        onDelete={setPendingArchivedTaskDelete}
+                        onDelete={requestArchivedTaskDelete}
                       />
                     ) : (
                       <BoardColumn
@@ -5434,7 +5456,7 @@ export function App() {
                       ? undefined
                       : (initialStatus) => setEditor({ task: null, status: initialStatus })}
                     onRestore={(task) => void restoreArchivedTask(task)}
-                    onDelete={setPendingArchivedTaskDelete}
+                    onDelete={requestArchivedTaskDelete}
                     onEdit={openTaskDetail}
                     onUpdate={updateTaskProperties}
                     onContextMenu={openTaskContextMenu}
@@ -5643,9 +5665,10 @@ export function App() {
               `Permanently delete ${pendingArchivedTaskDelete.identifier}?`,
             )}</h2>
             <p>{text(
-              `“${pendingArchivedTaskDelete.title}”及其评论和附件将被永久删除，此操作无法撤销。`,
-              `“${pendingArchivedTaskDelete.title}” and its comments and attachments will be permanently deleted. This cannot be undone.`,
+              `“${pendingArchivedTaskDelete.title}”、评论以及 Taskboard 保存的附件和 ZIP 副本将被永久删除，此操作无法撤销。工作区源文件和已上传的文件会保留。`,
+              `“${pendingArchivedTaskDelete.title}”, its comments, and attachment and ZIP copies stored by Taskboard will be permanently deleted. This cannot be undone. Workspace source files and files already uploaded will be kept.`,
             )}</p>
+            {actionErrorText && <p className="project-dialog-error" role="alert">{actionErrorText}</p>}
             <div>
               <button
                 className="button secondary"

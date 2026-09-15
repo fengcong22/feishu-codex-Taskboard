@@ -60,6 +60,10 @@ function isLeaseLost(error) {
   return error?.code === "LEASE_LOST" || error?.code === "LEASE_NOT_OWNED";
 }
 
+function isPermanentlyDeletedRegistration(error) {
+  return error?.status === 410 && error?.code === "FEISHU_TASK_DELETED";
+}
+
 const DECISION_SNAPSHOT_VERSION = 1;
 
 function packageConfigFingerprint(packageConfig) {
@@ -592,7 +596,15 @@ export function createBridge({
         error.status = 503;
         throw error;
       }
-      task = await register.call(taskboard, payload, { bridgeSecret });
+      try {
+        task = await register.call(taskboard, payload, { bridgeSecret });
+      } catch (error) {
+        if (!isPermanentlyDeletedRegistration(error)) throw error;
+        return completePhased(record, "ignored", {
+          kind: "ignored",
+          reason: "task_permanently_deleted",
+        }, heartbeat, { requireTaskIdentifier: false });
+      }
     }
     return completePhased(record, "register", {
       kind: "register",
@@ -796,7 +808,15 @@ export function createBridge({
       if (!task) {
         await heartbeat.ensureActive();
         if (typeof taskboard.createFeishuTask === "function") {
-          task = await taskboard.createFeishuTask(payload);
+          try {
+            task = await taskboard.createFeishuTask(payload);
+          } catch (error) {
+            if (!isPermanentlyDeletedRegistration(error)) throw error;
+            return await completePhased(record, "ignored", {
+              kind: "ignored",
+              reason: "task_permanently_deleted",
+            }, heartbeat, { requireTaskIdentifier: false });
+          }
         } else if (allowLegacyTaskCreation && typeof taskboard.createTask === "function") {
           // Kept only for historical unit fixtures.  The real Bridge cannot
           // reach this branch because validateConfig() drops the flag.

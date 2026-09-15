@@ -6,6 +6,9 @@ import { test } from "node:test";
 
 import { createTaskboardServer } from "../server/index.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
+import { createBridge } from "../../src/bridge.mjs";
+import { JsonStateStore } from "../../src/state-store.mjs";
+import { TaskboardClient } from "../../src/taskboard-client.mjs";
 
 const SECRET = "fixture-stage-registration-secret";
 const SUBJECT_KEY = "bas_stage:tbl_math";
@@ -171,6 +174,66 @@ function registration(subject, overrides = {}) {
     },
   };
 }
+
+test("archived stage tasks can be deleted without recreating or executing deleted events", async () => {
+  const f = await fixture();
+  try {
+    const subject = await enableSubject(f);
+    const payload = registration(subject);
+    const created = await request(f.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(created.response.status, 201);
+    const task = created.body.task;
+    const archived = await request(f.baseUrl, `/api/tasks/${task.id}/archive`, { version: task.version });
+    const deleted = await fetch(`${f.baseUrl}/api/tasks/${task.id}`, {
+      method: "DELETE", headers: { "content-type": "application/json", "x-taskboard-client": "web" },
+      body: JSON.stringify({ version: archived.body.task.version }),
+    });
+    assert.equal(deleted.status, 204, await deleted.text());
+    assert.equal(f.app.database.getTask(task.id), null);
+    const replay = await request(f.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(replay.response.status, 410, JSON.stringify(replay.body));
+    assert.equal(replay.body.error.code, "FEISHU_TASK_DELETED");
+    const statePath = path.join(f.directory, "bridge-state.json");
+    const bridgeSubject = Object.fromEntries([
+      "subjectKey", "baseToken", "tableId", "tableName", "configVersion", "lifecycle", "statusField",
+      "documentField", "namingField", "stages", "execution", "packageRoute", "upload",
+    ].map((key) => [key, subject[key]]));
+    const bridgeOptions = {
+      bridgeSecret: SECRET,
+      config: {
+        tables: [bridgeSubject],
+        packages: { "Auto-cut-lite": { projectId: "autocut-lite", workspacePath: f.workspace, prompt: "trusted package prompt" } },
+        delivery: { maxAttempts: 2, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 5000, pollIntervalMs: 100 },
+      },
+      workflowStore: { resolveSubjectVersionAt: async () => bridgeSubject },
+      readControlledContext: async () => payload.controlledContext,
+      taskboard: new TaskboardClient(f.baseUrl, { bridgeSecret: SECRET }),
+    };
+    const event = {
+      ...payload.event, fieldId: "fld_status", fieldName: "流程", beforePresent: true, afterPresent: true,
+      beforeValue: "其他", afterValue: "初稿", eventOccurredAt: payload.event.occurredAt,
+      eventOccurredAtPresent: true, fields: {}, fieldValuesById: {},
+    };
+    const store = new JsonStateStore(statePath);
+    const bridge = createBridge({ ...bridgeOptions, store });
+    const ignored = { kind: "ignored", reason: "task_permanently_deleted" };
+    assert.deepEqual(await bridge.handle(event), ignored);
+    assert.equal((await store.get(event.eventId)).deliveryState, "succeeded");
+    const restarted = createBridge({ ...bridgeOptions, store: new JsonStateStore(statePath) });
+    assert.deepEqual(await restarted.handle(event), { ...ignored, duplicate: true });
+    assert.equal(f.app.database.listFeishuTasks().length, 0);
+    assert.equal(f.app.database.listTaskAiStarts().length, 0);
+    const changed = structuredClone(payload);
+    changed.controlledContext.namingDisplayValue = "Different input";
+    const conflict = await request(f.baseUrl, "/api/local/feishu/tasks", changed);
+    assert.equal(conflict.response.status, 409);
+    assert.equal(conflict.body.error.code, "FEISHU_EVENT_BINDING_CONFLICT");
+    const next = structuredClone(payload); next.event.eventId = "next-genuine-event";
+    assert.equal((await request(f.baseUrl, "/api/local/feishu/tasks", next)).response.status, 201);
+    f.app.database.database.exec("DELETE FROM feishu_subject_versions");
+    assert.equal((await request(f.baseUrl, "/api/local/feishu/tasks", payload)).response.status, 410);
+  } finally { await f.app.close(); await rm(f.directory, { recursive: true, force: true }); }
+});
 
 test("canonical stage registration derives execution policy from the enabled snapshot and replays idempotently", async () => {
   const fixtureData = await fixture();

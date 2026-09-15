@@ -68,6 +68,24 @@ function feishuCreateResponse(feishuOrigin, suffix = "trusted") {
   } };
 }
 
+for (const method of ["createFeishuTask", "registerFeishuStageTask"]) {
+  test(`${method} preserves the deleted-event HTTP status and safe error code`, async (t) => {
+    const app = await fixture((_request, response) => {
+      response.writeHead(410, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "FEISHU_TASK_DELETED", message: "Task was permanently deleted" } }));
+    });
+    t.after(app.close);
+    const client = new TaskboardClient(app.url, { bridgeSecret: "fixture-bridge-secret" });
+
+    await assert.rejects(
+      () => client[method](feishuCreatePayload(fullFeishuMetadata())),
+      (error) => error instanceof TaskboardError
+        && error.status === 410
+        && error.code === "FEISHU_TASK_DELETED",
+    );
+  });
+}
+
 test("creates a project and a task with exact JSON bodies", async (t) => {
   const calls = [];
   const app = await fixture(async (request, response) => {
