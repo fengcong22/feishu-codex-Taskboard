@@ -3703,9 +3703,7 @@ export function App() {
     setFeishuConfigurationBaseToken(base?.baseToken ?? null);
     closeTaskDetail();
     if (subject) {
-      changeProject(subject.projectId, "workflow");
-      beginProjectRequestContext(subject.projectId, subject.subjectKey);
-      setSelectedFeishuSubjectKey(subject.subjectKey);
+      changeProject(subject.projectId, "workflow", subject.subjectKey);
       setFeishuConfigurationOpen(true);
     } else {
       setSelectedFeishuSubjectKey(null);
@@ -4136,10 +4134,16 @@ export function App() {
     });
   }
 
-  function changeProject(projectId: string, preferredView?: BoardView) {
+  function changeProject(projectId: string, preferredView?: BoardView, subjectKey?: string | null) {
     const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
-    beginProjectRequestContext(projectId, subject?.subjectKey ?? null);
-    clearRemovedFeishuSelectionState();
+    const nextSubjectKey = subjectKey === undefined ? subject?.subjectKey ?? null : subjectKey;
+    const scopeChanged = projectId !== selectedProjectIdRef.current
+      || nextSubjectKey !== selectedFeishuSubjectKeyRef.current
+      || projectId !== taskScopeProjectIdRef.current;
+    if (scopeChanged) {
+      beginProjectRequestContext(projectId, nextSubjectKey);
+      clearRemovedFeishuSelectionState();
+    }
     closeContextMenu();
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
@@ -4154,7 +4158,7 @@ export function App() {
     } else {
       setBoardView(readProjectBoardView(projectId));
     }
-    setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
+    setSelectedFeishuSubjectKey(nextSubjectKey);
     setFeishuConfigurationBaseToken(subject
       ? feishuCatalog.find((base) => base.subjects.some((candidate) => (
         candidate.subjectKey === subject.subjectKey
@@ -5273,9 +5277,7 @@ export function App() {
               onSelectSubject={(subjectKey, openProject = true) => {
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (!subject) return;
-                changeProject(subject.projectId, openProject ? "issues" : "workflow");
-                beginProjectRequestContext(subject.projectId, subjectKey);
-                setSelectedFeishuSubjectKey(subjectKey);
+                changeProject(subject.projectId, openProject ? "issues" : "workflow", subjectKey);
                 setFeishuConfigurationOpen(!openProject);
               }}
               onAddBase={async (url) => {
@@ -5284,9 +5286,7 @@ export function App() {
                 const nextSubjectKey = next.subjects[0]?.subjectKey ?? null;
                 const nextSubject = next.subjects[0];
                 if (nextSubject) {
-                  changeProject(nextSubject.projectId, "workflow");
-                  beginProjectRequestContext(nextSubject.projectId, nextSubject.subjectKey);
-                  setSelectedFeishuSubjectKey(nextSubject.subjectKey);
+                  changeProject(nextSubject.projectId, "workflow", nextSubject.subjectKey);
                   setFeishuConfigurationOpen(true);
                 } else {
                   beginProjectRequestContext(selectedProjectIdRef.current, nextSubjectKey);

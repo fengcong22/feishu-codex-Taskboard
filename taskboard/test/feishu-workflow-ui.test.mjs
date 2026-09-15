@@ -118,7 +118,7 @@ test("hidden subject selection stays in configuration while visible subjects ope
   assert.match(panel, /onSelectSubject\(subject\.subjectKey, true\)/);
   assert.match(panel, /onSelectSubject\(subject\.subjectKey, false\)/);
   assert.match(app, /onSelectSubject=\{\(subjectKey, openProject = true\)/);
-  assert.match(app, /changeProject\(subject\.projectId, openProject \? ["']issues["'] : ["']workflow["']\)/);
+  assert.match(app, /changeProject\(subject\.projectId, openProject \? ["']issues["'] : ["']workflow["'], subjectKey\)/);
   assert.match(app, /setFeishuConfigurationOpen\(!openProject\)/);
 });
 
