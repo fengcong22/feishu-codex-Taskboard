@@ -180,6 +180,10 @@ The Feishu Bridge and Taskboard integration is local-only. The Bridge creates wo
 
 A server-registered Feishu task may run its locally registered Auto-Cut package from a non-Git workspace. Taskboard supplies Codex's non-Git workspace option only after resolving the server-owned task provenance and trusted package snapshot; ordinary tasks, copied markers, browser input, and Feishu cells cannot request it.
 
+Package reference counts and deletion use the same backend checks. Archived tasks without active execution no longer block deletion. Unarchived unfinished tasks, pending/running execution reservations, launch claims, running AI instances, and enabled workflow configurations still block it, independently of task archival. A workflow's active configuration remains a reference while a new draft is being edited or refreshed; rebind and enable the replacement configuration, or explicitly disable the subject, to release that reference.
+
+Deleting a package preserves historical tasks, server-owned provenance, immutable snapshots, and event deduplication records. Restoring a server-registered Feishu task requires its original package alias to exist and be enabled. A missing, disabled, or draft package returns a controlled conflict asking the operator to configure and enable the original package. Restore neither refreshes historical snapshots nor schedules execution, and ordinary tasks or copied markers gain no execution privileges. Do not clear task history, the database, or Bridge state to release a package reference.
+
 If Codex exits before returning a native thread ID, moving the trusted task back to `todo` and starting it again detaches the failed local conversation while preserving that conversation in history. A task whose native Codex thread already started is never detached automatically, which prevents an accidental duplicate Auto-Cut run.
 
 The Bridge uses these loopback routes for lifecycle reconciliation:

@@ -399,6 +399,21 @@ export function createFeishuPackageStore({
     });
   }
 
+  // Keep validation and the dependent task mutation in the same queue as
+  // remove/disable. A separate get() followed by a restore can race deletion.
+  function withEnabledPackage(alias, operation) {
+    return enqueueMutation(async () => {
+      const { record } = await current(alias);
+      if (!record) {
+        throw new PackageConfigError("PACKAGE_NOT_FOUND", "原 Auto-Cut 包已删除，无法恢复任务；请先配置并启用原包");
+      }
+      if (record.state !== "enabled") {
+        throw new PackageConfigError("PACKAGE_DISABLED", "原 Auto-Cut 包尚未启用，无法恢复任务；请先启用原包");
+      }
+      return operation(clone(record));
+    });
+  }
+
   return {
     read: readCatalog,
     async list() { return Object.values(await readCatalog()).map(clone); },
@@ -410,6 +425,7 @@ export function createFeishuPackageStore({
     enable,
     disable,
     remove,
+    withEnabledPackage,
     async references(alias) { return clone(await listReferences(packageAlias(alias))); },
     async snapshot(alias) {
       const result = await current(alias);

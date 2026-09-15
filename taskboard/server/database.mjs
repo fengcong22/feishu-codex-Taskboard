@@ -4973,23 +4973,33 @@ export class TaskboardDatabase {
     const packageAlias = alias.trim();
     const references = [];
     const subjects = this.database.prepare(`
+      WITH enabled_routes AS (
+        SELECT subject_key, config_json
+        FROM feishu_subjects
+        WHERE lifecycle = 'enabled'
+        UNION ALL
+        SELECT subject_key, snapshot_json AS config_json
+        FROM feishu_subject_versions
+        WHERE lifecycle = 'enabled' AND closed_at IS NULL
+      )
       SELECT
         feishu_subjects.subject_key,
         feishu_subjects.base_token,
         feishu_subjects.table_id,
         feishu_subjects.table_name,
-        feishu_subjects.lifecycle,
-        feishu_subjects.config_json,
+        enabled_routes.config_json,
         feishu_bases.base_name
       FROM feishu_subjects
       JOIN feishu_bases ON feishu_bases.base_token = feishu_subjects.base_token
-      WHERE feishu_subjects.lifecycle = 'enabled'
-        AND feishu_subjects.removed_at IS NULL
+      JOIN enabled_routes ON enabled_routes.subject_key = feishu_subjects.subject_key
+      WHERE feishu_subjects.removed_at IS NULL
         AND feishu_bases.removed_at IS NULL
       ORDER BY feishu_bases.base_name, feishu_subjects.table_name, feishu_subjects.subject_key
     `).all();
+    const referencedSubjects = new Set();
     for (const row of subjects) {
       try {
+        if (referencedSubjects.has(row.subject_key)) continue;
         const route = JSON.parse(row.config_json)?.packageRoute;
         const aliases = new Set([
           route?.packageAlias,
@@ -5003,8 +5013,9 @@ export class TaskboardDatabase {
           baseName: row.base_name,
           tableId: row.table_id,
           tableName: row.table_name,
-          lifecycle: row.lifecycle,
+          lifecycle: "enabled",
         });
+        referencedSubjects.add(row.subject_key);
       } catch {}
     }
 
@@ -5014,25 +5025,47 @@ export class TaskboardDatabase {
         tasks.identifier,
         tasks.title,
         tasks.status,
-        feishu_task_origins.metadata_json
-      FROM feishu_task_origins
-      JOIN tasks ON tasks.id = feishu_task_origins.task_id
-      WHERE tasks.status NOT IN ('done', 'canceled')
+        tasks.archived_at,
+        feishu_task_origins.metadata_json,
+        feishu_task_executions.package_alias AS execution_package_alias,
+        (
+          EXISTS (SELECT 1 FROM task_ai_starts WHERE task_ai_starts.task_id = tasks.id)
+          OR EXISTS (
+            SELECT 1 FROM ai_chat_threads
+            JOIN ai_chat_runs ON ai_chat_runs.thread_id = ai_chat_threads.id
+            WHERE ai_chat_threads.origin_issue_id = tasks.id
+              AND ai_chat_runs.status = 'running'
+          )
+          OR EXISTS (
+            SELECT 1 FROM feishu_autocut_runs
+            JOIN ai_chat_runs ON ai_chat_runs.id = feishu_autocut_runs.run_id
+            WHERE feishu_autocut_runs.task_id = tasks.id
+              AND ai_chat_runs.status = 'running'
+          )
+        ) AS has_active_start
+      FROM tasks
+      LEFT JOIN feishu_task_origins ON feishu_task_origins.task_id = tasks.id
+      LEFT JOIN feishu_task_executions ON feishu_task_executions.task_id = tasks.id
+      WHERE feishu_task_origins.task_id IS NOT NULL
+        OR feishu_task_executions.package_alias = ?
       ORDER BY tasks.created_at, tasks.id
-    `).all();
+    `).all(packageAlias);
     for (const row of tasks) {
-      try {
-        const origin = normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json));
-        if (origin.packageAlias !== packageAlias) continue;
-        references.push({
-          type: "task",
-          taskId: row.id,
-          identifier: row.identifier,
-          title: row.title,
-          status: row.status,
-          ...(origin.subjectKey ? { subjectKey: origin.subjectKey } : {}),
-        });
-      } catch {}
+      let origin = null;
+      try { origin = normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json)); } catch {}
+      const needsPackage = row.archived_at === null && !["done", "canceled"].includes(row.status);
+      // Execution reservations own their alias independently of mutable task state.
+      // Claims cover startup; running turns cover work after a claim is detached.
+      if (row.execution_package_alias !== packageAlias
+        && !(origin?.packageAlias === packageAlias && (needsPackage || row.has_active_start))) continue;
+      references.push({
+        type: "task",
+        taskId: row.id,
+        identifier: row.identifier,
+        title: row.title,
+        status: row.status,
+        ...(origin?.subjectKey ? { subjectKey: origin.subjectKey } : {}),
+      });
     }
     return references;
   }
