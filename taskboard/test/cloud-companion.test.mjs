@@ -634,6 +634,7 @@ test("configured server proxies business APIs without touching local rows and ad
   const app = createTaskboardServer({
     dataDirectory: directory,
     cloudConfigPath: configPath,
+    allowAutomaticExecution: false,
     remoteFetch: async (url, init) => {
       upstreamCalls.push({ url: url.toString(), init });
       return jsonResponse({ tasks: [{ id: "REMOTE-1", projectId: "portfolio" }] });
@@ -645,7 +646,7 @@ test("configured server proxies business APIs without touching local rows and ad
   try {
     const metadata = await fetch(`${baseUrl}/api/meta`).then((response) => response.json());
     assert.deepEqual(metadata, {
-      capabilities: { localAiChat: true },
+      capabilities: { localAiChat: true, automaticExecution: false },
       mode: "cloud",
       realtime: {
         transport: "websocket",
