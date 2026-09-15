@@ -94,7 +94,7 @@ test("project selection starts from the route or recent projects and updates the
   assert.match(appSource, /const initialProjectId = query\.get\("project"\) \?\? recentProjectIds\[0\] \?\? ALL_PROJECTS_ID/);
   assert.match(appSource, /const rememberProjectOpen = useCallback/);
   assert.match(appSource, /taskboardStorage\.setItem\(RECENT_PROJECT_IDS_KEY, JSON\.stringify\(next\)\)/);
-  assert.match(appSource, /function changeProject\(projectId: string, preferredView\?: BoardView\)/);
+  assert.match(appSource, /function changeProject\(projectId: string, preferredView\?: BoardView, subjectKey\?: string \| null\)/);
   assert.match(appSource, /setSelectedProjectId\(projectId\)/);
   assert.match(appSource, /const url = buildIssueUrl\(window\.location\.href, projectId, null\)/);
   assert.match(appSource, /window\.history\.replaceState\(null, "", url\)/);

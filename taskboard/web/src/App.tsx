@@ -184,7 +184,7 @@ import {
 import { createRevisionPoller, createRevisionWebSocketClient, getRevisionPollingInterval, getRevisionWebSocketConfig } from "./revisionPolling.mjs";
 // These selection rules stay runtime-independent so history navigation can be regression-tested.
 // @ts-expect-error The helper's structural inputs are enforced at its call sites.
-import { findFeishuSubjectKeyForProject, resolveProjectIdAfterRefresh } from "./projectSelection.mjs";
+import { findFeishuSubjectKeyForProject, resolveAiImportProjectId, resolveProjectIdAfterRefresh } from "./projectSelection.mjs";
 // The classifier is intentionally kept in ESM JavaScript so node:test can use it directly.
 // @ts-expect-error The helper has no runtime-dependent TypeScript surface.
 import { classifyUnifiedStage } from "./unifiedWorkflow.mjs";
@@ -1207,14 +1207,14 @@ export function App() {
     selectedProject?.id,
     text,
   ]);
-  const aiImportProjectId = hasLoadedTasks
-    && tasks.length === 0
-    && selectedProject
-    && selectedProject.id !== GLOBAL_PROJECT_ID
-    && !isJiraProject
-    && localAiChatAvailable
-      ? selectedProject.id
-      : null;
+  const aiImportProjectId = resolveAiImportProjectId({
+    project: selectedProject,
+    isFeishuProject: isSelectedFeishuProject,
+    hasLoadedTasks,
+    taskCount: tasks.length,
+    localAiChatAvailable,
+    globalProjectId: GLOBAL_PROJECT_ID,
+  }) as string | null;
   useEffect(() => {
     setAiImportReadyProjectId(null);
     if (!aiImportProjectId) return;
@@ -3110,6 +3110,11 @@ export function App() {
   const activeFilterCount = taskFilterCount(filters);
   const hasActiveTaskFilters = Boolean(search.trim()) || activeFilterCount > 0;
 
+  const activeTaskAiThreadIds = useMemo(() => [...new Set(tasks
+    .filter((task) => task.status === "in_progress" && !task.threadBinding)
+    .map((task) => task.threadId)
+    .filter((threadId): threadId is string => Boolean(threadId)))].sort(), [tasks]);
+
   const taskCodexThreadIds = useMemo(() => new Map(
     aiThreads
       .filter((thread) => thread.origin.issueId && thread.codexThreadId)
@@ -3698,9 +3703,7 @@ export function App() {
     setFeishuConfigurationBaseToken(base?.baseToken ?? null);
     closeTaskDetail();
     if (subject) {
-      changeProject(subject.projectId, "workflow");
-      beginProjectRequestContext(subject.projectId, subject.subjectKey);
-      setSelectedFeishuSubjectKey(subject.subjectKey);
+      changeProject(subject.projectId, "workflow", subject.subjectKey);
       setFeishuConfigurationOpen(true);
     } else {
       setSelectedFeishuSubjectKey(null);
@@ -4131,10 +4134,16 @@ export function App() {
     });
   }
 
-  function changeProject(projectId: string, preferredView?: BoardView) {
+  function changeProject(projectId: string, preferredView?: BoardView, subjectKey?: string | null) {
     const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
-    beginProjectRequestContext(projectId, subject?.subjectKey ?? null);
-    clearRemovedFeishuSelectionState();
+    const nextSubjectKey = subjectKey === undefined ? subject?.subjectKey ?? null : subjectKey;
+    const scopeChanged = projectId !== selectedProjectIdRef.current
+      || nextSubjectKey !== selectedFeishuSubjectKeyRef.current
+      || projectId !== taskScopeProjectIdRef.current;
+    if (scopeChanged) {
+      beginProjectRequestContext(projectId, nextSubjectKey);
+      clearRemovedFeishuSelectionState();
+    }
     closeContextMenu();
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
@@ -4149,7 +4158,7 @@ export function App() {
     } else {
       setBoardView(readProjectBoardView(projectId));
     }
-    setSelectedFeishuSubjectKey(subject?.subjectKey ?? null);
+    setSelectedFeishuSubjectKey(nextSubjectKey);
     setFeishuConfigurationBaseToken(subject
       ? feishuCatalog.find((base) => base.subjects.some((candidate) => (
         candidate.subjectKey === subject.subjectKey
@@ -5056,10 +5065,9 @@ export function App() {
             onError={setActionError}
           />
         ) : boardView !== "readme"
-          && hasLoadedTasks
-          && tasks.length === 0
           && selectedProject
-          && aiImportReadyProjectId === selectedProject.id ? (
+          && aiImportProjectId !== null
+          && aiImportReadyProjectId === aiImportProjectId ? (
           <div className="page-empty">
             <h2>{text("当前项目还没有任务", "This project has no issues yet")}</h2>
             <p>{text(
@@ -5269,9 +5277,7 @@ export function App() {
               onSelectSubject={(subjectKey, openProject = true) => {
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (!subject) return;
-                changeProject(subject.projectId, openProject ? "issues" : "workflow");
-                beginProjectRequestContext(subject.projectId, subjectKey);
-                setSelectedFeishuSubjectKey(subjectKey);
+                changeProject(subject.projectId, openProject ? "issues" : "workflow", subjectKey);
                 setFeishuConfigurationOpen(!openProject);
               }}
               onAddBase={async (url) => {
@@ -5280,9 +5286,7 @@ export function App() {
                 const nextSubjectKey = next.subjects[0]?.subjectKey ?? null;
                 const nextSubject = next.subjects[0];
                 if (nextSubject) {
-                  changeProject(nextSubject.projectId, "workflow");
-                  beginProjectRequestContext(nextSubject.projectId, nextSubject.subjectKey);
-                  setSelectedFeishuSubjectKey(nextSubject.subjectKey);
+                  changeProject(nextSubject.projectId, "workflow", nextSubject.subjectKey);
                   setFeishuConfigurationOpen(true);
                 } else {
                   beginProjectRequestContext(selectedProjectIdRef.current, nextSubjectKey);
@@ -5731,6 +5735,7 @@ export function App() {
             projectId={selectedProjectId || null}
             issueId={detailTaskId}
             codexProjectIdentity={selectedCodexProjectIdentity}
+            taskThreadIds={activeTaskAiThreadIds}
             onThreadsChange={setAiThreads}
             openThreadRequest={aiOpenThreadRequest}
             onOpenThreadRequestHandled={handleAiOpenThreadRequestHandled}

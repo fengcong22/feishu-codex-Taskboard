@@ -1,3 +1,18 @@
+export function resolveAiImportProjectId({
+  project,
+  isFeishuProject,
+  hasLoadedTasks,
+  taskCount,
+  localAiChatAvailable,
+  globalProjectId,
+}) {
+  // Feishu projects keep their configured stage columns when there are no tasks.
+  if (!hasLoadedTasks || taskCount !== 0 || !localAiChatAvailable || !project
+    || project.id === globalProjectId || project.source === "jira"
+    || project.source === "feishu" || isFeishuProject) return null;
+  return project.id;
+}
+
 export function resolveProjectIdAfterRefresh(projects, {
   requestedProjectId,
   currentProjectId,

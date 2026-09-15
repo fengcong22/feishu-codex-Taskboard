@@ -3080,17 +3080,18 @@ export function createTaskboardServer(options = {}) {
     }
     return { diagnostics: normalizeBridgeShareDiagnostics(payload.diagnostics, configuration) };
   }
+  const feishuWorkflowStore = createFeishuWorkflowStore({
+    database,
+    packageAliases: async () => (typeof feishuPackages.list === "function"
+      ? (await feishuPackages.list()).filter((record) => record.state === "enabled").map((record) => record.alias)
+      : Object.keys(await feishuPackages.read()).filter((alias) => alias)),
+    syncSubject: typeof options.feishuWorkflowSync === "function"
+      ? options.feishuWorkflowSync
+      : syncFeishuSubjectToBridge,
+  });
   const feishuWorkflowApi = createFeishuWorkflowApi({
     database,
-    store: createFeishuWorkflowStore({
-      database,
-      packageAliases: async () => (typeof feishuPackages.list === "function"
-        ? (await feishuPackages.list()).filter((record) => record.state === "enabled").map((record) => record.alias)
-        : Object.keys(await feishuPackages.read()).filter((alias) => alias)),
-      syncSubject: typeof options.feishuWorkflowSync === "function"
-        ? options.feishuWorkflowSync
-        : syncFeishuSubjectToBridge,
-    }),
+    store: feishuWorkflowStore,
     inspectShareImport: typeof options.feishuWorkflowShareImport === "function"
       ? options.feishuWorkflowShareImport
       : inspectFeishuShareImportWithBridge,
@@ -3320,11 +3321,33 @@ export function createTaskboardServer(options = {}) {
       // task by its server-owned alias instead of requiring project IDs to
       // match.  An ordinary task must use the normal project workspace even
       // when its description contains a Feishu-looking marker.
-      const packageConfig = trustedOrigin?.packageAlias
+      let packageConfig = trustedOrigin?.packageAlias
         ? packageSnapshot ?? packageCatalog[trustedOrigin.packageAlias]
         : issue
           ? null
           : Object.values(packageCatalog).find((entry) => entry.projectId === projectId);
+      if (!issue) {
+        const project = database.getProject(projectId);
+        if (project?.source === "feishu" && project.subjectKey) {
+          // Project chat follows the saved subject binding, independently of
+          // the event snapshot. This does not grant trusted task provenance.
+          const subject = await feishuWorkflowStore.getSubject(project.subjectKey);
+          const route = subject.packageRoute;
+          if (subject.projectId !== projectId || route?.routeMode !== "fixed"
+            || typeof route.packageAlias !== "string" || !route.packageAlias.trim()) {
+            throw new ApiError(409, "PACKAGE_ROUTE_UNAVAILABLE", "请先为当前飞书项目配置固定的 Auto-Cut 包");
+          }
+          packageConfig = Object.hasOwn(packageCatalog, route.packageAlias)
+            ? packageCatalog[route.packageAlias]
+            : null;
+          if (!packageConfig) {
+            throw new ApiError(409, "PACKAGE_NOT_FOUND", "当前飞书项目绑定的 Auto-Cut 包不存在，请检查本机包配置");
+          }
+          if (packageConfig.state !== "enabled") {
+            throw new ApiError(409, "PACKAGE_DISABLED", "当前飞书项目绑定的 Auto-Cut 包尚未启用，请先启用该包");
+          }
+        }
+      }
       if (packageConfig) {
         const project = database.getProject(projectId);
         if (!project) {
