@@ -184,7 +184,7 @@ import {
 import { createRevisionPoller, createRevisionWebSocketClient, getRevisionPollingInterval, getRevisionWebSocketConfig } from "./revisionPolling.mjs";
 // These selection rules stay runtime-independent so history navigation can be regression-tested.
 // @ts-expect-error The helper's structural inputs are enforced at its call sites.
-import { findFeishuSubjectKeyForProject, resolveProjectIdAfterRefresh } from "./projectSelection.mjs";
+import { findFeishuSubjectKeyForProject, resolveAiImportProjectId, resolveProjectIdAfterRefresh } from "./projectSelection.mjs";
 // The classifier is intentionally kept in ESM JavaScript so node:test can use it directly.
 // @ts-expect-error The helper has no runtime-dependent TypeScript surface.
 import { classifyUnifiedStage } from "./unifiedWorkflow.mjs";
@@ -1207,14 +1207,14 @@ export function App() {
     selectedProject?.id,
     text,
   ]);
-  const aiImportProjectId = hasLoadedTasks
-    && tasks.length === 0
-    && selectedProject
-    && selectedProject.id !== GLOBAL_PROJECT_ID
-    && !isJiraProject
-    && localAiChatAvailable
-      ? selectedProject.id
-      : null;
+  const aiImportProjectId = resolveAiImportProjectId({
+    project: selectedProject,
+    isFeishuProject: isSelectedFeishuProject,
+    hasLoadedTasks,
+    taskCount: tasks.length,
+    localAiChatAvailable,
+    globalProjectId: GLOBAL_PROJECT_ID,
+  }) as string | null;
   useEffect(() => {
     setAiImportReadyProjectId(null);
     if (!aiImportProjectId) return;
@@ -5056,10 +5056,9 @@ export function App() {
             onError={setActionError}
           />
         ) : boardView !== "readme"
-          && hasLoadedTasks
-          && tasks.length === 0
           && selectedProject
-          && aiImportReadyProjectId === selectedProject.id ? (
+          && aiImportProjectId !== null
+          && aiImportReadyProjectId === aiImportProjectId ? (
           <div className="page-empty">
             <h2>{text("当前项目还没有任务", "This project has no issues yet")}</h2>
             <p>{text(

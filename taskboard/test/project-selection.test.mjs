@@ -3,6 +3,42 @@ import { test } from "node:test";
 
 const selectionModule = import("../web/src/projectSelection.mjs").catch(() => null);
 
+test("empty Feishu projects retain their workflow board even when local AI becomes available", async () => {
+  const { resolveAiImportProjectId } = await selectionModule;
+  assert.equal(typeof resolveAiImportProjectId, "function");
+  for (const localAiChatAvailable of [false, true]) {
+    assert.equal(resolveAiImportProjectId({
+      project: { id: "feishu-empty", source: "feishu" },
+      isFeishuProject: true, hasLoadedTasks: true, taskCount: 0,
+      localAiChatAvailable, globalProjectId: "local",
+    }), null);
+  }
+  // The navigator may identify a subject before the refreshed project row arrives.
+  assert.equal(resolveAiImportProjectId({
+    project: { id: "subject-loading", source: "local" },
+    isFeishuProject: true, hasLoadedTasks: true, taskCount: 0,
+    localAiChatAvailable: true, globalProjectId: "local",
+  }), null);
+});
+
+test("AI task import is offered only to an empty loaded ordinary project with local AI", async () => {
+  const { resolveAiImportProjectId } = await selectionModule;
+  assert.equal(typeof resolveAiImportProjectId, "function");
+  const ordinary = {
+    project: { id: "ordinary", source: "local" }, isFeishuProject: false,
+    hasLoadedTasks: true, taskCount: 0, localAiChatAvailable: true, globalProjectId: "local",
+  };
+  assert.equal(resolveAiImportProjectId(ordinary), "ordinary");
+  for (const override of [
+    { project: null }, { project: { id: "local", source: "local" } },
+    { project: { id: "jira", source: "jira" } },
+    { project: { id: "feishu", source: "feishu" } },
+    { hasLoadedTasks: false }, { taskCount: 1 }, { localAiChatAvailable: false },
+  ]) {
+    assert.equal(resolveAiImportProjectId({ ...ordinary, ...override }), null);
+  }
+});
+
 test("an explicitly selected archived project remains open after a catalog refresh", async () => {
   const module = await selectionModule;
   assert.ok(module, "project selection helpers must be available");

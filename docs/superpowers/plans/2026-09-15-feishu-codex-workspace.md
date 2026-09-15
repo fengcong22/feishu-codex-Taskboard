@@ -30,3 +30,19 @@
 - Independent review: no actionable findings.
 - Local startup with -EnableFeishu and check-local.ps1 -RequireFeishu succeeded; listener reports sdk_managed.
 - The originally failing project catalog returned 6 models, 67 skills, and 52 commands; composer returned 3 candidates. These checks did not send a conversation turn or trigger an Auto-Cut job.
+
+## Empty workflow board follow-up
+
+After the catalog began succeeding, the existing generic zero-task import page took precedence over the Feishu board. Keep the board visible by sharing `resolveAiImportProjectId` between catalog probing and empty-page rendering; it excludes source-managed Feishu projects and subjects identified by the navigator. The render branch must check current eligibility as well as the asynchronously captured readiness so stale responses cannot hide workflow columns.
+
+- Add behavioral eligibility tests covering AI availability transitions, Feishu identification before project refresh, and ordinary/Jira/global/loading/non-empty cases.
+- Verify the real zero-task subject still renders its configured nine columns with catalog success.
+- Run focused selection/board tests, the full standard check, and independent review; rebuild the web assets without restarting the running Bridge.
+
+### Follow-up validation evidence
+
+- Focused selection, home, and workflow board tests: 62 passed.
+- Full npm test: 1,560 Node tests passed, 3 skipped, 0 failed; 42 component tests passed; typecheck and web build succeeded.
+- Browser verification of the originally affected zero-task subject: all nine workflow columns remain in the page, and the Codex panel opens with its model selector and no workspace error.
+- check-local.ps1 -RequireFeishu passed after the web rebuild; the listener remains sdk_managed. No production table event or Auto-Cut job was triggered.
+- Independent follow-up review: no actionable defects. A full App component test for late catalog responses remains a non-blocking coverage improvement; the shared eligibility rules and current render guard were reviewed directly.
