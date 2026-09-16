@@ -41,7 +41,8 @@ for (const launcher of launchers) {
           input: "\r\n",
           encoding: "utf8",
           windowsHide: true,
-          timeout: 20_000,
+          // Allow for PowerShell cold start while the full suite loads a Windows runner.
+          timeout: 60_000,
         });
         assert.ifError(result.error);
         assert.equal(result.status, exitCode, result.stderr || result.stdout);
