@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -65,6 +65,74 @@ test("writes one immutable manifest and naming input under the run root", async 
     assert.equal(path.extname(result.packageZipPath), ".zip");
     assert.match(result.packageZipPath, /\.taskboard-autocut[\\/]task-1[\\/]run-1[\\/]课程001_初稿\.zip$/u);
     assert.match(result.draftsRoot, /autocut-runs[\\/]task-1[\\/]run-1[\\/]drafts$/u);
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("uses the frozen driver source when the optional package ZIP directory is absent", async () => {
+  const fixtureData = await fixture();
+  try {
+    for (const packageSnapshot of [{}, { zipSourceDirectory: null }]) {
+      const request = input(fixtureData, { packageSnapshot });
+      request.subjectVersion.upload = {
+        artifactSourceMode: "driver_report",
+        artifactSourcePath: fixtureData.packageRoot,
+        targetPath: path.join(fixtureData.dataDirectory, "upload-destination"),
+      };
+      request.subjectVersion.stages.initial.artifactTargetPath = path.join(fixtureData.dataDirectory, "stage-destination");
+      const before = structuredClone(request);
+      const result = await prepareFeishuRunInputs(request);
+      assert.equal(result.packageZipPath, path.join(await realpath(fixtureData.packageRoot), ".taskboard-autocut", "task-1", "run-1", "课程001_初稿.zip"));
+      assert.equal(result.stageDestinationPath, request.subjectVersion.stages.initial.artifactTargetPath);
+      assert.deepEqual(request, before);
+    }
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("never replaces an explicit package source with a subject upload path", async () => {
+  const fixtureData = await fixture();
+  try {
+    const request = input(fixtureData);
+    request.subjectVersion.upload = {
+      artifactSourceMode: "driver_report",
+      artifactSourcePath: fixtureData.dataDirectory,
+    };
+    const result = await prepareFeishuRunInputs(request);
+    assert.equal(result.packageZipPath, path.join(await realpath(fixtureData.packageRoot), ".taskboard-autocut", "task-1", "run-1", "课程001_初稿.zip"));
+    for (const zipSourceDirectory of ["", "relative/source", path.join(fixtureData.packageRoot, "missing")]) {
+      request.packageSnapshot = { zipSourceDirectory };
+      await assert.rejects(prepareFeishuRunInputs(request), (error) => (
+        ["AUTOCUT_RUN_INPUT_INVALID", "AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE"].includes(error.code)
+      ));
+    }
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("rejects absent package sources without a frozen absolute driver source", async () => {
+  const fixtureData = await fixture();
+  try {
+    for (const upload of [
+      undefined,
+      { artifactSourceMode: "manual_select", artifactSourcePath: fixtureData.packageRoot },
+      { artifactSourceMode: "driver_report", targetPath: fixtureData.packageRoot },
+      { artifactSourceMode: "driver_report", artifactSourcePath: "relative/source" },
+      { artifactSourceMode: "driver_report", artifactSourcePath: path.join(fixtureData.packageRoot, "missing") },
+    ]) {
+      const request = input(fixtureData, { packageSnapshot: {} });
+      request.subjectVersion.upload = upload;
+      request.subjectVersion.stages.initial.artifactTargetPath = fixtureData.packageRoot;
+      await assert.rejects(prepareFeishuRunInputs(request), (error) => (
+        ["AUTOCUT_RUN_INPUT_INVALID", "AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE"].includes(error.code)
+      ));
+    }
   } finally {
     await rm(fixtureData.dataDirectory, { recursive: true, force: true });
     await rm(fixtureData.packageRoot, { recursive: true, force: true });

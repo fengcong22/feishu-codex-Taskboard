@@ -13,6 +13,7 @@ import { ApiError } from "./database.mjs";
 
 const execFileAsync = promisify(execFile);
 const CATALOG_TIMEOUT_MS = 10_000;
+const CATALOG_TERMINATE_GRACE_MS = 1_000;
 const CATALOG_MAX_BUFFER = 2 * 1024 * 1024;
 const COMPOSER_CONTRACT_VERSION = "composer.v1";
 const SLASH_COMMAND_CATALOG_URL = new URL("./codex-slash-commands-0.139.0.json", import.meta.url);
@@ -390,20 +391,24 @@ function listSkills(codexExecutable, workspacePath, processEnv) {
       windowsHide: true,
     });
     let buffer = "";
-    let settled = false;
+    let outcome = null;
+    let killTimer;
     const timeout = setTimeout(
       () => finish(new Error("Timed out while reading Codex skills")),
       CATALOG_TIMEOUT_MS,
     );
 
     function finish(error, value) {
-      if (settled) return;
-      settled = true;
+      if (outcome) return;
+      outcome = { error, value };
       clearTimeout(timeout);
       child.stdin.end();
-      child.kill("SIGTERM");
-      if (error) reject(error);
-      else resolve(value);
+      // kill() only requests termination. Keep ownership of the workspace
+      // until close confirms the process and its stdio handles are released.
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        killTimer = setTimeout(() => child.kill("SIGKILL"), CATALOG_TERMINATE_GRACE_MS);
+      }
     }
 
     function send(message) {
@@ -428,13 +433,14 @@ function listSkills(codexExecutable, workspacePath, processEnv) {
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      if (outcome) return;
       buffer += chunk;
       if (buffer.length > CATALOG_MAX_BUFFER) {
         finish(new Error("Codex skills response exceeded the catalog size limit"));
         return;
       }
       let newlineIndex = buffer.indexOf("\n");
-      while (newlineIndex >= 0 && !settled) {
+      while (newlineIndex >= 0 && !outcome) {
         const line = buffer.slice(0, newlineIndex).trim();
         buffer = buffer.slice(newlineIndex + 1);
         if (line) {
@@ -446,11 +452,14 @@ function listSkills(codexExecutable, workspacePath, processEnv) {
       }
     });
     child.stdin.on("error", (error) => finish(error));
+    child.stdout.on("error", (error) => finish(error));
     child.once("error", (error) => finish(error));
-    child.once("exit", (code, signal) => {
-      if (!settled) {
-        finish(new Error(`Codex app-server exited before listing skills (${signal || code})`));
-      }
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      clearTimeout(killTimer);
+      if (!outcome) reject(new Error(`Codex app-server exited before listing skills (${signal || code})`));
+      else if (outcome.error) reject(outcome.error);
+      else resolve(outcome.value);
     });
     child.once("spawn", () => {
       send({
@@ -995,18 +1004,27 @@ export async function discoverAiCatalog({
 }) {
   const environment = withoutTaskboardLauncherEnvironment(processEnv);
   const debugInvocation = codexInvocation(codexExecutable, ["debug", "models"]);
-  const [modelResult, skillEntries, commands] = await Promise.all([
+  let firstFailure;
+  const results = await Promise.allSettled([
     execFileAsync(debugInvocation.command, debugInvocation.args, {
       cwd: workspacePath,
       env: environment,
       encoding: "utf8",
       timeout: CATALOG_TIMEOUT_MS,
+      killSignal: "SIGKILL",
       maxBuffer: CATALOG_MAX_BUFFER,
       windowsHide: true,
     }),
     listSkills(codexExecutable, workspacePath, environment),
     loadSlashCommands(),
-  ]);
+  ].map((probe) => probe.catch((error) => {
+    firstFailure ??= { error };
+    throw error;
+  })));
+  // A failed probe still owns its sibling's temporary process/workspace.
+  // Drain every probe before exposing a result or the first reported failure.
+  if (firstFailure) throw firstFailure.error;
+  const [modelResult, skillEntries, commands] = results.map((result) => result.value);
   const modelCatalog = JSON.parse(modelResult.stdout);
   return {
     models: sanitizeModels(modelCatalog?.models),

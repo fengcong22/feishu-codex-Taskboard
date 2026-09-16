@@ -96,6 +96,21 @@ function packageZipFilename(artifactName) {
   return `${artifactName}.zip`;
 }
 
+export function resolveFeishuPackageSourceDirectory(packageSnapshot, subjectVersion) {
+  const packageSource = packageSnapshot?.zipSourceDirectory ?? packageSnapshot?.artifactSourcePath;
+  // ZIP source is optional in a package registry. The task's immutable local
+  // subject version also binds an approved driver source; upload destinations
+  // and live settings must never substitute for that frozen source.
+  const subjectSource = subjectVersion?.upload?.artifactSourceMode === "driver_report"
+    ? subjectVersion.upload.artifactSourcePath
+    : undefined;
+  const directory = text(packageSource ?? subjectSource, "packageSnapshot.zipSourceDirectory");
+  if (!path.isAbsolute(directory)) {
+    throw fail("AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE", "The package ZIP source directory must be absolute");
+  }
+  return directory;
+}
+
 /**
  * Build the immutable files and paths used by one trusted phased Auto-Cut run.
  * All source descriptors remain opaque; no Feishu cell is interpreted as a
@@ -144,11 +159,7 @@ export async function prepareFeishuRunInputs({
   const draftsRoot = path.join(jobRoot, "drafts");
   await mkdir(draftsRoot, { recursive: true, mode: 0o700 });
 
-  const packageDirectoryInput = packageSnapshot?.zipSourceDirectory ?? packageSnapshot?.artifactSourcePath;
-  const packageDirectory = text(packageDirectoryInput, "packageSnapshot.zipSourceDirectory");
-  if (!path.isAbsolute(packageDirectory)) {
-    throw fail("AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE", "The package ZIP source directory must be absolute");
-  }
+  const packageDirectory = resolveFeishuPackageSourceDirectory(packageSnapshot, subjectVersion);
   let packageRoot;
   try {
     packageRoot = await realpath(packageDirectory);

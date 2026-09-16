@@ -47,7 +47,7 @@ import { runLocalAutoCut } from "./autocut-local-runner.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
 import { readCurrentControlledContext } from "./feishu-controlled-context-client.mjs";
-import { prepareFeishuRunInputs } from "./feishu-run-inputs.mjs";
+import { prepareFeishuRunInputs, resolveFeishuPackageSourceDirectory } from "./feishu-run-inputs.mjs";
 import { canonicalJson } from "./feishu-source-manifest.mjs";
 import { stageRegistrationOrigin } from "./feishu-deleted-event.mjs";
 
@@ -3838,8 +3838,9 @@ export function createTaskboardServer(options = {}) {
       );
     }
     const packageSnapshot = database.getFeishuTaskPackageSnapshot(run.taskId);
+    const subjectVersion = database.getFeishuSubjectVersion(metadata.subjectKey, metadata.configVersion);
     const configuredSource = driverArtifactSourceForMetadata(metadata);
-    if (!packageSnapshot?.zipSourceDirectory || !configuredSource?.artifactSourcePath) {
+    if (!packageSnapshot || !subjectVersion || !configuredSource?.artifactSourcePath) {
       throw autoCutResultError(
         "AUTOCUT_PACKAGE_SOURCE_UNAVAILABLE",
         "The frozen Auto-Cut ZIP source is unavailable",
@@ -3851,7 +3852,7 @@ export function createTaskboardServer(options = {}) {
     let reportedPath;
     try {
       [packageRoot, configuredRoot, expectedPath, reportedPath] = await Promise.all([
-        realpath(packageSnapshot.zipSourceDirectory),
+        realpath(resolveFeishuPackageSourceDirectory(packageSnapshot, subjectVersion)),
         realpath(configuredSource.artifactSourcePath),
         realpath(run.packageZipPath),
         realpath(report.path),
