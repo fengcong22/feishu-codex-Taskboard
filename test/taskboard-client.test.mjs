@@ -20,6 +20,45 @@ async function fixture(handler) {
   };
 }
 
+test("reads the current automatic execution capability without caching startup state", async (t) => {
+  let automaticExecution = false;
+  const app = await fixture((request, response) => {
+    assert.equal(request.url, "/api/meta");
+    assert.equal(request.method, "GET");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ capabilities: { automaticExecution } }));
+  });
+  t.after(app.close);
+  const client = new TaskboardClient(app.url);
+  assert.equal(await client.getAutomaticExecutionEnabled(), false);
+  automaticExecution = true;
+  assert.equal(await client.getAutomaticExecutionEnabled(), true);
+  automaticExecution = false;
+  assert.equal(await client.getAutomaticExecutionEnabled(), false);
+});
+
+test("rejects missing or nonboolean automatic execution capabilities", async (t) => {
+  let payload;
+  const app = await fixture((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(payload));
+  });
+  t.after(app.close);
+  const client = new TaskboardClient(app.url);
+  for (payload of [null, {}, { capabilities: {} }, { capabilities: { automaticExecution: "false" } },
+    { capabilities: { automaticExecution: 0 } }, { capabilities: { automaticExecution: null } }]) {
+    await assert.rejects(() => client.getAutomaticExecutionEnabled(), invalidResponse);
+  }
+});
+
+test("does not treat an unavailable Taskboard as automatic execution disabled", async () => {
+  const client = new TaskboardClient("http://127.0.0.1:47823", {
+    fetchImplementation: async () => { throw new Error("connection failed"); },
+  });
+  await assert.rejects(() => client.getAutomaticExecutionEnabled(),
+    (error) => error instanceof TaskboardError && error.code === "TASKBOARD_UNAVAILABLE");
+});
+
 function fullFeishuMetadata(overrides = {}) {
   return {
     version: 1,

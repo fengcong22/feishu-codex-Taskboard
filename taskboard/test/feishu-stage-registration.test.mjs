@@ -256,6 +256,117 @@ test("canonical stage registration derives execution policy from the enabled sna
   }
 });
 
+test("stage task titles use the captured naming field with a record ID fallback", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    for (const [index, namingDisplayValue, expectedName] of [
+      [0, "  中国古代史 第一课  ", "中国古代史 第一课"],
+      [1, "", "rec_1"],
+      [2, "   ", "rec_1"],
+      [3, undefined, "rec_1"],
+    ]) {
+      const payload = registration(subject, {
+        event: { eventId: `evt-naming-${index}` },
+        controlledContext: { namingDisplayValue, namingValueUnique: false },
+      });
+      const result = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+      assert.equal(result.response.status, 201, JSON.stringify(result.body));
+      assert.equal(result.body.task.title, `数学 · ${expectedName} · _初稿`);
+      assert.equal(result.body.task.feishuOrigin.recordId, "rec_1");
+      assert.equal(result.body.task.feishuOrigin.controlledContext.namingValueUnique, false);
+      assert.equal(fixtureData.app.database.database.prepare("SELECT title FROM tasks WHERE id = ?")
+        .get(result.body.task.id).title, result.body.task.title);
+    }
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("long naming snapshots produce editable new and historical task titles", async () => {
+  const f = await fixture();
+  try {
+    const subject = await enableSubject(f);
+    const name = "课程📚".repeat(60);
+    const payload = registration(subject, { controlledContext: { namingDisplayValue: name } });
+    const created = await request(f.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(created.response.status, 201);
+    const task = created.body.task;
+    assert.ok(task.title.length <= 240);
+    assert.ok(task.title.startsWith("数学 · "));
+    assert.ok(task.title.endsWith(" · _初稿"));
+    assert.equal(task.feishuOrigin.controlledContext.namingDisplayValue, name);
+    f.app.database.database.prepare("UPDATE tasks SET title = ? WHERE id = ?")
+      .run("数学 · rec_1 · _初稿", task.id);
+    const projected = f.app.database.getTask(task.id);
+    assert.equal(projected.title, task.title);
+    const response = await fetch(`${f.baseUrl}/api/tasks/${task.id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: projected.version, title: projected.title, priority: "high" }),
+    });
+    const patched = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(patched));
+    assert.equal(patched.task.priority, "high");
+    assert.equal(patched.task.feishuOrigin.controlledContext.namingDisplayValue, name);
+  } finally {
+    await f.app.close(); await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("historical generated task titles display stored names without rewriting identity or custom titles", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    const payload = registration(subject);
+    const created = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const { id, version, updatedAt } = created.body.task;
+    const database = fixtureData.app.database;
+    const sql = database.database;
+    const storedOrigin = sql.prepare("SELECT * FROM feishu_task_origins WHERE task_id = ?").get(id);
+    // Model the title emitted by releases before the naming-field fix.
+    sql.prepare("UPDATE tasks SET title = ? WHERE id = ?").run("数学 · rec_1 · _初稿", id);
+    const title = "数学 · 课程001 · _初稿";
+    assert.equal(database.getTask(id).title, title);
+    assert.equal(database.listTasks({}).find((task) => task.id === id).title, title);
+    const detail = await fetch(`${fixtureData.baseUrl}/api/tasks/${id}`);
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json()).task.title, title);
+    const replay = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
+    assert.equal(replay.response.status, 200);
+    assert.equal(replay.body.task.title, title);
+    assert.equal(replay.body.task.version, version);
+    assert.equal(replay.body.task.updatedAt, updatedAt);
+    assert.deepEqual(sql.prepare("SELECT * FROM feishu_task_origins WHERE task_id = ?").get(id), storedOrigin);
+    assert.equal(sql.prepare("SELECT title FROM tasks WHERE id = ?").get(id).title, "数学 · rec_1 · _初稿");
+
+    const archived = await request(fixtureData.baseUrl, `/api/tasks/${id}/archive`, { version });
+    assert.equal(archived.response.status, 200);
+    assert.equal(database.listTasks({ archived: "true" }).find((task) => task.id === id).title, title);
+
+    sql.prepare("UPDATE tasks SET title = ? WHERE id = ?").run("我的课程标题 · rec_1 · _初稿", id);
+    assert.equal(database.getTask(id).title, "我的课程标题 · rec_1 · _初稿");
+    assert.equal(database.listTasks({}).find((task) => task.id === id).title, "我的课程标题 · rec_1 · _初稿");
+
+    sql.prepare("UPDATE tasks SET title = ? WHERE id = ?").run("数学 · rec_1 · _初稿", id);
+    for (const namingDisplayValue of ["", "   "]) {
+      const context = { ...payload.controlledContext, namingDisplayValue };
+      sql.prepare("UPDATE feishu_task_origins SET controlled_context_json = ? WHERE task_id = ?")
+        .run(JSON.stringify(context), id);
+      assert.equal(database.getTask(id).title, "数学 · rec_1 · _初稿");
+    }
+    sql.prepare("UPDATE feishu_task_origins SET controlled_context_json = ? WHERE task_id = ?")
+      .run(storedOrigin.controlled_context_json, id);
+    sql.prepare("DELETE FROM feishu_subject_versions WHERE subject_key = ? AND version = ?")
+      .run(subject.subjectKey, subject.configVersion);
+    assert.equal(database.getTask(id).title, "数学 · rec_1 · _初稿");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
 test("canonical stage registration still schedules automatic execution internally", async () => {
   const fixtureData = await fixture({ allowAutomaticExecution: true });
   try {

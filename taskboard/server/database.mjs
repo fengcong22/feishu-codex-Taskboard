@@ -12,6 +12,7 @@ import {
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 import { UNIFIED_WORKFLOW_STAGES } from "../shared/unified-workflow-stages.mjs";
 import { originFingerprint, registrationFingerprint } from "./feishu-deleted-event.mjs";
+import { feishuTaskDisplayTitle } from "./feishu-task-title.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -3350,6 +3351,42 @@ export class TaskboardDatabase {
     return this.getProjectSummary(projectId);
   }
 
+  getAutomaticExecutionSetting(defaultEnabled = false) {
+    const row = this.database.prepare("SELECT value_json, version FROM taskboard_settings WHERE key = 'automatic-execution'").get();
+    if (!row) return { enabled: defaultEnabled === true, version: 1 };
+    try {
+      const value = JSON.parse(row.value_json);
+      if (!value || typeof value.enabled !== "boolean" || Object.keys(value).length !== 1
+        || !Number.isSafeInteger(row.version) || row.version < 1) throw new Error("invalid setting");
+      return { enabled: value.enabled, version: row.version };
+    } catch {
+      throw new ApiError(503, "AUTOMATIC_EXECUTION_SETTING_INVALID", "The local automatic execution setting is invalid");
+    }
+  }
+
+  saveAutomaticExecutionSetting(expectedVersion, enabled, defaultEnabled = false) {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1 || typeof enabled !== "boolean") {
+      throw new ApiError(400, "INVALID_FIELD", "A boolean enabled and positive expectedVersion are required");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getAutomaticExecutionSetting(defaultEnabled);
+      if (current.version !== expectedVersion) {
+        throw new ApiError(409, "VERSION_CONFLICT", "The local setting changed in another window", { current });
+      }
+      const next = { enabled, version: current.version + 1 };
+      this.database.prepare(`INSERT INTO taskboard_settings (key,value_json,version,updated_at)
+        VALUES ('automatic-execution',?,?,?) ON CONFLICT(key) DO UPDATE SET
+        value_json=excluded.value_json, version=excluded.version, updated_at=excluded.updated_at`)
+        .run(JSON.stringify({ enabled }), next.version, now());
+      this.database.exec("COMMIT");
+      return next;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
   getBoardStageLabels() {
     const row = this.database.prepare(`
       SELECT value_json, version
@@ -3870,7 +3907,13 @@ export class TaskboardDatabase {
         previewImagesByTask.get(row.id) ?? null,
       );
       const feishuOrigin = this.getFeishuTaskOrigin(task.id);
-      if (feishuOrigin) task.feishuOrigin = feishuOrigin;
+      if (feishuOrigin) {
+        task.feishuOrigin = feishuOrigin;
+        task.title = feishuTaskDisplayTitle(
+          task, feishuOrigin,
+          this.getFeishuSubjectVersion(feishuOrigin.subjectKey, feishuOrigin.configVersion),
+        );
+      }
       const packageSnapshot = this.getFeishuTaskPackageSnapshot(task.id);
       if (packageSnapshot) {
         task.feishuPackageSnapshot = {
@@ -3890,7 +3933,13 @@ export class TaskboardDatabase {
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
     const enriched = attachTaskActivity(task, comments, activities, previewImage);
     const feishuOrigin = this.getFeishuTaskOrigin(task.id);
-    if (feishuOrigin) enriched.feishuOrigin = feishuOrigin;
+    if (feishuOrigin) {
+      enriched.feishuOrigin = feishuOrigin;
+      enriched.title = feishuTaskDisplayTitle(
+        enriched, feishuOrigin,
+        this.getFeishuSubjectVersion(feishuOrigin.subjectKey, feishuOrigin.configVersion),
+      );
+    }
     const packageSnapshot = this.getFeishuTaskPackageSnapshot(task.id);
     if (packageSnapshot) {
       enriched.feishuPackageSnapshot = {
@@ -4736,9 +4785,12 @@ export class TaskboardDatabase {
     if (!['delayed', 'queued', 'running'].includes(state)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid Feishu execution state");
     }
-    const allowed = new Set(['readyAt', 'pumpRetries', 'launchRetries', 'leaseId', 'lastError']);
+    const allowed = new Set(['readyAt', 'pumpRetries', 'launchRetries', 'leaseId', 'lastError', 'trigger']);
     const unknown = Object.keys(patch).find((key) => !allowed.has(key));
     if (unknown) throw new ApiError(400, "INVALID_FIELD", `Unsupported execution field '${unknown}'`);
+    if (Object.hasOwn(patch, 'trigger') && !['manual', 'move', 'retry'].includes(patch.trigger)) {
+      throw new ApiError(400, "INVALID_FIELD", "Execution trigger updates require an explicit manual action");
+    }
     const current = this.getFeishuExecution(taskId);
     if (!current) throw new ApiError(404, "EXECUTION_NOT_FOUND", "Execution does not exist");
     if (current.version !== expectedVersion) throw new ApiError(409, "EXECUTION_VERSION_CONFLICT", "Execution state changed");
@@ -4749,6 +4801,7 @@ export class TaskboardDatabase {
           pump_retry_count = COALESCE(?, pump_retry_count),
           launch_retry_count = COALESCE(?, launch_retry_count),
           lease_id = COALESCE(?, lease_id),
+          trigger = COALESCE(?, trigger),
           last_error = CASE WHEN ? THEN ? ELSE last_error END,
           version = version + 1, updated_at = ?
       WHERE task_id = ? AND version = ?
@@ -4758,6 +4811,7 @@ export class TaskboardDatabase {
       patch.pumpRetries ?? null,
       patch.launchRetries ?? null,
       patch.leaseId ?? null,
+      patch.trigger ?? null,
       Object.hasOwn(patch, 'lastError') ? 1 : 0,
       patch.lastError ?? null,
       timestamp,

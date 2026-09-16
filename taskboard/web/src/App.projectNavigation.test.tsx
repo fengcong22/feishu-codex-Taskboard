@@ -3,12 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import * as api from "./api";
 import type { FeishuWorkflowPanelProps } from "./components/FeishuWorkflowPanel";
+import { LocalSettingsDialog } from "./components/LocalSettingsDialog";
+import { TaskboardLanguageProvider } from "./i18n";
+import { startAutomaticExecutionTestServer } from "../test/automatic-execution-server.mjs";
 import type { FeishuBaseCatalog, FeishuSubjectConfig, Project, Task } from "./types";
 
 vi.mock("./api", async (importOriginal) => ({
   ...await importOriginal<typeof import("./api")>(),
   listProjects: vi.fn(),
   getTaskboardMetadata: vi.fn(),
+  getAutomaticExecutionSettings: vi.fn(),
+  updateAutomaticExecutionSettings: vi.fn(),
   listDeviceWorkspaces: vi.fn(),
   getBoardStageLabels: vi.fn(),
   getJiraConnection: vi.fn(),
@@ -43,16 +48,19 @@ vi.mock("./components/FeishuPackageManager", () => ({
 }));
 
 vi.mock("./components/FeishuWorkflowPanel", () => ({
-  FeishuWorkflowPanel: ({ selectedSubjectKey, onSelectSubject }: FeishuWorkflowPanelProps) => (
+  FeishuWorkflowPanel: ({ selectedSubjectKey, onSelectSubject, onOpenLocalSettings, allowAutomaticExecution }: FeishuWorkflowPanelProps) => (
     <div role="region" aria-label="Subject configuration">
       <button type="button" onClick={() => onSelectSubject(selectedSubjectKey!, true)}>
         Return to subject board
       </button>
+      <button type="button" onClick={onOpenLocalSettings}>Manage local automatic editing</button>
+      <span>Machine automatic editing: {String(allowAutomaticExecution)}</span>
     </div>
   ),
 }));
 
 const NOW = "2026-09-15T03:00:00.000Z";
+let eventSources: EventTarget[] = [];
 
 function subject(key: string, tableName: string): FeishuSubjectConfig {
   return {
@@ -187,9 +195,9 @@ describe("App project navigation", () => {
       unobserve() {}
       disconnect() {}
     });
-    vi.stubGlobal("EventSource", class {
-      addEventListener() {}
-      removeEventListener() {}
+    eventSources = [];
+    vi.stubGlobal("EventSource", class extends EventTarget {
+      constructor() { super(); eventSources.push(this); }
       close() {}
     });
     // No test is allowed to reach the running Bridge or Taskboard services.
@@ -197,6 +205,8 @@ describe("App project navigation", () => {
 
     vi.mocked(api.listProjects).mockResolvedValue(PROJECTS);
     vi.mocked(api.getTaskboardMetadata).mockResolvedValue({ mode: "local", capabilities: { localAiChat: false } });
+    vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 1 });
+    vi.mocked(api.updateAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
     vi.mocked(api.listDeviceWorkspaces).mockResolvedValue({});
     const labels = {
       backlog: "Backlog", todo: "Ready", queued: "Queued", in_progress: "Processing",
@@ -246,6 +256,139 @@ describe("App project navigation", () => {
     fireEvent.click(subjectButton(FIRST_SUBJECT));
     expect(await screen.findByText(FIRST_TASK.title)).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Package manager" })).toBeNull();
+  });
+
+  it("saves the machine switch only after the server confirms and refreshes it when reopened", async () => {
+    const saved = deferred<{ enabled: boolean; version: number }>();
+    vi.mocked(api.updateAutomaticExecutionSettings).mockReturnValueOnce(saved.promise);
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    const dialog = screen.getByRole("dialog", { name: "Local settings" });
+    const toggle = await within(dialog).findByRole("switch", { name: "Allow automatic editing on this device" });
+    await waitFor(() => expect((toggle as HTMLInputElement).disabled).toBe(false));
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    expect(within(dialog).getByText(/all subjects on this device/)).toBeTruthy();
+    expect(within(dialog).getByText(/Running tasks will continue/)).toBeTruthy();
+    expect(within(dialog).getByText(/historical tasks/)).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(api.updateAutomaticExecutionSettings).toHaveBeenCalledWith({ enabled: true, expectedVersion: 1 });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    expect((toggle as HTMLInputElement).disabled).toBe(true);
+    await act(async () => saved.resolve({ enabled: true, version: 2 }));
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    openFirstSubjectConfiguration();
+    expect(screen.getByText("Machine automatic editing: true")).toBeTruthy();
+    vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 3 });
+    fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("refreshes after a conflicting update without reporting the attempted change as saved", async () => {
+    vi.mocked(api.getAutomaticExecutionSettings)
+      .mockResolvedValueOnce({ enabled: false, version: 1 })
+      .mockResolvedValue({ enabled: false, version: 3 });
+    vi.mocked(api.updateAutomaticExecutionSettings).mockRejectedValueOnce(new api.ApiError(409, {
+      error: { code: "VERSION_CONFLICT", message: "Conflict" },
+    }));
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("switch"));
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", "This setting changed elsewhere. The current value has been loaded; review it before trying again.");
+    expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(screen.getByRole("switch"));
+    expect(api.updateAutomaticExecutionSettings).toHaveBeenLastCalledWith({ enabled: true, expectedVersion: 3 });
+    await act(async () => {});
+  });
+
+  it("shows a failed save and keeps the confirmed value", async () => {
+    vi.mocked(api.updateAutomaticExecutionSettings).mockRejectedValueOnce(new Error("Service unavailable"));
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("switch"));
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Could not save the setting. Service unavailable");
+    expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("turns the machine switch off and preserves subject navigation", async () => {
+    vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 6 });
+    vi.mocked(api.updateAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 7 });
+    await renderFirstSubject();
+    screen.getByRole("button", { name: "Local settings" }).focus();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("switch"));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false));
+    expect(api.updateAutomaticExecutionSettings).toHaveBeenCalledWith({ enabled: false, expectedVersion: 6 });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(subjectButton(FIRST_SUBJECT).getAttribute("aria-current")).toBe("page");
+    expect(screen.getByRole("button", { name: "Local settings" })).toBe(document.activeElement);
+  });
+
+  it("keeps the switch disabled after a read error until retry succeeds", async () => {
+    vi.mocked(api.getAutomaticExecutionSettings).mockRejectedValueOnce(new Error("Offline"));
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Could not read the setting. Offline");
+    expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    expect(api.updateAutomaticExecutionSettings).not.toHaveBeenCalled();
+  });
+
+  it("refreshes an open settings dialog after another tab changes the switch", async () => {
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
+    await act(async () => {
+      eventSources.at(-1)!.dispatchEvent(new MessageEvent("automatic-execution.updated", { data: "{}" }));
+    });
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(true));
+    expect(api.updateAutomaticExecutionSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps a conflict explanation when a simultaneous server event triggers a refresh", async () => {
+    let rejectSave!: (error: Error) => void;
+    vi.mocked(api.updateAutomaticExecutionSettings).mockReturnValueOnce(new Promise((_, reject) => { rejectSave = reject; }));
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("switch"));
+    await act(async () => {
+      eventSources.at(-1)!.dispatchEvent(new MessageEvent("automatic-execution.updated", { data: "{}" }));
+    });
+    await act(async () => rejectSave(new api.ApiError(409, { error: { code: "VERSION_CONFLICT" } })));
+    expect(screen.getByRole("alert").textContent).toContain("changed elsewhere");
+    expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("does not expose machine settings in cloud mode", async () => {
+    vi.mocked(api.getTaskboardMetadata).mockResolvedValue({ mode: "cloud", capabilities: { localAiChat: false } });
+    await renderFirstSubject();
+    expect(screen.queryByRole("button", { name: "Local settings" })).toBeNull();
+  });
+
+  it("finishes saving when the host changes the interface language", async () => {
+    const pending = deferred<{ enabled: boolean; version: number }>();
+    vi.mocked(api.updateAutomaticExecutionSettings).mockReturnValueOnce(pending.promise);
+    const onSettingsChange = vi.fn();
+    const view = (language: "zh" | "en") => <TaskboardLanguageProvider language={language}>
+      <LocalSettingsDialog revision={0} onSettingsChange={onSettingsChange} onClose={vi.fn()} />
+    </TaskboardLanguageProvider>;
+    const { rerender } = render(view("en"));
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("switch"));
+    rerender(view("zh"));
+    vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
+    await act(async () => pending.resolve({ enabled: true, version: 2 }));
+    expect((screen.getByRole("switch", { name: "允许本机自动剪辑" }) as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(true);
   });
 
   it("keeps task cards when the current sidebar subject is clicked repeatedly", async () => {
@@ -364,5 +507,46 @@ describe("App project navigation", () => {
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
     expect(screen.queryByText(archived.title)).toBeNull();
     expect(api.deleteArchivedTask).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Automatic execution settings API", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("reads the setting and writes a versioned update with the local web client header", async () => {
+    const actualApi = await vi.importActual<typeof import("./api")>("./api");
+    const setting = { enabled: true, version: 8 };
+    const fetchRequest = vi.fn(async () => new Response(JSON.stringify({ setting }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchRequest);
+    expect(await actualApi.getAutomaticExecutionSettings()).toEqual(setting);
+    expect(await actualApi.updateAutomaticExecutionSettings({ enabled: true, expectedVersion: 7 })).toEqual(setting);
+    const calls = fetchRequest.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(new URL(calls[0][0]).pathname).toBe("/api/local/settings/automatic-execution");
+    expect(new URL(calls[1][0]).pathname).toBe("/api/local/settings/automatic-execution");
+    expect(calls[1][1].method).toBe("PUT");
+    expect(new Headers(calls[1][1].headers).get("X-Taskboard-Client")).toBe("web");
+    expect(JSON.parse(String(calls[1][1].body))).toEqual({ enabled: true, expectedVersion: 7 });
+  });
+
+  it("round trips the web API through an isolated Taskboard server", async () => {
+    const actualApi = await vi.importActual<typeof import("./api")>("./api");
+    const server = await startAutomaticExecutionTestServer();
+    const base = document.createElement("base");
+    try {
+      base.href = server.baseUrl;
+      document.head.prepend(base);
+      expect(await actualApi.getAutomaticExecutionSettings()).toEqual({ enabled: false, version: 1 });
+      expect(await actualApi.updateAutomaticExecutionSettings({ enabled: true, expectedVersion: 1 })).toEqual({ enabled: true, version: 2 });
+      expect((await actualApi.getTaskboardMetadata()).capabilities?.automaticExecution).toBe(true);
+      await expect(actualApi.updateAutomaticExecutionSettings({ enabled: false, expectedVersion: 1 })).rejects.toMatchObject({ status: 409, code: "VERSION_CONFLICT" });
+      expect(await actualApi.getAutomaticExecutionSettings()).toEqual({ enabled: true, version: 2 });
+      expect(await actualApi.updateAutomaticExecutionSettings({ enabled: false, expectedVersion: 2 })).toEqual({ enabled: false, version: 3 });
+    } finally {
+      base.remove();
+      await server.close();
+    }
   });
 });

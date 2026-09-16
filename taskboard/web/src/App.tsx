@@ -78,6 +78,7 @@ import {
 } from "./components/BoardCardDisplayMenu";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
+import { LocalSettingsDialog } from "./components/LocalSettingsDialog";
 import { ArchivedTasksColumn, OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
   resolveInlineAttachmentMarkdown,
@@ -459,6 +460,7 @@ const EVENT_NAMES = [
   "artifact.deleted",
   "artifact.upload.updated",
   "autocut.package.updated",
+  "automatic-execution.updated",
   "board-stage-labels.updated",
   "project.created",
   "project.updated",
@@ -676,6 +678,7 @@ interface LocalRealtimeSyncProps {
   setBoardStageLabels: Dispatch<SetStateAction<import("./types").BoardStageLabels | null>>;
   refreshProjectBoardDisplaySettings: () => Promise<void>;
   setReadmeRevision: Dispatch<SetStateAction<number>>;
+  onAutomaticExecutionChanged: () => void;
 }
 
 function LocalRealtimeSync({
@@ -692,6 +695,7 @@ function LocalRealtimeSync({
   setBoardStageLabels,
   refreshProjectBoardDisplaySettings,
   setReadmeRevision,
+  onAutomaticExecutionChanged,
 }: LocalRealtimeSyncProps) {
   useEffect(() => {
     const source = new EventSource(resolveTaskboardUrl("/api/events"));
@@ -750,6 +754,10 @@ function LocalRealtimeSync({
       }
       if (event.type === "autocut.package.updated") {
         setAutoCutPackagesRevision((current) => current + 1);
+        return;
+      }
+      if (event.type === "automatic-execution.updated") {
+        onAutomaticExecutionChanged();
         return;
       }
       if (event.type === "board-stage-labels.updated") {
@@ -826,6 +834,7 @@ function LocalRealtimeSync({
     setCommentsRevision,
     setConnection,
     setReadmeRevision,
+    onAutomaticExecutionChanged,
   ]);
 
   return null;
@@ -848,6 +857,22 @@ export function App() {
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
   const [manageTaskboardSkillPath, setManageTaskboardSkillPath] = useState("");
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
+  const [localSettingsOpen, setLocalSettingsOpen] = useState(false);
+  const [localSettingsRevision, setLocalSettingsRevision] = useState(0);
+  const applyAutomaticExecutionSettings = useCallback((settings: import("./types").AutomaticExecutionSettings) => {
+    setTaskboardMetadata((current) => current ? {
+      ...current,
+      capabilities: {
+        ...current.capabilities,
+        localAiChat: current.capabilities?.localAiChat ?? false,
+        automaticExecution: settings.enabled,
+      },
+    } : current);
+  }, []);
+  const handleAutomaticExecutionChanged = useCallback(() => {
+    setLocalSettingsRevision((current) => current + 1);
+    void getTaskboardMetadata().then(setTaskboardMetadata).catch(() => {});
+  }, []);
   const [localAiChatAvailable, setLocalAiChatAvailable] = useState(false);
   const [aiImportReadyProjectId, setAiImportReadyProjectId] = useState<string | null>(null);
   const [aiThreads, setAiThreads] = useState<AiChatThread[]>([]);
@@ -4561,6 +4586,7 @@ export function App() {
           setBoardStageLabels={setBoardStageLabels}
           refreshProjectBoardDisplaySettings={refreshProjectBoardDisplaySettings}
           setReadmeRevision={setReadmeRevision}
+          onAutomaticExecutionChanged={handleAutomaticExecutionChanged}
         />
       )}
       {!embedded && (
@@ -4617,6 +4643,12 @@ export function App() {
 
           <div className="nav-spacer" />
           <div className="nav-footer">
+            {taskboardMetadata?.mode === "local" && (
+              <button className="theme-toggle" type="button" onClick={() => setLocalSettingsOpen(true)}>
+                <span aria-hidden="true"><LinearIcon name="displayOptions" /></span>
+                {text("本机设置", "Local settings")}
+              </button>
+            )}
             <div className={`connection connection-${connection}`}>
               <span aria-hidden="true" />
               {connection === "live"
@@ -5296,6 +5328,7 @@ export function App() {
               configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
               allowAutomaticExecution={taskboardMetadata?.capabilities?.automaticExecution}
+              onOpenLocalSettings={taskboardMetadata?.mode === "local" ? () => setLocalSettingsOpen(true) : undefined}
               onSelectSubject={(subjectKey, openProject = true) => {
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (!subject) return;
@@ -5506,6 +5539,14 @@ export function App() {
             </button>
           )}
         </div>
+      )}
+
+      {localSettingsOpen && taskboardMetadata?.mode === "local" && (
+        <LocalSettingsDialog
+          revision={localSettingsRevision}
+          onSettingsChange={applyAutomaticExecutionSettings}
+          onClose={() => setLocalSettingsOpen(false)}
+        />
       )}
 
       {jiraDialogOpen && (

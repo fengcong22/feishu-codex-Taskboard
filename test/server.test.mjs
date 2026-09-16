@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { createFeishuBaseMetadataReader } from "../src/feishu-base-metadata.mjs";
 import { createBridgeServer, resolveSimulationEnabled } from "../src/server.mjs";
+import { TaskboardClient } from "../src/taskboard-client.mjs";
 
 const TASKBOARD_WRITE_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -437,6 +438,68 @@ test("disables simulation whenever the real listener or automatic execution is e
   assert.equal(response.status, 403);
   assert.equal((await response.json()).error.code, "SIMULATION_DISABLED");
   assert.equal(calls, 0);
+});
+
+test("simulation reevaluates the live Taskboard switch for each request and preserves nonproduction provenance", async (t) => {
+  let automaticExecutionEnabled = true;
+  let listenerEnabled = false;
+  const received = [];
+  let policyReads = 0;
+  const taskboard = new TaskboardClient("http://127.0.0.1:47823", {
+    fetchImplementation: async (url) => {
+      assert.equal(url, "http://127.0.0.1:47823/api/meta");
+      policyReads += 1;
+      return Response.json({ capabilities: { automaticExecution: automaticExecutionEnabled } });
+    },
+  });
+  const app = await start(async (event) => {
+    received.push(event);
+    return { kind: "ready", taskIdentifier: "AUTO-SIM" };
+  }, undefined, undefined, undefined, {
+    simulationEnabled: async () => listenerEnabled === false
+      && (await taskboard.getAutomaticExecutionEnabled()) === false,
+  });
+  t.after(app.close);
+  const post = () => fetch(`${app.url}/api/simulate/record-changed`, {
+    method: "POST", headers: SIMULATION_WRITE_HEADERS,
+    body: JSON.stringify({ eventId: "evt_dynamic", baseToken: "bas_demo", tableId: "tbl_a",
+      recordId: "rec_1", fieldName: "进度", fields: {}, deliverySource: "feishu" }),
+  });
+  assert.equal((await post()).status, 403);
+  automaticExecutionEnabled = false;
+  assert.equal((await post()).status, 201);
+  assert.equal(received.length, 1);
+  assert.equal(received[0].deliverySource, "simulation");
+  automaticExecutionEnabled = true;
+  assert.equal((await post()).status, 403);
+  automaticExecutionEnabled = false;
+  listenerEnabled = true;
+  assert.equal((await post()).status, 403);
+  assert.equal(received.length, 1);
+  assert.equal(policyReads, 3);
+});
+
+test("simulation fails closed with a safe error when the live policy cannot be read", async (t) => {
+  let failRequest = true;
+  const taskboard = new TaskboardClient("http://127.0.0.1:47823", {
+    fetchImplementation: async () => {
+      if (failRequest) throw new Error("private upstream error");
+      return Response.json({ capabilities: { automaticExecution: "false" } });
+    },
+  });
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    simulationEnabled: async () => (await taskboard.getAutomaticExecutionEnabled()) === false,
+  });
+  t.after(app.close);
+  for (failRequest of [true, false]) {
+    const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+      method: "POST", headers: SIMULATION_WRITE_HEADERS, body: "{}",
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: { code: "SIMULATION_POLICY_UNAVAILABLE", message: "Cannot verify the current automatic execution setting" },
+    });
+  }
 });
 
 test("rejects non-loopback Host and Origin values before simulation", async (t) => {

@@ -74,6 +74,7 @@ function createFixture({
   allowAutomaticExecution = true,
   failStarts = 0,
   startError = null,
+  beforeStart = null,
   packageStore: packageStoreOverride = null,
 } = {}) {
   const clock = createClock();
@@ -238,6 +239,7 @@ function createFixture({
         actor,
         autoCutRunConsent,
       });
+      if (beforeStart) await beforeStart(currentTask);
       if (remainingStartFailures > 0) {
         remainingStartFailures -= 1;
         throw Object.assign(new Error("fixture start failure"), { code: "FIXTURE_START_FAILED" });
@@ -292,6 +294,275 @@ test("automatic scheduling respects the local execution policy", async () => {
     ),
     (error) => error?.code === "AUTOMATIC_EXECUTION_DISABLED",
   );
+});
+
+test("automatic scheduling reads the current execution policy callback", async () => {
+  let enabled = false;
+  const fixture = createFixture({ allowAutomaticExecution: () => enabled });
+  fixture.tasks.set("task-1", task("task-1"));
+  await assert.rejects(
+    fixture.coordinator.schedule(fixture.tasks.get("task-1"), automaticMetadata("Auto-cut-copyA"), "automatic"),
+    { code: "AUTOMATIC_EXECUTION_DISABLED" },
+  );
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  enabled = true;
+  await fixture.coordinator.schedule(fixture.tasks.get("task-1"), automaticMetadata("Auto-cut-copyA"), "automatic");
+  assert.equal(fixture.database.getFeishuExecution("task-1").state, "delayed");
+});
+
+test("an unreadable automatic execution policy fails closed for scheduling and recovery", async () => {
+  const fixture = createFixture({
+    allowAutomaticExecution() { throw new Error("settings storage unavailable"); },
+  });
+  fixture.tasks.set("task-1", task("task-1"));
+  fixture.origins.set("task-1", automaticMetadata("Auto-cut-copyA"));
+  await assert.rejects(
+    fixture.coordinator.schedule(fixture.tasks.get("task-1"), automaticMetadata("Auto-cut-copyA"), "automatic"),
+    { code: "AUTOMATIC_EXECUTION_DISABLED" },
+  );
+  fixture.database.createFeishuExecution({
+    taskId: "task-1", mode: "automatic", trigger: "automatic", readyAt: 10_000,
+    packageAlias: "Auto-cut-copyA", packageRevision: 1,
+  });
+  await fixture.coordinator.recover();
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  assert.equal(fixture.starts.length, 0);
+});
+
+for (const trigger of ["manual", "move", "retry"]) {
+  test(`a ${trigger} start takes durable ownership of an automatic delay before queueing`, async () => {
+    let enabled = true;
+    const fixture = createFixture({
+      allowAutomaticExecution: () => enabled,
+      packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+    });
+    const currentMetadata = automaticMetadata("Auto-cut-copyA");
+    fixture.tasks.set("running", task("running"));
+    fixture.tasks.set("waiting", task("waiting"));
+    fixture.origins.set("waiting", currentMetadata);
+    await fixture.coordinator.schedule(fixture.tasks.get("running"), metadata("Auto-cut-copyA"));
+    await fixture.coordinator.schedule(fixture.tasks.get("waiting"), currentMetadata, "automatic");
+    const actor = { type: "user", id: "tester", name: "Tester" };
+    const consent = { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true };
+    await fixture.coordinator.schedule(fixture.tasks.get("waiting"), currentMetadata, trigger, {
+      actor, autoCutRunConsent: consent,
+    });
+    assert.equal(fixture.database.getFeishuExecution("waiting").trigger, trigger);
+    assert.equal(fixture.database.getFeishuExecution("waiting").state, "queued");
+    enabled = false;
+    assert.equal(fixture.coordinator.cancelPendingAutomatic(), 0);
+    fixture.scheduler.release(fixture.scheduler.snapshot().active[0]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fixture.starts[1].trigger, trigger);
+    assert.deepEqual(fixture.starts[1].actor, actor);
+    assert.deepEqual(fixture.starts[1].autoCutRunConsent, consent);
+  });
+}
+
+test("a manually expedited automatic reservation survives restart with automatic execution disabled", async () => {
+  let enabled = true;
+  const fixture = createFixture({
+    allowAutomaticExecution: () => enabled,
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+  });
+  const currentMetadata = automaticMetadata("Auto-cut-copyA");
+  fixture.tasks.set("running", task("running"));
+  fixture.tasks.set("waiting", task("waiting"));
+  fixture.origins.set("waiting", currentMetadata);
+  await fixture.coordinator.schedule(fixture.tasks.get("running"), metadata("Auto-cut-copyA"));
+  await fixture.coordinator.schedule(fixture.tasks.get("waiting"), currentMetadata, "automatic");
+  await fixture.coordinator.schedule(fixture.tasks.get("waiting"), currentMetadata, "manual");
+  await fixture.coordinator.close();
+  enabled = false;
+  const recovered = fixture.createCoordinator();
+  await recovered.recover();
+  assert.equal(fixture.database.getFeishuExecution("waiting")?.trigger, "manual");
+  assert.equal(recovered.cancelPendingAutomatic(), 0);
+  fixture.scheduler.release(fixture.scheduler.snapshot().active[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.starts[1].trigger, "manual");
+  await recovered.close();
+});
+
+test("disabling automatic execution during package reads revokes the reservation", async (t) => {
+  for (const blockedRead of [1, 2]) {
+    await t.test(blockedRead === 1 ? "pump package read" : "launch package read", async () => {
+      let enabled = true;
+      let enter;
+      const entered = new Promise((resolve) => { enter = resolve; });
+      let proceed;
+      const waiting = new Promise((resolve) => { proceed = resolve; });
+      let reads = 0;
+      const fixture = createFixture({
+        allowAutomaticExecution: () => enabled,
+        packageStore: {
+          async get() {
+            if (++reads === blockedRead) { enter(); await waiting; }
+            return { maxConcurrent: 1 };
+          },
+        },
+      });
+      fixture.tasks.set("task-1", task("task-1"));
+      await fixture.coordinator.schedule(fixture.tasks.get("task-1"), automaticMetadata("Auto-cut-copyA"), "automatic");
+      const advancing = fixture.clock.advance(5_000);
+      await entered;
+      enabled = false;
+      proceed();
+      await advancing;
+      assert.equal(fixture.starts.length, 0);
+      assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+      assert.equal(fixture.database.getTask("task-1").status, "todo");
+      assert.equal(fixture.scheduler.snapshot().active.length, 0);
+    });
+  }
+});
+
+test("automatic resource wait rechecks the current execution policy before starting", async () => {
+  let enabled = true;
+  const fixture = createFixture({
+    allowAutomaticExecution: () => enabled,
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+  });
+  fixture.tasks.set("running", task("running"));
+  fixture.tasks.set("queued", task("queued"));
+  await fixture.coordinator.schedule(fixture.tasks.get("running"), metadata("Auto-cut-copyA"));
+  await fixture.coordinator.schedule(fixture.tasks.get("queued"), automaticMetadata("Auto-cut-copyA"), "automatic");
+  await fixture.clock.advance(5_000);
+  assert.equal(fixture.database.getTask("queued").status, "queued");
+  enabled = false;
+  fixture.scheduler.release(fixture.scheduler.snapshot().active[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fixture.starts.map((start) => start.taskId), ["running"]);
+  assert.equal(fixture.database.getTask("queued").status, "todo");
+  assert.equal(fixture.database.getFeishuExecution("queued"), null);
+  assert.equal(fixture.scheduler.snapshot().active.length, 0);
+});
+
+test("global disable cancels pending automatic reservations while preserving running and manual executions", async () => {
+  let enabled = true;
+  const fixture = createFixture({
+    allowAutomaticExecution: () => enabled,
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+  });
+  const automatic = automaticMetadata("Auto-cut-copyA");
+  for (const id of ["running", "queued", "delayed", "manual", "persisted"]) {
+    fixture.tasks.set(id, task(id));
+  }
+  await fixture.coordinator.schedule(fixture.tasks.get("running"), automatic, "automatic");
+  await fixture.clock.advance(5_000);
+  await fixture.coordinator.schedule(fixture.tasks.get("queued"), automatic, "automatic");
+  await fixture.clock.advance(5_000);
+  await fixture.coordinator.schedule(fixture.tasks.get("delayed"), automatic, "automatic");
+  await fixture.coordinator.schedule(fixture.tasks.get("manual"), metadata("Auto-cut-copyA"));
+  fixture.database.createFeishuExecution({
+    taskId: "persisted", mode: "automatic", trigger: "automatic", readyAt: fixture.clock.now() + 60_000,
+    packageAlias: "Auto-cut-copyA", packageRevision: 1,
+  });
+
+  enabled = false;
+  const cancelled = fixture.coordinator.cancelPendingAutomatic();
+  assert.equal(cancelled, 3);
+  for (const id of ["queued", "delayed", "persisted"]) {
+    assert.equal(fixture.database.getFeishuExecution(id), null);
+    assert.equal(fixture.database.getTask(id).status, "todo");
+  }
+  assert.equal(fixture.database.getFeishuExecution("running").state, "running");
+  assert.equal(fixture.database.getTask("running").status, "in_progress");
+  assert.equal(fixture.database.getFeishuExecution("manual").state, "queued");
+  assert.deepEqual(fixture.scheduler.snapshot().pending.map((entry) => entry.requestId), ["manual"]);
+
+  enabled = true;
+  await fixture.coordinator.recover();
+  await fixture.coordinator.wake();
+  await fixture.clock.advance(60_000);
+  fixture.scheduler.release(fixture.scheduler.snapshot().active[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fixture.starts.map((start) => start.taskId), ["running", "manual"]);
+});
+
+test("a cancelled automatic launch rejection cannot resurrect its reservation", async () => {
+  let enabled = true;
+  let enter;
+  const entered = new Promise((resolve) => { enter = resolve; });
+  let rejectStart;
+  const blocked = new Promise((_, reject) => { rejectStart = reject; });
+  let startCount = 0;
+  const fixture = createFixture({
+    allowAutomaticExecution: () => enabled,
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+    async beforeStart() {
+      if (++startCount === 1) { enter(); await blocked; }
+    },
+  });
+  fixture.tasks.set("task-1", task("task-1"));
+  const origin = automaticMetadata("Auto-cut-copyA");
+  await fixture.coordinator.schedule(fixture.tasks.get("task-1"), origin, "automatic");
+  const advancing = fixture.clock.advance(5_000);
+  await entered;
+  enabled = false;
+  assert.equal(fixture.coordinator.cancelPendingAutomatic(), 1);
+  rejectStart(Object.assign(new Error("launch preparation failed"), { code: "FIXTURE_START_FAILED" }));
+  await advancing;
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  assert.equal(fixture.scheduler.snapshot().active.length, 0);
+  enabled = true;
+  await fixture.clock.advance(60_000);
+  assert.equal(startCount, 1);
+  await fixture.coordinator.schedule(fixture.tasks.get("task-1"), origin, "automatic");
+  assert.equal(fixture.database.getFeishuExecution("task-1")?.state, "delayed");
+  await fixture.clock.advance(5_000);
+  assert.equal(startCount, 2);
+  assert.equal(fixture.database.getFeishuExecution("task-1").state, "running");
+});
+
+test("an automatic-disabled launch error revokes execution instead of retrying", async () => {
+  const fixture = createFixture({
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1 } },
+    startError: Object.assign(new Error("disabled during startup"), { code: "AUTOMATIC_EXECUTION_DISABLED" }),
+  });
+  fixture.tasks.set("task-1", task("task-1"));
+  await fixture.coordinator.schedule(fixture.tasks.get("task-1"), automaticMetadata("Auto-cut-copyA"), "automatic");
+  await fixture.clock.advance(5_000);
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  assert.equal(fixture.database.getTask("task-1").status, "todo");
+  await fixture.clock.advance(60_000);
+  assert.equal(fixture.starts.length, 1);
+});
+
+test("a disabled policy revokes an automatic launch even when its package became disabled", async () => {
+  let enabled = true;
+  let reads = 0;
+  const fixture = createFixture({
+    allowAutomaticExecution: () => enabled,
+    packageStore: {
+      async get() {
+        if (++reads === 2) {
+          enabled = false;
+          return { state: "disabled" };
+        }
+        return { state: "enabled" };
+      },
+    },
+  });
+  fixture.tasks.set("task-1", task("task-1"));
+  await fixture.coordinator.schedule(fixture.tasks.get("task-1"), automaticMetadata("Auto-cut-copyA"), "automatic");
+  await fixture.clock.advance(5_000);
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  assert.equal(fixture.database.getTask("task-1").status, "todo");
+  assert.equal(fixture.starts.length, 0);
+});
+
+test("disabled recovery immediately cancels automatic reservations with future deadlines", async () => {
+  const fixture = createFixture({ allowAutomaticExecution: () => false });
+  fixture.tasks.set("task-1", task("task-1"));
+  fixture.origins.set("task-1", automaticMetadata("Auto-cut-copyA"));
+  fixture.database.createFeishuExecution({
+    taskId: "task-1", mode: "automatic", trigger: "automatic", readyAt: fixture.clock.now() + 60_000,
+    packageAlias: "Auto-cut-copyA", packageRevision: 1,
+  });
+  await fixture.coordinator.recover();
+  assert.equal(fixture.database.getFeishuExecution("task-1"), null);
+  assert.equal(fixture.requestCount, 0);
 });
 
 test("delayed automatic execution is cancelled when its trusted origin is removed", async () => {

@@ -39,6 +39,7 @@ import { ProjectSummaryService } from "./project-summary.mjs";
 import { codexInvocation } from "../shared/codex-invocation.mjs";
 import { createFeishuWorkflowStore, subjectProjectId } from "./feishu-workflow-store.mjs";
 import { STAGE_IDS } from "./feishu-workflow-stages.mjs";
+import { feishuStageTaskTitle, TASK_TITLE_MAX_LENGTH } from "./feishu-task-title.mjs";
 import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 import { createResourceScheduler } from "./resource-scheduler.mjs";
 import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator.mjs";
@@ -479,6 +480,11 @@ async function sendFetchResponse(response, upstream) {
 
 function normalizeHostname(hostname) {
   return hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+function isLoopbackHostname(hostname) {
+  const host = normalizeHostname(hostname);
+  return host === "localhost" || host === "::1" || (isIP(host) === 4 && host.split(".")[0] === "127");
 }
 
 function isTrustedNetworkHost(hostname) {
@@ -1116,7 +1122,7 @@ function parseTaskCreate(body) {
   const projectId = validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID);
   const task = {
     projectId,
-    title: stringField(body.title, "title", { required: true, maxLength: 240 }),
+    title: stringField(body.title, "title", { required: true, maxLength: TASK_TITLE_MAX_LENGTH }),
     description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
     status: parseStatus(body.status, "backlog"),
     priority: parsePriority(body.priority, "none"),
@@ -1148,7 +1154,7 @@ function parseTaskPatch(body) {
   const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
   const changes = {};
   if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
-  if (body.title !== undefined) changes.title = stringField(body.title, "title", { required: true, maxLength: 240 });
+  if (body.title !== undefined) changes.title = stringField(body.title, "title", { required: true, maxLength: TASK_TITLE_MAX_LENGTH });
   if (body.description !== undefined) changes.description = stringField(body.description, "description", { maxLength: 100_000 });
   if (body.status !== undefined) changes.status = parseStatus(body.status);
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
@@ -2927,7 +2933,12 @@ export function createTaskboardServer(options = {}) {
     };
     const taskInput = {
       projectId: subjectProjectId(binding.subjectKey),
-      title: `${subjectVersion.tableName ?? "Auto-Cut"} · ${event.recordId} · ${stage.nameSuffix}`,
+      title: feishuStageTaskTitle({
+        tableName: subjectVersion.tableName,
+        recordId: event.recordId,
+        nameSuffix: stage.nameSuffix,
+        namingDisplayValue: controlledContext.namingDisplayValue,
+      }),
       description: `${feishuTaskDescriptionMarker(marker)}\n\n${subjectVersion.tableName ?? "Auto-Cut"} ${stage.nameSuffix}`,
       status: "todo",
       priority: "high",
@@ -2959,9 +2970,19 @@ export function createTaskboardServer(options = {}) {
     }
   }
   const resourceScheduler = options.resourceScheduler ?? createResourceScheduler();
-  const allowAutomaticExecution = options.allowAutomaticExecution === undefined
+  const automaticExecutionDefault = options.allowAutomaticExecution === undefined
     ? resolveAutomaticExecution()
     : options.allowAutomaticExecution === true;
+  function automaticExecutionEnabled() {
+    try { return database.getAutomaticExecutionSetting(automaticExecutionDefault).enabled; }
+    catch { return false; }
+  }
+  function assertAutomaticStartAllowed(trigger, expectedVersion = null) {
+    if (trigger === "automatic" && (!automaticExecutionEnabled()
+      || (expectedVersion !== null && database.getAutomaticExecutionSetting(automaticExecutionDefault).version !== expectedVersion))) {
+      throw new ApiError(409, "AUTOMATIC_EXECUTION_DISABLED", "Automatic execution is disabled in local settings");
+    }
+  }
   const taskStartAbortController = new AbortController();
   const taskStartOperations = new Set();
   let closing = false;
@@ -4376,6 +4397,7 @@ export function createTaskboardServer(options = {}) {
   }
 
   function requireCurrentExecutionContext(taskId, trigger) {
+    assertAutomaticStartAllowed(trigger);
     const task = database.getTask(taskId);
     const metadata = currentExecutionMetadata(task, trigger);
     if (!task || !metadata) {
@@ -4637,7 +4659,20 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
-  async function prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig) {
+  function cancelPreparedAutomaticRun(run, claimedTask, actor, error) {
+    database.markFeishuAutoCutRunBlocked(run.id, error);
+    database.updateAiChatRun(run.id, {
+      status: "interrupted", exitCode: 1, error: error.message,
+      finishedAt: new Date().toISOString(),
+    });
+    aiChat.publishLocalRun(run.id);
+    const task = database.releaseTaskFromAiStart(claimedTask.id, claimedTask.claimToken, actor);
+    clearFeishuExecutionAfterRun(claimedTask.id);
+    events.emit("task.updated", { task });
+  }
+
+  async function prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig, assertStartAllowed) {
+    assertStartAllowed();
     const threadId = randomUUID();
     const project = database.getProject(claimedTask.projectId);
     if (!project) {
@@ -4711,6 +4746,7 @@ export function createTaskboardServer(options = {}) {
         bridgeSecret: resolved.feishuBridgeSecret,
         origin,
       });
+      assertStartAllowed();
       const prepared = await prepareFeishuRunInputs({
         dataDirectory: resolved.dataDirectory,
         task: boundTask,
@@ -4720,6 +4756,7 @@ export function createTaskboardServer(options = {}) {
         packageSnapshot,
         controlledContext,
       });
+      assertStartAllowed();
       aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "complete" });
       return {
         task: database.getTask(boundTask.id),
@@ -4728,6 +4765,10 @@ export function createTaskboardServer(options = {}) {
         autoCutRun: database.markFeishuAutoCutRunPrepared(run.id, prepared),
       };
     } catch (error) {
+      if (error?.code === "AUTOMATIC_EXECUTION_DISABLED") {
+        cancelPreparedAutomaticRun(run, claimedTask, actor, error);
+        throw error;
+      }
       const failure = blockedPreparationError(error);
       database.markFeishuAutoCutRunBlocked(run.id, failure);
       aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "failed" });
@@ -4759,12 +4800,17 @@ export function createTaskboardServer(options = {}) {
     lease,
     trigger,
     autoCutRunConsent = null,
+    assertStartAllowed = () => assertAutomaticStartAllowed(trigger),
   ) {
     let prepared;
     try {
-      prepared = await prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig);
+      prepared = await prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig, assertStartAllowed);
+      assertStartAllowed();
       database.updateFeishuAutoCutRun(prepared.run.id, { state: "running" });
     } catch (error) {
+      if (prepared && error?.code === "AUTOMATIC_EXECUTION_DISABLED") {
+        cancelPreparedAutomaticRun(prepared.run, claimedTask, actor, error);
+      }
       resourceScheduler.release(lease);
       if (error?.feishuAutoCutPreparationBlocked !== true) {
         try {
@@ -4863,13 +4909,10 @@ export function createTaskboardServer(options = {}) {
       autoCutRunConsent = null,
     } = {},
   ) {
-    if (trigger === "automatic" && !allowAutomaticExecution) {
-      throw new ApiError(
-        409,
-        "AUTOMATIC_EXECUTION_DISABLED",
-        "Automatic Codex execution is disabled by the local policy",
-      );
-    }
+    assertAutomaticStartAllowed(trigger);
+    const policyVersion = trigger === "automatic"
+      ? database.getAutomaticExecutionSetting(automaticExecutionDefault).version : null;
+    const assertStartAllowed = () => assertAutomaticStartAllowed(trigger, policyVersion);
     assertTaskStartAllowed(signal);
     const packages = await feishuPackages.read();
     assertTaskStartAllowed(signal);
@@ -4926,6 +4969,7 @@ export function createTaskboardServer(options = {}) {
       throw new ApiError(409, "PACKAGE_DISABLED", "Auto-Cut package is disabled and cannot start");
     }
     const finalContext = requireCurrentExecutionContext(task.id, trigger);
+    assertStartAllowed();
     if (finalContext.metadata.packageAlias !== metadata.packageAlias) {
       throw new ApiError(409, "TASK_NOT_STARTABLE", "Task execution package changed during startup");
     }
@@ -4945,6 +4989,7 @@ export function createTaskboardServer(options = {}) {
     try {
       if (!lease) lease = await resourceScheduler.request(execution);
       assertTaskStartAllowed(signal);
+      assertStartAllowed();
       const useLocalAutoCut = isPhasedAutoCutOrigin(metadata)
         && (trigger === "automatic" || (
           trigger === "retry"
@@ -4962,6 +5007,7 @@ export function createTaskboardServer(options = {}) {
         lease,
         trigger,
         autoCutRunConsent,
+        assertStartAllowed,
       );
     } catch (error) {
       if (lease) resourceScheduler.release(lease);
@@ -4982,7 +5028,7 @@ export function createTaskboardServer(options = {}) {
     database,
     packageStore: feishuPackages,
     scheduler: resourceScheduler,
-    allowAutomaticExecution,
+    allowAutomaticExecution: automaticExecutionEnabled,
     resolveCurrentMetadata: (task, { trigger } = {}) => currentExecutionMetadata(task, trigger),
     onTaskUpdated: (task) => events.emit("task.updated", { task }),
     startClaimedTask: (
@@ -5215,6 +5261,40 @@ export function createTaskboardServer(options = {}) {
         assertAiLoopbackRequest(request);
       } else if (pathname.startsWith("/api/local/")) {
         assertLoopbackRequest(request);
+      }
+      if (pathname === "/api/local/settings/automatic-execution") {
+        assertNoQuery(url.searchParams, pathname);
+        const host = parseRequestHost(request.headers.host);
+        if (!isLoopbackHostname(host.hostname)) throw new ApiError(403, "INVALID_HOST", "Local settings require a loopback Host");
+        const origin = request.headers.origin;
+        if (origin && origin !== "app://-") {
+          let originUrl;
+          try { originUrl = new URL(origin); } catch {}
+          if (!originUrl || !["http:", "https:"].includes(originUrl.protocol)
+            || !isLoopbackHostname(originUrl.hostname)) {
+            throw new ApiError(403, "INVALID_ORIGIN", "Local settings require a loopback Origin");
+          }
+        }
+        if (origin === "app://-" && !resolved.instanceToken) {
+          throw new ApiError(403, "INVALID_ORIGIN", "Local settings require a verified launcher");
+        }
+        if (request.method === "GET") {
+          return sendJson(response, 200, { setting: database.getAutomaticExecutionSetting(automaticExecutionDefault) });
+        }
+        if (request.method === "PUT") {
+          if (request.headers["x-taskboard-client"] !== "web") throw new ApiError(403, "LOCAL_SETTINGS_CLIENT_REQUIRED", "Local settings require an explicit web request");
+          if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+            throw new ApiError(415, "JSON_REQUIRED", "Local settings require JSON");
+          }
+          const input = await readJson(request);
+          assertPlainObject(input);
+          assertAllowedKeys(input, new Set(["enabled", "expectedVersion"]));
+          const setting = database.saveAutomaticExecutionSetting(input.expectedVersion, input.enabled, automaticExecutionDefault);
+          if (!setting.enabled) executionCoordinator.cancelPendingAutomatic();
+          events.emit("automatic-execution.updated", { setting });
+          return sendJson(response, 200, { setting });
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
       }
       if (pathname === "/api/local/autocut/packages"
         || pathname.startsWith("/api/local/autocut/packages/")) {
@@ -5533,7 +5613,7 @@ export function createTaskboardServer(options = {}) {
           capabilities: {
             localAiChat: !configuredTrustedRequest
               && isLoopbackAddress(request.socket.remoteAddress),
-            automaticExecution: allowAutomaticExecution,
+            automaticExecution: automaticExecutionEnabled(),
           },
           ...(capabilityCloudConfig?.remoteUrl
             ? {
@@ -5981,7 +6061,7 @@ export function createTaskboardServer(options = {}) {
           const result = await createCanonicalFeishuStageTask(registration, actor);
           const task = result.task;
           events.emit(result.created ? "task.created" : "task.updated", { task });
-          if (allowAutomaticExecution && ["todo", "queued"].includes(task.status)) {
+          if (automaticExecutionEnabled() && ["todo", "queued"].includes(task.status)) {
             const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
             if (metadata && executionModeForMetadata(metadata) === "automatic") {
               assertTaskStartAllowed();
@@ -6116,7 +6196,7 @@ export function createTaskboardServer(options = {}) {
             assignee: resolveAssignee(assigneeTarget, actor),
           });
           events.emit("task.created", { task });
-          if (allowAutomaticExecution && !closing) {
+          if (automaticExecutionEnabled() && !closing) {
             const metadata = parseFeishuTaskMetadata(task.description);
             if (metadata && trustedFeishuTaskOrigin(task) && executionModeForMetadata(metadata) === "automatic") {
               void startTrackedTask(task.id, () => executionCoordinator.schedule(

@@ -500,7 +500,20 @@ export function createBridgeServer({
         }
       }
       if (request.method === "POST" && url.pathname === "/api/simulate/record-changed") {
-        if (simulationEnabled !== true) {
+        let simulationAllowed;
+        try {
+          simulationAllowed = typeof simulationEnabled === "function"
+            ? await simulationEnabled()
+            : simulationEnabled;
+        } catch {
+          return sendJson(response, 503, {
+            error: {
+              code: "SIMULATION_POLICY_UNAVAILABLE",
+              message: "Cannot verify the current automatic execution setting",
+            },
+          });
+        }
+        if (simulationAllowed !== true) {
           return sendJson(response, 403, {
             error: { code: "SIMULATION_DISABLED", message: "Simulated events are disabled" },
           });

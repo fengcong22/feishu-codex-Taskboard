@@ -33,6 +33,7 @@ export interface FeishuWorkflowPanelProps {
   configurationBaseToken: string | null;
   selectedSubjectKey: string | null;
   allowAutomaticExecution?: boolean;
+  onOpenLocalSettings?: () => void;
   /** Select a subject; the second flag controls whether to open its task board. */
   onSelectSubject: (subjectKey: string, openProject?: boolean) => void;
   onCatalogChange: (catalog: FeishuBaseCatalog[]) => void;
@@ -323,6 +324,7 @@ export function FeishuWorkflowPanel({
   configurationBaseToken,
   selectedSubjectKey,
   allowAutomaticExecution,
+  onOpenLocalSettings,
   onSelectSubject,
   onCatalogChange,
   onSubjectChange,
@@ -840,6 +842,7 @@ export function FeishuWorkflowPanel({
               ? "本机自动执行总开关：已关闭。即使选择自动，也不会自动启动任务，需手动开始。"
               : "本机自动执行总开关：状态未知。暂时无法确认是否允许自动启动任务。"}
         </p>
+        {onOpenLocalSettings && <button className="button secondary" type="button" onClick={onOpenLocalSettings}>修改本机总开关</button>}
       </fieldset>
       {phased && subjectForm.stages && <section className="feishu-phased-settings" aria-label="分阶段素材配置">
         <fieldset disabled={busy}>
