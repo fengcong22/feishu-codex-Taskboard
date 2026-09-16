@@ -1450,7 +1450,14 @@ test("share import asks the loopback Bridge for live diagnostics and merges loca
     assert.ok(result.body.diagnostics.some((entry) => entry.code === "FIELD_NOT_FOUND"));
     assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE"));
     assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_WORKSPACE_PATH_UNBOUND"));
-    assert.equal(result.body.diagnostics.some((entry) => entry.code === "UPLOAD_TARGET_PATH_UNBOUND"), false);
+    assert.deepEqual(
+      result.body.diagnostics
+        .filter((entry) => entry.code === "UPLOAD_TARGET_PATH_UNBOUND")
+        .map((entry) => entry.path),
+      ["initial", "first_review", "final_review"].map((stageId) => (
+        `bases.bas_share.subjects.tbl_subject.stages.${stageId}.artifactTargetPath`
+      )),
+    );
     assert.ok(result.body.diagnostics.some((entry) => (
       entry.code === "FIELD_NOT_FOUND"
       && entry.path === "bases.bas_share.subjects.tbl_subject.stages.first_review.videoSource.fieldId"

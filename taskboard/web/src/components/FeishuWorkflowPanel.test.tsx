@@ -390,6 +390,114 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
   });
 });
 
+describe("FeishuWorkflowPanel upload destinations", () => {
+  afterEach(() => cleanup());
+
+  function configuredSubject(kind: "phased" | "legacy" = "phased") {
+    const configured = kind === "phased" ? subject("history", "高中历史") : legacySubject("history", "高中历史");
+    if (kind === "legacy") configured.metadata = { fields: [] };
+    else {
+      configured.documentField = { fieldId: "fld_text", fieldName: "普通文本" };
+      configured.namingField = { fieldId: "fld_text", fieldName: "普通文本" };
+      configured.stages!.first_review.artifactTargetPath = null;
+      configured.stages!.final_review.artifactTargetPath = null;
+    }
+    configured.packageRoute!.packageAlias = "Auto-cut-A";
+    configured.upload!.enqueueMode = "automatic";
+    return configured;
+  }
+
+  function panelProps(configured: FeishuSubjectConfig) {
+    vi.mocked(listFeishuPackages).mockResolvedValueOnce([{
+      alias: "Auto-cut-A", name: "Auto-Cut A", projectId: "auto-cut-a", workspacePath: null,
+      model: null, reasoningEffort: null, prompt: null, zipSourceDirectory: null,
+      maxConcurrent: 1, state: "enabled", revision: 1, updatedAt: "2026-09-16T00:00:00.000Z",
+      referenceCount: 0, references: [],
+    }]);
+    return {
+      catalog: catalog(configured),
+      configurationBaseToken: "bas_test",
+      selectedSubjectKey: configured.subjectKey,
+      onSelectSubject: vi.fn(),
+      onCatalogChange: vi.fn(),
+      onSubjectChange: vi.fn(),
+    };
+  }
+
+  it("enables automatic phased upload with only enabled stage destinations", async () => {
+    const configured = configuredSubject();
+    const onEnable = vi.fn(async () => configured);
+    render(<FeishuWorkflowPanel {...panelProps(configured)} onEnable={onEnable} />);
+
+    const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
+    await waitFor(() => expect(enable.disabled).toBe(false));
+    fireEvent.click(enable);
+    await waitFor(() => expect(onEnable).toHaveBeenCalledWith(configured));
+    expect(configured.upload).toMatchObject({ targetId: null, targetPath: null });
+  });
+
+  it.each(["initial", "first_review", "final_review"] as const)("requires the enabled %s destination for automatic upload", async (stageId) => {
+    const configured = configuredSubject();
+    configured.stages![stageId].enabled = true;
+    configured.stages![stageId].artifactTargetPath = null;
+    render(<FeishuWorkflowPanel {...panelProps(configured)} />);
+
+    const labels = { initial: "初稿", first_review: "初审修改", final_review: "终审修改" };
+    const reason = `${labels[stageId]}需要 ZIP 目标目录`;
+    expect(screen.getByText(reason)).toBeTruthy();
+    const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
+    await waitFor(() => expect(enable.getAttribute("title")).toBe(reason));
+    expect(enable.disabled).toBe(true);
+  });
+
+  it("does not require stage destinations for manual upload", async () => {
+    const configured = configuredSubject();
+    configured.upload!.enqueueMode = "manual";
+    configured.stages!.initial.artifactTargetPath = null;
+    render(<FeishuWorkflowPanel {...panelProps(configured)} />);
+
+    expect(screen.queryByText("初稿需要 ZIP 目标目录")).toBeNull();
+    await waitFor(() => expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it("keeps the common destination required for legacy automatic upload", async () => {
+    const configured = configuredSubject("legacy");
+    render(<FeishuWorkflowPanel {...panelProps(configured)} />);
+
+    expect(screen.getByRole("textbox", { name: "上传路径" })).toBeTruthy();
+    const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
+    await waitFor(() => expect(enable.getAttribute("title")).toBe("请填写上传路径"));
+    expect(enable.disabled).toBe(true);
+  });
+
+  it.each(["phased", "legacy"] as const)("preserves historical upload settings without an alias input for %s subjects", async (kind) => {
+    const configured = configuredSubject(kind);
+    configured.upload = {
+      ...configured.upload!,
+      artifactSourceMode: "driver_report",
+      artifactSourcePath: "C:\\approved\\output",
+      targetId: "historical-upload",
+      targetPath: "C:\\approved\\historical-target",
+    };
+    const onSaveDraft = vi.fn(async (_subjectKey: string, _patch: unknown) => configured);
+    render(<FeishuWorkflowPanel {...panelProps(configured)} onSaveDraft={onSaveDraft} />);
+
+    expect(screen.queryByRole("textbox", { name: "上传目标别名" })).toBeNull();
+    const commonPath = screen.queryByRole("textbox", { name: "上传路径" });
+    if (kind === "phased") {
+      expect(commonPath).toBeNull();
+      expect((screen.getByRole("textbox", { name: "初稿 ZIP 目标目录" }) as HTMLInputElement).value).toBe(stage.artifactTargetPath);
+    } else expect((commonPath as HTMLInputElement).value).toBe(configured.upload.targetPath);
+    expect((screen.getByRole("textbox", { name: "ZIP 来源根目录" }) as HTMLInputElement).value).toBe(configured.upload.artifactSourcePath);
+    expect(screen.getByRole("combobox", { name: "上传入队" })).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("spinbutton", { name: "上传并发数" }), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+    expect(onSaveDraft.mock.calls[0][1]).toMatchObject({ upload: { ...configured.upload, uploadConcurrency: 2 } });
+  });
+});
+
 describe("FeishuWorkflowPanel audio drafts", () => {
   afterEach(() => cleanup());
 
@@ -959,59 +1067,6 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(screen.queryByText("初审修改需要 ZIP 目标目录")).toBeNull();
     expect(screen.queryByText("终审修改需要 ZIP 目标目录")).toBeNull();
     expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(false);
-  });
-
-  it("blocks enable when automatic upload has no subject-level upload path", async () => {
-    vi.mocked(listFeishuPackages).mockResolvedValueOnce([{
-      alias: "Auto-cut-A",
-      name: "Auto-Cut A",
-      projectId: "auto-cut-a",
-      workspacePath: null,
-      model: null,
-      reasoningEffort: null,
-      prompt: null,
-      zipSourceDirectory: null,
-      maxConcurrent: 1,
-      state: "enabled",
-      revision: 1,
-      updatedAt: "2026-09-13T00:00:00.000Z",
-      referenceCount: 0,
-      references: [],
-    }]);
-    const configured = subject("automatic-missing-upload", "缺少上传路径");
-    configured.packageRoute = {
-      routeMode: configured.packageRoute?.routeMode ?? "fixed",
-      packageAlias: "Auto-cut-A",
-      subjectCodeFieldId: configured.packageRoute?.subjectCodeFieldId ?? null,
-      branchMap: configured.packageRoute?.branchMap ?? null,
-    };
-    configured.documentField = { fieldId: "fld_text", fieldName: "普通文本" };
-    configured.namingField = { fieldId: "fld_text", fieldName: "普通文本" };
-    configured.upload = {
-      enqueueMode: "automatic",
-      artifactSourceMode: configured.upload?.artifactSourceMode ?? "manual_select",
-      artifactSourcePath: configured.upload?.artifactSourcePath ?? null,
-      targetId: "local-upload",
-      targetPath: null,
-      uploadConcurrency: configured.upload?.uploadConcurrency ?? 1,
-    };
-    configured.stages!.first_review.artifactTargetPath = null;
-    configured.stages!.final_review.artifactTargetPath = null;
-
-    render(<FeishuWorkflowPanel
-      catalog={catalog(configured)}
-      configurationBaseToken="bas_test"
-      selectedSubjectKey="automatic-missing-upload"
-      onSelectSubject={vi.fn()}
-      onCatalogChange={vi.fn()}
-      onSubjectChange={vi.fn()}
-    />);
-
-    await waitFor(() => {
-      const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
-      expect(enable.disabled).toBe(true);
-      expect(enable.getAttribute("title")).toBe("请填写上传路径");
-    });
   });
 
   it("keeps audio drafts isolated by subject and stage and saves only the active source", async () => {
