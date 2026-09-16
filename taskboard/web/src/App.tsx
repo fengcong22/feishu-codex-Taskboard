@@ -857,6 +857,7 @@ export function App() {
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
   const [manageTaskboardSkillPath, setManageTaskboardSkillPath] = useState("");
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
+  const localSettingsAvailable = taskboardMetadata !== null && taskboardMetadata.mode !== "cloud";
   const [localSettingsOpen, setLocalSettingsOpen] = useState(false);
   const [localSettingsRevision, setLocalSettingsRevision] = useState(0);
   const applyAutomaticExecutionSettings = useCallback((settings: import("./types").AutomaticExecutionSettings) => {
@@ -4643,12 +4644,6 @@ export function App() {
 
           <div className="nav-spacer" />
           <div className="nav-footer">
-            {taskboardMetadata?.mode === "local" && (
-              <button className="theme-toggle" type="button" onClick={() => setLocalSettingsOpen(true)}>
-                <span aria-hidden="true"><LinearIcon name="displayOptions" /></span>
-                {text("本机设置", "Local settings")}
-              </button>
-            )}
             <div className={`connection connection-${connection}`}>
               <span aria-hidden="true" />
               {connection === "live"
@@ -4828,6 +4823,12 @@ export function App() {
           <div ref={dragRegionRef} className="workspace-drag-region" aria-hidden="true" />
 
           <div className="header-actions">
+            {localSettingsAvailable && (
+              <button className="button secondary local-settings-entry" type="button" onClick={() => setLocalSettingsOpen(true)}>
+                <LinearIcon name="displayOptions" />
+                {text("本机设置", "Local settings")}
+              </button>
+            )}
             {selectedProject && boardView !== "autocut_packages" && (
               <ProjectAutomationMenu
                 automation={selectedProjectAutomation}
@@ -5328,7 +5329,7 @@ export function App() {
               configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
               allowAutomaticExecution={taskboardMetadata?.capabilities?.automaticExecution}
-              onOpenLocalSettings={taskboardMetadata?.mode === "local" ? () => setLocalSettingsOpen(true) : undefined}
+              onOpenLocalSettings={localSettingsAvailable ? () => setLocalSettingsOpen(true) : undefined}
               onSelectSubject={(subjectKey, openProject = true) => {
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (!subject) return;
@@ -5541,7 +5542,7 @@ export function App() {
         </div>
       )}
 
-      {localSettingsOpen && taskboardMetadata?.mode === "local" && (
+      {localSettingsOpen && localSettingsAvailable && (
         <LocalSettingsDialog
           revision={localSettingsRevision}
           onSettingsChange={applyAutomaticExecutionSettings}
