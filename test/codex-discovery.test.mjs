@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, open, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, open, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ test("Codex discovery validates real CLI candidates in an isolated fresh Windows
   skip: process.platform !== "win32",
   timeout: 120_000,
 }, async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "codex-discovery-"));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "codex-discovery-")));
   try {
     const template = await compileCodexFixture(directory);
     const environment = {
