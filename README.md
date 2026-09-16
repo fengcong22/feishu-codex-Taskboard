@@ -22,6 +22,8 @@ flowchart LR
 
 ## Auto-Cut 执行环境与制品登记
 
+phased 任务的 ZIP 根目录优先使用任务冻结包快照中的 `zipSourceDirectory`（兼容 `artifactSourcePath`）。包未配置该可选字段时，使用同一任务 `configVersion` 冻结学科配置中 `upload.artifactSourceMode = driver_report` 的 `upload.artifactSourcePath`。生成和制品登记使用同一规则，显式无效路径仍会阻断，登记仍要求 ZIP 根目录与该冻结学科来源一致；不会改用当前配置、工作区或上传目标路径，也不会改写旧任务快照。
+
 通过所有自动执行门禁的 phased 任务（包含重启恢复的预约）直接使用 Taskboard 已有的本机 Auto-Cut runner。runner 读取当前 Windows 用户 `%LOCALAPPDATA%/Auto-Cut/auto-cut-lite/deployment-report.json`，核对 `workspace_root` 与白名单项目包相符，使用报告内固定 Python 和 runtime 中的 `scripts/jy_wrapper.py`。已有双项授权重试也使用该 runner；手动启动和未携带授权的重试仍走原 Codex 流程。
 
 启动前检查在与 runner 相同的 Windows 账号、环境和访问权限下执行，默认最多 30 秒：
@@ -179,6 +181,8 @@ Set-Location ..
 删除包会保留历史任务、服务端来源登记、不可变配置快照及事件去重记录。恢复服务端登记的飞书任务时，原包别名必须仍存在且处于 `enabled`；包已删除、禁用或为草稿时，接口返回受控冲突并提示先配置、启用原包。恢复不会更新历史快照或安排执行，普通任务或复制描述标记的任务也不会因此获得执行权限。
 
 ## 团队交接与健康检查
+
+针对 Windows 升级后 `EBUSY rmdir` 和 `packageSnapshot.zipSourceDirectory is invalid` 的修复及原地更新步骤，见 [Windows 升级问题修复与验收](./docs/windows-upgrade-followup.zh-CN.md)。临时 AI 目录查询在成功和失败时都会等待子进程 `close`，并等待并行模型/技能探测全部结束后返回；超出退出宽限期的技能子进程会被强制终止。`npm test` 不跳过 Windows 用例，也不通过重复删除临时目录隐藏未退出的子进程。
 
 需要让目标电脑上的 Codex 完成 Windows 源码部署，并接入使用者自己的飞书应用，请把 [给 Codex 的 Windows 源码部署 Runbook](./docs/windows-source-install-guide.zh-CN.md) 交给目标电脑上已经可用的 Codex 执行。Runbook 不安装、更新、登录或修复 Codex；源码部署另行要求 Git for Windows 和 Node.js 22.13 或更高版本。它不共享本机凭据、Codex 登录态、路径或运行状态，遇到飞书权限、秘密和真实业务数据时会暂停交还本人。
 

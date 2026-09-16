@@ -110,6 +110,7 @@ async function createFixture({
   autoCutRunner = undefined,
   localAutoCutArtifactReportTimeoutMs = undefined,
   processEnvironmentOverrides = {},
+  packageZipSourceDirectory = undefined,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-autocut-lifecycle-"));
   const workspacePath = path.join(directory, "workspace");
@@ -179,7 +180,7 @@ if (args[0] === "debug") {
           name: "Auto-Cut Lite",
           projectId: "autocut-lite",
           workspacePath,
-          zipSourceDirectory,
+          zipSourceDirectory: packageZipSourceDirectory === undefined ? zipSourceDirectory : packageZipSourceDirectory,
           prompt: "trusted package prompt",
           state: "enabled",
           revision: 1,
@@ -399,6 +400,61 @@ test("an initial automatic phased run completes locally without Codex or taskctl
     assert.equal(fixture.app.database.getTaskAiStartForArtifactReport(task.id, run.runId), null);
     await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
   } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("an automatic phased run with no package ZIP directory uses its frozen subject source through artifact verification", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/frozen-zip-source"],
+    namingDisplayValue: "冻结来源目录",
+    namingValueUnique: true,
+  };
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const invocations = [];
+  const fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    packageZipSourceDirectory: null,
+    autoCutRunner: async ({ run }) => {
+      invocations.push(run);
+      await writePassingRunResult(run);
+    },
+  });
+  fixture.bridge.holdResponses(gate);
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const snapshot = fixture.app.database.getFeishuTaskPackageSnapshot(created.body.task.id);
+    assert.equal(snapshot.zipSourceDirectory, undefined);
+    await waitForRun(fixture.app, created.body.task.id, 8_000);
+    const newerSource = path.join(fixture.directory, "newer-source");
+    await mkdir(newerSource);
+    const changed = await jsonRequest(fixture.baseUrl, `/api/local/feishu/workflow/subjects/${encodeURIComponent(SUBJECT_KEY)}`, {
+      upload: { ...subject.upload, artifactSourcePath: newerSource },
+    }, { method: "PATCH" });
+    assert.equal(changed.response.status, 200, JSON.stringify(changed.body));
+    release();
+    const deadline = Date.now() + 8_000;
+    let task;
+    do {
+      task = fixture.app.database.getTask(created.body.task.id);
+      if (["done", "blocked"].includes(task.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (Date.now() < deadline);
+    const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
+    assert.equal(task.status, "done", `${run.errorCode}: ${run.errorMessage}`);
+    assert.equal(run.state, "completed");
+    assert.equal(invocations.length, 1);
+    assert.equal(run.packageZipPath, path.join(fixture.zipSourceDirectory, ".taskboard-autocut", task.id, run.runId, `${run.artifactName}.zip`));
+    assert.equal(fixture.app.database.getTaskArtifactForRun(task.id, run.runId).validationStatus, "verified");
+    assert.deepEqual(fixture.app.database.getFeishuTaskPackageSnapshot(task.id), snapshot);
+  } finally {
+    release();
     await fixture.app.close();
     await fixture.bridge.close();
     await rm(fixture.directory, { recursive: true, force: true });
@@ -666,7 +722,8 @@ for (const [failure, expectedCode] of [
   });
 }
 
-test("an authorized phased retry runs locally without starting another Codex turn", async () => {
+for (const missingPackageZipDirectory of [false, true]) {
+test(`an authorized phased retry runs locally without starting another Codex turn${missingPackageZipDirectory ? " with a frozen subject ZIP source" : ""}`, async () => {
   const controlledContext = {
     documentLinks: ["https://guanghe.feishu.cn/docx/taskboard-owned-runner"],
     namingDisplayValue: "课程000",
@@ -677,6 +734,7 @@ test("an authorized phased retry runs locally without starting another Codex tur
   fixture = await createFixture({
     controlledContext,
     allowAutomaticExecution: true,
+    packageZipSourceDirectory: missingPackageZipDirectory ? null : undefined,
     autoCutRunner: async ({ run }) => {
       invocations.push(run.runId);
       await writePassingRunResult(run);
@@ -736,6 +794,7 @@ test("an authorized phased retry runs locally without starting another Codex tur
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });
+}
 
 test("local runner receives deadline options without inheriting Taskboard launcher variables", async () => {
   const controlledContext = {
