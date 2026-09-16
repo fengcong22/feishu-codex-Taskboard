@@ -1,8 +1,12 @@
 param(
-  [switch]$RequireFeishu
+  [switch]$RequireFeishu,
+  [switch]$DependenciesOnly
 )
 
 $ErrorActionPreference = 'Stop'
+if ($DependenciesOnly -and $RequireFeishu) {
+  throw '-DependenciesOnly cannot be combined with -RequireFeishu.'
+}
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $config = if ($env:BRIDGE_CONFIG) { $env:BRIDGE_CONFIG } else { Join-Path $root 'config\bridge.local.json' }
@@ -23,6 +27,18 @@ $nodeMajor = [int]$Matches[1]
 $nodeMinor = [int]$Matches[2]
 if ($nodeMajor -lt 22 -or ($nodeMajor -eq 22 -and $nodeMinor -lt 13)) {
   throw "Node.js >= 22.13 is required (found $nodeVersionOutput)."
+}
+
+. (Join-Path $PSScriptRoot 'codex-discovery.ps1')
+$codexExecutable = Resolve-CodexExecutable -ExplicitExecutable $env:CODEX_EXECUTABLE
+if ([string]::IsNullOrWhiteSpace($codexExecutable)) {
+  throw 'A usable Codex CLI was not found. Automatic discovery checked PATH, Codex Desktop CLI directories and npm vendor locations. An existing custom CLI may be supplied with CODEX_EXECUTABLE for this process; it must report a codex-cli version with --version.'
+}
+if ($DependenciesOnly) {
+  Write-Host "Node: $nodeVersionOutput"
+  Write-Host 'Codex CLI: ok (--version verified)'
+  Write-Host 'Local dependency check passed; services and Feishu were not checked.'
+  exit 0
 }
 
 if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
@@ -99,6 +115,7 @@ $queueRetryWait = Get-QueueCount $queue 'retryWait'
 $queueDeadLetter = Get-QueueCount $queue 'deadLetter'
 
 Write-Host "Node: $nodeVersionOutput"
+Write-Host 'Codex CLI: ok (--version verified)'
 Write-Host "Config: ok (tables=$($configSummary.tables), packages=$($configSummary.packages))"
 Write-Host "Taskboard: ok ($taskboardUrl)"
 Write-Host "Bridge: ok ($bridgeUrl)"

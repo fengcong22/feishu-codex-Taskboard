@@ -92,83 +92,11 @@ $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 $node = if ($nodeCommand) { $nodeCommand.Source } else { 'C:\Program Files\nodejs\node.exe' }
 $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
 $npm = if ($npmCommand) { $npmCommand.Source } else { 'npm.cmd' }
-$npmRoot = Join-Path $env:APPDATA 'npm\node_modules\@openai\codex\node_modules'
-
-function Get-CodexVendorCandidates {
-  [CmdletBinding()]
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$NpmRoot,
-    [string]$Architecture = $null
-  )
-
-  $reportedArchitecture = $Architecture
-  if ([string]::IsNullOrWhiteSpace($reportedArchitecture)) {
-    $reportedArchitecture = [string]$env:PROCESSOR_ARCHITECTURE
-    if ($reportedArchitecture -match '^(?i)x86$' -and
-      -not [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
-      $reportedArchitecture = [string]$env:PROCESSOR_ARCHITEW6432
-    }
-  }
-
-  $normalizedArchitecture = switch -Regex ($reportedArchitecture.Trim().ToLowerInvariant()) {
-    '^(arm64|aarch64)$' { 'arm64'; break }
-    '^(amd64|x64|x86_64)$' { 'x64'; break }
-    default { $null; break }
-  }
-  if ([string]::IsNullOrWhiteSpace($normalizedArchitecture)) { return @() }
-
-  if ($normalizedArchitecture -eq 'arm64') {
-    return @(
-      (Join-Path $NpmRoot '@openai\codex-win32-arm64\vendor\aarch64-pc-windows-msvc\bin\codex.exe')
-    )
-  }
-  return @(
-    (Join-Path $NpmRoot '@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe')
-  )
+. (Join-Path $PSScriptRoot 'codex-discovery.ps1')
+$codexExecutable = Resolve-CodexExecutable -ExplicitExecutable $env:CODEX_EXECUTABLE -NpmCommand $npm
+if ([string]::IsNullOrWhiteSpace($codexExecutable)) {
+  throw 'Codex executable was not found. No candidate passed the Codex CLI version check. Automatic discovery checked PATH, Codex Desktop CLI directories and npm vendor locations. Run scripts/check-local.ps1 -DependenciesOnly; for an existing custom CLI, set CODEX_EXECUTABLE for this process.'
 }
-$codexCandidates = @(Get-CodexVendorCandidates -NpmRoot $npmRoot)
-
-function Resolve-CodexExecutable {
-  [CmdletBinding()]
-  param(
-    [string]$ExplicitExecutable = $null,
-    [string[]]$Candidates = @()
-  )
-
-  $resolveFileSystemLeaf = {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-    try {
-      $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-      if ($item.PSProvider.Name -ne 'FileSystem' -or $item.PSIsContainer) { return $null }
-      return [System.IO.Path]::GetFullPath([string]$item.FullName)
-    } catch {
-      return $null
-    }
-  }
-
-  if (-not [string]::IsNullOrWhiteSpace($ExplicitExecutable)) {
-    $resolvedExplicit = & $resolveFileSystemLeaf $ExplicitExecutable
-    if (-not [string]::IsNullOrWhiteSpace($resolvedExplicit)) { return $resolvedExplicit }
-    Write-Warning 'Configured CODEX_EXECUTABLE was not found; continuing with automatic Codex discovery.'
-  }
-
-  $pathCommand = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-  if ($pathCommand) {
-    $resolvedPathCommand = & $resolveFileSystemLeaf $pathCommand.Source
-    if (-not [string]::IsNullOrWhiteSpace($resolvedPathCommand)) { return $resolvedPathCommand }
-  }
-
-  foreach ($candidate in $Candidates) {
-    $resolvedCandidate = & $resolveFileSystemLeaf $candidate
-    if (-not [string]::IsNullOrWhiteSpace($resolvedCandidate)) { return $resolvedCandidate }
-  }
-
-  return $null
-}
-$codexExecutable = Resolve-CodexExecutable $env:CODEX_EXECUTABLE $codexCandidates
 
 foreach ($directory in @($runtime, $logs, $taskboardData, $bridgeData)) {
   New-Item -ItemType Directory -Force -Path $directory | Out-Null
@@ -185,10 +113,6 @@ if (-not (Test-Path -LiteralPath $packageRegistry -PathType Leaf)) {
   Copy-Item (Join-Path $root 'config\autocut-packages.example.json') $packageRegistry
   Write-Host "Created package registry: $packageRegistry"
 }
-if ([string]::IsNullOrWhiteSpace($codexExecutable) -or -not (Test-Path -LiteralPath $codexExecutable -PathType Leaf)) {
-  throw 'Codex executable was not found. Ensure codex.exe is available on PATH or set CODEX_EXECUTABLE for this launch to an existing stable executable.'
-}
-
 function Build-TaskboardWeb([string]$TaskboardRoot) {
   Push-Location -LiteralPath $TaskboardRoot
   try {

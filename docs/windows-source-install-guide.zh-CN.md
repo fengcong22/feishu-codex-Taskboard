@@ -142,17 +142,38 @@ function Resolve-ExistingLocalDirectory([string]$Candidate, [string]$Label) {
 $gitCommand = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 $nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 $npmCommand = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-$codexCommand = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+$codexCommands = @(Get-Command codex.exe -CommandType Application -All -ErrorAction SilentlyContinue)
 $codexExecutableOverride = ''
 $codexCandidates = @()
-if ($codexCommand) {
+foreach ($codexCommand in $codexCommands) {
   $codexCandidates += $codexCommand.Source
 }
+$codexArchitecture = [string]$env:PROCESSOR_ARCHITECTURE
+if ($codexArchitecture -eq 'x86' -and -not [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
+  $codexArchitecture = $env:PROCESSOR_ARCHITEW6432
+}
+$codexVendorRelativePath = switch ($codexArchitecture.ToLowerInvariant()) {
+  'amd64' { '@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe' }
+  'arm64' { '@openai\codex-win32-arm64\vendor\aarch64-pc-windows-msvc\bin\codex.exe' }
+  default { $null }
+}
 $applicationDataPath = [Environment]::GetFolderPath([System.Environment+SpecialFolder]::ApplicationData)
-if (-not [string]::IsNullOrWhiteSpace($applicationDataPath) -and $applicationDataPath -match '^[A-Za-z]:[\\/]') {
+if ($codexVendorRelativePath -and -not [string]::IsNullOrWhiteSpace($applicationDataPath) -and $applicationDataPath -match '^[A-Za-z]:[\\/]') {
   $npmCodexRoot = Join-Path $applicationDataPath 'npm\node_modules\@openai\codex\node_modules'
-  $codexCandidates += (Join-Path $npmCodexRoot '@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe')
-  $codexCandidates += (Join-Path $npmCodexRoot '@openai\codex-win32-arm64\vendor\aarch64-pc-windows-msvc\bin\codex.exe')
+  $codexCandidates += (Join-Path $npmCodexRoot $codexVendorRelativePath)
+}
+$localApplicationDataPath = [Environment]::GetFolderPath([System.Environment+SpecialFolder]::LocalApplicationData)
+if (-not [string]::IsNullOrWhiteSpace($localApplicationDataPath) -and $localApplicationDataPath -match '^[A-Za-z]:[\\/]') {
+  $desktopCliRoot = Join-Path $localApplicationDataPath 'OpenAI\Codex\bin'
+  if (Test-Path -LiteralPath $desktopCliRoot -PathType Container) {
+    $codexCandidates += @(
+      Get-ChildItem -LiteralPath $desktopCliRoot -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-Item -LiteralPath (Join-Path $_.FullName 'codex.exe') -ErrorAction SilentlyContinue } |
+        Where-Object { -not $_.PSIsContainer } |
+        Sort-Object -Property @{ Expression = 'LastWriteTimeUtc'; Descending = $true }, FullName |
+        ForEach-Object { $_.FullName }
+    )
+  }
 }
 $inheritedCodexExecutable = [Environment]::GetEnvironmentVariable('CODEX_EXECUTABLE', 'Process')
 if ($null -ne $inheritedCodexExecutable) {
@@ -226,11 +247,13 @@ if ($effectiveExecutionPolicy -in @('Restricted', 'AllSigned') -or
 Write-Host "PowerShell execution policy: $effectiveExecutionPolicy"
 ```
 
-本 Runbook 把目标电脑上的 Codex 已经可用作为硬前提。这里检查 `codex.exe` 只是因为 Taskboard 后续需要启动本机 Codex 进程；候选路径与 `scripts/start-local.ps1` 一致，包括 PATH 和全局 npm 包内的 Windows x64/ARM64 vendor 可执行文件。进程中只要继承了 `CODEX_EXECUTABLE` 就先停止，不信任其值；若当前 Codex 可以使用，但上述位置都不可发现，Codex 必须只让用户确认现有可执行文件的绝对路径。取得确认后，Codex 仅在本次临时 PowerShell 命令副本中把 `$codexExecutableOverride` 赋为该路径并重新执行，用户不编辑 Runbook。用户无法确认现有路径或该文件不能正常报告版本时，停止部署并报告“现有 Codex 不可调用”；本 Runbook 不进入安装、更新、登录或账号修复流程。最终报告只写“已发现”或“未发现”，不打印该路径。
+本 Runbook 把目标电脑上的 Codex 已经可用作为硬前提。这里检查 `codex.exe` 是因为 Taskboard 后续需要调用本机 Codex CLI；能打开 Codex Desktop 不等于 CLI 已在 PATH 中。克隆前只做初步定位：PATH、与当前 Windows 进程架构匹配的默认 npm vendor 文件，以及 `%LOCALAPPDATA%\OpenAI\Codex\bin\<版本>\codex.exe`；不枚举或运行 Desktop 图形程序。此处尚不能加载仓库脚本，也不宣称与正式发现逻辑完全相同。克隆并验证版本后，阶段 B 必须调用正式 `check-local.ps1 -DependenciesOnly`，其与启动脚本共用 `scripts/codex-discovery.ps1`，按显式路径、PATH、Desktop、npm 实际全局目录、默认 npm vendor 的顺序发现，并为每个候选做 3 秒内成功返回 `codex-cli` 版本号的检查。
+
+进程中只要继承了 `CODEX_EXECUTABLE` 就先停止，不信任其值；若当前 Codex 可以使用，但初步候选都不可发现，Codex 必须只让用户确认现有 CLI 可执行文件的绝对路径。取得确认后，Codex 仅在本次临时 PowerShell 命令副本中把 `$codexExecutableOverride` 赋为该路径并重新执行，用户不编辑 Runbook。用户无法确认现有路径或该文件不能正常报告版本时，停止部署并报告“现有 Codex 不可调用”；本 Runbook 不进入安装、更新、登录或账号修复流程。最终报告只写“已发现”或“未发现”，不打印该路径。
 
 `CODEX_HOME` 是目标用户自己的 Codex 登录目录，不能像其他覆盖变量一样一律拒绝：未设置时固定采用目标用户默认的 `%USERPROFILE%\.codex`；若进程已设置自定义值，Codex 必须先让用户明确确认，再要求它是已存在的绝对路径、固定本地磁盘目录且路径链没有重解析点。阶段 A 保存精确规范化后的 `$confirmedCodexHome`，后续每个会启动 Taskboard/Codex 的 PowerShell 块都显式注入同一个值；不要读取、打印、复制或提交该目录内容。自定义路径未确认、目录不存在、位于 UNC/映射盘或含重解析点时停止。
 
-Codex 必须在自己的部署执行上下文中保留本阶段得到的 `$confirmedGitExecutable`、`$confirmedNodeExecutable`、`$confirmedNpmExecutable`、`$confirmedNpmCli`、`$npmVersionText`、`$confirmedCodexExecutable` 和 `$confirmedCodexHome`；后续代码块中的对应占位符都替换为这些已验证值，不能重新搜索 PATH、`APPDATA`、`CODEX_HOME` 或用户配置。Node 与 npm 必须是同一安装目录中的固定 pair；直接 npm 调用一律由已确认的 `node.exe` 显式执行同目录 `node_modules\npm\bin\npm-cli.js`，仓库根脚本内部的 bare `npm` 则通过受控 PATH 解析到同一 `npm.cmd`。路径只用于本机命令调用，不写入仓库、用户级或机器级环境，也不向对话输出。每个启动块都显式把同一个 `$confirmedCodexExecutable` 注入当前进程的 `CODEX_EXECUTABLE`，并把同一个 `$confirmedCodexHome` 注入 `CODEX_HOME`，保证 Taskboard 使用阶段 A 验证过的 Codex 文件和登录目录。
+Codex 必须在自己的部署执行上下文中保留本阶段得到的 `$confirmedGitExecutable`、`$confirmedNodeExecutable`、`$confirmedNpmExecutable`、`$confirmedNpmCli`、`$npmVersionText`、`$confirmedCodexExecutable` 和 `$confirmedCodexHome`；后续代码块中的对应占位符都替换为这些已验证值，不能重新搜索 PATH、`APPDATA`、`CODEX_HOME` 或用户配置来替换这些已确认值。阶段 B 的独立桌面环境预检是单独的兼容性验收，只检查正式自动发现能否成功，不改变这些部署值。Node 与 npm 必须是同一安装目录中的固定 pair；直接 npm 调用一律由已确认的 `node.exe` 显式执行同目录 `node_modules\npm\bin\npm-cli.js`，仓库根脚本内部的 bare `npm` 则通过受控 PATH 解析到同一 `npm.cmd`。路径只用于本机命令调用，不写入仓库、用户级或机器级环境，也不向对话输出。每个启动块都显式把同一个 `$confirmedCodexExecutable` 注入当前进程的 `CODEX_EXECUTABLE`，并把同一个 `$confirmedCodexHome` 注入 `CODEX_HOME`，保证 Taskboard 使用阶段 A 验证过的 Codex 文件和登录目录；这些临时注入不能替代独立桌面环境预检。
 
 源码运行要求 Windows x64、Git for Windows 和 Node.js `22.13` 或更高版本。Vite 8 要求 Node.js `22.12` 或更高版本，而本仓库直接使用的 `node:sqlite` 从 `22.13` 起才无需额外实验开关，因此统一以 `22.13` 为安全下限。Rust、Visual Studio Build Tools 和 Windows SDK 不是源码运行的前置条件；它们只在构建 Windows NSIS 安装包时需要。Git 或 Node.js 缺失、Node.js 版本过低时，暂停并让用户从 [Git for Windows](https://git-scm.com/download/win) 或 [Node.js](https://nodejs.org/en/download) 官方入口完成安装或升级，然后重新运行本阶段检查。仓库的 `.ps1` 文件没有代码签名；若有效执行策略为 `Restricted`、`AllSigned`、`Undefined`，或企业策略实际阻止脚本，暂停并让用户按组织批准的方式处理，不运行全局 `Set-ExecutionPolicy ... Bypass`、不修改企业策略。
 
@@ -1059,6 +1082,62 @@ foreach ($metadataPath in @((Join-Path $gitDirectory 'info\grafts'), (Join-Path 
 $worktreeStatus = @(& $confirmedGitExecutable status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0) { throw 'Could not read the Git worktree status.' }
 if ($worktreeStatus.Count -gt 0) { throw 'The verified checkout has local changes; preserve them and stop.' }
+$desktopPreflightScript = @'
+$ErrorActionPreference = 'Stop'
+$deploymentBlockedPattern = '^(?:ALL_PROXY|CURL_CA_BUNDLE|HTTPS?_PROXY|SSL_CERT_FILE|BRIDGE_(?:ENV_FILE|CONFIG|WORKFLOW_CONFIG)|CODEX_EXECUTABLE|CODEX_FEISHU_(?:PACKAGES_PATH|BRIDGE_URL|BRIDGE_SECRET)|CODEX_TASKBOARD_.+|FEISHU_(?:APP_ID|APP_SECRET|LISTENER_ENABLED|READ_ENABLED)|GIT_.+|NODE_(?:OPTIONS|PATH|TLS_REJECT_UNAUTHORIZED|EXTRA_CA_CERTS)|NPM_CONFIG_.+)$'
+$blockedProcessVariables = @(
+  ([Environment]::GetEnvironmentVariables([System.EnvironmentVariableTarget]::Process)).Keys |
+    ForEach-Object { [string]$_ } |
+    Where-Object { $_ -match $deploymentBlockedPattern } |
+    Sort-Object
+)
+if ($blockedProcessVariables.Count -gt 0) {
+  throw 'DESKTOP_PREFLIGHT_UNSAFE_ENVIRONMENT'
+}
+foreach ($scope in @('User', 'Machine')) {
+  if ($null -ne [Environment]::GetEnvironmentVariable('CODEX_EXECUTABLE', $scope)) {
+    throw 'DESKTOP_PREFLIGHT_PERSISTED_CODEX_OVERRIDE'
+  }
+}
+$persistentMachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$persistentUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$env:PATH = [Environment]::ExpandEnvironmentVariables((@($persistentMachinePath, $persistentUserPath) -join ';'))
+Remove-Item -LiteralPath Env:CODEX_EXECUTABLE -ErrorAction SilentlyContinue
+try {
+  .\scripts\check-local.ps1 -DependenciesOnly
+  Write-Host 'DESKTOP_DEPENDENCIES_OK'
+} catch {
+  Write-Host 'DESKTOP_DEPENDENCIES_FAILED'
+  exit 1
+}
+'@
+$desktopPreflightInfo = [System.Diagnostics.ProcessStartInfo]::new()
+$desktopPreflightInfo.FileName = Join-Path $PSHOME 'powershell.exe'
+$desktopPreflightInfo.WorkingDirectory = $repositoryRoot
+$desktopPreflightInfo.UseShellExecute = $false
+$desktopPreflightInfo.CreateNoWindow = $true
+$desktopPreflightInfo.RedirectStandardOutput = $true
+$desktopPreflightInfo.RedirectStandardError = $true
+$desktopPreflightInfo.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($desktopPreflightScript))
+# These two variables were added by this block only after the complete inherited-variable gate.
+# Drop them only from the child; it independently applies the same gate before running any tools.
+$desktopPreflightInfo.EnvironmentVariables.Remove('GIT_CONFIG_NOSYSTEM')
+$desktopPreflightInfo.EnvironmentVariables.Remove('GIT_CONFIG_GLOBAL')
+$desktopPreflightProcess = [System.Diagnostics.Process]::Start($desktopPreflightInfo)
+$desktopPreflightOutput = $desktopPreflightProcess.StandardOutput.ReadToEndAsync()
+$desktopPreflightError = $desktopPreflightProcess.StandardError.ReadToEndAsync()
+try {
+  if (-not $desktopPreflightProcess.WaitForExit(60000)) {
+    $desktopPreflightProcess.Kill()
+    throw 'Independent desktop dependency preflight timed out.'
+  }
+  if ($desktopPreflightProcess.ExitCode -ne 0) {
+    throw 'DESKTOP_DEPENDENCIES_FAILED: independent desktop dependency preflight failed; do not report deployment success.'
+  }
+  Write-Host 'DESKTOP_DEPENDENCIES_OK'
+} finally {
+  $desktopPreflightProcess.Dispose()
+}
 $runtimeDirectory = Join-Path $repositoryRoot '.runtime'
 $isolationDirectory = Join-Path $runtimeDirectory 'bootstrap'
 foreach ($directory in @($runtimeDirectory, $isolationDirectory)) {
@@ -1103,6 +1182,8 @@ if ($postInstallStatus.Count -gt 0) {
   throw 'Dependency installation or tests changed the approved worktree; preserve the changes and stop.'
 }
 ```
+
+上述独立桌面环境预检在创建配置和安装依赖之前运行：新建一个 `-NoProfile` PowerShell 进程，以持久的用户/系统 PATH 覆盖部署进程临时追加的 PATH，并确保没有临时或持久的 `CODEX_EXECUTABLE`。它重做完整环境门禁，只从子进程移除本代码块自己在门禁后设置的两项 Git 隔离变量；不会修改父进程、用户级或机器级环境。`check-local.ps1 -DependenciesOnly` 只验证 Node.js 和 Codex CLI，不读取项目本机 JSON、不创建或修改项目配置和运行状态、不启动服务，也不要求服务在线。仅此依赖定位预检允许以 `npm root --global` 只读解析本机 npm 配置中的实际全局安装目录；后续依赖安装和服务启动仍必须遵循原有隔离配置。输出仅包含固定结果码，不含可执行文件路径。单个 Codex 候选最多等待 3 秒，整个独立检查最多等待 60 秒；失效版本会继续尝试其余批准候选，Desktop 版本候选按文件修改时间从新到旧排列。失败必须先保留为“未完成”，不能靠重新注入部署会话的 `$confirmedCodexExecutable` 绕过，也不能安装或修复 Codex。这个检查避免“部署会话可以启动，之后桌面双击找不到 CLI”的假成功；它不证明用户登录状态、服务健康或任务已经能执行。若后续安装工具改变了持久 PATH，须重新做同一独立检查；资源管理器可能保留旧环境，必要时重新登录 Windows 后再验收双击入口。
 
 两层依赖都必须通过 `npm ci` 从批准版本的 lockfile 安装。上述进程级 npm 设置只指向本克隆 `.runtime\bootstrap` 中新建并重新核对为零字节的两份配置，并把 npm 的默认 registry 配置为官方地址；因此不会读取目标电脑的用户级或全局 `.npmrc`，也不会把设置持久化到用户级或机器级环境。不得设置 `replace-registry-host=always` 或重写 lockfile；`package-lock.json` 和 `taskboard/package-lock.json` 中已经记录的 `resolved` URL 必须按批准版本保留，`npm ci` 在 manifest 与 lockfile 不一致时直接失败。两层安装和完整测试后必须再次确认整个仓库工作树干净。若团队要求统一供应链来源，维护者必须另行重新生成、审查并提交 lockfile。固定目录中的空 Git/npm 配置是该部署的本机运行文件，后续启动仍会核对并使用，不能复制给别人，也不要单独删除或修改。仓库内不存在 `.npmrc`，若批准版本以后新增该文件，它属于已验证 commit 的一部分，必须在部署前重新评审。直接 npm 调用由已确认的 Node 显式执行已确认的 `npm-cli.js`；根 `test` 脚本内的 bare `npm` 通过受控 PATH 解析到同一安装目录中的 `npm.cmd`。测试失败、lockfile 不一致或工作树变化时停止，不连接真实飞书、不修改生产 Base，并在报告中保留失败命令和安全错误摘要。
 
@@ -2523,6 +2604,7 @@ Set-Location -LiteralPath '<工作目录>' -ErrorAction Stop
 仓库 commit：<完整 SHA>
 Node.js：<版本>
 Codex 可执行文件：已发现 / 未发现
+独立桌面环境依赖预检（无临时 CODEX_EXECUTABLE）：通过 / 未执行 / 失败
 根目录依赖：通过 / 失败
 taskboard 依赖：通过 / 失败
 已确认 Node/npm CLI 执行的完整 npm test：通过 / 失败
@@ -2539,7 +2621,7 @@ Taskboard→Codex 无害执行：通过 / 未执行 / 失败
 仍需用户完成：<仅列人工步骤，不列秘密>
 ```
 
-只有完整测试、两个本机健康检查、真实测试 Base 的本轮新事件，以及该新任务的 Taskboard→Codex 无害执行全部通过时，`部署结论` 才能写“成功”。模拟验收可以因没有匹配 fixture 而跳过；真实事件或无害执行为“未执行”时，结论必须是“未完成”，不能称为已经部署成功。
+只有独立桌面环境依赖预检、完整测试、两个本机健康检查、真实测试 Base 的本轮新事件，以及该新任务的 Taskboard→Codex 无害执行全部通过时，`部署结论` 才能写“成功”。模拟验收可以因没有匹配 fixture 而跳过；独立依赖预检、真实事件或无害执行为“未执行”时，结论必须是“未完成”，不能称为已经部署成功。仅在部署进程中设置 `CODEX_EXECUTABLE` 后启动成功，不满足独立依赖预检要求。
 
 不得把本机的 `%USERPROFILE%\.codex`、Codex token、飞书凭据、Base token、Bridge Secret、`.env.local`、两个本机 JSON、`.runtime` 或生产任务数据提交到 Git 或转发给维护者。根目录 `AGENTS.md`、源码、脚本和示例文件才是可以从仓库共享的项目内容；个人 Codex 全局配置和登录态不是部署输入。
 
@@ -2551,5 +2633,7 @@ Taskboard→Codex 无害执行：通过 / 未执行 / 失败
 - Auto-Cut 包示例：`config/autocut-packages.example.json`
 - 启动：`scripts/start-local.ps1`
 - 健康检查：`scripts/check-local.ps1`
+- 启动依赖预检：`scripts/check-local.ps1 -DependenciesOnly`
+- 共用 Codex CLI 发现：`scripts/codex-discovery.ps1`
 - 停止：`scripts/stop-local.ps1`
 - 模拟事件：`scripts/simulate-ready.ps1`

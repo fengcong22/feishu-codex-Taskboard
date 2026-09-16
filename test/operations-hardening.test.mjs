@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { compileCodexFixture, installCodexFixture } from "./helpers/codex-cli-fixture.mjs";
 
 const checkUrl = new URL("../scripts/check-local.ps1", import.meta.url);
 const agentsUrl = new URL("../AGENTS.md", import.meta.url);
@@ -146,6 +147,7 @@ test("Node 22.13 floor stays aligned across runtime contracts and user-facing do
 
 test("check script enforces the stable Node 22.13 boundary before reading local config", async () => {
   const fixtureDirectory = await mkdtemp(join(tmpdir(), "codex-feishu-node-gate-"));
+  const codexExecutable = join(fixtureDirectory, "codex.exe");
   const powershell = join(
     process.env.SystemRoot ?? "C:\\Windows",
     "System32",
@@ -167,6 +169,7 @@ test("check script enforces the stable Node 22.13 boundary before reading local 
       env: {
         ...baseEnvironment,
         Path: fixtureDirectory,
+        CODEX_EXECUTABLE: codexExecutable,
         BRIDGE_CONFIG: join(fixtureDirectory, "missing-bridge.json"),
         CODEX_FEISHU_PACKAGES_PATH: join(fixtureDirectory, "missing-packages.json"),
       },
@@ -174,6 +177,9 @@ test("check script enforces the stable Node 22.13 boundary before reading local 
   };
 
   try {
+    const template = await compileCodexFixture(fixtureDirectory);
+    await installCodexFixture(template, codexExecutable);
+
     const belowFloor = await runWithVersion("v22.12.9");
     assert.notEqual(belowFloor.status, 0);
     assert.match(belowFloor.stderr, /Node\.js >= 22\.13 is required/);
@@ -181,11 +187,13 @@ test("check script enforces the stable Node 22.13 boundary before reading local 
     const prerelease = await runWithVersion("v22.13.0-rc.1");
     assert.notEqual(prerelease.status, 0);
     assert.match(prerelease.stderr, /Could not determine the Node\.js version/);
+    await assert.rejects(readFile(`${codexExecutable}.invocations`), { code: "ENOENT" });
 
     const supported = await runWithVersion("v22.13.0");
     assert.notEqual(supported.status, 0);
     assert.match(supported.stderr, /Local config is missing/);
     assert.doesNotMatch(supported.stderr, /Node\.js >= 22\.13|Could not determine/);
+    assert.equal(await readFile(`${codexExecutable}.invocations`, "utf8"), "--version\n");
   } finally {
     await rm(fixtureDirectory, { recursive: true, force: true });
   }
