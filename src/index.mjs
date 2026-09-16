@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.mjs";
 import { loadPackageRegistry } from "./package-config.mjs";
 import { createBridge } from "./bridge.mjs";
-import { createBridgeServer, resolveSimulationEnabled } from "./server.mjs";
+import { createBridgeServer } from "./server.mjs";
 import { createCompensationWorker } from "./compensation-worker.mjs";
 import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
@@ -36,7 +36,6 @@ function envEnabled(name) {
   );
 }
 const listenerEnabled = envEnabled("FEISHU_LISTENER_ENABLED");
-const automaticExecutionEnabled = envEnabled("CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION");
 const apiEnabled = listenerEnabled || envEnabled("FEISHU_READ_ENABLED");
 const sdk = apiEnabled ? await loadFeishuSdk() : null;
 const feishuApi = apiEnabled
@@ -73,6 +72,9 @@ const workflowRuntime = createWorkflowRuntime({
   metadataReader,
 });
 const store = new JsonStateStore(config.stateFile);
+const taskboard = new TaskboardClient(config.taskboardUrl, {
+  bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET,
+});
 const bridge = createBridge({
   config,
   packageCatalog,
@@ -91,9 +93,7 @@ const bridge = createBridge({
     return controlledContextReader.read(subject, identity);
   },
   store,
-  taskboard: new TaskboardClient(config.taskboardUrl, {
-    bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET,
-  }),
+  taskboard,
   resolveRecordTitle: (...args) => resolveRecordTitle?.(...args),
 });
 const compensationWorker = createCompensationWorker({
@@ -158,7 +158,8 @@ const app = createBridgeServer({
     packages: Object.keys(packageCatalog),
   },
   handleEvent: (event) => bridge.handle(event),
-  simulationEnabled: resolveSimulationEnabled({ listenerEnabled, automaticExecutionEnabled }),
+  simulationEnabled: async () => listenerEnabled === false
+    && (await taskboard.getAutomaticExecutionEnabled()) === false,
   workflowStore: workflowRuntime,
   baseMetadataReader: metadataReader,
   getHealth: async () => ({

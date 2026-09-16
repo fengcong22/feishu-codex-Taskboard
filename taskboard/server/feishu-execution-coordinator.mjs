@@ -54,6 +54,16 @@ export function createFeishuExecutionCoordinator({
       : "manual";
   }
 
+  function automaticExecutionAllowed() {
+    try {
+      return (typeof allowAutomaticExecution === "function"
+        ? allowAutomaticExecution()
+        : allowAutomaticExecution) === true;
+    } catch {
+      return false;
+    }
+  }
+
   function eligibleMetadata(entry, task) {
     const metadata = resolveCurrentMetadata(task, {
       trigger: entry.trigger,
@@ -61,7 +71,7 @@ export function createFeishuExecutionCoordinator({
     });
     if (!metadata) return null;
     if (entry.trigger === "automatic" && (
-      !allowAutomaticExecution
+      !automaticExecutionAllowed()
       || Object.hasOwn(metadata, "deliverySource")
       || executionModeForMetadata(metadata) !== "automatic"
     )) {
@@ -153,6 +163,12 @@ export function createFeishuExecutionCoordinator({
 
   function schedulePumpRetry(entry, error) {
     if (closed || entries.get(entry.task.id) !== entry || entry.timer !== null) return false;
+    if (entry.trigger === "automatic" && (
+      error?.code === "AUTOMATIC_EXECUTION_DISABLED" || !automaticExecutionAllowed()
+    )) {
+      revokeReservation(entry);
+      return false;
+    }
     if ((entry.pumpRetries ?? 0) >= MAX_PUMP_RETRIES) {
       try { database.clearFeishuExecution(entry.task.id); } catch {}
       entries.delete(entry.task.id);
@@ -178,7 +194,7 @@ export function createFeishuExecutionCoordinator({
     entry.pumpAttempted = false;
     try {
       const result = await pump(entry);
-      if (entry.pumpAttempted) {
+      if (entry.pumpAttempted && entries.get(entry.task.id) === entry) {
         entry.pumpRetries = 0;
         const current = database.getFeishuExecution(entry.task.id);
         if (current && current.pumpRetries !== 0) {
@@ -210,6 +226,7 @@ export function createFeishuExecutionCoordinator({
         scheduler.release(lease);
         return executionResult(entry.task.id);
       }
+      if (entry.trigger === "automatic" && !automaticExecutionAllowed()) return revokeReservation(entry, lease);
       if (!packageConfig || (packageConfig.state && packageConfig.state !== "enabled")) {
         scheduler.release(lease);
         entry.launching = false;
@@ -232,6 +249,7 @@ export function createFeishuExecutionCoordinator({
         entry.actor,
         entry.autoCutRunConsent,
       );
+      if (entries.get(entry.task.id) !== entry) return result ?? executionResult(entry.task.id);
       const current = database.getFeishuExecution(entry.task.id);
       if (current) {
         const patch = {
@@ -249,7 +267,15 @@ export function createFeishuExecutionCoordinator({
       entries.delete(entry.task.id);
       return result ?? executionResult(entry.task.id);
     } catch (error) {
-      if (error?.code === "TASK_NOT_STARTABLE") {
+      // Cancellation can happen during any awaited preparation. A late
+      // rejection belongs only to that old reservation, never a newer one.
+      if (closed || entries.get(entry.task.id) !== entry) {
+        scheduler.release(lease);
+        throw error;
+      }
+      if (error?.code === "TASK_NOT_STARTABLE" || (entry.trigger === "automatic" && (
+        error?.code === "AUTOMATIC_EXECUTION_DISABLED" || !automaticExecutionAllowed()
+      ))) {
         revokeReservation(entry, lease);
         throw error;
       }
@@ -280,7 +306,6 @@ export function createFeishuExecutionCoordinator({
         entry.leasePending = false;
         entry.scheduling = true;
         armPumpTimer(entry, readyAt - clock());
-        entries.set(entry.task.id, entry);
       } else {
         if (!closed) database.clearFeishuExecution(entry.task.id);
         entries.delete(entry.task.id);
@@ -290,9 +315,10 @@ export function createFeishuExecutionCoordinator({
   }
 
   async function pump(entry) {
-    if (closed) return executionResult(entry.task.id);
+    if (closed || entries.get(entry.task.id) !== entry) return executionResult(entry.task.id);
     const current = database.getFeishuExecution(entry.task.id);
     if (!current || current.state === "running") return executionResult(entry.task.id);
+    if (entry.trigger === "automatic" && !automaticExecutionAllowed()) return revokeReservation(entry);
     if (entry.pumping || entry.leasePending || entry.launching) {
       return executionResult(entry.task.id);
     }
@@ -388,7 +414,7 @@ export function createFeishuExecutionCoordinator({
     { actor = null, autoCutRunConsent = null } = {},
   ) {
     if (closed) throw new Error("Execution coordinator is closed");
-    if (trigger === "automatic" && !allowAutomaticExecution) {
+    if (trigger === "automatic" && !automaticExecutionAllowed()) {
       throw new ApiError(409, "AUTOMATIC_EXECUTION_DISABLED", "Automatic Codex execution is disabled by the local policy");
     }
     if (!task?.id) throw new TypeError("task.id is required");
@@ -423,9 +449,12 @@ export function createFeishuExecutionCoordinator({
       if (trigger !== "automatic") {
         const current = database.getFeishuExecution(task.id);
         if (current && Number(current.readyAt) > clock()) {
-          updateExecution(task.id, current.state, { readyAt: clock() });
+          updateExecution(task.id, current.state, { readyAt: clock(), trigger });
           existing.task = database.getTask(task.id) ?? task;
+          existing.metadata = metadata;
           existing.trigger = trigger;
+          existing.actor = actor;
+          existing.autoCutRunConsent = autoCutRunConsent;
           existing.scheduling = true;
           if (existing.timer !== null) timers.clearTimeout(existing.timer);
           existing.timer = null;
@@ -490,6 +519,23 @@ export function createFeishuExecutionCoordinator({
     const execution = database.getFeishuExecution(taskId);
     if (execution && execution.state !== "running") database.clearFeishuExecution(taskId);
     return Boolean(entry || execution);
+  }
+
+  function cancelPendingAutomatic() {
+    const pending = new Map(database.listPendingFeishuExecutions()
+      .filter((execution) => execution.trigger === "automatic")
+      .map((execution) => [execution.taskId, execution]));
+    for (const entry of entries.values()) {
+      if (entry.trigger === "automatic" && !pending.has(entry.task.id)) {
+        const execution = database.getFeishuExecution(entry.task.id);
+        if (!execution || execution.state !== "running") pending.set(entry.task.id, execution);
+      }
+    }
+    for (const taskId of pending.keys()) {
+      cancel(taskId);
+      if (database.getTask(taskId)?.status === "queued") updateTaskStatus(taskId, "todo");
+    }
+    return pending.size;
   }
 
   async function recover() {
@@ -557,5 +603,5 @@ export function createFeishuExecutionCoordinator({
     if (backgroundLaunches.size > 0) await Promise.allSettled([...backgroundLaunches]);
   }
 
-  return { schedule, cancel, recover, wake, close };
+  return { schedule, cancel, cancelPendingAutomatic, recover, wake, close };
 }

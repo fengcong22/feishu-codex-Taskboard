@@ -9,6 +9,7 @@ import type {
   Attachment,
   ArtifactUpload,
   ArtifactUploadListItem,
+  AutomaticExecutionSettings,
   BoardStageLabels,
   Comment,
   ComposerCandidatesQuery,
@@ -171,6 +172,24 @@ export async function listProjects(options: { includeArchived?: boolean; signal?
   const query = normalized.includeArchived === undefined ? "" : `?includeArchived=${normalized.includeArchived ? "true" : "false"}`;
   const data = await request<{ projects: Project[] }>(`/api/projects${query}`, { signal: normalized.signal });
   return data.projects;
+}
+
+export async function getAutomaticExecutionSettings(signal?: AbortSignal): Promise<AutomaticExecutionSettings> {
+  const data = await request<{ setting: AutomaticExecutionSettings }>(
+    "/api/local/settings/automatic-execution", { signal },
+  );
+  return data.setting;
+}
+
+export async function updateAutomaticExecutionSettings(input: {
+  enabled: boolean;
+  expectedVersion: number;
+}): Promise<AutomaticExecutionSettings> {
+  const data = await request<{ setting: AutomaticExecutionSettings }>(
+    "/api/local/settings/automatic-execution",
+    { method: "PUT", headers: { "X-Taskboard-Client": "web" }, body: JSON.stringify(input) },
+  );
+  return data.setting;
 }
 
 export async function getJiraConnection(signal?: AbortSignal): Promise<JiraConnection> {

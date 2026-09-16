@@ -6286,6 +6286,54 @@ kbd {
   width: min(400px, 100%);
 }
 
+.local-settings-dialog {
+  width: min(460px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+
+.local-settings-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin: 20px 0 12px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.local-settings-switch {
+  appearance: none;
+  position: relative;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 21px;
+  margin: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.local-settings-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 120ms ease;
+}
+
+.local-settings-switch:checked { background: var(--accent); }
+.local-settings-switch:checked::after { transform: translateX(15px); }
+.local-settings-switch:disabled { cursor: wait; opacity: 0.55; }
+.local-settings-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.local-settings-help p { margin-top: 9px; line-height: 1.7; }
+.local-settings-dialog .local-settings-status { margin-top: 14px; }
+
 .delete-dialog .jira-http-warning {
   margin-top: 7px;
   color: var(--warning-text, #9a6700);

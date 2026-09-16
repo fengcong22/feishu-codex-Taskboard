@@ -65,6 +65,11 @@ export interface TaskboardCapabilities {
   automaticExecution?: boolean;
 }
 
+export interface AutomaticExecutionSettings {
+  enabled: boolean;
+  version: number;
+}
+
 export type AiChatSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type AiChatThreadStatus = "idle" | "running" | "failed";
 export type AiChatRunStatus = "running" | "completed" | "failed" | "interrupted";

@@ -72,6 +72,7 @@ async function createBridge(controlledContext, status = 200) {
   const requests = [];
   let currentContext = controlledContext;
   let currentStatus = status;
+  let responseGate = null;
   const bridge = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/api/feishu/workflow/controlled-context") {
       response.writeHead(404).end();
@@ -80,6 +81,7 @@ async function createBridge(controlledContext, status = 200) {
     let body = "";
     for await (const chunk of request) body += chunk;
     requests.push(JSON.parse(body));
+    await responseGate;
     response.writeHead(currentStatus, { "content-type": "application/json" });
     response.end(JSON.stringify(
       currentStatus >= 200 && currentStatus < 300
@@ -91,6 +93,7 @@ async function createBridge(controlledContext, status = 200) {
   return {
     requests,
     url: `http://127.0.0.1:${bridge.address().port}`,
+    holdResponses(gate) { responseGate = gate; },
     setResponse(nextContext, nextStatus = 200) {
       currentContext = nextContext;
       currentStatus = nextStatus;
@@ -398,6 +401,80 @@ test("an initial automatic phased run completes locally without Codex or taskctl
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("switch off then on during input preparation cancels the old automatic start", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/switch-race"],
+    namingDisplayValue: "开关准备阶段测试", namingValueUnique: true,
+  };
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let starts = 0;
+  const fixture = await createFixture({ controlledContext, allowAutomaticExecution: true,
+    autoCutRunner: async ({ run }) => { starts += 1; await writePassingRunResult(run); } });
+  fixture.bridge.holdResponses(gate);
+  const save = (enabled, expectedVersion) => jsonRequest(fixture.baseUrl,
+    "/api/local/settings/automatic-execution", { enabled, expectedVersion },
+    { method: "PUT", headers: { "x-taskboard-client": "web" } });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    const taskId = created.body.task.id;
+    await waitForRun(fixture.app, taskId, 8_000);
+    assert.equal((await save(false, 1)).response.status, 200);
+    assert.equal((await save(true, 2)).response.status, 200);
+    release();
+    await waitForTaskStatus(fixture.app, taskId, "todo");
+    assert.equal(starts, 0);
+    const run = fixture.app.database.listFeishuAutoCutRuns(taskId)[0];
+    assert.equal(fixture.app.database.getAiChatRun(run.runId).status, "interrupted");
+    assert.equal(fixture.app.database.getTaskAiStartForArtifactReport(taskId, run.runId), null);
+    assert.equal(fixture.app.database.getFeishuExecution(taskId), null);
+  } finally {
+    release();
+    await fixture.app.close(); await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("local switch cancels waiting automatic tasks while a running edit completes", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/switch-queue"],
+    namingDisplayValue: "队列开关测试", namingValueUnique: true,
+  };
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let started = false;
+  const fixture = await createFixture({ controlledContext, allowAutomaticExecution: true,
+    autoCutRunner: async ({ run }) => { started = true; await gate; await writePassingRunResult(run); } });
+  const save = (enabled, expectedVersion) => jsonRequest(fixture.baseUrl,
+    "/api/local/settings/automatic-execution", { enabled, expectedVersion },
+    { method: "PUT", headers: { "x-taskboard-client": "web" } });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const waiting = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal((await save(false, 1)).response.status, 200);
+    assert.equal(fixture.app.database.getFeishuExecution(waiting.body.task.id), null);
+    assert.equal((await save(true, 2)).response.status, 200);
+    assert.equal(fixture.app.database.getFeishuExecution(waiting.body.task.id), null);
+    const next = registration(subject, controlledContext);
+    next.event.eventId = "evt-switch-second";
+    next.event.recordId = "rec_switch_second";
+    const running = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", next);
+    const deadline = Date.now() + 8_000;
+    while (!started && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(started, true);
+    assert.equal((await save(false, 3)).response.status, 200);
+    release();
+    await waitForTaskStatus(fixture.app, running.body.task.id, "done");
+    assert.equal(fixture.app.database.getTask(waiting.body.task.id).status, "todo");
+    assert.equal(fixture.app.database.listFeishuAutoCutRuns(waiting.body.task.id).length, 0);
+  } finally {
+    release();
+    await fixture.app.close(); await fixture.bridge.close();
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });

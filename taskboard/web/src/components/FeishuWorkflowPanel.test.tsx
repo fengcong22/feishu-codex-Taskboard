@@ -379,6 +379,15 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
     expect(props.onSubjectChange).not.toHaveBeenCalled();
   });
+
+  it("opens machine settings from the global switch status without modifying the subject", () => {
+    const props = panelProps(subject("history", "高中历史"));
+    const onOpenLocalSettings = vi.fn();
+    render(<FeishuWorkflowPanel {...props} allowAutomaticExecution={false} onOpenLocalSettings={onOpenLocalSettings} />);
+    fireEvent.click(screen.getByRole("button", { name: "修改本机总开关" }));
+    expect(onOpenLocalSettings).toHaveBeenCalledOnce();
+    expect(props.onSubjectChange).not.toHaveBeenCalled();
+  });
 });
 
 describe("FeishuWorkflowPanel audio drafts", () => {

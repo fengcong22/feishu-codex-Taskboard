@@ -169,6 +169,16 @@ export class TaskboardClient {
     }
   }
 
+  async getAutomaticExecutionEnabled() {
+    const pathname = "/api/meta";
+    const payload = await this.#request(pathname, { method: "GET" });
+    if (!objectPayload(payload?.capabilities)
+      || typeof payload.capabilities.automaticExecution !== "boolean") {
+      throw invalidResponse(pathname);
+    }
+    return payload.capabilities.automaticExecution;
+  }
+
   async createTask(payload) {
     const response = await this.#request("/api/tasks", { body: payload });
     if (!validTask(response?.task)) throw invalidResponse("/api/tasks");
