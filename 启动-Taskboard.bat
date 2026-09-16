@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-powershell.exe -NoLogo -NoProfile -File "%~dp0scripts\start-local.ps1" -EnableFeishu
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start-local.ps1" -EnableFeishu
 set "exitCode=%ERRORLEVEL%"
 if not "%exitCode%"=="0" (
   echo.
