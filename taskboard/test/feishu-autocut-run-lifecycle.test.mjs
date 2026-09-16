@@ -211,6 +211,8 @@ if (args[0] === "debug") {
 async function registerSubject(fixture, {
   executionMode = "manual",
   enqueueMode = "manual",
+  targetPath = path.join(fixture.directory, "upload"),
+  targetId = "target",
 } = {}) {
   const catalog = await jsonRequest(fixture.baseUrl, "/api/local/feishu/workflow/catalog", {
     baseToken: "bas_lifecycle",
@@ -259,8 +261,8 @@ async function registerSubject(fixture, {
       enqueueMode,
       artifactSourceMode: "driver_report",
       artifactSourcePath: fixture.zipSourceDirectory,
-      targetId: "target",
-      targetPath: path.join(fixture.directory, "upload"),
+      targetId,
+      targetPath,
       uploadConcurrency: 1,
     },
   }, { method: "PATCH" });
@@ -1222,51 +1224,65 @@ test("controlled-context preparation failure blocks and preserves the task and A
   }
 });
 
-test("a phased report binds the terminal receipt and uploads to the frozen stage destination", async () => {
-  const controlledContext = {
-    documentLinks: ["https://guanghe.feishu.cn/docx/report-lifecycle"],
-    namingDisplayValue: "课程003",
-    namingValueUnique: true,
-  };
-  const fixture = await createFixture({
-    controlledContext,
-    turnDelayMs: 500,
-    allowAutomaticExecution: true,
-  });
-  try {
-    const subject = await registerSubject(fixture, {
-      executionMode: "automatic",
-      enqueueMode: "automatic",
+for (const hasCommonTarget of [true, false]) {
+  test(`a phased report uploads to the frozen stage destination ${hasCommonTarget ? "with" : "without"} a common target`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/report-lifecycle"],
+      namingDisplayValue: "课程003",
+      namingValueUnique: true,
+    };
+    const fixture = await createFixture({
+      controlledContext,
+      turnDelayMs: 500,
+      allowAutomaticExecution: true,
     });
-    const created = await jsonRequest(
-      fixture.baseUrl,
-      "/api/local/feishu/tasks",
-      registration(subject, controlledContext),
-    );
-    assert.equal(created.response.status, 201, JSON.stringify(created.body));
-    const started = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
-    assert.equal(started.response.status, 202, JSON.stringify(started.body));
-    const run = await waitForRun(fixture.app, created.body.task.id);
-    const archiveSha256 = await writePassingRunResult(run);
-    const reported = await reportRunArtifact(fixture, run, { sha256: archiveSha256 });
-    assert.equal(reported.response.status, 201, JSON.stringify(reported.body));
-    assert.equal(fixture.app.database.getFeishuAutoCutRun(run.runId).state, "reported");
+    try {
+      const subject = await registerSubject(fixture, {
+        executionMode: "automatic",
+        enqueueMode: "automatic",
+        ...(hasCommonTarget ? {} : { targetPath: null, targetId: null }),
+      });
+      const created = await jsonRequest(
+        fixture.baseUrl,
+        "/api/local/feishu/tasks",
+        registration(subject, controlledContext),
+      );
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      const started = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+      assert.equal(started.response.status, 202, JSON.stringify(started.body));
+      const run = await waitForRun(fixture.app, created.body.task.id);
+      const updated = await jsonRequest(fixture.baseUrl,
+        `/api/local/feishu/workflow/subjects/${encodeURIComponent(SUBJECT_KEY)}`, {
+          stages: { initial: { artifactTargetPath: path.join(fixture.directory, "new-stage-output") } },
+        }, { method: "PATCH" });
+      assert.equal(updated.response.status, 200, JSON.stringify(updated.body));
+      const reenabled = await jsonRequest(fixture.baseUrl,
+        `/api/local/feishu/workflow/subjects/${encodeURIComponent(SUBJECT_KEY)}/enable`, {
+          expectedVersion: updated.body.subject.configVersion,
+        });
+      assert.equal(reenabled.response.status, 200, JSON.stringify(reenabled.body));
+      const archiveSha256 = await writePassingRunResult(run);
+      const reported = await reportRunArtifact(fixture, run, { sha256: archiveSha256 });
+      assert.equal(reported.response.status, 201, JSON.stringify(reported.body));
+      assert.equal(fixture.app.database.getFeishuAutoCutRun(run.runId).state, "reported");
 
-    const completed = await waitForTaskStatus(fixture.app, run.taskId, "done");
-    assert.equal(completed.status, "done");
-    assert.equal(fixture.app.database.getFeishuAutoCutRun(run.runId).state, "completed");
-    const [upload] = fixture.app.database.listTaskArtifactUploads(run.taskId);
-    assert.ok(upload);
-    const storedUpload = fixture.app.database.database.prepare(
-      "SELECT target_path FROM artifact_uploads WHERE id = ?",
-    ).get(upload.id);
-    assert.equal(storedUpload.target_path, path.join(fixture.directory, "stage-output"));
-  } finally {
-    await fixture.app.close();
-    await fixture.bridge.close();
-    await rm(fixture.directory, { recursive: true, force: true });
-  }
-});
+      const completed = await waitForTaskStatus(fixture.app, run.taskId, "done");
+      assert.equal(completed.status, "done");
+      assert.equal(fixture.app.database.getFeishuAutoCutRun(run.runId).state, "completed");
+      const [upload] = fixture.app.database.listTaskArtifactUploads(run.taskId);
+      assert.ok(upload);
+      const storedUpload = fixture.app.database.database.prepare(
+        "SELECT target_path, target_id FROM artifact_uploads WHERE id = ?",
+      ).get(upload.id);
+      assert.equal(storedUpload.target_path, path.join(fixture.directory, "stage-output"));
+      assert.equal(storedUpload.target_id, hasCommonTarget ? "target" : null);
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
 
 test("a phased report rejects a result without the exact adjacent package receipt", async () => {
   const controlledContext = {

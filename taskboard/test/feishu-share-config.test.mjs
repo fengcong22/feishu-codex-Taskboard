@@ -155,8 +155,78 @@ async function attachmentShareConfiguration(baseUrl, baseToken) {
 
 function stagedFieldDiagnostics(body) {
   return body.diagnostics
-    .filter((entry) => entry.path?.includes(".stages."))
+    .filter((entry) => entry.code.startsWith("FIELD_") && entry.path?.includes(".stages."))
     .map((entry) => [entry.code, entry.path]);
+}
+
+for (const scenario of [
+  { name: "bound stages without a common path", targetId: "historical-alias", missing: [], unbound: [] },
+  { name: "missing enabled stage paths without an alias", targetId: null, missing: ["initial", "first_review"], unbound: ["initial", "first_review"] },
+  { name: "the local common path fallback", targetId: "historical-alias", missing: ["first_review"], targetPath: "C:\\legacy-upload", unbound: [] },
+  { name: "a historical snake-case local stage path", targetId: "historical-alias", missing: [], snakeCaseInitial: true, unbound: [] },
+]) {
+  test(`phased share upload diagnostics follow ${scenario.name}`, async () => {
+    const fixtureData = await fixture();
+    try {
+      const baseToken = "bas_stage_upload_binding";
+      const subjectKey = await seedSubject(fixtureData.baseUrl, baseToken, phasedMetadata().fields);
+      const stages = {
+        initial: phasedStage("initial", "opt_initial", "初稿"),
+        first_review: phasedStage("first_review", "opt_review", "初审修改"),
+        final_review: { ...phasedStage("final_review", "opt_final", "终审修改"), enabled: false, artifactTargetPath: null },
+      };
+      for (const stageId of scenario.missing) stages[stageId].artifactTargetPath = null;
+      const configured = await request(
+        fixtureData.baseUrl,
+        `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+        {
+          method: "PATCH",
+          body: {
+            statusField: { fieldId: "fld_status", fieldName: "流程" },
+            documentField: { fieldId: "fld_document", fieldName: "素材文档" },
+            namingField: { fieldId: "fld_name", fieldName: "命名" },
+            stages,
+            upload: { targetId: scenario.targetId, targetPath: scenario.targetPath ?? null },
+          },
+        },
+      );
+      assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
+      const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+      assert.equal(exported.response.status, 200, JSON.stringify(exported.body));
+      if (scenario.snakeCaseInitial) {
+        const db = fixtureData.app.database.database;
+        const row = db.prepare("SELECT config_json FROM feishu_subjects WHERE subject_key = ?").get(subjectKey);
+        const local = JSON.parse(row.config_json);
+        local.stages.initial.artifact_target_path = local.stages.initial.artifactTargetPath;
+        delete local.stages.initial.artifactTargetPath;
+        db.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+          .run(JSON.stringify(local), subjectKey);
+      }
+      for (const dryRun of [true, false]) {
+        const imported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+          method: "POST",
+          body: { configuration: exported.body.configuration, dryRun },
+        });
+        assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
+        const diagnostics = imported.body.diagnostics.filter((entry) => entry.code === "UPLOAD_TARGET_PATH_UNBOUND");
+        assert.deepEqual(
+          diagnostics.map((entry) => entry.path),
+          scenario.unbound.map((stageId) => `bases.${baseToken}.subjects.tbl_chinese.stages.${stageId}.artifactTargetPath`),
+        );
+        assert.doesNotMatch(JSON.stringify(diagnostics), /approved|legacy-upload/);
+      }
+      const catalog = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog");
+      assert.equal(catalog.response.status, 200, JSON.stringify(catalog.body));
+      const importedStages = catalog.body.catalog[0].subjects[0].stages;
+      for (const stageId of ["initial", "first_review"]) {
+        assert.equal(importedStages[stageId].artifactTargetPath, stages[stageId].artifactTargetPath ?? scenario.targetPath ?? null);
+      }
+      assert.equal(importedStages.final_review.artifactTargetPath, null);
+    } finally {
+      await fixtureData.app.close();
+      await rm(fixtureData.directory, { recursive: true, force: true });
+    }
+  });
 }
 
 test("workflow share export is schema-versioned and redacts machine-local paths", async () => {
@@ -395,7 +465,7 @@ test("share import diagnoses staged attachment bindings against explicitly empty
     assert.equal(dryRun.response.status, 200, JSON.stringify(dryRun.body));
     assert.deepEqual(
       dryRun.body.diagnostics
-        .filter((entry) => entry.path?.includes(".stages."))
+        .filter((entry) => entry.code.startsWith("FIELD_") && entry.path?.includes(".stages."))
         .map((entry) => [entry.code, entry.path]),
       [
         ["FIELD_NOT_FOUND", "bases.bas_empty_attachment_metadata.subjects.tbl_chinese.stages.initial.videoSource.fieldId"],

@@ -2039,6 +2039,74 @@ function phasedPatch() {
   };
 }
 
+test("phased automatic upload enables using stage destinations without a common target", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const patch = phasedPatch();
+    patch.upload.enqueueMode = "automatic";
+    patch.stages.first_review.artifactTargetPath = null;
+    patch.stages.final_review.artifactTargetPath = null;
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    const enabled = await store.enableSubject(draft.subjectKey, draft.configVersion);
+    assert.equal(enabled.lifecycle, "enabled");
+    assert.equal(enabled.upload.targetPath, null);
+    assert.equal(enabled.upload.targetId, null);
+    assert.equal(enabled.stages.initial.artifactTargetPath, patch.stages.initial.artifactTargetPath);
+    assert.equal(enabled.stages.first_review.artifactTargetPath, null);
+    assert.equal(enabled.stages.final_review.artifactTargetPath, null);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("phased automatic upload rejects a missing enabled stage destination without changing the draft", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const patch = phasedPatch();
+    patch.upload.enqueueMode = "automatic";
+    patch.stages.initial.artifactTargetPath = null;
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "INVALID_FIELD" && /stage 'initial'.*artifactTargetPath/u.test(error.message),
+    );
+    const current = await store.getSubject(draft.subjectKey);
+    assert.equal(current.lifecycle, "draft");
+    assert.equal(current.configVersion, draft.configVersion);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy automatic upload still requires and uses its common destination", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const catalog = await store.upsertBasePreview(preview());
+    const legacy = { ...catalog.subjects[0], ...subjectPatch() };
+    for (const field of ["statusField", "documentField", "namingField", "stages"]) delete legacy[field];
+    legacy.upload.enqueueMode = "automatic";
+    const persist = () => database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(legacy), legacy.subjectKey);
+    persist();
+    await assert.rejects(
+      () => store.enableSubject(legacy.subjectKey, legacy.configVersion),
+      (error) => error.code === "UPLOAD_TARGET_NOT_CONFIGURED",
+    );
+    legacy.upload.targetPath = "C:\\approved\\legacy";
+    persist();
+    const enabled = await store.enableSubject(legacy.subjectKey, legacy.configVersion);
+    assert.equal(enabled.upload.targetPath, legacy.upload.targetPath);
+    assert.equal(enabled.stages, undefined);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("catalog preview creates independent Base/subject rows and deterministic project ids", async () => {
   const { directory, database, store } = await fixture();
   try {

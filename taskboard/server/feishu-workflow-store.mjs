@@ -1208,7 +1208,23 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             message: "Artifact source path must be bound on this machine before upload can run",
           });
         }
-        if (subject.upload?.targetId && !targetPath) {
+        if (isPhasedSubject(subject)) {
+          const legacyTargetPath = typeof targetPath === "string" && targetPath.trim() !== "" ? targetPath : null;
+          for (const stageId of STAGE_IDS) {
+            if (!subject.stages?.[stageId]?.enabled) continue;
+            const localStage = currentConfig?.stages?.[stageId];
+            const stageTargetPath = localStage?.artifactTargetPath ?? localStage?.artifact_target_path ?? null;
+            // Import preserves each local stage binding, then fills empty
+            // enabled stages from the existing common destination.
+            if (stageTargetPath || legacyTargetPath) continue;
+            diagnostics.push({
+              code: "UPLOAD_TARGET_PATH_UNBOUND",
+              severity: "warning",
+              path: `bases.${base.baseToken}.subjects.${subject.tableId}.stages.${stageId}.artifactTargetPath`,
+              message: "Stage upload target path must be bound on this machine before upload can run",
+            });
+          }
+        } else if (subject.upload?.targetId && !targetPath) {
           diagnostics.push({
             code: "UPLOAD_TARGET_PATH_UNBOUND",
             severity: "warning",
@@ -1733,6 +1749,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       }
       if (
         currentConfig.upload.enqueueMode === "automatic"
+        && !isPhasedSubject(currentConfig)
         && !(typeof currentConfig.upload.targetPath === "string" && currentConfig.upload.targetPath.trim())
       ) {
         throw new ApiError(

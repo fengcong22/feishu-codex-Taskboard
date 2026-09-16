@@ -463,7 +463,7 @@ export function FeishuWorkflowPanel({
               ? "该 ZIP 获取方式将在后续开放"
               : subjectForm.artifactSourceMode === "driver_report" && !subjectForm.artifactSourcePath.trim()
                 ? "请填写 ZIP 来源根目录"
-                : subjectForm.enqueueMode === "automatic" && !subjectForm.targetPath.trim()
+                : !phased && subjectForm.enqueueMode === "automatic" && !subjectForm.targetPath.trim()
                   ? "请填写上传路径"
                   : phased && phasedValidationErrors.length > 0
                     ? phasedValidationErrors[0]
@@ -939,9 +939,8 @@ export function FeishuWorkflowPanel({
           <label>ZIP 获取方式<select value={subjectForm.artifactSourceMode} onChange={(event) => setSubjectForm({ ...subjectForm, artifactSourceMode: event.target.value as SubjectForm["artifactSourceMode"] })}><option value="manual_select">手动选择</option><option value="watch_directory" disabled>监控目录（后续）</option><option value="driver_report">Auto-Cut 上报</option></select></label>
           <label>上传入队<select value={subjectForm.enqueueMode} onChange={(event) => setSubjectForm({ ...subjectForm, enqueueMode: event.target.value as SubjectForm["enqueueMode"] })}><option value="manual">手动</option><option value="automatic">自动</option></select></label>
           <label className="feishu-settings-wide">ZIP 来源根目录<input value={subjectForm.artifactSourcePath} disabled={subjectForm.artifactSourceMode === "manual_select"} onChange={(event) => setSubjectForm({ ...subjectForm, artifactSourcePath: event.target.value })} /></label>
-          <label>上传目标别名<input value={subjectForm.targetId} onChange={(event) => setSubjectForm({ ...subjectForm, targetId: event.target.value })} /></label>
           <label>上传并发数<input type="number" min={1} step={1} value={subjectForm.uploadConcurrency} onChange={(event) => setSubjectForm({ ...subjectForm, uploadConcurrency: event.target.value })} /></label>
-          <label className="feishu-settings-wide">上传路径<input value={subjectForm.targetPath} onChange={(event) => setSubjectForm({ ...subjectForm, targetPath: event.target.value })} /></label>
+          {!phased && <label className="feishu-settings-wide">上传路径<input value={subjectForm.targetPath} onChange={(event) => setSubjectForm({ ...subjectForm, targetPath: event.target.value })} /></label>}
         </div>
       </fieldset>
       <div className="feishu-subject-actions">
