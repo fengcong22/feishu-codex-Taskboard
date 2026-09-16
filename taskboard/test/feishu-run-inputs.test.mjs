@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -84,7 +84,7 @@ test("uses the frozen driver source when the optional package ZIP directory is a
       request.subjectVersion.stages.initial.artifactTargetPath = path.join(fixtureData.dataDirectory, "stage-destination");
       const before = structuredClone(request);
       const result = await prepareFeishuRunInputs(request);
-      assert.equal(result.packageZipPath, path.join(fixtureData.packageRoot, ".taskboard-autocut", "task-1", "run-1", "课程001_初稿.zip"));
+      assert.equal(result.packageZipPath, path.join(await realpath(fixtureData.packageRoot), ".taskboard-autocut", "task-1", "run-1", "课程001_初稿.zip"));
       assert.equal(result.stageDestinationPath, request.subjectVersion.stages.initial.artifactTargetPath);
       assert.deepEqual(request, before);
     }
@@ -103,7 +103,7 @@ test("never replaces an explicit package source with a subject upload path", asy
       artifactSourcePath: fixtureData.dataDirectory,
     };
     const result = await prepareFeishuRunInputs(request);
-    assert.equal(result.packageZipPath, path.join(fixtureData.packageRoot, ".taskboard-autocut", "task-1", "run-1", "课程001_初稿.zip"));
+    assert.equal(result.packageZipPath, path.join(await realpath(fixtureData.packageRoot), ".taskboard-autocut", "task-1", "run-1", "课程001_初稿.zip"));
     for (const zipSourceDirectory of ["", "relative/source", path.join(fixtureData.packageRoot, "missing")]) {
       request.packageSnapshot = { zipSourceDirectory };
       await assert.rejects(prepareFeishuRunInputs(request), (error) => (

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -450,7 +450,7 @@ test("an automatic phased run with no package ZIP directory uses its frozen subj
     assert.equal(task.status, "done", `${run.errorCode}: ${run.errorMessage}`);
     assert.equal(run.state, "completed");
     assert.equal(invocations.length, 1);
-    assert.equal(run.packageZipPath, path.join(fixture.zipSourceDirectory, ".taskboard-autocut", task.id, run.runId, `${run.artifactName}.zip`));
+    assert.equal(run.packageZipPath, path.join(await realpath(fixture.zipSourceDirectory), ".taskboard-autocut", task.id, run.runId, `${run.artifactName}.zip`));
     assert.equal(fixture.app.database.getTaskArtifactForRun(task.id, run.runId).validationStatus, "verified");
     assert.deepEqual(fixture.app.database.getFeishuTaskPackageSnapshot(task.id), snapshot);
   } finally {
