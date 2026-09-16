@@ -8,6 +8,8 @@ import { TaskboardLanguageProvider } from "./i18n";
 import { startAutomaticExecutionTestServer } from "../test/automatic-execution-server.mjs";
 import type { FeishuBaseCatalog, FeishuSubjectConfig, Project, Task } from "./types";
 
+const realFetch = globalThis.fetch;
+
 vi.mock("./api", async (importOriginal) => ({
   ...await importOriginal<typeof import("./api")>(),
   listProjects: vi.fn(),
@@ -204,7 +206,7 @@ describe("App project navigation", () => {
     vi.stubGlobal("fetch", vi.fn(() => { throw new Error("Unexpected backend request"); }));
 
     vi.mocked(api.listProjects).mockResolvedValue(PROJECTS);
-    vi.mocked(api.getTaskboardMetadata).mockResolvedValue({ mode: "local", capabilities: { localAiChat: false } });
+    vi.mocked(api.getTaskboardMetadata).mockResolvedValue({ capabilities: { localAiChat: false, automaticExecution: false } });
     vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 1 });
     vi.mocked(api.updateAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
     vi.mocked(api.listDeviceWorkspaces).mockResolvedValue({});
@@ -283,6 +285,27 @@ describe("App project navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
     await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
     expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("opens machine settings from the workspace header with real local server metadata", async () => {
+    const server = await startAutomaticExecutionTestServer();
+    try {
+      const metadata = await realFetch(new URL("api/meta", server.baseUrl)).then(response => response.json());
+      // Use the actual HTTP metadata contract; keep unrelated AI network work disabled.
+      vi.mocked(api.getTaskboardMetadata).mockResolvedValue({ ...metadata, capabilities: { ...metadata.capabilities, localAiChat: false } });
+    } finally {
+      await server.close();
+    }
+    await renderFirstSubject();
+    const header = document.querySelector(".workspace-header") as HTMLElement;
+    fireEvent.click(within(header).getByRole("button", { name: "Local settings" }));
+    expect(await screen.findByRole("dialog", { name: "Local settings" })).toBeTruthy();
+    await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    openFirstSubjectConfiguration();
+    fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
+    expect(await screen.findByRole("dialog", { name: "Local settings" })).toBeTruthy();
+    await act(async () => {});
   });
 
   it("refreshes after a conflicting update without reporting the attempted change as saved", async () => {
@@ -549,4 +572,5 @@ describe("Automatic execution settings API", () => {
       await server.close();
     }
   });
+
 });

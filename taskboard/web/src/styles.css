@@ -1466,6 +1466,19 @@ kbd {
   gap: 5px;
 }
 
+.button.local-settings-entry {
+  flex-shrink: 0;
+  white-space: nowrap;
+  gap: 5px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.local-settings-entry svg {
+  width: 14px;
+  height: 14px;
+}
+
 .compact-select select {
   height: 26px;
   max-width: 150px;
