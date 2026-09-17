@@ -17,11 +17,14 @@
 - 自动运行仍要求本机开关、专用来源、automatic 快照、启用的包白名单；手工启动的可信任务同样可使用已配置回写规则。
 - 需要课程目录的新版配置，在第一条可信阶段事件或 `00成片` 事件固定逻辑课程绑定；实际目录按需要创建，不预建三个阶段目录。仅状态回写且未启用上传/目录触发的配置不要求目录绑定。
 - 初稿、初审修改、终审修改的文件夹分别固定为 `01初稿`、`02初审`、`03终审`。
-- 首个成功 ZIP 触发课程路径回写；同一 run 的最终 ZIP 清单全部上传成功才触发该阶段完成回写。
+- 首个成功 ZIP 触发课程路径回写；当前 Auto-Cut-Lite 协议每 run 只允许一个精确 ZIP，该 ZIP 上传成功才触发该 run 的阶段完成回写。未来若需要一个 run 交付多个 ZIP，必须先另行设计并确认 manifest、result、receipt、artifact 与数据库协议升级。
 - 映射盘/UNC 的回写路径去掉服务器，保留共享名到课程目录；纯本地盘回写去盘符后的课程目录，不能伪造共享名。必须区分本地磁盘与不可解析/断开的网络映射，后者不能降级成去盘符的本地路径。
 - 不创建飞书字段或单选选项；保存稳定字段/选项 ID，通过真实元数据验证，并在官方 SDK 适配器边界转换为实际 API 要求的表示。
 - 不覆盖目标同名异内容 ZIP，不自动换名；至少一次投递、有限重试、可见失败，不宣称 exactly-once。
 - 新资源锁快照来自 Auto-Cut 包；阶段任务同包并发上限继续为 1。锁范围是同一 Taskboard 调度器，不是跨机器全局锁。
+- Auto-Cut-Lite 的 `source-manifest` schema v1、`execution_input` schema v1、`review-document-run` 参数、`CODEX_AUTOCUT_*` 环境变量及结果/回执 SHA-256 校验是冻结协议。本计划不改它们的字段或版本；目录/回写数据不得进入 manifest。
+- `stageSnapshot.artifactTargetPath` 是既有 Taskboard 上传协议字段。新界面移除直接编辑入口，但新任务必须在首次课程绑定时派生、校验并冻结绝对阶段路径到该字段；旧任务继续读取自己的已冻结值。
+- 任一协议字段的删除、改名、语义改变或 schema 升级，必须另列消费者清单、旧运行迁移、三阶段 golden fixture 和用户明确确认；“界面不展示”不构成删除授权。
 - 涉及筛选、路由或凭据的每批变更同时更新测试与 README；测试表/示例项目联调、代码评审后才能合并。
 
 ---
@@ -93,11 +96,11 @@ const delivery = {
 | 调用 | 签名与返回 |
 | --- | --- |
 | 事实查询 | `store.listDeliveryFacts(runId: string) -> Array<{ id, kind, runId, bindingId }>`，kind 为 `course_path | stage_uploaded | processing` |
-| 上传汇总 | `store.getRunDeliveryProgress(runId: string) -> { finalized: boolean, total: number, uploaded: number, allUploaded: boolean }` |
+| 上传查询 | `store.getRunDeliveryProgress(runId: string) -> { artifactId: string | null, registered: boolean, uploaded: boolean }`，当前 Lite run 最多绑定一个 artifact |
 | 操作查询 | `store.listDeliveryOperations({ subjectKey?: string, kind?: string, runId?: string }) -> DeliveryOperation[]` |
 | 事实记录 | `store.recordDeliveryFact({ dedupeKey, kind, runId, bindingId, snapshot }) -> DeliveryFact`，必须在调用方事务内执行 |
-| 集合冻结 | `store.finalizeRunArtifacts(runId: string, artifactIds: string[], finalizedAt: string) -> RunManifest`，非空，冻结后内容不同为冲突 |
 | 绑定查询 | `store.findCourseBinding(identity) -> binding | null` |
+| 阶段路径派生 | `deriveStageDestination(binding, stageId) -> string`，仅接受三个固定 stage ID，返回绑定课程目录下的绝对阶段路径，不创建目录；可信任务登记把结果冻结到 `origin.stageSnapshot.artifactTargetPath` |
 | 原子事务 | `store.transaction(callback: () => T) -> T`，复用现有连接，外部 I/O 不在事务回调内 |
 | Bridge 写入 | `writer.apply(operation: DeliveryOperation) -> Promise<{ operationId: string, status: 'succeeded' | 'conflict', fieldResults: Array<{ fieldId: string, status: 'updated' | 'unchanged' | 'conflict' }> }>` |
 | 本机写客户端 | `client.apply(operation: DeliveryOperation)` 仅发送 `operationId/claimToken/version`，与 `writer.apply` 返回类型一致；协议异常抛安全 code |
@@ -164,7 +167,9 @@ assert.throws(() => normalizeCourseNameValue('../课程001', { type: 1 }), { cod
 
 **Interfaces:** 包增加 `resourceGroups: string[]`，规范化 trim/去重，空数组为默认；新任务包快照记录资源名。调度 group 继续 `autocut:<alias>`，阶段任务 `fixedMaxConcurrent: true, maxConcurrent: 1`；非阶段任务继续现有读取当前包并发策略。旧任务没有新快照时读取旧 origin 锁，不清空。
 
-- [ ] 编写“不同包同资源不能同时进入执行”“阶段包即便 maxConcurrent=3 仍串行”“改包资源只影响新快照”“旧 subject 锁不会消失”“旧排队/运行任务快照不变”测试。
+`zipSourceDirectory` 的所有权可以在包配置界面呈现，但它仍是 Auto-Cut-Lite 生成并校验本机 ZIP 的受控来源根，不是飞书视频、音频或 NAS 上传总路径。迁移必须保留 `resolveFeishuPackageSourceDirectory` 对旧包 `artifactSourcePath` 及 `upload.artifactSourcePath` 的冻结回退，且不得改变 `.taskboard-autocut/<task>/<run>/<artifact>.zip`、`packageZipPath`、manifest、`execution_input`、runner 参数或结果/receipt 的精确路径约束。素材来源继续保留在三个阶段的 `videoSource`、`reviewSource` 与 `audio` 中。
+
+- [ ] 编写“不同包同资源不能同时进入执行”“阶段包即便 maxConcurrent=3 仍串行”“改包资源只影响新快照”“旧 subject 锁不会消失”“旧排队/运行任务快照不变”测试。为缺少 `zipSourceDirectory` 的旧包 `artifactSourcePath` 和 driver-report 学科 `upload.artifactSourcePath` 分别建立 fixture，断言两种回退均不读取 NAS/课程/阶段上传目标。
 
 ```js
 assert.deepEqual(newTaskPackageSnapshot.resourceGroups, ['剪映主机']);
@@ -186,6 +191,7 @@ assert.deepEqual(oldQueuedTaskOrigin.resourceGroups, ['legacy-resource']);
 
 - `previewCoursePath({ rootPath, courseName }, { resolveMappedDrive, classifyDrive }) -> Promise<{ actualRoot, coursePath, displayPath, pathKind }>`，只读，不 mkdir；本地盘返回去盘符后的显示值。`classifyDrive(rootPath) -> Promise<'local' | 'network' | 'unknown'>` 读取系统磁盘类型；`resolveMappedDrive(rootPath) -> Promise<string | null>` 读取网络映射。network 无映射或 unknown 都阻断，不当成本地盘。真实映射解析只有显式检查时执行；实时示例预览仅使用已读映射信息，不访问 NAS。
 - `ensureCourseBinding({ identity, subjectVersion, namingValue, resolvedPaths, trustedEventId }) -> binding`，键为 Base/table/record；绑定字段含实际绝对根、课程名、实际课程路径、展示路径、首次版本与事件。另持久化 `canonicalLocationKey`：网络用解析后规范 UNC，本地用规范卷位置和路径，统一 Windows 大小写/分隔符；唯一约束防止不同盘符/直接 UNC 别名绕过同名检查。服务器别名/DFS 无法解析时限制配置为同一规范共享入口或阻断，不许宣称可以识别所有物理别名。
+- `deriveStageDestination(binding, stageId) -> absolutePath`，只接受 `initial`、`first_review`、`final_review`，返回课程路径下固定的 `01初稿`、`02初审`、`03终审`，只计算不创建目录。可信阶段任务登记在同一事务将该值复制到新任务 `origin.stageSnapshot.artifactTargetPath`；已有任务的阶段快照保持原值，绝不按新配置改写。
 - `ensureStageDirectory(binding, stageId)` / `ensureFinalDirectory(binding)`，只允许固定子目录，根必须事先存在；首次可信登记建立逻辑绑定但不建目录。
 
 - [ ] 添加路径纯测试，映射盘解析依赖使用假数据；增加保留共享名、纯本地盘、映射盘断开、UNC 根、非法 Windows 名称、尾空格/点、大小写碰撞、超长路径、目录链接逃逸及名称后改不搬迁的用例。
@@ -209,43 +215,32 @@ await assert.rejects(() => previewCoursePath({ rootPath: 'W:\\交付', courseNam
 
 - [ ] 执行 `node --test taskboard/test/feishu-course-path.test.mjs taskboard/test/feishu-course-binding.test.mjs`，预期新模块缺失失败。
 - [ ] 建增量表 `feishu_course_bindings`；仅处理中回写且上传/目录触发均关闭时跳过绑定，允许 null 并覆盖登记/真实启动完整用例。需要目录时先查绑定，存在则直接复用，不再读取当前命名字段；不存在才取得白名单命名值/解析根，再同事务处理新任务可信登记/目录操作入队与绑定。事务内重新查绑定以处理并发。根/命名改变只影响未绑定记录。需要绑定却失败时阻断该副作用并保留可见错误，不把异常路径降级成当前工作目录。持久化解析的 UNC 位置，并在每次文件操作前检查盘符仍映射到同一位置；映射到共享子目录时保留该子目录及共享名。Windows 查询映射使用固定程序和结构化参数，绝不拼接单元格值成命令。
-- [ ] 加入并发两事件争抢相同 record、不同 record 同名、W:/V:/直接 UNC 同位置碰撞、数据库重启、预览零写入断言；运行上述测试与 `node --test taskboard/test/feishu-database-migration.test.mjs test/phased-bridge.test.mjs`，预期全部通过。
+- [ ] 加入并发两事件争抢相同 record、不同 record 同名、W:/V:/直接 UNC 同位置碰撞、数据库重启、预览零写入断言；增加三个固定阶段的路径派生、任务快照冻结、旧快照不被覆盖及路径派生零 `mkdir` 断言。运行上述测试与 `node --test taskboard/test/feishu-database-migration.test.mjs test/phased-bridge.test.mjs`，预期全部通过。
 - [ ] 同步根目录要求/惰性创建 README，提交 `feat: persist safe course directory bindings`。
 
-## Task 5：阶段 ZIP 发布、完整路径与最终产物集合
+## Task 5：阶段 ZIP 发布、完整路径与单制品运行交付
 
 **Files:** 修改 `taskboard/server/upload-worker.mjs`、`taskboard/server/database.mjs`、`taskboard/server/app.mjs`、`taskboard/server/artifact-service.mjs`、`taskboard/server/feishu-delivery-store.mjs`；扩展 `taskboard/test/artifact-upload-queue.test.mjs`、`taskboard/test/artifact-upload-lease.test.mjs`、`taskboard/test/feishu-autocut-run-lifecycle.test.mjs`；计划新增 `taskboard/test/feishu-delivery-manifest.test.mjs`。
 
 **Interfaces:**
 
-- 每 run 冻结 `artifactIds` 与 `manifestFinalizedAt`；只有明确完成产物发现并校验后才能 finalize。零 ZIP 不算交付完成。晚到 ZIP 不静默插入已完成集合，应显式重新核对 run。
+- 当前每个 Auto-Cut-Lite run 只绑定一个精确 `packageZipPath` 和一个注册 artifact。只有 result、receipt、artifact report、SHA-256 和绑定校验都通过后才能登记它；零 ZIP、第二个 ZIP、目录扫描发现的 ZIP 或与绑定路径不同的 ZIP 都不算交付。
 - 扩展现有 `markArtifactUploadUploaded` 接受 `{ publication: { destination, sha256, created } }` 并保存 `published_path`；原有 lease token / provenance 检查继续执行。
-- 在同一事务产生 `course_path`（绑定首次成功 ZIP）和 `stage_uploaded`（非空最终集合全部成功）事实，后续任务 6 从事实生成 outbox；不能依赖 SSE `onUpdate`。
+- 在该唯一 artifact 成功发布的同一事务产生 `course_path`（绑定首次成功 ZIP）和 `stage_uploaded` 事实，后续任务 6 从事实生成 outbox；不能依赖 SSE `onUpdate`。
+- 上传 worker 只读取任务 `origin.stageSnapshot.artifactTargetPath` 的冻结上传目标，不能从当前学科配置或 UI 重新推导；它从已登记的受验证 Taskboard artifact `storageKey` 发布，且 provenance 必须继续绑定本次 `runId` 和经过核验的 `packageZipPath`。上传重试不得重新读取或扫描 `packageZipPath`。课程目录、阶段目录和回写数据不得进入 Auto-Cut-Lite 的 manifest、`execution_input`、环境变量、runner 参数、result、receipt 或 artifact report。
 
-- [ ] 编写最小两 ZIP 用例：一个成功而另一个未排队，课程路径事实为 1、阶段完成事实为 0；第二个成功后阶段完成为 1。再次提交成功、丢失响应后重试都不重复事实。
+- [ ] 编写单 run 单 ZIP 用例：成功发布后课程路径事实和阶段完成事实各为 1；同一 artifact 再次提交、丢失响应后的上传重试都不重复事实；第二个 ZIP 或不同于 `packageZipPath` 的 ZIP 被拒绝。另建两个不同 run 的顺序用例，验证它们各自的阶段上传状态与 runGeneration 不混淆。
 
 ```js
 assert.equal(store.listDeliveryFacts(run.id).filter(x => x.kind === 'course_path').length, 1);
-assert.equal(store.listDeliveryFacts(run.id).filter(x => x.kind === 'stage_uploaded').length, 0);
+assert.equal(store.listDeliveryFacts(run.id).filter(x => x.kind === 'stage_uploaded').length, 1);
 assert.deepEqual(store.getRunDeliveryProgress(run.id), {
-  finalized: true, total: 2, uploaded: 1, allUploaded: false,
+  artifactId: artifact.id, registered: true, uploaded: true,
 });
 ```
 
 - [ ] 执行 `node --test taskboard/test/feishu-delivery-manifest.test.mjs taskboard/test/artifact-upload-queue.test.mjs taskboard/test/artifact-upload-lease.test.mjs`，确认新增断言失败。
-- [ ] 上传目标来自绑定与固定阶段名；仅准备实际上传的目录，禁止递归创建缺失总根。保存实际 publication 结果。同名同 hash 成功，不同 hash 为冲突；临时文件校验后原子不覆盖发布。NAS 不支持现有 hard-link 方法时返回明确的 `TARGET_ATOMIC_PUBLISH_UNSUPPORTED`；不改用可能覆盖的 rename/copy。
-
-新增汇总纯函数 `summarizeRunDelivery(manifest: { finalizedAt: string | null, artifactIds: string[] }, uploads: Array<{ artifactId: string, status: string }>)`，供仓储汇总与投影共用，核心算法如下。上传查询须先按本 run、当前 binding 和目标路径过滤，不能混入旧上传结果。
-
-```js
-export function summarizeRunDelivery(manifest, uploads) {
-  const expected = new Set(manifest.artifactIds);
-  const successful = new Set(uploads.filter(row => row.status === 'uploaded').map(row => row.artifactId));
-  const uploaded = [...expected].filter(id => successful.has(id)).length;
-  const finalized = manifest.finalizedAt !== null;
-  return { finalized, total: expected.size, uploaded, allUploaded: finalized && expected.size > 0 && uploaded === expected.size };
-}
-```
+- [ ] 上传目标来自绑定与固定阶段名，并在任务创建时冻结；仅准备实际上传的目录，禁止递归创建缺失总根。保存实际 publication 结果。同名同 hash 成功，不同 hash 为冲突；临时文件校验后原子不覆盖发布。NAS 不支持现有 hard-link 方法时返回明确的 `TARGET_ATOMIC_PUBLISH_UNSUPPORTED`；不改用可能覆盖的 rename/copy。新增“NAS 目标与 `packageZipPath` 不同”的成功用例，验证目录操作只在本机 ZIP、result、receipt、artifact report 都通过且 artifact 已登记后，从 artifact `storageKey` 读取内容发布。
 - [ ] 增加崩溃于“文件已发布、DB 尚未确认”的恢复、源 hash 变化、目标链接、失效 lease、来源撤销、root 断开测试。运行上述测试及 `node --test taskboard/test/feishu-autocut-run-lifecycle.test.mjs`，预期通过。
 - [ ] 同步 README 的上传完成定义及 NAS 发布限制，提交 `feat: publish stage ZIPs and persist complete run delivery facts`。
 
@@ -355,12 +350,12 @@ expect(screen.queryByLabelText('流程名称')).toBeNull();
 
 **Files:** 计划新增 `taskboard/web/src/components/FeishuDeliveryStatus.tsx`、`FeishuDeliveryStatus.test.tsx`；修改 `taskboard/web/src/components/AutoCutRunSummary.tsx`、`AutoCutRunSummary.test.tsx`、`taskboard/web/src/unifiedWorkflow.mjs`、`taskboard/web/src/api.ts`、`taskboard/web/src/types.ts`、`taskboard/package.json`；扩展 `taskboard/test/artifact-upload-views.test.mjs`、`taskboard/test/unified-workflow-projection.test.mjs`。
 
-**Interfaces:** 任务 8 的 API 输出 `editingState, manifestFinalized, totalZips, uploadedZips, statusWritebacks, coursePathWriteback`；不得通过“存在任一 uploaded”推算整卡已上传。新组件测试文件显式加入现有 `test:components` 脚本，否则默认脚本不会执行它。
+**Interfaces:** 任务 8 的 API 输出 `editingState, artifactRegistered, uploadState, statusWritebacks, coursePathWriteback`；不得把 runner 结束、artifact 已登记、ZIP 已上传和飞书回写成功混成同一状态。当前每个 Lite run 仅显示一个 ZIP 的登记与上传状态。新组件测试文件显式加入现有 `test:components` 脚本，否则默认脚本不会执行它。
 
-- [ ] 断言两 ZIP 一个成功显示“上传 1/2”，回写待重试不把剪辑改为失败，点击回写重试仅请求该 operation，成片记录在学科额外触发区可见。
+- [ ] 断言单 ZIP 成功显示“ZIP：已上传”，回写待重试不把剪辑改为失败，点击回写重试仅请求该 operation，成片记录在学科额外触发区可见。
 
 ```tsx
-expect(screen.getByText('上传 1/2')).toBeTruthy();
+expect(screen.getByText('ZIP：已上传')).toBeTruthy();
 expect(screen.getByText('课程路径：待重试')).toBeTruthy();
 fireEvent.click(screen.getByRole('button', { name: '重试课程路径回写' }));
 expect(retryDeliveryOperation).toHaveBeenCalledWith('op_course_path', 1);
@@ -375,8 +370,11 @@ expect(enqueueArtifactUpload).not.toHaveBeenCalled();
 
 **Files:** 扩展 `taskboard/test/feishu-database-migration.test.mjs`、`test/phased-bridge.test.mjs`、`test/startup-scripts.test.mjs`、`test/operations-hardening.test.mjs`；计划新增 `taskboard/test/feishu-course-delivery-integration.test.mjs`；必要实现修正限于前述模块。
 
-- [ ] 建立旧数据库/旧包 fixture：旧阶段路径相同、不同、非空资源、旧自定义名称、排队/执行/上传中的任务各一例。迁移事务失败回滚，再次启动幂等；旧任务继续使用旧快照和路径，新配置激活后才对新记录生效；已存在绑定不重新绑定。
-- [ ] 使用临时文件夹、loopback 两服务与 SDK 假实现跑完整序列：可信事件 → 绑定无目录 → 真正开始 → processing 回写 → 两 ZIP 逐个发布 → 首 ZIP 路径回写 → 全 ZIP 阶段回写 → 改名后第二阶段仍原目录。加 `00成片` 抢先与后到两种顺序。
+- [ ] 建立旧数据库/旧包 fixture：旧阶段路径相同、不同、非空资源、旧自定义名称、排队/执行/上传中的任务各一例，以及缺少包 `zipSourceDirectory` 的旧包来源和 driver-report 学科来源各一例。迁移事务失败回滚，再次启动幂等；旧任务继续使用旧快照和路径及来源回退，新配置激活后才对新记录生效；已存在绑定不重新绑定。
+- [ ] 使用临时文件夹、loopback 两服务与 SDK 假实现跑完整序列：可信初稿事件 → 绑定无目录 → 真正开始 → processing 回写 → 本 run 唯一 ZIP 验证、登记并发布 → 首 ZIP 路径回写和初稿完成回写 → 改名后初审修改新 run 仍用原课程目录并完成自身 ZIP 发布与阶段回写。加 `00成片` 抢先与后到两种顺序。
+- [ ] 为 `initial`、`first_review`、`final_review` 各建立冻结快照 golden fixture，分别覆盖视频原音、文档目录外部音频、Base 附件外部音频。断言每个 manifest 的 `binding.stage_id`、视频/意见/音频来源、音频容差、`nameSuffix` 生成的 `artifact_name` 互不串用，且 schema v1 的 canonical SHA-256 不变。
+- [ ] 对自动、手动和授权 retry 三条本机运行路径固定断言 `review-document-run` argv、`runtimeEnvironment` 明确注入的 `CODEX_AUTOCUT_*` allowlist、`execution_input.json`、`packageZipPath`、结果和 receipt；断言这些直接运行环境不含 `CODEX_AUTOCUT_ARTIFACT_REPORT_URL` 或 `CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN`。artifact report 的 loopback capability 另测其自身请求与精确路径/哈希，不把令牌扩散到本机 runner 环境。`packageZipPath` 必须位于本机受控 ZIP 来源根，且不得等于 NAS/课程/阶段上传目标。
+- [ ] 验证课程路径、阶段状态回写、`00成片` 与目录配置仅走 Taskboard/Bridge 的持久化副作用链：不新增 manifest 或 execution-input 字段，不改变 runner 命令或环境，也不因模拟来源创建目录、回写或启动 Lite。任何协议字段变动均使 golden fixture 失败，并阻断合并直至按协议升级流程获得明确确认。
 
 ```js
 assert.deepEqual((await readdir(courseDirectory)).sort(), ['00成片', '01初稿', '02初审']);
@@ -404,7 +402,7 @@ await assert.rejects(() => access(unusedFinalReviewDirectory), { code: 'ENOENT' 
 
 ## 实施前核对结论
 
-规格验收场景与任务对应：A01/A05/A14–A16 → 任务 2、4；A02–A04/A17 → 任务 5；A08–A13 → 任务 6、7；A06/A07 → 任务 8；A18/A19/A23 → 任务 1、9；A20/A21 → 任务 3、9、11；A22 → 任务 8、10。任务 11、12 对这些场景做组合回归与真实测试环境验收。
+规格验收场景与任务对应：A01/A05/A14–A16 → 任务 2、4；A02–A04/A17 → 任务 5；A08–A13 → 任务 6、7；A06/A07 → 任务 8；A18/A19/A23 → 任务 1、9；A20/A21 → 任务 3、9、11；A22 → 任务 8、10；A24/A25 → 任务 4、5、11。任务 11、12 对这些场景做组合回归与真实测试环境验收。
 
 - 已核对当前 `npm test` 会运行 Node 测试、Taskboard typecheck、web build 和显式列表组件测试；新增组件测试必须登记。
 - 当前上传 worker 已做 hash 与 hard-link 原子不覆盖，但尚未保存完整 publication 路径；现有上传失败需要手动重试，不能描述为已有退避/死信能力。
