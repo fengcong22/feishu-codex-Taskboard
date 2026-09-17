@@ -333,9 +333,9 @@ assert.equal(codexStarts.length, 0);
 
 **Files:** 修改 `taskboard/web/src/components/FeishuWorkflowPanel.tsx`、`FeishuStageEditor.tsx`、`FeishuPackageManager.tsx`、`UnifiedWorkflowBoard.tsx`、`UnifiedWorkflowViewControls.tsx`、`taskboard/web/src/App.tsx`、`taskboard/web/src/api.ts`、`taskboard/web/src/types.ts`、`taskboard/web/src/styles.css`；计划新增契约目录中的三个配置 section 文件；修改 `taskboard/web/src/components/FeishuWorkflowPanel.test.tsx`、`taskboard/test/unified-workflow-view-controls.test.mjs`、`taskboard/test/feishu-workflow-ui.test.mjs`。
 
-**Interfaces:** 组件按 `基础与执行 / 素材与阶段 / 存储与目录 / 飞书回写 / 额外触发` 分区，输入绑定共享 subject draft；`issues` 使用任务 1 的同一字段路径。新 section 都接收 `{ value, metadata, issues, onChange }`，不各自存储第二份配置。包管理增加 `resourceGroups`，显示阶段任务实际串行限制。
+**Interfaces:** 组件按 `基础与执行 / 素材与阶段 / 存储与目录 / 飞书回写 / 额外触发` 分区，输入绑定共享 subject draft；`issues` 使用任务 1 的同一字段路径。新 section 都接收 `{ value, metadata, issues, onChange }`，不各自存储第二份配置。包管理增加 `resourceGroups`，显示阶段任务实际串行限制。`素材与阶段` 继续直接编辑每个 `stages[stageId].videoSource`、`reviewSource`、`audio` 和 `nameSuffix`；不得新增学科级共享 `materialField` 或用一个选择覆盖三个阶段。
 
-- [ ] 编写组件行为测试：点击任一学科只切换编辑对象；“查看任务”另走导航；草稿切换保留；离开未保存警告；字段改变清空已失效选项；禁用阶段不阻断启用；网络错误不同于空列表；刷新不清空编辑；启用失败保留旧活动版本。使用现有 `subject()` / `fields` fixture 扩展。
+- [ ] 编写组件行为测试：点击任一学科只切换编辑对象；“查看任务”另走导航；草稿切换保留；离开未保存警告；字段改变清空已失效选项；禁用阶段不阻断启用；网络错误不同于空列表；刷新不清空编辑；启用失败保留旧活动版本。增加三个阶段分别选择不同视频附件字段、不同音频模式/来源并保存的断言；视频原音隐藏音频来源详情及时长误差；折叠摘要能区分每阶段视频/音频/意见来源；页面不存在学科级“素材字段”。使用现有 `subject()` / `fields` fixture 扩展。
 
 ```tsx
 fireEvent.change(screen.getByLabelText('处理中回写字段'), { target: { value: 'fld_other' } });
@@ -346,7 +346,7 @@ expect(screen.queryByLabelText('流程名称')).toBeNull();
 ```
 
 - [ ] 执行 `npm --prefix taskboard run test:components -- --reporter=dot`，确认新增断言失败。
-- [ ] 实现左列表右内容、单主要滚动区域、固定底部操作；活动/已存草稿/未保存编辑三种状态明示；错误计数可跳转。上传总路径只有一个，ZIP 来源展示包继承值，课程命名字段与 ZIP 命名区分。
+- [ ] 实现左列表右内容、单主要滚动区域、固定底部操作；活动/已存草稿/未保存编辑三种状态明示；错误计数可跳转。上传总路径只有一个，ZIP 来源展示包继承值，课程命名字段与 ZIP 命名区分。素材与阶段顶部只保留共同触发字段；三个可折叠阶段编辑区各自展示触发选项、视频来源类型/详情、音频来源类型/详情、剪辑意见来源和命名后缀，不改变现有每阶段素材契约。
 - [ ] 移除普通学科并发/资源输入、局部名称说明和全局名称编辑入口。读取固定系统 label，停止使用旧显示 override；旧数据库值留存，不隐藏编辑后继续生效。没有其他引用再删除 `UnifiedWorkflowStageSettings.tsx` / `BoardStageSettings.tsx`；内部 stage ID 不变。
 - [ ] 原音模式隐藏无关配音设置；未启用阶段折叠摘要保留值。加入真实/展示路径预览差异、预览不创建说明、显式测试写入操作和字段刷新。
 - [ ] 执行 `npm --prefix taskboard run typecheck`、`npm --prefix taskboard run test:components`、`node --test taskboard/test/unified-workflow-view-controls.test.mjs taskboard/test/feishu-workflow-ui.test.mjs`；预期通过。用宽屏和窄窗口实际检查无双层高度裁剪、遮挡和横向溢出；提交 `feat: reorganize Feishu configuration and use fixed workflow labels`。
@@ -404,7 +404,7 @@ await assert.rejects(() => access(unusedFinalReviewDirectory), { code: 'ENOENT' 
 
 ## 实施前核对结论
 
-规格验收场景与任务对应：A01/A05/A14–A16 → 任务 2、4；A02–A04/A17 → 任务 5；A08–A13 → 任务 6、7；A06/A07 → 任务 8；A18/A19 → 任务 1、9；A20/A21 → 任务 3、9、11；A22 → 任务 8、10。任务 11、12 对这些场景做组合回归与真实测试环境验收。
+规格验收场景与任务对应：A01/A05/A14–A16 → 任务 2、4；A02–A04/A17 → 任务 5；A08–A13 → 任务 6、7；A06/A07 → 任务 8；A18/A19/A23 → 任务 1、9；A20/A21 → 任务 3、9、11；A22 → 任务 8、10。任务 11、12 对这些场景做组合回归与真实测试环境验收。
 
 - 已核对当前 `npm test` 会运行 Node 测试、Taskboard typecheck、web build 和显式列表组件测试；新增组件测试必须登记。
 - 当前上传 worker 已做 hash 与 hard-link 原子不覆盖，但尚未保存完整 publication 路径；现有上传失败需要手动重试，不能描述为已有退避/死信能力。
