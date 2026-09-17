@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import { normalizeDeliveryConfig } from "../taskboard/shared/feishu-delivery-config.mjs";
+
 /**
  * Version of the local Base/subject configuration document.
  *
@@ -62,6 +64,7 @@ const SUBJECT_KEYS = new Set([
   "documentField",
   "namingField",
   "stages",
+  "delivery",
   "enabledAt",
   "closedAt",
   "activeSnapshot",
@@ -81,6 +84,7 @@ const ROUTE_KEYS = new Set([
   "branchMap",
 ]);
 const UPLOAD_KEYS = new Set([
+  "enabled",
   "enqueueMode",
   "artifactSourceMode",
   "artifactSourcePath",
@@ -432,6 +436,7 @@ function normalizeUpload(value, name = "upload") {
     fail(`${name}.artifactSourceMode is not supported`);
   }
   return {
+    ...(input.enabled === undefined ? {} : { enabled: booleanValue(input.enabled, `${name}.enabled`) }),
     enqueueMode,
     artifactSourceMode,
     artifactSourcePath: localPath(input.artifactSourcePath, `${name}.artifactSourcePath`),
@@ -511,6 +516,7 @@ export function validateSubjectConfig(value) {
     execution,
     packageRoute: normalizePackageRoute(input.packageRoute ?? { packageAlias: input.defaultPackageAlias }),
     upload,
+    ...(input.delivery === undefined ? {} : { delivery: normalizeDeliveryConfig(input.delivery) }),
   };
   if (input.activeSnapshot !== undefined && input.activeSnapshot !== null) {
     normalized.activeSnapshot = validateSubjectConfig({
@@ -537,6 +543,7 @@ export function portableSubject(value) {
     result.upload.artifactSourcePath = null;
     result.upload.targetPath = null;
   }
+  if (result.delivery) result.delivery.rootPath = null;
   if (result.activeSnapshot) result.activeSnapshot = portableSubject(result.activeSnapshot);
   return result;
 }
@@ -580,6 +587,7 @@ function normalizeSubject(value, base, index, { allowActiveSnapshot = true } = {
     execution: normalizeExecution(input.execution, `subject[${index}].execution`),
     packageRoute: normalizePackageRoute(input.packageRoute, `subject[${index}].packageRoute`),
     upload: normalizeUpload(input.upload, `subject[${index}].upload`),
+    ...(input.delivery === undefined ? {} : { delivery: normalizeDeliveryConfig(input.delivery) }),
   };
   if (typeof normalized.displayEnabled !== "boolean") {
     fail(`subject[${index}].displayEnabled must be boolean`);

@@ -839,6 +839,67 @@ test("local Feishu workflow API persists preview and subject lifecycle", async (
   }
 });
 
+test("workflow API saves incomplete delivery drafts and reports activation requirements", async () => {
+  const fixtureData = await fixture();
+  try {
+    const preview = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog", {
+      method: "POST",
+      body: {
+        baseToken: "bas_delivery_api",
+        baseName: "Delivery API Base",
+        tables: [{
+          tableId: "tbl_delivery",
+          tableName: "数学",
+          fields: [
+            {
+              fieldId: "fld_status",
+              fieldName: "状态",
+              type: 3,
+              uiType: "SingleSelect",
+              options: [{ id: "opt_ready", name: "待剪辑" }],
+            },
+            { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+            { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+          ],
+        }],
+      },
+    });
+    const subject = preview.body.catalog[0].subjects[0];
+    const key = encodeURIComponent(subject.subjectKey);
+    const draft = await request(fixtureData.baseUrl, `/api/local/feishu/workflow/subjects/${key}`, {
+      method: "PATCH",
+      body: {
+        expectedVersion: subject.configVersion,
+        upload: { ...subject.upload, enabled: true },
+        delivery: {
+          version: 1,
+          rootPath: null,
+          courseNaming: { mode: "field", fieldId: null },
+          coursePathWriteback: { enabled: false, fieldId: null },
+          writeback: {
+            initial: { onProcessing: [], onUploaded: [] },
+            first_review: { onProcessing: [], onUploaded: [] },
+            final_review: { onProcessing: [], onUploaded: [] },
+          },
+          finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+        },
+      },
+    });
+    assert.equal(draft.response.status, 200);
+    assert.equal(draft.body.subject.delivery.rootPath, null);
+
+    const activation = await request(fixtureData.baseUrl, `/api/local/feishu/workflow/subjects/${key}/enable`, {
+      method: "POST",
+      body: { expectedVersion: draft.body.subject.configVersion },
+    });
+    assert.equal(activation.response.status, 409);
+    assert.equal(activation.body.error.code, "DELIVERY_ROOT_PATH_REQUIRED");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
 test("Feishu removal archives its source project and preview restoration reactivates it", async () => {
   const fixtureData = await fixture();
   try {

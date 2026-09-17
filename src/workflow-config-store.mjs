@@ -131,6 +131,7 @@ function subjectWithoutRuntime(subject, { forceDraft = false } = {}) {
   if (forceDraft) result.lifecycle = "draft";
   result.upload.artifactSourcePath = null;
   result.upload.targetPath = null;
+  if (result.delivery) result.delivery.rootPath = null;
   return result;
 }
 
@@ -196,6 +197,9 @@ function mergeImported(current, imported) {
         }
         if (nextSubject.upload.targetPath === null) {
           nextSubject.upload.targetPath = currentSubject.upload.targetPath ?? null;
+        }
+        if (nextSubject.delivery?.rootPath === null && currentSubject.delivery?.rootPath) {
+          nextSubject.delivery.rootPath = currentSubject.delivery.rootPath;
         }
         nextSubject.configVersion = currentSubject.configVersion + 1;
         nextSubject.updatedAt = null;
@@ -645,6 +649,9 @@ export function createWorkflowConfigStore({
         targetPath: null,
       },
     };
+    if (input.delivery !== undefined || current.delivery !== undefined) {
+      next.delivery = clone(input.delivery ?? current.delivery);
+    }
     for (const field of ["statusField", "documentField", "namingField", "stages"]) {
       if (next[field] === undefined) delete next[field];
     }

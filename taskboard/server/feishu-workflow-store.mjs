@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 
 import { ApiError } from "./database.mjs";
 import {
+  normalizeDeliveryConfig,
+  validateDeliveryConfig,
+} from "../shared/feishu-delivery-config.mjs";
+import {
   STAGE_IDS,
   assertPhasedAttachmentBindings,
   canonicalizePhasedSubjectPatch,
@@ -670,6 +674,7 @@ function localMetadataForShareImport(subject) {
 }
 
 function shareableSubject(subject, { forceDraft = false } = {}) {
+  const delivery = Object.hasOwn(subject, "delivery") ? clone(subject.delivery) : undefined;
   const result = {
     subjectKey: subject.subjectKey,
     baseToken: subject.baseToken,
@@ -700,6 +705,7 @@ function shareableSubject(subject, { forceDraft = false } = {}) {
     execution: clone(subject.execution),
     packageRoute: clone(subject.packageRoute),
     upload: clone(subject.upload),
+    ...(delivery === undefined ? {} : { delivery }),
     metadata: portableMetadata(subject.metadata),
   };
   // A share file is a portable description of workflow intent.  Runtime
@@ -714,6 +720,7 @@ function shareableSubject(subject, { forceDraft = false } = {}) {
     artifactSourcePath: null,
     targetPath: null,
   };
+  if (result.delivery) result.delivery.rootPath = null;
   return result;
 }
 
@@ -769,7 +776,7 @@ function validateShareDocument(value) {
       const subjectAllowed = new Set([
         "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId", "displayEnabled",
         "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title", "execution",
-        "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages",
+        "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages", "delivery",
       ]);
       const subjectUnknown = Object.keys(inputSubject).find((key) => !subjectAllowed.has(key));
       if (subjectUnknown) {
@@ -806,6 +813,7 @@ function validateShareDocument(value) {
         execution: clone(inputSubject.execution),
         packageRoute: clone(inputSubject.packageRoute),
         upload: clone(inputSubject.upload),
+        ...(inputSubject.delivery === undefined ? {} : { delivery: clone(inputSubject.delivery) }),
         statusField: clone(inputSubject.statusField),
         documentField: clone(inputSubject.documentField),
         namingField: clone(inputSubject.namingField),
@@ -838,6 +846,14 @@ function validateShareDocument(value) {
       normalized.upload ??= { enqueueMode: "manual", artifactSourceMode: "manual_select", artifactSourcePath: null, targetId: null, targetPath: null, uploadConcurrency: 1 };
       normalized.upload.artifactSourcePath = null;
       normalized.upload.targetPath = null;
+      if (Object.hasOwn(normalized, "delivery")) {
+        try {
+          normalized.delivery = normalizeDeliveryConfig(normalized.delivery);
+        } catch (error) {
+          throw new ApiError(400, "INVALID_SHARE_CONFIGURATION", error.message);
+        }
+        if (normalized.delivery) normalized.delivery.rootPath = null;
+      }
       try {
         if (!hasExplicitPhasedShape) {
           normalized = phasedDefaultsForSubject({
@@ -889,7 +905,7 @@ function validateShareDocument(value) {
 
 const SUBJECT_PATCH_KEYS = new Set([
   "displayEnabled", "trigger", "title", "execution", "packageRoute", "upload",
-  "statusField", "documentField", "namingField", "stages", "expectedVersion",
+  "statusField", "documentField", "namingField", "stages", "delivery", "expectedVersion",
 ]);
 
 export function validateSubjectConfig(value, { projectLegacyTrigger = false } = {}) {
@@ -899,7 +915,7 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
   const allowedTopLevel = new Set([
     "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId",
     "displayEnabled", "lifecycle", "configVersion", "trigger", "title", "execution",
-    "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages",
+    "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages", "delivery",
     "createdAt", "updatedAt",
   ]);
   const unknownTopLevel = Object.keys(value).find((key) => !allowedTopLevel.has(key));
@@ -950,7 +966,10 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
       }
     }
   }
-  assertKeys(value.upload, new Set(["enqueueMode", "artifactSourceMode", "artifactSourcePath", "targetId", "targetPath", "uploadConcurrency"]), "upload");
+  assertKeys(value.upload, new Set(["enabled", "enqueueMode", "artifactSourceMode", "artifactSourcePath", "targetId", "targetPath", "uploadConcurrency"]), "upload");
+  if (value.upload.enabled !== undefined && typeof value.upload.enabled !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "upload.enabled must be boolean");
+  }
   if (!EXECUTION_MODES.has(value.upload.enqueueMode)) throw new ApiError(400, "INVALID_FIELD", "upload.enqueueMode is invalid");
   if (!ARTIFACT_SOURCE_MODES.has(value.upload.artifactSourceMode)) throw new ApiError(400, "INVALID_FIELD", "upload.artifactSourceMode is invalid");
   if (!Number.isSafeInteger(value.upload.uploadConcurrency) || value.upload.uploadConcurrency < 1) throw new ApiError(400, "INVALID_FIELD", "upload.uploadConcurrency must be positive");
@@ -995,6 +1014,13 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
       }
     } catch (error) {
       if (error instanceof ApiError) throw error;
+      throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
+    }
+  }
+  if (Object.hasOwn(value, "delivery")) {
+    try {
+      value.delivery = normalizeDeliveryConfig(value.delivery);
+    } catch (error) {
       throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
     }
   }
@@ -1048,6 +1074,29 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         error?.path ? { path: error.path } : undefined,
       );
     }
+  }
+
+  function assertDeliveryConfiguration(subject, mode) {
+    if (!Object.hasOwn(subject, "delivery")) return;
+    const fields = Array.isArray(subject?.metadata?.fields) ? subject.metadata.fields : [];
+    const namingField = fields.find((field) => (
+      metadataFieldId(field) === subject?.namingField?.fieldId
+    )) ?? null;
+    const result = validateDeliveryConfig(subject.delivery, {
+      mode,
+      fields,
+      stages: subject.stages,
+      uploadEnabled: subject.upload?.enabled !== false,
+      namingField,
+    });
+    if (result.issues.length === 0) return;
+    const first = result.issues[0];
+    throw new ApiError(
+      mode === "activation" ? 409 : 400,
+      first.code,
+      first.message,
+      { path: first.path },
+    );
   }
   async function assertPackageAlias(alias) {
     if (typeof packageAliases !== "function") return;
@@ -1368,6 +1417,12 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 artifactSourcePath: local?.upload?.artifactSourcePath ?? null,
                 targetPath: local?.upload?.targetPath ?? null,
               },
+              ...(imported.delivery === undefined ? {} : {
+                delivery: {
+                  ...imported.delivery,
+                  rootPath: local?.delivery?.rootPath ?? null,
+                },
+              }),
               ...(imported.stages ? {
                 stages: Object.fromEntries(STAGE_IDS.map((stageId) => {
                   const localStage = local?.stages?.[stageId];
@@ -1604,6 +1659,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           next = validate(merged, { projectLegacyTrigger: Object.hasOwn(rawChanges, "stages") });
         }
         assertStrictPhasedAttachments(next);
+        assertDeliveryConfiguration(next, "draft");
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
           .run(next.configVersion, JSON.stringify(next), next.displayEnabled === false ? 0 : 1, timestamp, key);
         saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
@@ -1784,6 +1840,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       const next = lifecycle === "enabled"
         ? validate(lifecycleCandidate, { projectLegacyTrigger: true })
         : validateLifecycleSnapshot(lifecycleCandidate);
+      if (lifecycle === "enabled") assertDeliveryConfiguration(next, "activation");
       if (typeof syncSubject === "function") {
         // Keep the local transaction open until Bridge accepts the same
         // validated snapshot.  A failed loopback sync rolls back the local

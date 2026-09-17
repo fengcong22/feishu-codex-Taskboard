@@ -292,6 +292,98 @@ test("status-only table keeps missing document and naming bindings pending and c
   }
 });
 
+test("course delivery settings remain repairable in a draft and block activation until complete", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const catalog = await store.upsertBasePreview(phasedPreview());
+    const subject = catalog.subjects[0];
+    const draft = await store.saveSubjectDraft(subject.subjectKey, {
+      expectedVersion: subject.configVersion,
+      upload: { ...subject.upload, enabled: true },
+      delivery: {
+        version: 1,
+        rootPath: null,
+        courseNaming: { mode: "field", fieldId: null },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {
+          initial: { onProcessing: [], onUploaded: [] },
+          first_review: { onProcessing: [], onUploaded: [] },
+          final_review: { onProcessing: [], onUploaded: [] },
+        },
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+
+    assert.equal(draft.lifecycle, "draft");
+    assert.equal(draft.upload.enabled, true);
+    assert.equal(draft.delivery.rootPath, null);
+    await assert.rejects(
+      () => store.enableSubject(subject.subjectKey, draft.configVersion),
+      (error) => error.code === "DELIVERY_ROOT_PATH_REQUIRED",
+    );
+    const unchanged = await store.getSubject(subject.subjectKey);
+    assert.equal(unchanged.lifecycle, "draft");
+    assert.equal(unchanged.configVersion, draft.configVersion);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("course delivery sharing retains rules while keeping the root path local", async () => {
+  const source = await fixture();
+  const target = await fixture();
+  try {
+    const sourceSubject = (await source.store.upsertBasePreview(phasedPreview())).subjects[0];
+    const existingTarget = (await target.store.upsertBasePreview(phasedPreview())).subjects[0];
+    await target.store.saveSubjectDraft(existingTarget.subjectKey, {
+      expectedVersion: existingTarget.configVersion,
+      delivery: {
+        version: 1,
+        rootPath: "D:\\本机交付目录",
+        courseNaming: { mode: "field", fieldId: "fld_name" },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {
+          initial: { onProcessing: [], onUploaded: [] },
+          first_review: { onProcessing: [], onUploaded: [] },
+          final_review: { onProcessing: [], onUploaded: [] },
+        },
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+    await source.store.saveSubjectDraft(sourceSubject.subjectKey, {
+      expectedVersion: sourceSubject.configVersion,
+      delivery: {
+        version: 1,
+        rootPath: "W:\\学科实拍素材临时传输\\【--剪映草稿--】",
+        courseNaming: { mode: "field", fieldId: "fld_name" },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {
+          initial: { onProcessing: [], onUploaded: [] },
+          first_review: { onProcessing: [], onUploaded: [] },
+          final_review: { onProcessing: [], onUploaded: [] },
+        },
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+
+    const shared = await source.store.exportShareable();
+    assert.equal(shared.bases[0].subjects[0].delivery.rootPath, null);
+    assert.deepEqual(shared.bases[0].subjects[0].delivery.courseNaming, { mode: "field", fieldId: "fld_name" });
+
+    const imported = await target.store.importShareable(shared);
+    const targetSubject = imported.catalog[0].subjects[0];
+    assert.equal(targetSubject.lifecycle, "draft");
+    assert.equal(targetSubject.delivery.rootPath, "D:\\本机交付目录");
+    assert.deepEqual(targetSubject.delivery.courseNaming, { mode: "field", fieldId: "fld_name" });
+  } finally {
+    source.database.close();
+    target.database.close();
+    await rm(source.directory, { recursive: true, force: true });
+    await rm(target.directory, { recursive: true, force: true });
+  }
+});
+
 test("refreshing a legacy subject upgrades it to phased defaults while preserving local settings", async () => {
   const { directory, database, store } = await fixture();
   try {

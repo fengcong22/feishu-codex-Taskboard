@@ -224,6 +224,53 @@ test("Bridge config round-trip retains three staged audio sources without a sche
   }
 });
 
+test("workflow sharing keeps delivery rules but removes the machine delivery root", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-delivery-share-"));
+  try {
+    const store = createWorkflowConfigStore({
+      filename: path.join(directory, "workflow.json"),
+      initial: validConfig({
+        bases: [{
+          ...validConfig().bases[0],
+          subjects: [validSubject({
+            upload: {
+              ...validSubject().upload,
+              enabled: true,
+            },
+            delivery: {
+              version: 1,
+              rootPath: "W:\\学科实拍素材临时传输\\【--剪映草稿--】",
+              courseNaming: { mode: "field", fieldId: "fld_title" },
+              coursePathWriteback: { enabled: true, fieldId: "fld_course_path" },
+              writeback: {
+                initial: {
+                  onProcessing: [{ fieldId: "fld_progress", optionId: "opt_editing" }],
+                  onUploaded: [{ fieldId: "fld_progress", optionId: "opt_finished" }],
+                },
+                first_review: { onProcessing: [], onUploaded: [] },
+                final_review: { onProcessing: [], onUploaded: [] },
+              },
+              finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+            },
+          })],
+        }],
+      }),
+    });
+
+    const local = (await store.read()).bases[0].subjects[0];
+    assert.equal(local.delivery.rootPath, "W:\\学科实拍素材临时传输\\【--剪映草稿--】");
+    assert.deepEqual(local.delivery.writeback.initial.onUploaded, [{ fieldId: "fld_progress", optionId: "opt_finished" }]);
+
+    const shared = await store.exportShareable();
+    const exported = shared.bases[0].subjects[0];
+    assert.equal(exported.delivery.rootPath, null);
+    assert.deepEqual(exported.delivery.courseNaming, { mode: "field", fieldId: "fld_title" });
+    assert.deepEqual(exported.delivery.writeback.initial.onProcessing, [{ fieldId: "fld_progress", optionId: "opt_editing" }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("workflow config store keeps drafts separate from active subjects and versions changes", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-config-"));
   const filename = path.join(directory, "workflow.json");
