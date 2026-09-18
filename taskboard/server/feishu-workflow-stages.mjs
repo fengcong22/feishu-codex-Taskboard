@@ -299,6 +299,9 @@ export function normalizeStage(stage, metadata = null, stageId = "stage") {
     `stages.${stageId}.trigger.fieldName`,
     { optional: !enabled },
   );
+  if (statusField && fieldNameValue && fieldName(statusField) !== fieldNameValue) {
+    throw fail(`stages.${stageId}.trigger.fieldName does not match metadata`, "FIELD_NAME_MISMATCH");
+  }
 
   const videoSource = normalizeSource(stage.videoSource ?? stage.video_source, metadata, `stages.${stageId}.videoSource`);
   const reviewSource = normalizeSource(stage.reviewSource ?? stage.review_source, metadata, `stages.${stageId}.reviewSource`, { review: true });
@@ -338,6 +341,9 @@ function validateMetadataField(metadata, descriptor, name, predicate = null, { r
   const matches = metadataFieldMatches(metadata, id);
   if (matches.length > 1) throw fail(`${name}.fieldId is not unique in metadata`, "FIELD_NOT_UNIQUE");
   if (hasKnownMetadata(metadata) && !field) throw fail(`${name}.fieldId is not present in metadata`, "FIELD_NOT_FOUND");
+  if (field && configuredName && fieldName(field) !== configuredName) {
+    throw fail(`${name}.fieldName does not match metadata`, "FIELD_NAME_MISMATCH");
+  }
   if (field && predicate && !predicate(field)) throw fail(`${name}.fieldId has an incompatible type`, "FIELD_TYPE_INVALID");
   return { fieldId: id, fieldName: configuredName ?? text(fieldName(field), `${name}.fieldName`) };
 }

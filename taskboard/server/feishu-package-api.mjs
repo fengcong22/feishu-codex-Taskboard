@@ -2,12 +2,13 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 
 import { ApiError } from "./database.mjs";
-import { PackageConfigError } from "./feishu-package-config.mjs";
+import { PackageConfigError, validateCustomZipOutputDirectory } from "./feishu-package-config.mjs";
+import { inspectAutoCutPackageWorkspace, prepareAutoCutPackageOutputDirectory } from "./feishu-package-identity.mjs";
 
 const PACKAGE_ROOT = "/api/local/autocut/packages";
 const PACKAGE_FIELDS = new Set([
   "alias", "name", "projectName", "projectId", "workspacePath", "model", "reasoningEffort",
-  "prompt", "zipSourceDirectory", "maxConcurrent",
+  "prompt", "zipSourceDirectory", "zipOutputMode", "maxConcurrent", "resourceGroups",
 ]);
 const PACKAGE_MUTATION_FIELDS = new Set([
   ...PACKAGE_FIELDS, "revision", "expectedRevision",
@@ -63,6 +64,19 @@ async function discoverCatalog(getModelCatalog, workspacePath) {
   }
 }
 
+async function manifestIdentity(record) {
+  if (!record || typeof record.workspacePath !== "string" || !record.workspacePath.trim()) return null;
+  try {
+    const inspection = await inspectAutoCutPackageWorkspace({
+      workspacePath: record.workspacePath,
+      existingPackages: [],
+    });
+    return { ...inspection, alias: record.alias, projectId: record.projectId };
+  } catch {
+    return null;
+  }
+}
+
 function packagePatch(body, { allowRevision = false } = {}) {
   plainObject(body, "package");
   assertAllowed(body, allowRevision ? PACKAGE_MUTATION_FIELDS : PACKAGE_FIELDS, "package");
@@ -85,8 +99,11 @@ export function createFeishuPackageApi({ store, getModelCatalog = null } = {}) {
           if (method === "GET") {
             const packages = await store.list();
             const enriched = await Promise.all(packages.map(async (record) => {
-              const references = await store.references(record.alias);
-              return { ...record, references, referenceCount: references.length };
+              const [references, identity] = await Promise.all([
+                store.references(record.alias),
+                manifestIdentity(record),
+              ]);
+              return { ...record, identity, references, referenceCount: references.length };
             }));
             return { status: 200, body: { packages: enriched } };
           }
@@ -119,6 +136,40 @@ export function createFeishuPackageApi({ store, getModelCatalog = null } = {}) {
             throw new ApiError(503, "PACKAGE_MODEL_CATALOG_UNAVAILABLE", "Codex model catalog is unavailable");
           }
           return { status: 200, body: catalog && typeof catalog === "object" ? catalog : { catalog } };
+        }
+
+        if (pathname === `${PACKAGE_ROOT}/inspect-workspace`) {
+          if (method !== "POST") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+          const input = plainObject(body, "package workspace");
+          assertAllowed(input, new Set(["workspacePath"]), "package workspace");
+          if (typeof input.workspacePath !== "string" || !path.isAbsolute(input.workspacePath.trim())) {
+            throw new ApiError(400, "INVALID_FIELD", "workspacePath must be absolute");
+          }
+          const existingPackages = await store.list();
+          const inspection = await inspectAutoCutPackageWorkspace({
+            workspacePath: input.workspacePath,
+            existingPackages,
+          });
+          return { status: 200, body: { inspection } };
+        }
+
+        if (pathname === `${PACKAGE_ROOT}/prepare-output-directory`) {
+          if (method !== "POST") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+          const input = plainObject(body, "package workspace");
+          assertAllowed(input, new Set(["workspacePath"]), "package workspace");
+          if (typeof input.workspacePath !== "string" || !path.isAbsolute(input.workspacePath.trim())) {
+            throw new ApiError(400, "INVALID_FIELD", "workspacePath must be absolute");
+          }
+          const { zipOutput } = await prepareAutoCutPackageOutputDirectory({ workspacePath: input.workspacePath });
+          return { status: 200, body: { zipOutput } };
+        }
+
+        if (pathname === `${PACKAGE_ROOT}/validate-output-directory`) {
+          if (method !== "POST") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+          const input = plainObject(body, "output directory");
+          assertAllowed(input, new Set(["directory"]), "output directory");
+          const directory = await validateCustomZipOutputDirectory(input.directory);
+          return { status: 200, body: { directory } };
         }
         const match = pathname.match(/^\/api\/local\/autocut\/packages\/([^/]+)(?:\/(enable|disable))?$/);
         if (!match) return null;

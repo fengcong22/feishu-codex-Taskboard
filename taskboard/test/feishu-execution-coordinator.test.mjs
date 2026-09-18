@@ -83,6 +83,7 @@ function createFixture({
   const resolutionErrors = new Map();
   const executionReadErrors = new Map();
   const executions = new Map();
+  const packageSnapshots = new Map();
   const starts = [];
   const waiters = new Map();
   const active = new Map();
@@ -115,6 +116,9 @@ function createFixture({
       if (executionReadErrors.has(taskId)) throw executionReadErrors.get(taskId);
       return executions.get(taskId) ? { ...executions.get(taskId) } : null;
     },
+    getFeishuTaskPackageSnapshot(taskId) {
+      return packageSnapshots.get(taskId) ? structuredClone(packageSnapshots.get(taskId)) : null;
+    },
     listPendingFeishuExecutions() { return [...executions.values()].filter((row) => row.state !== "running").map((row) => ({ ...row })); },
     setFeishuExecutionState(taskId, expectedVersion, state, patch = {}) {
       const row = executions.get(taskId);
@@ -142,7 +146,12 @@ function createFixture({
       const limit = request.maxConcurrent ?? maxConcurrent;
       const count = [...active.values()].filter((entry) => entry.request.concurrencyGroup === request.concurrencyGroup).length;
       if (count < limit) {
-        const lease = { requestId: request.requestId, leaseId: `lease-${++leaseNumber}`, concurrencyGroup: request.concurrencyGroup, resourceGroups: [] };
+        const lease = {
+          requestId: request.requestId,
+          leaseId: `lease-${++leaseNumber}`,
+          concurrencyGroup: request.concurrencyGroup,
+          resourceGroups: [...request.resourceGroups],
+        };
         active.set(request.requestId, { request, lease });
         return Promise.resolve(lease);
       }
@@ -190,7 +199,7 @@ function createFixture({
           requestId,
           leaseId: `lease-${++leaseNumber}`,
           concurrencyGroup: group,
-          resourceGroups: [],
+          resourceGroups: [...waiter.request.resourceGroups],
         };
         active.set(requestId, { request: waiter.request, lease });
         matching.push({ request: waiter.request, lease });
@@ -263,6 +272,7 @@ function createFixture({
     resolutionErrors,
     executionReadErrors,
     executions,
+    packageSnapshots,
     packages,
     createCoordinator,
     get requestCount() { return requestCount; },
@@ -1280,12 +1290,38 @@ test("phased runs stay serial even when the package allows wider concurrency", a
   assert.equal(first.execution.state, "running");
   assert.equal(second.execution.state, "queued");
   assert.equal(fixture.scheduler.snapshot().pending[0].fixedMaxConcurrent, true);
+  assert.equal(fixture.scheduler.snapshot().pending[0].maxConcurrent, 1);
   assert.deepEqual(fixture.starts.map((entry) => entry.taskId), ["task-1"]);
 
   await fixture.coordinator.wake("Auto-cut-copyA");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fixture.database.getFeishuExecution("task-2").state, "queued");
   assert.deepEqual(fixture.starts.map((entry) => entry.taskId), ["task-1"]);
+});
+
+test("package snapshots retain new resource locks while legacy origins retain their old locks", async () => {
+  const snapshotFixture = createFixture({
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1, resourceGroups: ["changed-live-package"] } },
+  });
+  snapshotFixture.tasks.set("snapshot-task", task("snapshot-task"));
+  snapshotFixture.packageSnapshots.set("snapshot-task", { resourceGroups: ["frozen-package-resource"] });
+  await snapshotFixture.coordinator.schedule(
+    snapshotFixture.tasks.get("snapshot-task"),
+    metadata("Auto-cut-copyA", { resourceGroups: ["legacy-subject-resource"] }),
+    "manual",
+  );
+  assert.deepEqual(snapshotFixture.starts[0].lease.resourceGroups, ["frozen-package-resource"]);
+
+  const legacyFixture = createFixture({
+    packages: { "Auto-cut-copyA": { maxConcurrent: 1, resourceGroups: ["new-package-resource"] } },
+  });
+  legacyFixture.tasks.set("legacy-task", task("legacy-task"));
+  await legacyFixture.coordinator.schedule(
+    legacyFixture.tasks.get("legacy-task"),
+    metadata("Auto-cut-copyA", { resourceGroups: ["legacy-resource"] }),
+    "manual",
+  );
+  assert.deepEqual(legacyFixture.starts[0].lease.resourceGroups, ["legacy-resource"]);
 });
 
 test("retry exhaustion releases the durable execution so a manual retry can start", async () => {

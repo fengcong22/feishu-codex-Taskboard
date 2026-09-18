@@ -142,10 +142,20 @@ function safeContext(context) {
   const links = Array.isArray(input.documentLinks)
     ? input.documentLinks.filter((value) => typeof value === "string").map((value) => value.trim()).filter(Boolean).slice(0, 16)
     : [];
+  const courseName = typeof input.courseName === "string" ? input.courseName.trim() : "";
+  const safeCourseName = courseName !== ""
+    && courseName.length <= 180
+    && !/[\u0000-\u001f\u007f<>:"/\\|?*]/u.test(courseName)
+    && courseName !== "."
+    && courseName !== ".."
+    && !/[. ]$/u.test(courseName)
+    ? courseName
+    : null;
   return {
     documentLinks: links,
     namingDisplayValue: typeof input.namingDisplayValue === "string" ? input.namingDisplayValue.trim().slice(0, 1024) : "",
     namingValueUnique: input.namingValueUnique === true,
+    courseName: safeCourseName ?? "",
   };
 }
 

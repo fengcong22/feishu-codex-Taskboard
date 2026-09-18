@@ -546,7 +546,9 @@ test("README presents the verified bridge capabilities without claiming unsuppor
   assert.match(source, /当前已支持/);
   assert.match(source, /5 分钟快速体验/);
   assert.match(source, /不会自动启动 Codex/);
-  assert.match(source, /不会回写飞书记录/);
+  assert.match(source, /处理中.*回写意图|回写意图.*处理中/s);
+  assert.match(source, /已有字段\/选项|已有字段.*选项/s);
+  assert.match(source, /模拟事件.*回写|回写.*模拟事件/s);
   assert.match(source, /CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION/);
   assert.match(source, /活动配置快照.*automatic|automatic.*活动配置快照/s);
   assert.match(source, /可信来源|专用来源/);

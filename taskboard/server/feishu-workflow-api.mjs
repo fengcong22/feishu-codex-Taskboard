@@ -250,6 +250,30 @@ export function createFeishuWorkflowApi({ database, store, previewBase = null, i
         }
         throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
       }
+      const baseRefreshMatch = pathname.match(/^\/api\/local\/feishu\/workflow\/bases\/([^/]+)\/refresh-metadata$/);
+      if (baseRefreshMatch) {
+        if (method !== "POST") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        assertNoQuery(query, "Base metadata refresh");
+        requireObjectBody(body, "Base metadata refresh");
+        assertBodyKeys(body, new Set(), "Base metadata refresh");
+        let baseToken;
+        try { baseToken = decodeURIComponent(baseRefreshMatch[1]); } catch { throw new ApiError(400, "INVALID_PATH", "Base token contains invalid encoding"); }
+        await store.getBase(baseToken);
+        if (typeof previewBase !== "function") {
+          throw new ApiError(503, "FEISHU_BRIDGE_UNAVAILABLE", "Feishu Bridge preview is unavailable");
+        }
+        // The Base token is already a trusted local binding. Use a canonical
+        // direct Base URL so a stale or Wiki source label cannot redirect it.
+        const preview = await previewBase(`https://feishu.cn/base/${baseToken}`);
+        if (preview?.baseToken !== baseToken) {
+          throw new ApiError(502, "FEISHU_METADATA_INVALID_RESPONSE", "Feishu Base metadata response is invalid");
+        }
+        const base = await store.upsertBasePreview({
+          ...preview,
+          metadataRefreshedAt: Date.now(),
+        }, { refreshExistingOnly: true });
+        return { status: 200, body: { base } };
+      }
       const baseMatch = pathname.match(/^\/api\/local\/feishu\/workflow\/bases\/([^/]+)$/);
       if (baseMatch) {
         if (method !== "DELETE") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");

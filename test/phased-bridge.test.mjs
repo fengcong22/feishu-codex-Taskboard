@@ -371,11 +371,13 @@ test("index wires the Feishu naming search into controlled-context reads", async
   assert.match(source, /searchNaming\s*:/);
 });
 
-test("index can enable read-only Feishu APIs without starting the WebSocket listener", async () => {
+test("index initializes read-only Feishu APIs from configured credentials without starting the WebSocket listener", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
-  assert.match(source, /FEISHU_READ_ENABLED/);
-  assert.match(source, /const sdk = apiEnabled \? await loadFeishuSdk\(\) : null/);
+  assert.doesNotMatch(source, /FEISHU_READ_ENABLED/);
+  assert.doesNotMatch(source, /apiEnabled/);
+  assert.match(source, /const feishuApi = await createFeishuApiContext\(\{/);
+  assert.doesNotMatch(source, /loadFeishuSdk/);
   assert.ok(
     source.indexOf("controlledContextReader = createFeishuControlledContextReader")
       < source.lastIndexOf("if (listenerEnabled)"),
@@ -405,9 +407,13 @@ test("trusted task payload contains binding and context but no executable path",
     documentLinks: ["https://guanghe.feishu.cn/docx/one"],
     namingDisplayValue: "课程001",
     namingValueUnique: true,
+    courseName: "课程001",
+    rootPath: "D:\\untrusted",
   });
   assert.equal(payload.binding.stageId, "initial");
   assert.equal(payload.controlledContext.namingDisplayValue, "课程001");
+  assert.equal(payload.controlledContext.courseName, "课程001");
+  assert.equal(Object.hasOwn(payload.controlledContext, "rootPath"), false);
   assert.equal(Object.hasOwn(payload, "workspacePath"), false);
   assert.equal(Object.hasOwn(payload, "prompt"), false);
   assert.equal(Object.hasOwn(payload, "artifactTargetPath"), false);
@@ -427,6 +433,24 @@ test("trusted phased payload preserves server-owned simulation provenance", () =
     namingValueUnique: true,
   });
   assert.equal(payload.event.deliverySource, "simulation");
+});
+
+test("trusted task payload refuses a path-like course name", () => {
+  const payload = buildTrustedTaskPayload({
+    kind: "register",
+    subject,
+    stageId: "initial",
+    configVersion: 7,
+    packageAlias: "Auto-cut-lite",
+    event: edge("opt_other", "opt_initial"),
+  }, {
+    documentLinks: [],
+    namingDisplayValue: "课程001",
+    namingValueUnique: true,
+    courseName: "D:\\untrusted",
+  });
+
+  assert.equal(payload.controlledContext.courseName, "");
 });
 
 test("rehydrated ambiguous phased events remain manual-only in registration payloads", async () => {
@@ -484,7 +508,11 @@ test("controlled context endpoint requires Taskboard identity and shared secret"
     bridgeSecret: "bridge-secret",
     getSubjectVersion: async (key, version) => key === subject.subjectKey && version === 7 ? subject : null,
     readControlledContext: async () => ({
-      documentLinks: [], namingDisplayValue: "课程001", namingValueUnique: true,
+      documentLinks: [],
+      namingDisplayValue: "课程001",
+      namingValueUnique: true,
+      courseName: "课程001",
+      workspacePath: "D:\\untrusted",
     }),
   });
   const address = await app.listen();
@@ -511,7 +539,7 @@ test("controlled context endpoint requires Taskboard identity and shared secret"
   });
   assert.equal(allowed.status, 200);
   assert.deepEqual(await allowed.json(), {
-    documentLinks: [], namingDisplayValue: "课程001", namingValueUnique: true,
+    documentLinks: [], namingDisplayValue: "课程001", namingValueUnique: true, courseName: "课程001",
   });
 });
 

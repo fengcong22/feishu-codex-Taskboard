@@ -153,8 +153,8 @@ function packageFieldValue(table, after, source) {
 
 /**
  * Convert the SDK's event envelope into the Bridge's deliberately small event
- * shape. The SDK can batch several record actions in one callback, so one
- * normalized event is returned per action.
+ * shape. The SDK can batch several record actions in one callback, and one
+ * action can independently change more than one watched select field.
  */
 export function normalizeBitableRecordChanged(payload, table) {
   const { header, event } = eventEnvelope(payload);
@@ -209,18 +209,19 @@ export function normalizeBitableRecordChanged(payload, table) {
       actionObject.after_value ?? actionObject.afterValue ?? event.after_value ?? event.afterValue,
     );
     const changedIds = changedFieldIds(before, after);
-    const triggerFieldId = table.triggerFieldId && (before.has(table.triggerFieldId) || after.has(table.triggerFieldId))
-      ? table.triggerFieldId
-      : changedIds[0] ?? table.triggerFieldId ?? "";
-    const statusFieldId = table.statusField?.fieldId ?? table.statusField?.field_id ?? table.triggerFieldId ?? triggerFieldId;
-    const beforeOptionId = optionIdValue(beforeRaw.get(statusFieldId));
-    const afterOptionId = optionIdValue(afterRaw.get(statusFieldId));
-    const beforeValue = before.has(triggerFieldId)
-      ? fieldDisplayValue(beforeRaw.get(triggerFieldId), table, beforeOptionId)
-      : "";
-    const afterValue = after.has(triggerFieldId)
-      ? fieldDisplayValue(afterRaw.get(triggerFieldId), table, afterOptionId)
-      : "";
+    const statusFieldId = table.statusField?.fieldId ?? table.statusField?.field_id ?? table.triggerFieldId ?? "";
+    const finalDirectoryFieldId = table.delivery?.version === 1
+      && table.delivery.finalDirectoryTrigger?.enabled === true
+      ? table.delivery.finalDirectoryTrigger.fieldId
+      : null;
+    const watchedFieldIds = [statusFieldId, finalDirectoryFieldId]
+      .filter((fieldId, index, entries) => typeof fieldId === "string" && fieldId !== "" && entries.indexOf(fieldId) === index);
+    const edgeFieldIds = watchedFieldIds.filter((fieldId) => changedIds.includes(fieldId));
+    if (edgeFieldIds.length === 0) {
+      const fallbackFieldId = changedIds[0] ?? statusFieldId;
+      if (typeof fallbackFieldId === "string" && fallbackFieldId !== "") edgeFieldIds.push(fallbackFieldId);
+    }
+    if (edgeFieldIds.length === 0) return;
     const packageValue = packageFieldValue(table, after, actionObject);
     const fields = {};
     if (table.packageField && packageValue !== undefined) fields[table.packageField] = packageValue;
@@ -234,61 +235,73 @@ export function normalizeBitableRecordChanged(payload, table) {
     const occurrence = actionOccurrences.get(occurrenceKey) ?? 0;
     actionOccurrences.set(occurrenceKey, occurrence + 1);
     const fallbackId = `feishu:${baseToken}:${tableId}:${recordId}:${actionSignature}:${occurrence}`;
-    const eventId = sourceEventId
+    const actionEventId = sourceEventId
       ? (batched
         ? `${sourceEventId}:${tableId}:${recordId}:${actionSignature}:${occurrence}`
         : sourceEventId)
       : fallbackId;
-    const baseResult = {
-      eventId,
-      baseToken,
-      tableId,
-      recordId,
-      recordTitle: String(
-        actionObject.record_title
-          ?? actionObject.recordTitle
-          ?? event.record_title
-          ?? event.recordTitle
-          ?? "",
-      ).trim(),
-      action: actionName,
-      fieldId: triggerFieldId,
-      fieldName: triggerFieldId === table.triggerFieldId
-        ? table.triggerField
-        : String(actionObject.field_name ?? actionObject.fieldName ?? triggerFieldId).trim(),
-      beforeValue,
-      afterValue,
-      fields,
-      fieldValuesById: Object.fromEntries(after.entries()),
-    };
     // Keep the legacy event shape byte-for-byte for old table configurations;
     // phased subjects opt into the presence-aware fields below.
     const phased = Boolean(table.statusField || table.stages || table.subjectKey || table.configVersion);
-    if (phased) {
-      const occurredAt = occurrenceTime(
-        actionObject.event_occurred_at,
-        actionObject.eventOccurredAt,
-        actionObject.create_time,
-        actionObject.createTime,
-        event.event_occurred_at,
-        event.eventOccurredAt,
-        event.create_time,
-        event.createTime,
-        header.event_occurred_at,
-        header.eventOccurredAt,
-        header.create_time,
-        header.createTime,
-      );
-      baseResult.statusFieldId = statusFieldId;
-      baseResult.beforePresent = beforeRaw.has(statusFieldId);
-      baseResult.afterPresent = afterRaw.has(statusFieldId);
-      baseResult.beforeOptionId = beforeOptionId;
-      baseResult.afterOptionId = afterOptionId;
-      baseResult.eventOccurredAtPresent = occurredAt !== null;
-      if (occurredAt !== null) baseResult.eventOccurredAt = occurredAt;
-      else baseResult.eventOccurredAt = null;
+    const occurredAt = phased ? occurrenceTime(
+      actionObject.event_occurred_at,
+      actionObject.eventOccurredAt,
+      actionObject.create_time,
+      actionObject.createTime,
+      event.event_occurred_at,
+      event.eventOccurredAt,
+      event.create_time,
+      event.createTime,
+      header.event_occurred_at,
+      header.eventOccurredAt,
+      header.create_time,
+      header.createTime,
+    ) : null;
+    for (const edgeFieldId of edgeFieldIds) {
+      const beforeOptionId = optionIdValue(beforeRaw.get(edgeFieldId));
+      const afterOptionId = optionIdValue(afterRaw.get(edgeFieldId));
+      const beforeValue = before.has(edgeFieldId)
+        ? fieldDisplayValue(beforeRaw.get(edgeFieldId), table, beforeOptionId)
+        : "";
+      const afterValue = after.has(edgeFieldId)
+        ? fieldDisplayValue(afterRaw.get(edgeFieldId), table, afterOptionId)
+        : "";
+      const baseResult = {
+        // Preserve the established stage-event key even when an additional
+        // watched field is enabled. Extra delivery fields receive their own
+        // key so each side effect remains independently idempotent.
+        eventId: edgeFieldId === statusFieldId ? actionEventId : `${actionEventId}:${edgeFieldId}`,
+        baseToken,
+        tableId,
+        recordId,
+        recordTitle: String(
+          actionObject.record_title
+            ?? actionObject.recordTitle
+            ?? event.record_title
+            ?? event.recordTitle
+            ?? "",
+        ).trim(),
+        action: actionName,
+        fieldId: edgeFieldId,
+        fieldName: edgeFieldId === table.triggerFieldId
+          ? table.triggerField
+          : String(actionObject.field_name ?? actionObject.fieldName ?? edgeFieldId).trim(),
+        beforeValue,
+        afterValue,
+        fields,
+        fieldValuesById: Object.fromEntries(after.entries()),
+      };
+      if (phased) {
+        baseResult.statusFieldId = edgeFieldId;
+        baseResult.beforePresent = beforeRaw.has(edgeFieldId);
+        baseResult.afterPresent = afterRaw.has(edgeFieldId);
+        baseResult.beforeOptionId = beforeOptionId;
+        baseResult.afterOptionId = afterOptionId;
+        baseResult.eventOccurredAtPresent = occurredAt !== null;
+        baseResult.eventOccurredAt = occurredAt;
+      }
+      normalized.push(baseResult);
     }
-    normalized.push(baseResult);
   });
 
   return normalized;

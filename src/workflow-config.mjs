@@ -63,6 +63,7 @@ const SUBJECT_KEYS = new Set([
   "statusField",
   "documentField",
   "namingField",
+  "courseNamingField",
   "stages",
   "delivery",
   "enabledAt",
@@ -94,6 +95,7 @@ const UPLOAD_KEYS = new Set([
 ]);
 const STATUS_FIELD_KEYS = new Set(["fieldId", "fieldName", "name", "type", "uiType", "options", "optionList", "property"]);
 const FIELD_KEYS = new Set(["fieldId", "fieldName", "name", "kind"]);
+const COURSE_NAMING_FIELD_KEYS = new Set(["fieldId", "fieldName", "type", "uiType"]);
 const STAGE_KEYS = new Set([
   "enabled",
   "trigger",
@@ -248,6 +250,30 @@ function normalizeConfiguredField(value, name, kind = null) {
     fieldName: nonEmptyString(input.fieldName ?? input.name, `${name}.fieldName`),
     ...(kind ? { kind } : input.kind ? { kind: nonEmptyString(input.kind, `${name}.kind`) } : {}),
   };
+}
+
+function normalizeCourseNamingField(value, delivery, name = "courseNamingField") {
+  if (value === undefined || value === null) return null;
+  const input = plainObject(value, name);
+  assertKnownKeys(input, COURSE_NAMING_FIELD_KEYS, name);
+  const type = input.type;
+  const uiType = nonEmptyString(input.uiType, `${name}.uiType`);
+  const normalizedUiType = uiType.replace(/[^A-Za-z]/gu, "").toLowerCase();
+  if (!((type === 1 && normalizedUiType === "text")
+    || (type === 20 && normalizedUiType === "formula"))) {
+    fail(`${name} must describe a text or formula field`);
+  }
+  const field = {
+    fieldId: idString(input.fieldId, `${name}.fieldId`),
+    fieldName: nonEmptyString(input.fieldName, `${name}.fieldName`),
+    type,
+    uiType,
+  };
+  if (delivery?.courseNaming?.mode !== "field"
+    || delivery.courseNaming.fieldId !== field.fieldId) {
+    fail(`${name}.fieldId must match delivery.courseNaming.fieldId`);
+  }
+  return field;
 }
 
 function normalizeSource(value, name, { allowBaseAttachment = true } = {}) {
@@ -486,6 +512,8 @@ export function validateSubjectConfig(value) {
   });
   const lifecycle = input.lifecycle ?? "draft";
   if (!LIFECYCLES.has(lifecycle)) fail("subject.lifecycle is not supported");
+  const delivery = input.delivery === undefined ? undefined : normalizeDeliveryConfig(input.delivery);
+  const courseNamingField = normalizeCourseNamingField(input.courseNamingField, delivery);
   const normalized = {
     ...clone(input),
     subjectKey: computedKey,
@@ -516,7 +544,8 @@ export function validateSubjectConfig(value) {
     execution,
     packageRoute: normalizePackageRoute(input.packageRoute ?? { packageAlias: input.defaultPackageAlias }),
     upload,
-    ...(input.delivery === undefined ? {} : { delivery: normalizeDeliveryConfig(input.delivery) }),
+    ...(delivery === undefined ? {} : { delivery }),
+    ...(courseNamingField ? { courseNamingField } : {}),
   };
   if (input.activeSnapshot !== undefined && input.activeSnapshot !== null) {
     normalized.activeSnapshot = validateSubjectConfig({
@@ -571,6 +600,8 @@ function normalizeSubject(value, base, index, { allowActiveSnapshot = true } = {
   }
   const lifecycle = input.lifecycle ?? "draft";
   if (!LIFECYCLES.has(lifecycle)) fail(`subject[${index}].lifecycle is not supported`);
+  const delivery = input.delivery === undefined ? undefined : normalizeDeliveryConfig(input.delivery);
+  const courseNamingField = normalizeCourseNamingField(input.courseNamingField, delivery, `subject[${index}].courseNamingField`);
   const normalized = {
     subjectKey: computedKey,
     baseToken: normalizedBaseToken,
@@ -587,7 +618,8 @@ function normalizeSubject(value, base, index, { allowActiveSnapshot = true } = {
     execution: normalizeExecution(input.execution, `subject[${index}].execution`),
     packageRoute: normalizePackageRoute(input.packageRoute, `subject[${index}].packageRoute`),
     upload: normalizeUpload(input.upload, `subject[${index}].upload`),
-    ...(input.delivery === undefined ? {} : { delivery: normalizeDeliveryConfig(input.delivery) }),
+    ...(delivery === undefined ? {} : { delivery }),
+    ...(courseNamingField ? { courseNamingField } : {}),
   };
   if (typeof normalized.displayEnabled !== "boolean") {
     fail(`subject[${index}].displayEnabled must be boolean`);

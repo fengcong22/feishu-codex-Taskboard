@@ -59,6 +59,7 @@ export interface FeishuStageEditorProps {
   onChange: (value: FeishuStageValue) => void;
   onAudioChange: (audio: FeishuStageValue["audio"], draft: FeishuStageAudioDraft) => void;
   validationErrors: string[];
+  showArtifactTargetPath?: boolean;
 }
 
 const STAGE_LABELS: Record<FeishuStageId, string> = {
@@ -134,6 +135,7 @@ export function FeishuStageEditor({
   onChange,
   onAudioChange,
   validationErrors,
+  showArtifactTargetPath = true,
 }: FeishuStageEditorProps) {
   const label = STAGE_LABELS[stageId];
   const attachmentFields = metadataFields.filter(isAttachmentField);
@@ -236,7 +238,7 @@ export function FeishuStageEditor({
       <span className={`feishu-stage-state${value.enabled ? " is-enabled" : ""}`}>{value.enabled ? "已启用" : "已关闭"}</span>
     </summary>
     <div className="feishu-stage-editor-body">
-      <div className="feishu-stage-grid">
+      <div className="feishu-stage-trigger">
         <label>
           <span>{label}触发选项</span>
           <select
@@ -249,6 +251,8 @@ export function FeishuStageEditor({
             {statusOptions.map((option, index) => <option key={`${option.id}:${index}`} value={option.id}>{option.name}</option>)}
           </select>
         </label>
+      </div>
+      <div className="feishu-stage-source-grid">
         {sourceControl("videoSource", "视频")}
         {sourceControl("reviewSource", "剪辑意见")}
       </div>
@@ -302,9 +306,6 @@ export function FeishuStageEditor({
               })}
             >
               <option value="">选择音频附件字段</option>
-              {audioDraft.baseAttachmentFieldId
-                && !attachmentFields.some((field) => field.fieldId === audioDraft.baseAttachmentFieldId)
-                && <option value={audioDraft.baseAttachmentFieldId} disabled>已配置字段（当前不可用）</option>}
               {attachmentFields.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}
             </select>
           </label>}
@@ -327,7 +328,7 @@ export function FeishuStageEditor({
       </fieldset>
 
       <div className="feishu-stage-grid feishu-stage-output-grid">
-        <label>
+        {showArtifactTargetPath && <label>
           <span>ZIP 目标目录</span>
           <input
             aria-label={`${label} ZIP 目标目录`}
@@ -336,7 +337,7 @@ export function FeishuStageEditor({
             onChange={(event) => update({ artifactTargetPath: event.target.value })}
             placeholder="本机或 NAS 目录"
           />
-        </label>
+        </label>}
         <label>
           <span>命名后缀</span>
           <input

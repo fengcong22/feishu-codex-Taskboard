@@ -90,6 +90,63 @@ function validArchiveInput(value) {
   return validTask(value) && validVersion(value.version);
 }
 
+function validWritebackIdentifier(value) {
+  return nonEmptyString(value)
+    && value.trim().length <= 512
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validWritebackClaim(value) {
+  return objectPayload(value)
+    && Object.keys(value).length === 3
+    && Object.hasOwn(value, "operationId")
+    && Object.hasOwn(value, "claimToken")
+    && Object.hasOwn(value, "version")
+    && validWritebackIdentifier(value.operationId)
+    && validWritebackIdentifier(value.claimToken)
+    && validVersion(value.version);
+}
+
+function validWritebackIntent(value) {
+  if (!objectPayload(value)
+    || Object.keys(value).length !== 2
+    || !Object.hasOwn(value, "target")
+    || !Object.hasOwn(value, "operation")
+    || !objectPayload(value.target)
+    || !objectPayload(value.operation)
+    || Object.keys(value.target).length !== 3
+    || !["baseToken", "tableId", "recordId"].every((key) => Object.hasOwn(value.target, key))
+    || ![value.target.baseToken, value.target.tableId, value.target.recordId].every(validWritebackIdentifier)) {
+    return false;
+  }
+  const operation = value.operation;
+  if (operation.type === "single_select") {
+    return Object.keys(operation).length === 3
+      && ["type", "fieldId", "optionId"].every((key) => Object.hasOwn(operation, key))
+      && validWritebackIdentifier(operation.fieldId)
+      && validWritebackIdentifier(operation.optionId);
+  }
+  return operation.type === "text"
+    && Object.keys(operation).length === 3
+    && ["type", "fieldId", "value"].every((key) => Object.hasOwn(operation, key))
+    && validWritebackIdentifier(operation.fieldId)
+    && typeof operation.value === "string"
+    && !operation.value.includes("\0")
+    && operation.value.length <= 4_096;
+}
+
+function validFinalDirectoryOperation(value) {
+  return objectPayload(value)
+    && Object.keys(value).every((key) => [
+      "id", "eventId", "kind", "state", "subjectKey", "configVersion", "courseBindingId", "createdAt", "updatedAt",
+    ].includes(key))
+    && nonEmptyString(value.id)
+    && value.kind === "ensure_final_directory"
+    && value.state === "succeeded"
+    && nonEmptyString(value.subjectKey)
+    && validVersion(value.configVersion);
+}
+
 export class TaskboardError extends Error {
   constructor(message, { code = "TASKBOARD_REQUEST_FAILED", status = 0 } = {}) {
     super(message);
@@ -223,6 +280,56 @@ export class TaskboardClient {
     });
     if (!validTask(response?.task)) throw invalidResponse(pathname);
     return response.task;
+  }
+
+  async ensureFinalDirectory(payload, { bridgeSecret = this.bridgeSecret } = {}) {
+    if (!objectPayload(payload)) throw invalidResponse("/api/local/feishu/directory-operations");
+    const secret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : "";
+    if (!secret) {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED",
+        status: 503,
+      });
+    }
+    const pathname = "/api/local/feishu/directory-operations";
+    const response = await this.#request(pathname, {
+      body: payload,
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": secret,
+      },
+    });
+    if (!validFinalDirectoryOperation(response?.operation)) throw invalidResponse(pathname);
+    return response.operation;
+  }
+
+  /**
+   * Resolve a claimed outbox item to its server-owned writeback target. The
+   * Bridge intentionally sends only opaque claim credentials to this route.
+   */
+  async resolveFeishuWritebackIntent(claim, { bridgeSecret = this.bridgeSecret } = {}) {
+    if (!validWritebackClaim(claim)) throw invalidResponse("/api/local/feishu/writeback/resolve");
+    const secret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : "";
+    if (!secret) {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED",
+        status: 503,
+      });
+    }
+    const pathname = "/api/local/feishu/writeback/resolve";
+    const response = await this.#request(pathname, {
+      body: {
+        operationId: claim.operationId.trim(),
+        claimToken: claim.claimToken.trim(),
+        version: claim.version,
+      },
+      headers: {
+        "x-taskboard-client": "feishu-bridge",
+        "x-feishu-bridge-secret": secret,
+      },
+    });
+    if (!validWritebackIntent(response)) throw invalidResponse(pathname);
+    return response;
   }
 
   async listFeishuTasks(options = {}) {

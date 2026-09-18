@@ -279,6 +279,60 @@ test("requires JSON and the Taskboard client header for workflow sync", async (t
   assert.equal(calls, 0);
 });
 
+test("applies a resolved frozen writeback intent without accepting Feishu coordinates from Taskboard", async (t) => {
+  const requests = [];
+  const applied = [];
+  const app = createBridgeServer({
+    host: "127.0.0.1",
+    port: 0,
+    bridgeSecret: BRIDGE_SECRET,
+    resolveWritebackIntent: async (request) => {
+      requests.push(request);
+      return {
+        target: { baseToken: "bas_private", tableId: "tbl_private", recordId: "rec_private" },
+        operation: { type: "single_select", fieldId: "fld_status", optionId: "opt_auto" },
+      };
+    },
+    recordWriter: {
+      apply: async (intent) => {
+        applied.push(intent);
+        return { outcome: "updated" };
+      },
+    },
+  });
+  const address = await app.listen();
+  t.after(app.close);
+  const endpoint = `http://127.0.0.1:${address.port}/api/feishu/workflow/writeback`;
+  const headers = {
+    ...TASKBOARD_WRITE_HEADERS,
+    "x-feishu-bridge-secret": BRIDGE_SECRET,
+  };
+
+  const accepted = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ operationId: "writeback-001", claimToken: "claim-001", version: 3 }),
+  });
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(await accepted.json(), { writeback: { outcome: "updated" } });
+  assert.deepEqual(requests, [{ operationId: "writeback-001", claimToken: "claim-001", version: 3 }]);
+  assert.equal(applied.length, 1);
+
+  const rejected = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      operationId: "writeback-001",
+      claimToken: "claim-001",
+      version: 3,
+      baseToken: "bas_attacker",
+    }),
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error.code, "INVALID_WRITEBACK_REQUEST");
+  assert.equal(requests.length, 1);
+});
+
 test("serves health and configuration summary", async (t) => {
   const app = await start(assert.fail);
   t.after(app.close);

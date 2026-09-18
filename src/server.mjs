@@ -113,6 +113,7 @@ function verifySubjectIdentity(subject, identity) {
 
 function boundedContext(value) {
   const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const courseName = typeof input.courseName === "string" ? input.courseName.trim() : "";
   return {
     documentLinks: Array.isArray(input.documentLinks)
       ? input.documentLinks
@@ -125,7 +126,41 @@ function boundedContext(value) {
       ? input.namingDisplayValue.slice(0, 1024)
       : "",
     namingValueUnique: input.namingValueUnique === true,
+    courseName: courseName.length <= 180
+      && !/[\u0000-\u001f\u007f<>:"/\\|?*]/u.test(courseName)
+      && courseName !== "."
+      && courseName !== ".."
+      && !/[. ]$/u.test(courseName)
+      ? courseName
+      : "",
   };
+}
+
+function writebackIdentifier(value, name) {
+  const text = requiredString(value, name);
+  if (text.length > 512 || /[\u0000-\u001f\u007f]/u.test(text)) {
+    const error = new Error(`${name} is invalid`);
+    error.code = "INVALID_CONTEXT_REQUEST";
+    error.status = 400;
+    throw error;
+  }
+  return text;
+}
+
+function writebackClaim(body) {
+  try {
+    exactKeys(body, new Set(["operationId", "claimToken", "version"]), "writeback request");
+    return {
+      operationId: writebackIdentifier(body.operationId, "operationId"),
+      claimToken: writebackIdentifier(body.claimToken, "claimToken"),
+      version: requiredVersion(body.version),
+    };
+  } catch {
+    const error = new Error("writeback request is invalid");
+    error.code = "INVALID_WRITEBACK_REQUEST";
+    error.status = 400;
+    throw error;
+  }
 }
 
 function portableWorkflowSubject(value) {
@@ -147,6 +182,9 @@ function portableWorkflowSubject(value) {
     delete subject.packageConfig.workspacePath;
     delete subject.packageConfig.prompt;
     delete subject.packageConfig.zipSourceDirectory;
+  }
+  if (subject.delivery && typeof subject.delivery === "object") {
+    subject.delivery.rootPath = null;
   }
   return subject;
 }
@@ -296,6 +334,8 @@ export function createBridgeServer({
   getSubjectVersion = null,
   readControlledContext = null,
   syncSubject = null,
+  resolveWritebackIntent = null,
+  recordWriter = null,
   simulationEnabled = false,
 }) {
   let address = null;
@@ -376,6 +416,27 @@ export function createBridgeServer({
           }
           const context = await reader(subject, identity);
           return sendJson(response, 200, boundedContext(context));
+        } catch (error) {
+          return sendJson(response, controlledErrorStatus(error), {
+            error: publicFailure(error),
+          });
+        }
+      }
+      if (request.method === "POST" && url.pathname === "/api/feishu/workflow/writeback") {
+        if (!requireLocalJsonWrite(request, response, "taskboard")) return;
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+          const claim = writebackClaim(await readJson(request));
+          const resolver = typeof resolveWritebackIntent === "function" ? resolveWritebackIntent : null;
+          if (!resolver || typeof recordWriter?.apply !== "function") {
+            const error = new Error("writeback service is unavailable");
+            error.code = "WRITEBACK_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          const intent = await resolver(claim);
+          const result = await recordWriter.apply(intent);
+          return sendJson(response, 200, { writeback: result });
         } catch (error) {
           return sendJson(response, controlledErrorStatus(error), {
             error: publicFailure(error),

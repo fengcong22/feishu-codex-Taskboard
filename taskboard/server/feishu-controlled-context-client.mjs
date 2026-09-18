@@ -1,3 +1,5 @@
+import { CONTROLLED_CONTEXT_FIELDS, normalizeOptionalCourseName } from "./feishu-controlled-context.mjs";
+
 function fail(code, message, status = 502) {
   const error = new Error(message);
   error.code = code;
@@ -29,7 +31,7 @@ function validateBridgeUrl(value) {
  * Refresh only the controlled document/name fields for an immutable subject
  * version.  The request body deliberately carries opaque identity only.
  */
-export async function readCurrentControlledContext({ bridgeUrl, bridgeSecret, origin }) {
+export async function readCurrentControlledContext({ bridgeUrl, bridgeSecret, origin, signal }) {
   const url = validateBridgeUrl(bridgeUrl);
   const secret = requireText(bridgeSecret, "bridgeSecret");
   if (!origin || typeof origin !== "object" || Array.isArray(origin)) {
@@ -58,6 +60,7 @@ export async function readCurrentControlledContext({ bridgeUrl, bridgeSecret, or
         "x-feishu-bridge-secret": secret,
       },
       body: JSON.stringify(body),
+      signal,
     });
     try { payload = await response.json(); } catch {}
   } catch (error) {
@@ -74,15 +77,21 @@ export async function readCurrentControlledContext({ bridgeUrl, bridgeSecret, or
     throw fail("CONTROLLED_CONTEXT_INVALID", "Feishu Bridge returned an invalid controlled context");
   }
   const links = context.documentLinks;
-  if (!Array.isArray(links) || links.some((link) => typeof link !== "string" || link.length > 2048)) {
+  if (Object.keys(context).some((key) => !CONTROLLED_CONTEXT_FIELDS.includes(key))
+    || !Array.isArray(links) || links.some((link) => typeof link !== "string" || link.length > 2048)) {
     throw fail("CONTROLLED_CONTEXT_INVALID", "Feishu Bridge returned invalid document links");
   }
   if (typeof context.namingDisplayValue !== "string" || typeof context.namingValueUnique !== "boolean") {
     throw fail("CONTROLLED_CONTEXT_INVALID", "Feishu Bridge returned invalid naming context");
   }
+  const courseName = normalizeOptionalCourseName(context.courseName);
+  if (courseName === null) {
+    throw fail("CONTROLLED_CONTEXT_INVALID", "Feishu Bridge returned an invalid course name", 400);
+  }
   return {
     documentLinks: links.map((link) => link.trim()),
     namingDisplayValue: context.namingDisplayValue,
     namingValueUnique: context.namingValueUnique,
+    ...(courseName === undefined ? {} : { courseName }),
   };
 }

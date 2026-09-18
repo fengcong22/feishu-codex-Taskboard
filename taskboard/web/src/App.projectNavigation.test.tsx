@@ -61,6 +61,10 @@ vi.mock("./components/FeishuWorkflowPanel", () => ({
   ),
 }));
 
+vi.mock("./components/UnifiedWorkflowStageSettings", () => ({
+  UnifiedWorkflowStageSettings: () => <div role="region" aria-label="Stage display settings" />,
+}));
+
 const NOW = "2026-09-15T03:00:00.000Z";
 let eventSources: EventTarget[] = [];
 
@@ -253,6 +257,7 @@ describe("App project navigation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Auto-Cut packages" }));
     expect(screen.getByRole("region", { name: "Package manager" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Board stage labels" })).toBeNull();
     expect(screen.queryByText(FIRST_TASK.title)).toBeNull();
 
     fireEvent.click(subjectButton(FIRST_SUBJECT));
@@ -446,6 +451,16 @@ describe("App project navigation", () => {
 
     expect(await screen.findByText(FIRST_TASK.title)).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Subject configuration" })).toBeNull();
+  });
+
+  it("does not mount stage name and description editing in subject configuration", async () => {
+    await renderFirstSubject();
+
+    openFirstSubjectConfiguration();
+
+    await waitFor(() => expect(api.getUnifiedWorkflowStageDisplays).toHaveBeenCalled());
+    await act(async () => {});
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Stage display settings" })).toBeNull());
   });
 
   it.each(["packages", "configuration", "current subject"])(

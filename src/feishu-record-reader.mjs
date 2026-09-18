@@ -79,6 +79,112 @@ function normalizedName(value) {
   return titleText(value).trim();
 }
 
+function courseNameError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function metadataType(field) {
+  if (typeof field?.type === "number" && Number.isSafeInteger(field.type)) return field.type;
+  if (typeof field?.type === "string" && /^\d+$/u.test(field.type.trim())) return Number(field.type);
+  return null;
+}
+
+function metadataUiType(field) {
+  if (typeof field?.uiType !== "string" || field.uiType.trim() === "") return null;
+  return field.uiType.replace(/[^A-Za-z]/gu, "").toLowerCase();
+}
+
+function courseNameFieldKind(field) {
+  const type = metadataType(field);
+  const uiType = metadataUiType(field);
+  if (type === 1 && (uiType === null || uiType === "text")) return "text";
+  if (type === 20 && (uiType === null || uiType === "formula")) return "formula";
+  throw courseNameError("COURSE_NAME_FIELD_TYPE_INVALID", "Course naming must use a text or formula field");
+}
+
+function safeCourseName(value) {
+  const result = value.trim();
+  if (result === "") throw courseNameError("COURSE_NAME_EMPTY", "Course name is empty");
+  if (result.length > 180 || /[\u0000-\u001f\u007f<>:"/\\|?*]/u.test(result)
+    || result === "." || result === ".." || /[. ]$/u.test(result)) {
+    throw courseNameError("COURSE_NAME_INVALID", "Course name is invalid");
+  }
+  return result;
+}
+
+/**
+ * Convert the explicitly configured course-name field into one directory-safe
+ * display value. Text fields may be returned by Feishu as a direct string or
+ * as exactly one structured text element; formula fields resolve to direct
+ * text results.
+ */
+export function normalizeCourseNameValue(value, field) {
+  const kind = courseNameFieldKind(field);
+  if (kind === "formula") {
+    if (typeof value !== "string") {
+      throw courseNameError("COURSE_NAME_NOT_TEXT", "Formula result is not text");
+    }
+    if (/^#(?:ERROR|REF|DIV\/0|VALUE|NAME\?|N\/A|NUM|NULL)!?$/iu.test(value.trim())) {
+      throw courseNameError("COURSE_NAME_NOT_TEXT", "Formula result is an error");
+    }
+    return safeCourseName(value);
+  }
+
+  if (typeof value === "string") return safeCourseName(value);
+
+  if (!Array.isArray(value) || value.length !== 1) {
+    throw courseNameError("COURSE_NAME_NOT_TEXT", "Text course name must contain one text element");
+  }
+  const [element] = value;
+  if (!element || typeof element !== "object" || Array.isArray(element)
+    || (element.type !== undefined && element.type !== "text")
+    || typeof element.text !== "string") {
+    throw courseNameError("COURSE_NAME_NOT_TEXT", "Text course name is invalid");
+  }
+  return safeCourseName(element.text);
+}
+
+function metadataFields(table) {
+  return Array.isArray(table?.metadata?.fields) ? table.metadata.fields : [];
+}
+
+function metadataFieldForId(table, fieldId) {
+  if (typeof fieldId !== "string" || fieldId.trim() === "") return null;
+  const matches = metadataFields(table).filter((field) => field?.fieldId === fieldId.trim());
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function descriptorForCourseNaming(table) {
+  const courseNaming = table?.delivery?.courseNaming;
+  if (courseNaming?.mode === "field") {
+    const metadataField = metadataFieldForId(table, courseNaming.fieldId);
+    if (metadataField) return metadataField;
+    const descriptor = table?.courseNamingField;
+    if (descriptor?.fieldId === courseNaming.fieldId) return descriptor;
+
+    // Older synchronized records did not retain courseNamingField. They can
+    // still be read only when the selected field is the existing name field
+    // and its persisted kind proves it is a plain text/formula value.
+    const naming = table?.namingField;
+    if (naming?.fieldId !== courseNaming.fieldId) return null;
+    const kind = typeof naming.kind === "string"
+      ? naming.kind.replace(/[^A-Za-z]/gu, "").toLowerCase()
+      : "";
+    if (kind === "text") return { ...naming, type: 1, uiType: "Text" };
+    if (kind === "formula") return { ...naming, type: 20, uiType: "Formula" };
+    return null;
+  }
+  const configured = table?.namingField ?? {
+    fieldId: table?.namingFieldId,
+    fieldName: table?.namingFieldName,
+  };
+  const configuredId = configured?.fieldId ?? configured?.field_id;
+  return metadataFieldForId(table, configuredId)
+    ?? (metadataType(configured) === null ? null : configured);
+}
+
 function uniqueProof(result, expectedRecordId) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return false;
   if (Array.isArray(result.records) || Array.isArray(result.items)) {
@@ -220,6 +326,20 @@ export function createFeishuControlledContextReader({ client, searchNaming = nul
     };
     const documentLinks = [...new Set(collectDocumentLinks(configuredFieldValue(fields, documentField)))].slice(0, 32);
     const namingDisplayValue = normalizedName(configuredFieldValue(fields, namingField));
+    const courseNameField = descriptorForCourseNaming(table);
+    let courseName = "";
+    if (courseNameField) {
+      try {
+        courseName = normalizeCourseNameValue(
+          configuredFieldValue(fields, courseNameField),
+          courseNameField,
+        );
+      } catch {
+        // Course directory creation is blocked later when the frozen value is
+        // absent. A malformed value must never be treated as a path here.
+        courseName = "";
+      }
+    }
     let namingValueUnique = false;
     if (namingDisplayValue && typeof searchNaming === "function") {
       try {
@@ -237,7 +357,7 @@ export function createFeishuControlledContextReader({ client, searchNaming = nul
         namingValueUnique = false;
       }
     }
-    return { documentLinks, namingDisplayValue, namingValueUnique };
+    return { documentLinks, namingDisplayValue, namingValueUnique, courseName };
   }
   return Object.freeze({ readControlledRecordContext: read, read });
 }
@@ -256,6 +376,7 @@ export async function readControlledRecordContext(reader, table, identity = {}) 
       : [],
     namingDisplayValue: typeof input.namingDisplayValue === "string" ? input.namingDisplayValue : "",
     namingValueUnique: input.namingValueUnique === true,
+    courseName: typeof input.courseName === "string" ? input.courseName : "",
   };
 }
 

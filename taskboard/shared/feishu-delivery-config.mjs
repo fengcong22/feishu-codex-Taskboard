@@ -334,6 +334,20 @@ export function validateDeliveryConfig(value, {
         "Choose an existing single-select option",
       ));
     }
+    for (const stageId of DELIVERY_STAGE_IDS) {
+      const stage = stages?.[stageId];
+      if (stage?.enabled !== true) continue;
+      const stageTrigger = stage.trigger ?? {};
+      if (stageTrigger.fieldId === normalized.finalDirectoryTrigger.fieldId
+        && stageTrigger.optionId === normalized.finalDirectoryTrigger.optionId) {
+        issues.push(issue(
+          "FINAL_DIRECTORY_TRIGGER_CONFLICT",
+          "delivery.finalDirectoryTrigger.optionId",
+          "The final-directory trigger cannot use an enabled Auto-Cut stage option",
+        ));
+        break;
+      }
+    }
   }
 
   return { value: normalized, issues };

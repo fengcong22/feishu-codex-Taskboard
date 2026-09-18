@@ -46,7 +46,16 @@ import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator
 import { runLocalAutoCut } from "./autocut-local-runner.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
+import { createFeishuWritebackWorker } from "./feishu-writeback-worker.mjs";
 import { readCurrentControlledContext } from "./feishu-controlled-context-client.mjs";
+import { CONTROLLED_CONTEXT_FIELDS, normalizeOptionalCourseName } from "./feishu-controlled-context.mjs";
+import { createFeishuDeliveryStore } from "./feishu-delivery-store.mjs";
+import { deriveStageDestination, previewCoursePath } from "./feishu-course-path.mjs";
+import { createWindowsCoursePathResolver } from "./feishu-course-path-resolver.mjs";
+import {
+  createFeishuDirectoryOperationStore,
+  createFinalDirectoryEnsurer,
+} from "./feishu-directory-operation.mjs";
 import { prepareFeishuRunInputs, resolveFeishuPackageSourceDirectory } from "./feishu-run-inputs.mjs";
 import { canonicalJson } from "./feishu-source-manifest.mjs";
 import { stageRegistrationOrigin } from "./feishu-deleted-event.mjs";
@@ -244,6 +253,23 @@ function safeBridgeStages(value) {
     portableStage.artifactTargetPath = null;
     return [stageId, portableStage];
   }));
+}
+
+function courseNamingFieldForBridge(subject) {
+  const fieldId = subject?.delivery?.version === 1
+    && subject.delivery.courseNaming?.mode === "field"
+    ? subject.delivery.courseNaming.fieldId
+    : null;
+  if (typeof fieldId !== "string" || fieldId.trim() === "") return null;
+  const matches = (subject?.metadata?.fields ?? []).filter((field) => field?.fieldId === fieldId);
+  if (matches.length !== 1) return null;
+  const field = matches[0];
+  return {
+    fieldId: field.fieldId,
+    fieldName: field.fieldName,
+    type: field.type,
+    uiType: field.uiType,
+  };
 }
 
 function bridgeShareInspectionConfiguration(configuration, sourceConfiguration = null) {
@@ -1771,9 +1797,7 @@ function parseFeishuStageRegistrationBody(body) {
   }
 
   assertPlainObject(body.controlledContext);
-  assertAllowedKeys(body.controlledContext, new Set([
-    "documentLinks", "namingDisplayValue", "namingValueUnique",
-  ]));
+  assertAllowedKeys(body.controlledContext, new Set(CONTROLLED_CONTEXT_FIELDS));
   if (!Array.isArray(body.controlledContext.documentLinks)
     || body.controlledContext.documentLinks.length > 32
     || body.controlledContext.documentLinks.some((link) => (
@@ -1789,12 +1813,90 @@ function parseFeishuStageRegistrationBody(body) {
   if (typeof body.controlledContext.namingValueUnique !== "boolean") {
     throw new ApiError(400, "INVALID_FIELD", "controlledContext.namingValueUnique must be a boolean");
   }
+  const courseName = normalizeOptionalCourseName(body.controlledContext.courseName);
+  if (courseName === null) {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.courseName is invalid");
+  }
   const controlledContext = {
     documentLinks: body.controlledContext.documentLinks.map((link) => link.trim()),
     namingDisplayValue: namingDisplayValue ?? "",
     namingValueUnique: body.controlledContext.namingValueUnique,
+    ...(courseName === undefined ? {} : { courseName }),
   };
   return { event, binding, controlledContext };
+}
+
+function parseFeishuDirectoryOperationBody(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["event", "binding", "controlledContext"]));
+  assertPlainObject(body.event);
+  assertAllowedKeys(body.event, new Set([
+    "eventId", "baseToken", "tableId", "recordId", "fieldId",
+    "beforeOptionId", "afterOptionId", "occurredAt", "deliverySource",
+  ]));
+  const event = {
+    eventId: stringField(body.event.eventId, "event.eventId", { required: true, maxLength: 256 }),
+    baseToken: stringField(body.event.baseToken, "event.baseToken", { required: true, maxLength: 256 }),
+    tableId: stringField(body.event.tableId, "event.tableId", { required: true, maxLength: 256 }),
+    recordId: stringField(body.event.recordId, "event.recordId", { required: true, maxLength: 256 }),
+    fieldId: stringField(body.event.fieldId, "event.fieldId", { required: true, maxLength: 256 }),
+    beforeOptionId: stringField(body.event.beforeOptionId, "event.beforeOptionId", { required: true, maxLength: 256 }),
+    afterOptionId: stringField(body.event.afterOptionId, "event.afterOptionId", { required: true, maxLength: 256 }),
+  };
+  if (body.event.occurredAt !== undefined) {
+    if (!Number.isSafeInteger(body.event.occurredAt) || body.event.occurredAt < 0) {
+      throw new ApiError(400, "INVALID_FIELD", "event.occurredAt must be a non-negative timestamp");
+    }
+    event.occurredAt = body.event.occurredAt;
+  }
+  if (body.event.deliverySource !== undefined) {
+    if (body.event.deliverySource !== "simulation") {
+      throw new ApiError(400, "INVALID_FIELD", "event.deliverySource is invalid");
+    }
+    event.deliverySource = "simulation";
+  }
+
+  assertPlainObject(body.binding);
+  assertAllowedKeys(body.binding, new Set(["subjectKey", "configVersion"]));
+  const binding = {
+    subjectKey: stringField(body.binding.subjectKey, "binding.subjectKey", { required: true, maxLength: 513 }),
+    configVersion: body.binding.configVersion,
+  };
+  if (!Number.isSafeInteger(binding.configVersion) || binding.configVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "binding.configVersion must be a positive integer");
+  }
+
+  assertPlainObject(body.controlledContext);
+  assertAllowedKeys(body.controlledContext, new Set(CONTROLLED_CONTEXT_FIELDS));
+  if (!Array.isArray(body.controlledContext.documentLinks)
+    || body.controlledContext.documentLinks.length > 32
+    || body.controlledContext.documentLinks.some((link) => (
+      typeof link !== "string" || link.length > 2048 || link.includes("\0")
+    ))) {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.documentLinks is invalid");
+  }
+  const namingDisplayValue = stringField(
+    body.controlledContext.namingDisplayValue,
+    "controlledContext.namingDisplayValue",
+    { maxLength: 512 },
+  );
+  if (typeof body.controlledContext.namingValueUnique !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.namingValueUnique must be a boolean");
+  }
+  const courseName = normalizeOptionalCourseName(body.controlledContext.courseName);
+  if (courseName === null || courseName === undefined) {
+    throw new ApiError(400, "INVALID_FIELD", "controlledContext.courseName is required");
+  }
+  return {
+    event,
+    binding,
+    controlledContext: {
+      documentLinks: body.controlledContext.documentLinks.map((link) => link.trim()),
+      namingDisplayValue: namingDisplayValue ?? "",
+      namingValueUnique: body.controlledContext.namingValueUnique,
+      courseName,
+    },
+  };
 }
 
 function parseStartAiBody(body) {
@@ -2651,6 +2753,12 @@ export function createTaskboardServer(options = {}) {
   }));
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const deliveryStore = options.feishuDeliveryStore ?? createFeishuDeliveryStore({ database });
+  const coursePathResolver = options.coursePathResolver ?? createWindowsCoursePathResolver();
+  const directoryOperationStore = options.feishuDirectoryOperationStore
+    ?? createFeishuDirectoryOperationStore({ database });
+  const ensureFinalDirectory = options.ensureFinalDirectory
+    ?? createFinalDirectoryEnsurer();
   const pendingFeishuReconciliations = new Set();
   const pendingLocalAutoCutRuns = new Set();
   const autoCutRunner = options.autoCutRunner ?? runLocalAutoCut;
@@ -2747,7 +2855,9 @@ export function createTaskboardServer(options = {}) {
       reasoningEffort: packageRecord.reasoningEffort ?? null,
       prompt: packageRecord.prompt,
       zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
+      ...(packageRecord.zipOutputMode ? { zipOutputMode: packageRecord.zipOutputMode } : {}),
       maxConcurrent: packageRecord.maxConcurrent,
+      resourceGroups: packageRecord.resourceGroups,
     };
   }
 
@@ -2853,6 +2963,47 @@ export function createTaskboardServer(options = {}) {
       throw new ApiError(409, "FEISHU_STAGE_BINDING_MISMATCH", "The Feishu status edge does not match the configured stage");
     }
 
+    let stageSnapshot = structuredClone(stage);
+    const delivery = subjectVersion.delivery;
+    const requiresCourseBinding = delivery?.version === 1
+      && event.deliverySource !== "simulation"
+      && (subjectVersion.upload?.enabled !== false || delivery.finalDirectoryTrigger?.enabled === true);
+    if (requiresCourseBinding) {
+      const courseIdentity = {
+        baseToken: event.baseToken,
+        tableId: event.tableId,
+        recordId: event.recordId,
+      };
+      let courseBinding = deliveryStore.getCourseBinding(courseIdentity);
+      if (!courseBinding) {
+        if (!controlledContext.courseName) {
+          throw new ApiError(409, "COURSE_NAME_UNAVAILABLE", "The configured course naming field is empty or invalid");
+        }
+        let resolvedPaths;
+        try {
+          resolvedPaths = await previewCoursePath({
+            rootPath: delivery.rootPath,
+            courseName: controlledContext.courseName,
+          }, coursePathResolver);
+          courseBinding = deliveryStore.ensureCourseBinding({
+            identity: courseIdentity,
+            subjectVersion: binding.configVersion,
+            namingValue: controlledContext.courseName,
+            resolvedPaths,
+            trustedEventId: event.eventId,
+          });
+        } catch (error) {
+          const code = typeof error?.code === "string" && error.code.trim()
+            ? error.code.trim() : "COURSE_BINDING_FAILED";
+          throw new ApiError(409, code, "The configured course delivery directory could not be bound");
+        }
+      }
+      stageSnapshot = {
+        ...stageSnapshot,
+        artifactTargetPath: deriveStageDestination(courseBinding, binding.stageId),
+      };
+    }
+
     const packageAlias = subjectVersion.packageRoute?.packageAlias;
     const packageRecord = typeof feishuPackages.get === "function"
       ? await feishuPackages.get(packageAlias)
@@ -2894,10 +3045,8 @@ export function createTaskboardServer(options = {}) {
       packageSource: "subject-config",
       concurrencyGroup: `autocut:${packageAlias}`,
       maxConcurrent: packageRecord.maxConcurrent,
-      resourceGroups: Array.isArray(subjectVersion.execution?.resourceGroups)
-        ? subjectVersion.execution.resourceGroups
-        : [],
-      stageSnapshot: structuredClone(stage),
+      resourceGroups: packageSnapshot.resourceGroups,
+      stageSnapshot,
       controlledContext: structuredClone(controlledContext),
     };
     const eventRows = database.findFeishuTaskByRegistrationEvent(identity);
@@ -2969,6 +3118,106 @@ export function createTaskboardServer(options = {}) {
       throw error;
     }
   }
+  async function createCanonicalFinalDirectoryOperation(registration) {
+    const { event, binding, controlledContext } = registration;
+    if (event.deliverySource === "simulation") {
+      throw new ApiError(
+        409,
+        "SIMULATION_DIRECTORY_OPERATION_FORBIDDEN",
+        "Simulated events cannot create course directories",
+      );
+    }
+    const separator = binding.subjectKey.indexOf(":");
+    if (
+      separator <= 0
+      || separator === binding.subjectKey.length - 1
+      || binding.subjectKey.indexOf(":", separator + 1) !== -1
+      || binding.subjectKey.slice(0, separator) !== event.baseToken
+      || binding.subjectKey.slice(separator + 1) !== event.tableId
+    ) {
+      throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Directory operation identity does not match its Base/table");
+    }
+    const subjectVersion = database.getFeishuSubjectVersion(binding.subjectKey, binding.configVersion);
+    if (!subjectVersion) {
+      throw new ApiError(409, "STALE_STAGE_EVENT", "The referenced Feishu workflow version does not exist");
+    }
+    const activeVersion = event.occurredAt === undefined
+      ? subjectVersion.lifecycle === "enabled" ? subjectVersion : null
+      : database.resolveFeishuSubjectVersionAt(binding.subjectKey, event.occurredAt);
+    if (!activeVersion || activeVersion.configVersion !== binding.configVersion) {
+      throw new ApiError(409, "STALE_STAGE_EVENT", "The Feishu event did not occur during the configured workflow version");
+    }
+    if (subjectVersion.baseToken !== event.baseToken || subjectVersion.tableId !== event.tableId) {
+      throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Directory operation subject identity is invalid");
+    }
+    const trigger = subjectVersion.delivery?.version === 1
+      ? subjectVersion.delivery.finalDirectoryTrigger
+      : null;
+    if (!trigger?.enabled || trigger.fieldId !== event.fieldId || trigger.optionId !== event.afterOptionId
+      || event.beforeOptionId === event.afterOptionId) {
+      throw new ApiError(409, "FINAL_DIRECTORY_TRIGGER_MISMATCH", "The Feishu status edge does not match the final-directory trigger");
+    }
+
+    const courseIdentity = {
+      baseToken: event.baseToken,
+      tableId: event.tableId,
+      recordId: event.recordId,
+    };
+    let courseBinding = deliveryStore.getCourseBinding(courseIdentity);
+    if (!courseBinding) {
+      let resolvedPaths;
+      try {
+        resolvedPaths = await previewCoursePath({
+          rootPath: subjectVersion.delivery.rootPath,
+          courseName: controlledContext.courseName,
+        }, coursePathResolver);
+        courseBinding = deliveryStore.ensureCourseBinding({
+          identity: courseIdentity,
+          subjectVersion: binding.configVersion,
+          namingValue: controlledContext.courseName,
+          resolvedPaths,
+          trustedEventId: event.eventId,
+        });
+      } catch (error) {
+        const code = typeof error?.code === "string" && error.code.trim()
+          ? error.code.trim() : "COURSE_BINDING_FAILED";
+        throw new ApiError(409, code, "The configured course delivery directory could not be bound");
+      }
+    }
+    const registered = directoryOperationStore.registerFinalDirectoryOperation({
+      event,
+      subjectKey: binding.subjectKey,
+      configVersion: binding.configVersion,
+      courseBinding: {
+        bindingId: courseBinding.bindingId,
+        baseToken: courseBinding.baseToken,
+        tableId: courseBinding.tableId,
+        recordId: courseBinding.recordId,
+        actualRoot: courseBinding.actualRoot,
+        coursePath: courseBinding.coursePath,
+      },
+    });
+    if (registered.operation.state === "succeeded") return registered;
+    try {
+      await ensureFinalDirectory({
+        bindingId: courseBinding.bindingId,
+        baseToken: courseBinding.baseToken,
+        tableId: courseBinding.tableId,
+        recordId: courseBinding.recordId,
+        actualRoot: courseBinding.actualRoot,
+        coursePath: courseBinding.coursePath,
+      });
+    } catch (error) {
+      const code = typeof error?.code === "string" && error.code.trim()
+        ? error.code.trim() : "FINAL_DIRECTORY_CREATE_FAILED";
+      throw new ApiError(503, code, "The final course directory could not be created");
+    }
+    return {
+      operation: directoryOperationStore.markFinalDirectoryOperationSucceeded(registered.operation.id),
+      created: registered.created,
+    };
+  }
+
   const resourceScheduler = options.resourceScheduler ?? createResourceScheduler();
   const automaticExecutionDefault = options.allowAutomaticExecution === undefined
     ? resolveAutomaticExecution()
@@ -2985,6 +3234,7 @@ export function createTaskboardServer(options = {}) {
   }
   const taskStartAbortController = new AbortController();
   const taskStartOperations = new Set();
+  const localAutoCutRunAborts = new Map();
   let closing = false;
 
   function assertTaskStartAllowed(signal = taskStartAbortController.signal) {
@@ -3025,6 +3275,7 @@ export function createTaskboardServer(options = {}) {
     if (bridgeUrl.protocol !== "http:" || bridgeUrl.hostname !== "127.0.0.1") {
       throw new ApiError(503, "FEISHU_BRIDGE_UNAVAILABLE", "Feishu Bridge is unavailable");
     }
+    const courseNamingField = courseNamingFieldForBridge(subject);
     const safeSubject = {
       subjectKey: subject.subjectKey,
       baseToken: subject.baseToken,
@@ -3037,6 +3288,7 @@ export function createTaskboardServer(options = {}) {
       ...(subject.statusField ? { statusField: structuredClone(subject.statusField) } : {}),
       ...(subject.documentField ? { documentField: structuredClone(subject.documentField) } : {}),
       ...(subject.namingField ? { namingField: structuredClone(subject.namingField) } : {}),
+      ...(courseNamingField ? { courseNamingField } : {}),
       ...(subject.stages ? {
         stages: safeBridgeStages(subject.stages),
       } : {}),
@@ -3044,6 +3296,14 @@ export function createTaskboardServer(options = {}) {
       title: subject.title,
       execution: subject.execution,
       packageRoute: subject.packageRoute,
+      ...(subject.delivery ? {
+        delivery: {
+          ...structuredClone(subject.delivery),
+          // Root paths are local Taskboard bindings. The Bridge only needs
+          // the field and option rule to classify an incoming event.
+          rootPath: null,
+        },
+      } : {}),
       upload: {
         ...subject.upload,
         // Upload locations are Taskboard-local bindings and are never sent to
@@ -3166,6 +3426,58 @@ export function createTaskboardServer(options = {}) {
     },
   });
   const events = new EventHub();
+  async function dispatchFeishuWritebackClaim(claim) {
+    let bridgeUrl;
+    try {
+      bridgeUrl = new URL(resolved.feishuBridgeUrl);
+    } catch {
+      throw new ApiError(503, "WRITEBACK_UNAVAILABLE", "Feishu writeback is unavailable");
+    }
+    if (bridgeUrl.protocol !== "http:" || bridgeUrl.hostname !== "127.0.0.1"
+      || typeof resolved.feishuBridgeSecret !== "string" || !resolved.feishuBridgeSecret.trim()) {
+      throw new ApiError(503, "WRITEBACK_UNAVAILABLE", "Feishu writeback is unavailable");
+    }
+    let response;
+    try {
+      response = await fetch(new URL("/api/feishu/workflow/writeback", bridgeUrl), {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          "content-type": "application/json",
+          "x-feishu-bridge-client": "taskboard",
+          "x-feishu-bridge-secret": resolved.feishuBridgeSecret,
+        },
+        body: JSON.stringify(claim),
+      });
+    } catch {
+      throw new ApiError(503, "WRITEBACK_UNAVAILABLE", "Feishu writeback is unavailable");
+    }
+    let payload;
+    try { payload = await response.json(); } catch { payload = null; }
+    if (!response.ok) {
+      const code = typeof payload?.error?.code === "string" && /^[A-Z0-9_]{1,128}$/u.test(payload.error.code)
+        ? payload.error.code
+        : "FEISHU_WRITEBACK_FAILED";
+      throw new ApiError(response.status >= 400 ? response.status : 502, code, "Feishu writeback failed");
+    }
+    if (!payload?.writeback || !["updated", "already_applied"].includes(payload.writeback.outcome)) {
+      throw new ApiError(502, "WRITEBACK_INVALID_RESPONSE", "Feishu writeback returned an invalid response");
+    }
+    return payload.writeback;
+  }
+
+  async function interruptLocalAutoCutRun(taskId) {
+    const active = localAutoCutRunAborts.get(taskId);
+    if (!active) return false;
+    active.controller.abort();
+    await active.completion;
+    return true;
+  }
+  const writebackWorker = options.writebackWorker ?? createFeishuWritebackWorker({
+    store: deliveryStore,
+    dispatch: dispatchFeishuWritebackClaim,
+    onUpdate: (writeback) => events.emit("feishu.writeback.updated", { writeback }),
+  });
   const uploadWorker = options.uploadWorker ?? createArtifactUploadWorker({
     database,
     artifactService,
@@ -3176,6 +3488,7 @@ export function createTaskboardServer(options = {}) {
       upload,
       task: upload?.taskId ? database.getTask(upload.taskId) : null,
     }),
+    onPublished: enqueuePublishedDeliveryWritebacks,
   });
   function emitArtifactUploadUpdated(upload) {
     events.emit("artifact.upload.updated", {
@@ -3194,6 +3507,112 @@ export function createTaskboardServer(options = {}) {
     void Promise.resolve(uploadWorker.start()).catch((error) => {
       console.error(`Artifact upload worker start failed: ${error?.code ?? "UPLOAD_WORKER_FAILED"}`);
     });
+  }
+
+  function wakeWritebackWorker() {
+    void Promise.resolve(writebackWorker.wake()).catch((error) => {
+      console.error(`Feishu writeback worker wake failed: ${error?.code ?? "WRITEBACK_WORKER_FAILED"}`);
+    });
+  }
+
+  function startWritebackWorker() {
+    void Promise.resolve(writebackWorker.start()).catch((error) => {
+      console.error(`Feishu writeback worker start failed: ${error?.code ?? "WRITEBACK_WORKER_FAILED"}`);
+    });
+  }
+
+  function enqueueProcessingWritebacks(task, origin, run) {
+    if (!isPhasedAutoCutOrigin(origin)
+      || origin.deliverySource === "simulation"
+      || !run
+      || run.taskId !== task?.id
+      || run.stageId !== origin.stageId
+      || typeof deliveryStore.recordProcessingWritebackIntents !== "function") {
+      return;
+    }
+    const subjectVersion = database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+    const assignments = subjectVersion?.delivery?.version === 1
+      ? subjectVersion.delivery.writeback?.[run.stageId]?.onProcessing
+      : null;
+    if (!Array.isArray(assignments)) return;
+    const result = deliveryStore.recordProcessingWritebackIntents({
+      taskId: task.id,
+      runId: run.runId,
+      stageId: run.stageId,
+      assignments,
+    });
+    if (result.intents.length > 0) wakeWritebackWorker();
+  }
+
+  function enqueuePublishedDeliveryWritebacks({ upload }) {
+    if (!upload?.runId || !upload.courseBindingId || !upload.taskId) return;
+    const task = database.getTask(upload.taskId);
+    const origin = trustedFeishuTaskOrigin(task, { requirePackage: true });
+    const run = database.getFeishuAutoCutRun(upload.runId);
+    if (!isPhasedAutoCutOrigin(origin)
+      || origin.deliverySource === "simulation"
+      || !run
+      || run.taskId !== task.id
+      || run.stageId !== origin.stageId
+      || typeof deliveryStore.listDeliveryFacts !== "function"
+      || typeof deliveryStore.enqueueWritebackIntent !== "function") {
+      return;
+    }
+    const subjectVersion = database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+    const delivery = subjectVersion?.delivery;
+    if (delivery?.version !== 1) return;
+    const facts = deliveryStore.listDeliveryFacts(run.runId);
+    if (!facts.some((fact) => fact.kind === "stage_uploaded" && fact.bindingId === upload.courseBindingId)) {
+      return;
+    }
+
+    const assignments = Array.isArray(delivery.writeback?.[run.stageId]?.onUploaded)
+      ? delivery.writeback[run.stageId].onUploaded
+      : [];
+    const intents = assignments.map((assignment, index) => deliveryStore.enqueueWritebackIntent({
+      idempotencyKey: `${run.runId}:stage-uploaded:${index}`,
+      taskId: task.id,
+      runId: run.runId,
+      courseBindingId: upload.courseBindingId,
+      operation: { type: "single_select", fieldId: assignment.fieldId, optionId: assignment.optionId },
+    }));
+
+    const coursePathFact = facts.find((fact) => (
+      fact.kind === "course_path" && fact.bindingId === upload.courseBindingId && fact.runId === run.runId
+    ));
+    if (coursePathFact && delivery.coursePathWriteback?.enabled === true) {
+      const binding = deliveryStore.getCourseBinding({
+        baseToken: origin.baseToken,
+        tableId: origin.tableId,
+        recordId: origin.recordId,
+      });
+      if (!binding || binding.bindingId !== upload.courseBindingId) {
+        throw new ApiError(409, "ARTIFACT_DELIVERY_BINDING_INVALID", "The ZIP publication has no matching course binding");
+      }
+      intents.push(deliveryStore.enqueueWritebackIntent({
+        idempotencyKey: `course-path:${binding.bindingId}`,
+        taskId: task.id,
+        runId: run.runId,
+        courseBindingId: binding.bindingId,
+        operation: {
+          type: "text",
+          fieldId: delivery.coursePathWriteback.fieldId,
+          value: binding.displayPath,
+        },
+      }));
+    }
+    if (intents.length > 0) wakeWritebackWorker();
+  }
+
+  function reconcilePublishedDeliveryWritebacks() {
+    if (typeof deliveryStore.listPublishedDeliveryUploads !== "function") return;
+    for (const upload of deliveryStore.listPublishedDeliveryUploads()) {
+      try {
+        enqueuePublishedDeliveryWritebacks({ upload });
+      } catch (error) {
+        console.error(`Delivery writeback reconciliation failed: ${error?.code ?? "WRITEBACK_RECONCILIATION_FAILED"}`);
+      }
+    }
   }
   let clientStorageWrite = Promise.resolve();
 
@@ -3850,13 +4269,16 @@ export function createTaskboardServer(options = {}) {
     let configuredRoot;
     let expectedPath;
     let reportedPath;
+    const packageOwnsSourceRoot = packageSnapshot.zipOutputMode === "custom";
     try {
-      [packageRoot, configuredRoot, expectedPath, reportedPath] = await Promise.all([
+      [packageRoot, expectedPath, reportedPath] = await Promise.all([
         realpath(resolveFeishuPackageSourceDirectory(packageSnapshot, subjectVersion)),
-        realpath(configuredSource.artifactSourcePath),
         realpath(run.packageZipPath),
         realpath(report.path),
       ]);
+      if (!packageOwnsSourceRoot) {
+        configuredRoot = await realpath(configuredSource.artifactSourcePath);
+      }
     } catch {
       throw autoCutResultError(
         "ARTIFACT_SOURCE_UNAVAILABLE",
@@ -3865,7 +4287,7 @@ export function createTaskboardServer(options = {}) {
     }
     const relativePath = path.relative(packageRoot, expectedPath);
     if (
-      packageRoot !== configuredRoot
+      (packageRoot !== configuredRoot && !packageOwnsSourceRoot)
       || expectedPath !== reportedPath
       || relativePath === ""
       || relativePath === ".."
@@ -4014,6 +4436,9 @@ export function createTaskboardServer(options = {}) {
   }
 
   function enqueueArtifactUpload(task, metadata, artifact, { automaticOnly = false } = {}) {
+    if (metadata.deliverySource === "simulation") {
+      throw new ApiError(409, "SIMULATION_UPLOAD_FORBIDDEN", "Simulated tasks cannot publish ZIP artifacts");
+    }
     const snapshotSubjectKey = metadata.subjectKey ?? `${metadata.baseToken}:${metadata.tableId}`;
     const snapshotTarget = Number.isSafeInteger(metadata.configVersion)
       ? database.getFeishuSubjectUploadTargetByVersion(snapshotSubjectKey, metadata.configVersion)
@@ -4045,6 +4470,30 @@ export function createTaskboardServer(options = {}) {
     if (workArtifact.validationStatus !== "verified") {
       throw new ApiError(409, "ARTIFACT_NOT_VERIFIED", "Only verified ZIP artifacts can be uploaded");
     }
+    const deliveryConfigured = stageTargetPath && Number.isSafeInteger(metadata.configVersion)
+      && database.getFeishuSubjectVersion(snapshotSubjectKey, metadata.configVersion)?.delivery?.version === 1;
+    let deliveryBinding = null;
+    if (deliveryConfigured) {
+      deliveryBinding = deliveryStore.getCourseBinding({
+        baseToken: metadata.baseToken,
+        tableId: metadata.tableId,
+        recordId: metadata.recordId,
+      });
+      if (!deliveryBinding || workArtifact.runId === null || typeof metadata.stageId !== "string") {
+        throw new ApiError(
+          409,
+          "ARTIFACT_DELIVERY_BINDING_INVALID",
+          "The verified ZIP is not bound to one course delivery run",
+        );
+      }
+      if (deriveStageDestination(deliveryBinding, metadata.stageId) !== stageTargetPath) {
+        throw new ApiError(
+          409,
+          "ARTIFACT_DELIVERY_BINDING_INVALID",
+          "The frozen ZIP target no longer matches its course delivery binding",
+        );
+      }
+    }
     const upload = database.createArtifactUpload({
       taskId: task.id,
       artifactId: workArtifact.id,
@@ -4055,6 +4504,11 @@ export function createTaskboardServer(options = {}) {
       uploadConcurrency: target.uploadConcurrency,
       filename: workArtifact.filename,
       sha256: workArtifact.sha256,
+      ...(deliveryBinding ? {
+        publicationRootPath: deliveryBinding.actualRoot,
+        courseBindingId: deliveryBinding.bindingId,
+        runId: workArtifact.runId,
+      } : {}),
     });
     emitArtifactUploadUpdated(upload);
     wakeUploadWorker();
@@ -4118,6 +4572,22 @@ export function createTaskboardServer(options = {}) {
   async function reconcileFeishuTaskAfterRun(taskId, threadId, run, actor, metadata, lease = null) {
     const current = database.getTask(taskId);
     if (!current || current.threadId !== threadId) {
+      if (current?.archivedAt !== null) {
+        const archivedClaim = database.listTaskAiStarts().find((entry) => (
+          entry.taskId === taskId
+          && entry.threadId === threadId
+          && entry.runId === run.id
+        ));
+        if (archivedClaim) {
+          database.settleTaskAiStart(
+            taskId,
+            archivedClaim.claimToken,
+            run.id,
+            "blocked",
+            actor,
+          );
+        }
+      }
       clearFeishuExecutionAfterRun(taskId, lease);
       if (lease) resourceScheduler.release(lease);
       return;
@@ -4361,13 +4831,16 @@ export function createTaskboardServer(options = {}) {
   function executionRequestForTask(task, metadata, packageConfig = null) {
     const mode = executionModeForMetadata(metadata);
     const packageAlias = metadata.packageAlias || "default";
+    const resourceGroups = Array.isArray(packageConfig?.resourceGroups)
+      ? packageConfig.resourceGroups
+      : Array.isArray(metadata.resourceGroups) ? metadata.resourceGroups : [];
     return {
       requestId: task.id,
       concurrencyGroup: `autocut:${packageAlias}`,
       maxConcurrent: Number.isSafeInteger(packageConfig?.maxConcurrent) && packageConfig.maxConcurrent > 0
         ? packageConfig.maxConcurrent
         : 1,
-      resourceGroups: Array.isArray(metadata.resourceGroups) ? metadata.resourceGroups : [],
+      resourceGroups,
       mode,
     };
   }
@@ -4622,7 +5095,8 @@ export function createTaskboardServer(options = {}) {
       });
       const preparedAttempt = database.getFeishuAutoCutRun(run.id);
       if (preparedAttempt?.state === "prepared") {
-        database.updateFeishuAutoCutRun(run.id, { state: "running" });
+        const runningAttempt = database.updateFeishuAutoCutRun(run.id, { state: "running" });
+        enqueueProcessingWritebacks(database.getTask(claimedTask.id), metadata, runningAttempt);
       }
     } catch (error) {
       unsubscribeRun?.();
@@ -4672,7 +5146,14 @@ export function createTaskboardServer(options = {}) {
     events.emit("task.updated", { task });
   }
 
-  async function prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig, assertStartAllowed) {
+  async function prepareClaimedPhasedAutoCutRun(
+    claimedTask,
+    actor,
+    metadata,
+    packageConfig,
+    assertStartAllowed,
+    { signal, onRunCreated } = {},
+  ) {
     assertStartAllowed();
     const threadId = randomUUID();
     const project = database.getProject(claimedTask.projectId);
@@ -4702,6 +5183,7 @@ export function createTaskboardServer(options = {}) {
     );
     events.emit("task.updated", { task: boundTask });
     const run = database.createAiChatRun({ threadId: thread.id });
+    onRunCreated?.(run);
     aiChat.publishLocalRun(run.id);
     aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "running" });
     database.bindTaskAiStartRun(
@@ -4746,6 +5228,7 @@ export function createTaskboardServer(options = {}) {
         bridgeUrl: resolved.feishuBridgeUrl,
         bridgeSecret: resolved.feishuBridgeSecret,
         origin,
+        signal,
       });
       assertStartAllowed();
       const prepared = await prepareFeishuRunInputs({
@@ -4770,11 +5253,14 @@ export function createTaskboardServer(options = {}) {
         cancelPreparedAutomaticRun(run, claimedTask, actor, error);
         throw error;
       }
-      const failure = blockedPreparationError(error);
+      const interrupted = signal?.aborted || error?.code === "AUTOCUT_RUN_INTERRUPTED";
+      const failure = blockedPreparationError(interrupted
+        ? autoCutResultError("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted")
+        : error);
       database.markFeishuAutoCutRunBlocked(run.id, failure);
       aiChat.recordLocalProgress(run.id, { phase: "input_prepare", status: "failed" });
       database.updateAiChatRun(run.id, {
-        status: "failed",
+        status: interrupted ? "interrupted" : "failed",
         exitCode: 1,
         error: failure.message.slice(0, 65_536),
         finishedAt: new Date().toISOString(),
@@ -4803,11 +5289,40 @@ export function createTaskboardServer(options = {}) {
     autoCutRunConsent = null,
     assertStartAllowed = () => assertAutomaticStartAllowed(trigger),
   ) {
+    let resolveLifecycle;
+    const localRunAbort = {
+      runId: null,
+      controller: new AbortController(),
+      completion: new Promise((resolve) => { resolveLifecycle = resolve; }),
+    };
+    const localRunSignal = AbortSignal.any([
+      taskStartAbortController.signal,
+      localRunAbort.controller.signal,
+    ]);
+    const assertLocalRunAllowed = () => {
+      assertTaskStartAllowed();
+      assertStartAllowed();
+      if (localRunSignal.aborted) {
+        throw autoCutResultError("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted");
+      }
+    };
+    localAutoCutRunAborts.set(claimedTask.id, localRunAbort);
     let prepared;
     try {
-      prepared = await prepareClaimedPhasedAutoCutRun(claimedTask, actor, metadata, packageConfig, assertStartAllowed);
-      assertStartAllowed();
-      database.updateFeishuAutoCutRun(prepared.run.id, { state: "running" });
+      prepared = await prepareClaimedPhasedAutoCutRun(
+        claimedTask,
+        actor,
+        metadata,
+        packageConfig,
+        assertLocalRunAllowed,
+        {
+          signal: localRunSignal,
+          onRunCreated(run) { localRunAbort.runId = run.id; },
+        },
+      );
+      assertLocalRunAllowed();
+      const runningAttempt = database.updateFeishuAutoCutRun(prepared.run.id, { state: "running" });
+      enqueueProcessingWritebacks(prepared.task, metadata, runningAttempt);
     } catch (error) {
       if (prepared && error?.code === "AUTOMATIC_EXECUTION_DISABLED") {
         cancelPreparedAutomaticRun(prepared.run, claimedTask, actor, error);
@@ -4823,62 +5338,73 @@ export function createTaskboardServer(options = {}) {
           events.emit("task.updated", { task: rollback });
         } catch {}
       }
+      if (localAutoCutRunAborts.get(claimedTask.id) === localRunAbort) {
+        localAutoCutRunAborts.delete(claimedTask.id);
+      }
+      resolveLifecycle();
       throw error;
     }
 
     let operation;
     operation = (async () => {
-      let terminalRun;
-      let activePhase = "environment_check";
-      const onProgress = (progress) => {
-        const event = aiChat.recordLocalProgress(prepared.run.id, progress);
-        // Only accepted, persisted events may change the failure stage.
-        if (event) activePhase = event.data.phase;
-      };
       try {
-        onProgress({ phase: "environment_check", status: "running" });
-        await autoCutRunner({
-          run: prepared.autoCutRun,
-          packageConfig,
-          environment: codexProcessEnvironment,
-          ...localAutoCutDeadlines,
-          signal: taskStartAbortController.signal,
-          onProgress,
-          ...(trigger === "retry" && autoCutRunConsent ? { autoCutRunConsent } : {}),
-        });
-        onProgress({ phase: "artifact_report", status: "running" });
-        const result = await reportLocalAutoCutArtifact(prepared.autoCutRun, claimedTask.claimToken);
-        if (result.status === "blocked") {
-          throw autoCutResultError(result.error.code, result.error.message);
+        let terminalRun;
+        let activePhase = "environment_check";
+        const onProgress = (progress) => {
+          const event = aiChat.recordLocalProgress(prepared.run.id, progress);
+          // Only accepted, persisted events may change the failure stage.
+          if (event) activePhase = event.data.phase;
+        };
+        try {
+          onProgress({ phase: "environment_check", status: "running" });
+          await autoCutRunner({
+            run: prepared.autoCutRun,
+            packageConfig,
+            environment: codexProcessEnvironment,
+            ...localAutoCutDeadlines,
+            signal: localRunSignal,
+            onProgress,
+            ...(trigger === "retry" && autoCutRunConsent ? { autoCutRunConsent } : {}),
+          });
+          onProgress({ phase: "artifact_report", status: "running" });
+          const result = await reportLocalAutoCutArtifact(prepared.autoCutRun, claimedTask.claimToken);
+          if (result.status === "blocked") {
+            throw autoCutResultError(result.error.code, result.error.message);
+          }
+          onProgress({ phase: "artifact_report", status: "complete" });
+          terminalRun = database.updateAiChatRun(prepared.run.id, {
+            status: "completed",
+            exitCode: 0,
+            error: null,
+            finishedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          database.markFeishuAutoCutRunBlocked(prepared.run.id, error);
+          onProgress({ phase: activePhase, status: "failed" });
+          terminalRun = database.updateAiChatRun(prepared.run.id, {
+            status: error?.name === "AbortError" || error?.code === "AUTOCUT_RUN_INTERRUPTED"
+              ? "interrupted"
+              : "failed",
+            exitCode: 1,
+            error: String(error?.message ?? error).slice(0, 65_536),
+            finishedAt: new Date().toISOString(),
+          });
         }
-        onProgress({ phase: "artifact_report", status: "complete" });
-        terminalRun = database.updateAiChatRun(prepared.run.id, {
-          status: "completed",
-          exitCode: 0,
-          error: null,
-          finishedAt: new Date().toISOString(),
-        });
-      } catch (error) {
-        database.markFeishuAutoCutRunBlocked(prepared.run.id, error);
-        onProgress({ phase: activePhase, status: "failed" });
-        terminalRun = database.updateAiChatRun(prepared.run.id, {
-          status: error?.name === "AbortError" || error?.code === "AUTOCUT_RUN_INTERRUPTED"
-            ? "interrupted"
-            : "failed",
-          exitCode: 1,
-          error: String(error?.message ?? error).slice(0, 65_536),
-          finishedAt: new Date().toISOString(),
-        });
+        aiChat.publishLocalRun(prepared.run.id);
+        await scheduleFeishuTaskReconciliation(
+          prepared.task.id,
+          prepared.thread.id,
+          terminalRun,
+          actor,
+          metadata,
+          lease,
+        );
+      } finally {
+        if (localAutoCutRunAborts.get(prepared.task.id) === localRunAbort) {
+          localAutoCutRunAborts.delete(prepared.task.id);
+        }
+        resolveLifecycle();
       }
-      aiChat.publishLocalRun(prepared.run.id);
-      await scheduleFeishuTaskReconciliation(
-        prepared.task.id,
-        prepared.thread.id,
-        terminalRun,
-        actor,
-        metadata,
-        lease,
-      );
     })();
     pendingLocalAutoCutRuns.add(operation);
     void operation.finally(() => pendingLocalAutoCutRuns.delete(operation)).catch(() => {});
@@ -5309,7 +5835,15 @@ export function createTaskboardServer(options = {}) {
           ),
         });
         if (result) {
-          if (request.method !== "GET" && pathname !== "/api/local/autocut/packages/catalog") {
+          const isPersistedPackageMutation = (
+            request.method === "POST" && pathname === "/api/local/autocut/packages"
+          ) || request.method === "PATCH"
+            || request.method === "DELETE"
+            || (
+              request.method === "POST"
+              && /^\/api\/local\/autocut\/packages\/[^/]+\/(enable|disable)$/u.test(pathname)
+            );
+          if (isPersistedPackageMutation) {
             events.emit("autocut.package.updated", {});
             void executionCoordinator.wake().catch((error) => {
               console.error(`Failed to wake Auto-Cut execution queue: ${error?.code ?? "QUEUE_WAKE_FAILED"}`);
@@ -5776,6 +6310,13 @@ export function createTaskboardServer(options = {}) {
         assertNoQuery(url.searchParams, "POST /api/local/ai/runs/:id/interrupt");
         const runId = decodeRouteSegment(aiInterruptRoute[1], "Run id");
         await assertEmptyRequestBody(request, "POST /api/local/ai/runs/:id/interrupt");
+        for (const [taskId, active] of localAutoCutRunAborts) {
+          if (active.runId !== runId) continue;
+          await interruptLocalAutoCutRun(taskId);
+          const run = database.getAiChatRun(runId);
+          if (!run) throw new ApiError(404, "AI_CHAT_RUN_NOT_FOUND", `AI chat run '${runId}' does not exist`);
+          return sendJson(response, 200, { run });
+        }
         const run = await aiChat.interrupt(runId);
         return sendJson(response, 200, { run });
       }
@@ -6046,6 +6587,54 @@ export function createTaskboardServer(options = {}) {
         );
       }
 
+      if (pathname === "/api/local/feishu/writeback/resolve" && request.method === "POST") {
+        assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
+        assertNoQuery(url.searchParams, "POST /api/local/feishu/writeback/resolve");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["operationId", "claimToken", "version"]));
+        const claim = {
+          operationId: stringField(body.operationId, "operationId", { required: true, maxLength: 512 }),
+          claimToken: stringField(body.claimToken, "claimToken", { required: true, maxLength: 512 }),
+          version: parseVersion(body.version),
+        };
+        if (typeof deliveryStore.resolveWritebackIntentForBridge !== "function") {
+          throw new ApiError(503, "WRITEBACK_UNAVAILABLE", "The local writeback resolver is unavailable");
+        }
+        const intent = deliveryStore.resolveWritebackIntentForBridge(claim);
+        const target = intent?.target;
+        const operation = intent?.operation;
+        if (!target || typeof target !== "object" || Array.isArray(target)
+          || !operation || typeof operation !== "object" || Array.isArray(operation)) {
+          throw new ApiError(502, "WRITEBACK_RESOLUTION_INVALID", "The local writeback resolver returned an invalid intent");
+        }
+        const safeOperation = operation.type === "single_select"
+          ? { type: operation.type, fieldId: operation.fieldId, optionId: operation.optionId }
+          : operation.type === "text"
+            ? { type: operation.type, fieldId: operation.fieldId, value: operation.value }
+            : null;
+        if (!safeOperation) {
+          throw new ApiError(502, "WRITEBACK_RESOLUTION_INVALID", "The local writeback resolver returned an invalid operation");
+        }
+        return sendJson(response, 200, {
+          target: {
+            baseToken: target.baseToken,
+            tableId: target.tableId,
+            recordId: target.recordId,
+          },
+          operation: safeOperation,
+        });
+      }
+
+      if (pathname === "/api/local/feishu/directory-operations" && request.method === "POST") {
+        assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
+        assertNoQuery(url.searchParams, "POST /api/local/feishu/directory-operations");
+        const result = await createCanonicalFinalDirectoryOperation(
+          parseFeishuDirectoryOperationBody(await readJson(request)),
+        );
+        return sendJson(response, result.created ? 201 : 200, { operation: result.operation });
+      }
+
       if (pathname === "/api/local/feishu/tasks" && request.method === "POST") {
         assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
         const actor = actorFromRequest(request);
@@ -6102,7 +6691,9 @@ export function createTaskboardServer(options = {}) {
             reasoningEffort: packageRecord.reasoningEffort ?? null,
             prompt: packageRecord.prompt,
             zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
+            ...(packageRecord.zipOutputMode ? { zipOutputMode: packageRecord.zipOutputMode } : {}),
             maxConcurrent: packageRecord.maxConcurrent,
+            resourceGroups: packageRecord.resourceGroups,
           };
         }
         const create = packageSnapshot || !metadata.packageAlias
@@ -6133,6 +6724,7 @@ export function createTaskboardServer(options = {}) {
         requireTrustedFeishuTask(task);
         const archived = database.archiveFeishuTask(id, version, actorFromRequest(request));
         executionCoordinator.cancel(id);
+        await interruptLocalAutoCutRun(id);
         events.emit("task.archived", { task: archived });
         return sendJson(response, 200, { task: archived });
       }
@@ -6741,7 +7333,10 @@ export function createTaskboardServer(options = {}) {
         }
         if (action === "retry" && request.method === "POST") {
           assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/upload/retry");
-          assertTaskArtifactEligible(task);
+          const metadata = assertTaskArtifactEligible(task);
+          if (metadata.deliverySource === "simulation") {
+            throw new ApiError(409, "SIMULATION_UPLOAD_FORBIDDEN", "Simulated tasks cannot publish ZIP artifacts");
+          }
           const { uploadId } = parseArtifactUploadRetry(await readJson(request));
           const existing = database.getArtifactUpload(uploadId);
           if (!existing || existing.taskId !== task.id) {
@@ -6952,7 +7547,9 @@ export function createTaskboardServer(options = {}) {
           reasoningEffort: packageRecord.reasoningEffort ?? null,
           prompt: packageRecord.prompt,
           zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
+          ...(packageRecord.zipOutputMode ? { zipOutputMode: packageRecord.zipOutputMode } : {}),
           maxConcurrent: packageRecord.maxConcurrent,
+          resourceGroups: packageRecord.resourceGroups,
         };
         const refreshed = database.refreshFeishuTaskPackageSnapshot(
           task.id,
@@ -7173,6 +7770,7 @@ export function createTaskboardServer(options = {}) {
             actorFromRequest(request),
           );
           executionCoordinator.cancel(id);
+          await interruptLocalAutoCutRun(id);
           events.emit("task.archived", { task });
           return sendJson(response, 200, { task });
         }
@@ -7394,7 +7992,9 @@ export function createTaskboardServer(options = {}) {
       }
       listening = true;
       reconcileAutomaticArtifactUploads();
+      reconcilePublishedDeliveryWritebacks();
       startUploadWorker();
+      startWritebackWorker();
       return address;
     },
     async close() {
@@ -7421,6 +8021,7 @@ export function createTaskboardServer(options = {}) {
           })
         : Promise.resolve();
       await uploadWorker.close();
+      await writebackWorker.close();
       await aiChat.close();
       await settleFeishuTaskReconciliations();
       await projectSummary.close();

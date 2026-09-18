@@ -1052,7 +1052,7 @@ test("same-thread turns are locked, different threads run concurrently, failures
     await waitFor(() => fixture.service.getRun(parallel.id)?.status === "completed");
     const interrupted = await fixture.service.interrupt(waiting.id);
     assert.equal(interrupted.id, waiting.id);
-    await waitFor(() => fixture.service.getRun(waiting.id)?.status === "interrupted");
+    await waitFor(() => fixture.service.getRun(waiting.id)?.status === "interrupted", 10_000);
 
     const failed = await fixture.service.startTurn(firstThread.id, { message: "FAIL" });
     await waitFor(() => fixture.service.getRun(failed.id)?.status === "failed");

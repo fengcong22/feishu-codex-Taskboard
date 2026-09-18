@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 
 import { TaskboardClient, TaskboardError } from "../src/taskboard-client.mjs";
+import { listenOnFetchSafePort } from "./fetch-safe-listen.mjs";
 
 function invalidResponse(error) {
   return error instanceof TaskboardError
@@ -12,8 +13,7 @@ function invalidResponse(error) {
 
 async function fixture(handler) {
   const server = createServer(handler);
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
+  const address = await listenOnFetchSafePort(server);
   return {
     url: `http://127.0.0.1:${address.port}`,
     close: () => new Promise((resolve) => server.close(resolve)),

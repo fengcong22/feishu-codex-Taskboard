@@ -280,6 +280,7 @@ function decisionFromPhasedSnapshot(record, snapshot) {
     reason: snapshot.reason ?? undefined,
     reasonCode: snapshot.reasonCode ?? undefined,
     stage: snapshot.stageId ? subject.stages?.[snapshot.stageId] : undefined,
+    operationKind: snapshot.kind === "directory_operation" ? "ensure_final_directory" : undefined,
     controlledContext: snapshot.controlledContext ?? null,
     packageAlias: subject.packageRoute?.packageAlias ?? subject.defaultPackageAlias ?? null,
     executionMode: subject.execution?.mode ?? "manual",
@@ -570,6 +571,55 @@ export function createBridge({
         kind: "blocked",
         reason: decision.reason,
         ...(decision.reasonCode ? { reasonCode: decision.reasonCode } : {}),
+      }, heartbeat, { requireTaskIdentifier: false });
+    }
+
+    if (decision.kind === "directory_operation") {
+      if (deliverySourceOf(record) === "simulation") {
+        return completePhased(record, "ignored", {
+          kind: "ignored",
+          reason: "simulation_forbidden",
+        }, heartbeat, { requireTaskIdentifier: false });
+      }
+      const context = decision.controlledContext ?? await readPhasedContext(subject, record.event);
+      if (!persistedSnapshot) await persistPhasedSnapshot(record, decision, context, heartbeat);
+      const operation = taskboard?.ensureFinalDirectory;
+      if (typeof operation !== "function") {
+        const error = new Error("Taskboard final-directory route is unavailable");
+        error.code = "TASKBOARD_DIRECTORY_OPERATION_UNAVAILABLE";
+        error.status = 503;
+        throw error;
+      }
+      await heartbeat.ensureActive();
+      const result = await operation.call(taskboard, {
+        event: {
+          eventId: record.event.eventId,
+          baseToken: record.event.baseToken,
+          tableId: record.event.tableId,
+          recordId: record.event.recordId,
+          fieldId: record.event.fieldId,
+          beforeOptionId: record.event.beforeOptionId,
+          afterOptionId: record.event.afterOptionId,
+          ...(record.event.eventOccurredAtPresent ? { occurredAt: record.event.eventOccurredAt } : {}),
+        },
+        binding: {
+          subjectKey: decision.subjectKey,
+          configVersion: decision.configVersion,
+        },
+        controlledContext: context,
+      }, { bridgeSecret });
+      if (!result || typeof result !== "object" || typeof result.id !== "string" || result.id.trim() === "") {
+        const error = new Error("Taskboard final-directory response is invalid");
+        error.code = "TASKBOARD_DIRECTORY_OPERATION_INVALID_RESPONSE";
+        error.status = 502;
+        throw error;
+      }
+      return completePhased(record, "directory_operation", {
+        kind: "directory_operation",
+        operationKind: "ensure_final_directory",
+        operationId: result.id,
+        subjectKey: decision.subjectKey,
+        configVersion: decision.configVersion,
       }, heartbeat, { requireTaskIdentifier: false });
     }
 

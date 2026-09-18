@@ -128,6 +128,7 @@ function mergePatch(current, patch, fieldName = "patch") {
 function subjectWithoutRuntime(subject, { forceDraft = false } = {}) {
   const result = clone(subject);
   delete result.activeSnapshot;
+  delete result.courseNamingField;
   if (forceDraft) result.lifecycle = "draft";
   result.upload.artifactSourcePath = null;
   result.upload.targetPath = null;

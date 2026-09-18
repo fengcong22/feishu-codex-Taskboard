@@ -38,7 +38,16 @@ const PENDING_IDENTIFIERS = new Set([
   "pending_document_field",
   "pending_naming_field",
   "pending_initial_option",
+  "pending_first_review_option",
+  "pending_final_review_option",
+  "pending_attachment_field",
 ]);
+
+const PENDING_STAGE_OPTION_IDS = Object.freeze({
+  initial: "pending_initial_option",
+  first_review: "pending_first_review_option",
+  final_review: "pending_final_review_option",
+});
 
 const DEFAULT_STAGE_SUFFIXES = Object.freeze(["_初稿", "_初审修改", "_终审修改"]);
 
@@ -75,6 +84,10 @@ function metadataOption(field, index) {
     ? option.name.trim()
     : null;
   return optionId && optionName ? { id: optionId, name: optionName } : null;
+}
+
+function metadataOptionName(option) {
+  return option?.name ?? option?.optionName ?? null;
 }
 
 function isPendingIdentifier(value) {
@@ -228,6 +241,7 @@ function phasedDefaultsForSubject({
   tableName,
   projectId,
   metadata,
+  previousMetadata = null,
   existing = null,
   lifecycle = "draft",
   configVersion,
@@ -236,6 +250,7 @@ function phasedDefaultsForSubject({
   validate,
 }) {
   const fields = Array.isArray(metadata?.fields) ? metadata.fields : [];
+  const previousFields = Array.isArray(previousMetadata?.fields) ? previousMetadata.fields : [];
   const existingTrigger = existing?.trigger
     && typeof existing.trigger === "object"
     && !Array.isArray(existing.trigger)
@@ -255,7 +270,22 @@ function phasedDefaultsForSubject({
   const legacyTriggerFieldId = !migratingLegacySubject
     ? null
     : validIdentifier(existingTrigger?.fieldId);
-  const legacyStatusMatches = legacyTriggerFieldId
+  const legacyTriggerFieldRenamed = Boolean(
+    migratingLegacySubject
+    && fieldDisplayNameChanged(fields, previousFields, legacyTriggerFieldId, existingTrigger?.fieldName),
+  );
+  const legacyTriggerOptionRenamed = Boolean(
+    migratingLegacySubject
+    && !legacyTriggerFieldRenamed
+    && optionDisplayNameChanged(
+      fields,
+      previousFields,
+      legacyTriggerFieldId,
+      existingTrigger?.optionId,
+      existingTrigger?.startValue,
+    ),
+  );
+  const legacyStatusMatches = legacyTriggerFieldId && !legacyTriggerFieldRenamed
     ? fields.filter((field) => (
       isSingleSelectMetadataField(field)
       && validIdentifier(metadataFieldId(field)) === legacyTriggerFieldId
@@ -311,7 +341,7 @@ function phasedDefaultsForSubject({
   const documentCandidate = remainingFields[0];
   const namingCandidate = remainingFields[1] ?? documentCandidate;
   const defaultStatusField = metadataDescriptor(
-    statusCandidate ?? (migratingLegacySubject ? existingTrigger : null),
+    statusCandidate ?? (migratingLegacySubject && !legacyTriggerFieldRenamed ? existingTrigger : null),
     "pending_status_field",
   );
   const defaultDocumentField = metadataDescriptor(documentCandidate, "pending_document_field");
@@ -344,7 +374,13 @@ function phasedDefaultsForSubject({
       stageId === "initial"
       && (migratingLegacySubject || shouldProjectTopLevelInitialTrigger)
     ) {
-      if (topLevelTriggerFieldId === statusField.fieldId) {
+      if (migratingLegacySubject && (legacyTriggerFieldRenamed || legacyTriggerOptionRenamed)) {
+        initialOptionNeedsRepair = true;
+        option = {
+          id: "pending_initial_option",
+          name: "待配置",
+        };
+      } else if (topLevelTriggerFieldId === statusField.fieldId) {
         const legacyOptionId = validIdentifier(existingTrigger?.optionId);
         const legacyStartValue = validRequiredText(existingTrigger?.startValue);
         const legacyOptionMatches = Array.isArray(statusCandidate?.options)
@@ -469,6 +505,23 @@ function phasedDefaultsForSubject({
       optionId: reusableTriggerOptionId,
     }
     : defaultLegacyTrigger;
+  const titleNeedsReselection = Boolean(
+    migratingLegacySubject
+    && fieldDisplayNameChanged(fields, previousFields, existing?.title?.fieldId, existing?.title?.fieldName),
+  );
+  const packageRoute = clone(existing?.packageRoute ?? {
+    routeMode: "fixed",
+    packageAlias: "Auto-cut-A",
+    subjectCodeFieldId: null,
+    branchMap: null,
+  });
+  if (migratingLegacySubject && fieldDisplayNameChanged(
+    fields,
+    previousFields,
+    packageRoute.subjectCodeFieldId,
+  )) {
+    packageRoute.subjectCodeFieldId = null;
+  }
   const candidate = {
     subjectKey,
     baseToken,
@@ -480,7 +533,7 @@ function phasedDefaultsForSubject({
     lifecycle,
     configVersion,
     trigger: clone(reusableTrigger),
-    title: clone(existing?.title ?? { fieldId: null, fieldName: null }),
+    title: titleNeedsReselection ? { fieldId: null, fieldName: null } : clone(existing?.title ?? { fieldId: null, fieldName: null }),
     execution: clone(existing?.execution ?? {
       // Only first discovery opts into automatic execution. Legacy repair and
       // restoration retain their conservative fallback when execution is absent.
@@ -489,12 +542,7 @@ function phasedDefaultsForSubject({
       maxConcurrent: 1,
       resourceGroups: [],
     }),
-    packageRoute: clone(existing?.packageRoute ?? {
-      routeMode: "fixed",
-      packageAlias: "Auto-cut-A",
-      subjectCodeFieldId: null,
-      branchMap: null,
-    }),
+    packageRoute,
     upload: clone(existing?.upload ?? {
       enqueueMode: "manual",
       artifactSourceMode: "manual_select",
@@ -503,6 +551,7 @@ function phasedDefaultsForSubject({
       targetPath: null,
       uploadConcurrency: 1,
     }),
+    ...(existing?.delivery === undefined ? {} : { delivery: clone(existing.delivery) }),
     statusField,
     documentField,
     namingField,
@@ -601,12 +650,25 @@ function rowSubject(row) {
   };
 }
 
+function subjectResponse(database, row) {
+  const active = database.prepare(`
+    SELECT version FROM feishu_subject_versions
+    WHERE subject_key = ? AND lifecycle = 'enabled' AND closed_at IS NULL
+    ORDER BY version DESC LIMIT 1
+  `).get(row.subject_key);
+  return {
+    ...rowSubject(row),
+    // Response-only state: editing a draft does not replace the active version.
+    activeConfigVersion: active?.version ?? null,
+  };
+}
+
 function rowBase(database, row) {
   const subjects = database.prepare(`
     SELECT * FROM feishu_subjects
     WHERE base_token = ? AND removed_at IS NULL
     ORDER BY table_name, table_id
-  `).all(row.base_token).map(rowSubject);
+  `).all(row.base_token).map((subject) => subjectResponse(database, subject));
   return {
     baseToken: row.base_token,
     baseName: row.base_name,
@@ -624,6 +686,244 @@ function snapshotFor(row) {
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
+}
+
+function uniqueMetadataField(fields, fieldId) {
+  const matches = fields.filter((field) => metadataFieldId(field) === fieldId);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function uniqueMetadataOption(field, optionId) {
+  const matches = (Array.isArray(field?.options) ? field.options : [])
+    .filter((option) => option?.id === optionId);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function missingMetadataField(fields, fieldId) {
+  const identifierValue = validIdentifier(fieldId);
+  return Boolean(
+    identifierValue
+    && !isPendingIdentifier(identifierValue)
+    && fields.filter((field) => metadataFieldId(field) === identifierValue).length === 0,
+  );
+}
+
+function missingMetadataOption(field, optionId) {
+  const identifierValue = validIdentifier(optionId);
+  return Boolean(
+    identifierValue
+    && !isPendingIdentifier(identifierValue)
+    && (Array.isArray(field?.options) ? field.options : [])
+      .filter((option) => option?.id === identifierValue).length === 0,
+  );
+}
+
+function metadataNameChanged(previousName, currentName, configuredName = null) {
+  const before = validRequiredText(previousName) ?? validRequiredText(configuredName);
+  const after = validRequiredText(currentName);
+  return before !== null && after !== null && before !== after;
+}
+
+function fieldDisplayNameChanged(fields, previousFields, fieldId, configuredName = null) {
+  const identifierValue = validIdentifier(fieldId);
+  if (!identifierValue || isPendingIdentifier(identifierValue)) return false;
+  const previousField = uniqueMetadataField(previousFields, identifierValue);
+  const currentField = uniqueMetadataField(fields, identifierValue);
+  if (!previousField || !currentField) return false;
+  return metadataNameChanged(
+    metadataFieldName(previousField),
+    metadataFieldName(currentField),
+    configuredName,
+  );
+}
+
+function fieldRequiresReselection(fields, previousFields, fieldId, configuredName = null) {
+  const identifierValue = validIdentifier(fieldId);
+  if (!identifierValue || isPendingIdentifier(identifierValue)) return false;
+  const matches = fields.filter((field) => metadataFieldId(field) === identifierValue);
+  if (matches.length === 0) return true;
+  if (matches.length !== 1) return false;
+  return fieldDisplayNameChanged(fields, previousFields, identifierValue, configuredName);
+}
+
+function optionDisplayNameChanged(fields, previousFields, fieldId, optionId, configuredName = null) {
+  const fieldIdValue = validIdentifier(fieldId);
+  const optionIdValue = validIdentifier(optionId);
+  if (!fieldIdValue || !optionIdValue || isPendingIdentifier(fieldIdValue) || isPendingIdentifier(optionIdValue)) return false;
+  const previousField = uniqueMetadataField(previousFields, fieldIdValue);
+  const currentField = uniqueMetadataField(fields, fieldIdValue);
+  if (!previousField || !currentField) return false;
+  const previousOption = uniqueMetadataOption(previousField, optionIdValue);
+  const currentOption = uniqueMetadataOption(currentField, optionIdValue);
+  if (!previousOption || !currentOption) return false;
+  return metadataNameChanged(
+    metadataOptionName(previousOption),
+    metadataOptionName(currentOption),
+    configuredName,
+  );
+}
+
+function optionRequiresReselection(fields, previousFields, fieldId, optionId, configuredName = null) {
+  const fieldIdValue = validIdentifier(fieldId);
+  const optionIdValue = validIdentifier(optionId);
+  if (!fieldIdValue || !optionIdValue || isPendingIdentifier(fieldIdValue) || isPendingIdentifier(optionIdValue)) return false;
+  const fieldMatches = fields.filter((field) => metadataFieldId(field) === fieldIdValue);
+  if (fieldMatches.length === 0) return true;
+  if (fieldMatches.length !== 1) return false;
+  const options = Array.isArray(fieldMatches[0]?.options) ? fieldMatches[0].options : [];
+  const matches = options.filter((option) => option?.id === optionIdValue);
+  if (matches.length === 0) return true;
+  if (matches.length !== 1) return false;
+  return optionDisplayNameChanged(fields, previousFields, fieldIdValue, optionIdValue, configuredName);
+}
+
+function clearDeletedMetadataBindings(value, metadata, previousMetadata = null) {
+  const fields = Array.isArray(metadata?.fields) ? metadata.fields : [];
+  const previousFields = Array.isArray(previousMetadata?.fields) ? previousMetadata.fields : [];
+  const next = clone(value);
+  let triggerChanged = false;
+  const repairDescriptor = (descriptor, pendingId) => {
+    if (!validIdentifier(descriptor?.fieldId)
+      || fieldRequiresReselection(fields, previousFields, descriptor.fieldId, descriptor.fieldName)) {
+      return { fieldId: pendingId, fieldName: "待配置" };
+    }
+    return descriptor;
+  };
+
+  next.statusField = repairDescriptor(next.statusField, "pending_status_field");
+  next.documentField = repairDescriptor(next.documentField, "pending_document_field");
+  next.namingField = repairDescriptor(next.namingField, "pending_naming_field");
+  if (next.title && fieldRequiresReselection(fields, previousFields, next.title.fieldId, next.title.fieldName)) {
+    next.title = { fieldId: null, fieldName: null };
+  }
+  if (next.packageRoute?.subjectCodeFieldId
+    && fieldRequiresReselection(fields, previousFields, next.packageRoute.subjectCodeFieldId)) {
+    next.packageRoute = { ...next.packageRoute, subjectCodeFieldId: null };
+  }
+  const triggerFieldRequiresReselection = fieldRequiresReselection(
+    fields,
+    previousFields,
+    next.trigger?.fieldId,
+    next.trigger?.fieldName,
+  );
+  const triggerOptionRequiresReselection = !triggerFieldRequiresReselection
+    && optionRequiresReselection(
+      fields,
+      previousFields,
+      next.trigger?.fieldId,
+      next.trigger?.optionId,
+      next.trigger?.startValue,
+    );
+  if (triggerFieldRequiresReselection || triggerOptionRequiresReselection) {
+    next.trigger = {
+      ...next.trigger,
+      ...(triggerFieldRequiresReselection ? {
+        fieldId: "pending_status_field",
+        fieldName: "待配置",
+      } : {}),
+      optionId: "pending_initial_option",
+      startValue: "待配置",
+    };
+  }
+  const statusWasCleared = isPendingIdentifier(next.statusField?.fieldId);
+
+  if (next.stages && typeof next.stages === "object") {
+    next.stages = Object.fromEntries(STAGE_IDS.map((stageId) => {
+      const stage = clone(next.stages[stageId]);
+      if (!stage) return [stageId, stage];
+      const trigger = stage.trigger ?? {};
+      const stageFieldMissing = fieldRequiresReselection(fields, previousFields, trigger.fieldId, trigger.fieldName);
+      const currentTriggerField = uniqueMetadataField(fields, trigger.fieldId);
+      const triggerField = statusWasCleared || stageFieldMissing
+        ? null
+        : currentTriggerField;
+      const triggerOptionMissing = triggerField && optionRequiresReselection(
+        fields,
+        previousFields,
+        trigger.fieldId,
+        trigger.optionId,
+        trigger.value,
+      );
+      if (statusWasCleared || stageFieldMissing || triggerOptionMissing) {
+        stage.trigger = {
+          ...trigger,
+          fieldId: next.statusField.fieldId,
+          fieldName: next.statusField.fieldName,
+          optionId: PENDING_STAGE_OPTION_IDS[stageId],
+          value: "待配置",
+        };
+        triggerChanged = true;
+      }
+      for (const sourceKey of ["videoSource", "reviewSource"]) {
+        const source = stage[sourceKey];
+        if (source?.kind === "base_attachment" && fieldRequiresReselection(fields, previousFields, source.fieldId)) {
+          stage[sourceKey] = { ...source, fieldId: "pending_attachment_field" };
+        }
+      }
+      if (stage.audio?.mode === "replace_original" && stage.audio.source?.kind === "base_attachment"
+        && fieldRequiresReselection(fields, previousFields, stage.audio.source.fieldId)) {
+        stage.audio = {
+          ...stage.audio,
+          source: { ...stage.audio.source, fieldId: "pending_attachment_field" },
+        };
+      }
+      return [stageId, stage];
+    }));
+  }
+
+  const firstEnabledStage = STAGE_IDS.map((stageId) => next.stages?.[stageId])
+    .find((stage) => stage?.enabled);
+  if (triggerChanged && firstEnabledStage?.trigger) {
+    next.trigger = {
+      ...next.trigger,
+      fieldId: firstEnabledStage.trigger.fieldId,
+      fieldName: firstEnabledStage.trigger.fieldName,
+      startValue: firstEnabledStage.trigger.value,
+      optionId: firstEnabledStage.trigger.optionId,
+    };
+  }
+
+  if (next.delivery) {
+    const delivery = clone(next.delivery);
+    if (delivery.courseNaming?.mode === "field"
+      && fieldRequiresReselection(fields, previousFields, delivery.courseNaming.fieldId)) {
+      delivery.courseNaming.fieldId = null;
+    }
+    if (delivery.coursePathWriteback
+      && fieldRequiresReselection(fields, previousFields, delivery.coursePathWriteback.fieldId)) {
+      delivery.coursePathWriteback.fieldId = null;
+    }
+    for (const stageId of STAGE_IDS) {
+      for (const moment of ["onProcessing", "onUploaded"]) {
+        delivery.writeback?.[stageId]?.[moment]?.forEach((assignment) => {
+          const field = uniqueMetadataField(fields, assignment.fieldId);
+          if (fieldRequiresReselection(fields, previousFields, assignment.fieldId)) {
+            assignment.fieldId = null;
+            assignment.optionId = null;
+          } else if (optionRequiresReselection(fields, previousFields, assignment.fieldId, assignment.optionId)) {
+            assignment.optionId = null;
+          }
+        });
+      }
+    }
+    if (delivery.finalDirectoryTrigger) {
+      const field = uniqueMetadataField(fields, delivery.finalDirectoryTrigger.fieldId);
+      if (fieldRequiresReselection(fields, previousFields, delivery.finalDirectoryTrigger.fieldId)) {
+        delivery.finalDirectoryTrigger.fieldId = null;
+        delivery.finalDirectoryTrigger.optionId = null;
+      } else if (optionRequiresReselection(
+        fields,
+        previousFields,
+        delivery.finalDirectoryTrigger.fieldId,
+        delivery.finalDirectoryTrigger.optionId,
+        null,
+      )) {
+        delivery.finalDirectoryTrigger.optionId = null;
+      }
+    }
+    next.delivery = delivery;
+  }
+  return next;
 }
 
 function safeSourceUrlLabel(value) {
@@ -984,7 +1284,7 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
   if (isPhasedSubject(value)) {
     try {
       const normalized = validatePhasedSubjectConfig(value);
-      if (value.lifecycle === "enabled" && value.upload.enqueueMode === "automatic") {
+      if (value.lifecycle === "enabled" && value.upload.enqueueMode === "automatic" && value.delivery?.version !== 1) {
         const missingDestination = STAGE_IDS.find((stageId) => (
           normalized.stages[stageId].enabled
           && normalized.stages[stageId].artifactTargetPath === null
@@ -1294,6 +1594,12 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     if (!row) throw new ApiError(404, "SUBJECT_NOT_FOUND", `Subject '${subjectKey}' does not exist`);
     return row;
   }
+  function getBase(baseToken) {
+    const row = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ? AND removed_at IS NULL")
+      .get(identifier(baseToken, "baseToken"));
+    if (!row) throw new ApiError(404, "BASE_NOT_FOUND", "Feishu Base does not exist");
+    return row;
+  }
   function saveVersion(row, snapshot, version, timestamp) {
     const lifecycle = LIFECYCLES.has(snapshot?.lifecycle) ? snapshot.lifecycle : "draft";
     const timestampMs = Date.parse(timestamp);
@@ -1485,17 +1791,30 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       return { ...resultConfiguration, configuration: resultConfiguration, catalog, diagnostics, diagnosticsOk, dryRun: false };
     },
     async getSubject(subjectKey) {
-      return rowSubject(getSubject(parseSubjectKey(subjectKey).subjectKey));
+      return subjectResponse(db, getSubject(parseSubjectKey(subjectKey).subjectKey));
     },
-    async upsertBasePreview(preview) {
+    async getBase(baseToken) {
+      return rowBase(db, getBase(baseToken));
+    },
+    async upsertBasePreview(preview, { refreshExistingOnly = false } = {}) {
       if (!preview || typeof preview !== "object" || Array.isArray(preview)) throw new ApiError(400, "INVALID_BODY", "Base preview must be an object");
       const baseToken = identifier(preview.baseToken, "baseToken");
       const baseName = requireText(preview.baseName, "baseName");
       if (!Array.isArray(preview.tables)) throw new ApiError(400, "INVALID_FIELD", "tables must be an array");
-      const sourceUrlLabel = safeSourceUrlLabel(preview.sourceUrlLabel);
+      if (typeof refreshExistingOnly !== "boolean") {
+        throw new ApiError(400, "INVALID_FIELD", "refreshExistingOnly must be boolean");
+      }
       const timestamp = now();
       db.exec("BEGIN IMMEDIATE");
       try {
+        const existingBase = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ? AND removed_at IS NULL")
+          .get(baseToken);
+        if (refreshExistingOnly && !existingBase) {
+          throw new ApiError(404, "BASE_NOT_FOUND", "Feishu Base does not exist");
+        }
+        const sourceUrlLabel = refreshExistingOnly
+          ? existingBase.source_url_label
+          : safeSourceUrlLabel(preview.sourceUrlLabel);
         db.prepare(`INSERT INTO feishu_bases (base_token, base_name, source_url_label, metadata_refreshed_at, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?)
           ON CONFLICT(base_token) DO UPDATE SET base_name=excluded.base_name, source_url_label=excluded.source_url_label,
@@ -1506,6 +1825,9 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           const tableName = requireText(table.tableName, "tableName");
           const key = `${baseToken}:${tableId}`;
           const existing = db.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(key);
+          // A manual metadata refresh is scoped to the current catalogue. It
+          // must never add a new subject or restore one that was removed.
+          if (refreshExistingOnly && (!existing || existing.removed_at !== null)) continue;
           const metadata = { fields: Array.isArray(table.fields) ? table.fields : [] };
           if (existing) {
             const existingConfig = rowSubject(existing);
@@ -1517,7 +1839,16 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               // A metadata refresh changes the configuration snapshot.  Keep
               // the Bridge's last enabled snapshot active until the operator
               // explicitly validates and re-enables the refreshed draft.
-              const next = phasedDefaultsNeeded
+              const refreshedDraft = clearDeletedMetadataBindings({
+                ...existingConfig,
+                baseName,
+                tableName,
+                metadata,
+                lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
+                configVersion: existing.config_version + 1,
+                updatedAt: timestamp,
+              }, metadata, existingConfig.metadata);
+              let next = phasedDefaultsNeeded
                 ? phasedDefaultsForSubject({
                   ...existingConfig,
                   baseToken,
@@ -1527,6 +1858,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                   projectId: subjectProjectId(key),
                   subjectKey: key,
                   metadata,
+                  previousMetadata: existingConfig.metadata,
                   existing: existingConfig,
                   lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
                   configVersion: existing.config_version + 1,
@@ -1534,15 +1866,12 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                   updatedAt: timestamp,
                   validate,
                 })
-                : validateMetadataRefreshDraft({
-                  ...existingConfig,
-                  baseName,
-                  tableName,
-                  metadata,
-                  lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
-                  configVersion: existing.config_version + 1,
-                  updatedAt: timestamp,
-                });
+                : validateMetadataRefreshDraft(refreshedDraft);
+              if (phasedDefaultsNeeded) {
+                next = validateMetadataRefreshDraft(
+                  clearDeletedMetadataBindings(next, metadata, existingConfig.metadata),
+                );
+              }
               // Refresh must retain missing IDs as a repairable draft.  Strict
               // metadata binding checks remain at save/enable; this pass only
               // validates the already-persisted configuration structurally.
@@ -1665,7 +1994,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
         db.exec("COMMIT");
       } catch (error) { db.exec("ROLLBACK"); throw error; }
-      return rowSubject(getSubject(key));
+      return subjectResponse(db, getSubject(key));
     },
     async setSubjectDisplayEnabled(subjectKey, displayEnabled) {
       const key = parseSubjectKey(subjectKey).subjectKey;
@@ -1682,7 +2011,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           .run(JSON.stringify(nextConfig), displayEnabled ? 1 : 0, timestamp, key);
         db.exec("COMMIT");
       } catch (error) { db.exec("ROLLBACK"); throw error; }
-      return rowSubject(getSubject(key));
+      return subjectResponse(db, getSubject(key));
     },
     async removeSubject(subjectKey) {
       const key = parseSubjectKey(subjectKey).subjectKey;
@@ -1856,6 +2185,6 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
-    return rowSubject(getSubject(key));
+    return subjectResponse(db, getSubject(key));
   }
 }

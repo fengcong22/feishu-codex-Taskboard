@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -7,6 +7,319 @@ import { test } from "node:test";
 import { createTaskboardServer } from "../server/index.mjs";
 import { createFeishuPackageApi } from "../server/feishu-package-api.mjs";
 import { createFeishuPackageStore } from "../server/feishu-package-config.mjs";
+
+test("workspace inspection reads fixed manifests and derives collision-safe package identity", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-inspection-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(path.join(workspace, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.9+codex.20260915222824",
+    interface: {
+      defaultPrompt: ["处理审阅文档", "生成交付包"],
+    },
+  }));
+  await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.9+codex.20260915222824",
+    embedded_runtime: { name: "auto-cut", version: "1.7.0" },
+  }));
+  const store = createFeishuPackageStore({
+    packages: {
+      "auto-cut-lite": { projectId: "auto-cut-lite", state: "draft" },
+      "auto-cut-lite-2": { projectId: "auto-cut-lite-2", state: "draft" },
+    },
+  });
+  const api = createFeishuPackageApi({ store });
+  try {
+    const result = await api.handle({
+      method: "POST",
+      pathname: "/api/local/autocut/packages/inspect-workspace",
+      body: { workspacePath: workspace },
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.inspection, {
+      displayName: "Auto-cut-lite1.6.9",
+      pluginVersion: "1.6.9",
+      runtimeVersion: "1.7.0",
+      defaultPrompt: "处理审阅文档\n生成交付包",
+      zipOutput: null,
+      alias: "auto-cut-lite-3",
+      projectId: "auto-cut-lite-3",
+    });
+    assert.equal((await store.list()).length, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace inspection exposes a declared ZIP output directory and preparation creates it", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-zip-output-"));
+  const workspace = path.join(directory, "workspace");
+  const relativeDirectory = "artifacts/zip";
+  const outputDirectory = path.join(workspace, "artifacts", "zip");
+  await mkdir(path.join(workspace, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.10",
+  }));
+  await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), JSON.stringify({
+    embedded_runtime: { version: "1.7.0" },
+    interface: { zipOutput: { relativeDirectory } },
+  }));
+  const store = createFeishuPackageStore({ packages: {} });
+  const api = createFeishuPackageApi({ store });
+
+  try {
+    await assert.rejects(() => stat(outputDirectory), { code: "ENOENT" });
+
+    const inspected = await api.handle({
+      method: "POST",
+      pathname: "/api/local/autocut/packages/inspect-workspace",
+      body: { workspacePath: workspace },
+    });
+    assert.deepEqual(inspected.body.inspection.zipOutput, {
+      relativeDirectory,
+      directory: outputDirectory,
+    });
+    await assert.rejects(() => stat(outputDirectory), { code: "ENOENT" });
+
+    const prepared = await api.handle({
+      method: "POST",
+      pathname: "/api/local/autocut/packages/prepare-output-directory",
+      body: { workspacePath: workspace },
+    });
+    assert.equal(prepared.status, 200);
+    assert.deepEqual(prepared.body.zipOutput, {
+      relativeDirectory,
+      directory: outputDirectory,
+    });
+    assert.equal((await stat(outputDirectory)).isDirectory(), true);
+    assert.deepEqual(await store.list(), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace inspection reports an absent ZIP output declaration and preparation rejects it", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-zip-output-undeclared-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(path.join(workspace, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.10",
+  }));
+  await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), JSON.stringify({
+    embedded_runtime: { version: "1.7.0" },
+  }));
+  const api = createFeishuPackageApi({ store: createFeishuPackageStore({ packages: {} }) });
+
+  try {
+    const inspected = await api.handle({
+      method: "POST",
+      pathname: "/api/local/autocut/packages/inspect-workspace",
+      body: { workspacePath: workspace },
+    });
+    assert.equal(inspected.body.inspection.zipOutput, null);
+    await assert.rejects(
+      () => api.handle({
+        method: "POST",
+        pathname: "/api/local/autocut/packages/prepare-output-directory",
+        body: { workspacePath: workspace },
+      }),
+      (error) => error.code === "PACKAGE_ZIP_OUTPUT_UNDECLARED",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace inspection rejects unsafe ZIP output directory declarations", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-zip-output-unsafe-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(path.join(workspace, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.10",
+  }));
+  await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), JSON.stringify({
+    embedded_runtime: { version: "1.7.0" },
+    interface: { zipOutput: { relativeDirectory: "..\\outside" } },
+  }));
+  const api = createFeishuPackageApi({ store: createFeishuPackageStore({ packages: {} }) });
+
+  try {
+    await assert.rejects(
+      () => api.handle({
+        method: "POST",
+        pathname: "/api/local/autocut/packages/inspect-workspace",
+        body: { workspacePath: workspace },
+      }),
+      (error) => error.code === "PACKAGE_MANIFEST_INVALID",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace inspection returns controlled errors for missing or malformed fixed manifests", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-inspection-errors-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(workspace);
+  const api = createFeishuPackageApi({ store: createFeishuPackageStore({ packages: {} }) });
+  const inspect = () => api.handle({
+    method: "POST",
+    pathname: "/api/local/autocut/packages/inspect-workspace",
+    body: { workspacePath: workspace },
+  });
+  try {
+    await assert.rejects(inspect, (error) => error.code === "PACKAGE_MANIFEST_UNAVAILABLE");
+    await mkdir(path.join(workspace, ".codex-plugin"));
+    await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), "{invalid-json");
+    await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), "{}");
+    await assert.rejects(inspect, (error) => error.code === "PACKAGE_MANIFEST_INVALID");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace inspection requires an absolute workspace path", async () => {
+  const api = createFeishuPackageApi({ store: createFeishuPackageStore({ packages: {} }) });
+  await assert.rejects(
+    () => api.handle({
+      method: "POST",
+      pathname: "/api/local/autocut/packages/inspect-workspace",
+      body: { workspacePath: "relative-workspace" },
+    }),
+    (error) => error.code === "INVALID_FIELD",
+  );
+});
+
+test("HTTP inspection is read-only and preparing output only creates its declared directory without broadcasting", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-inspection-events-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(path.join(workspace, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.9",
+  }));
+  await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), JSON.stringify({
+    embedded_runtime: { version: "1.7.0" },
+    interface: { zipOutput: { relativeDirectory: "output" } },
+  }));
+  const app = createTaskboardServer({ dataDirectory: path.join(directory, "data"), feishuPackages: {} });
+  let reader;
+  try {
+    const address = await app.listen({ port: 0 });
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const response = await fetch(`${baseUrl}/api/events`, { signal: AbortSignal.timeout(5_000) });
+    reader = response.body.getReader();
+    await reader.read();
+    const post = async (pathname, body) => {
+      const result = await fetch(`${baseUrl}${pathname}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5_000),
+      });
+      return { status: result.status, body: await result.json() };
+    };
+    const inspected = await post("/api/local/autocut/packages/inspect-workspace", { workspacePath: workspace });
+    assert.equal(inspected.status, 200);
+    assert.equal(inspected.body.inspection.displayName, "Auto-cut-lite1.6.9");
+    await assert.rejects(() => stat(path.join(workspace, "output")), { code: "ENOENT" });
+    const prepared = await post("/api/local/autocut/packages/prepare-output-directory", { workspacePath: workspace });
+    assert.equal(prepared.status, 200);
+    assert.equal(prepared.body.zipOutput.directory, path.join(workspace, "output"));
+    assert.equal((await stat(path.join(workspace, "output"))).isDirectory(), true);
+
+    // A subsequent event on the same stream is an ordering fence, avoiding a
+    // timing-dependent assertion that no inspection event arrived yet.
+    const sentinel = await post("/api/tasks", { title: "Inspection event ordering fence" });
+    assert.equal(sentinel.status, 201);
+    const decoder = new TextDecoder();
+    let messages = "";
+    while (!messages.includes("event: task.created\n")) {
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false);
+      messages += decoder.decode(chunk.value, { stream: true });
+    }
+    assert.doesNotMatch(messages, /event: autocut\.package\.updated/);
+
+    const saved = await post("/api/local/autocut/packages", {
+      alias: "auto-cut-lite",
+      name: "Auto-cut-lite1.6.9",
+      projectId: "auto-cut-lite",
+    });
+    assert.equal(saved.status, 201);
+    messages = "";
+    while (!messages.includes("event: autocut.package.updated\n")) {
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false);
+      messages += decoder.decode(chunk.value, { stream: true });
+    }
+  } finally {
+    await reader?.cancel().catch(() => {});
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("package listing exposes read-only manifest identity without changing stored routing values", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-list-identity-"));
+  const workspace = path.join(directory, "workspace");
+  await mkdir(path.join(workspace, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(workspace, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "auto-cut-lite",
+    version: "1.6.9+codex.20260915222824",
+  }));
+  await writeFile(path.join(workspace, "PACKAGE-MANIFEST.json"), JSON.stringify({
+    embedded_runtime: { version: "1.7.0" },
+  }));
+  const stored = {
+    alias: "historical-route-key",
+    name: "历史显示名称",
+    projectId: "historical-project-id",
+    workspacePath: workspace,
+    model: null,
+    reasoningEffort: null,
+    prompt: null,
+    zipSourceDirectory: null,
+    maxConcurrent: 1,
+  };
+  const missing = {
+    ...stored,
+    alias: "unavailable-package",
+    projectId: "unavailable-project",
+    workspacePath: path.join(directory, "missing-workspace"),
+  };
+  const store = createFeishuPackageStore({ packages: { [stored.alias]: stored, [missing.alias]: missing } });
+  const api = createFeishuPackageApi({ store });
+  try {
+    const result = await api.handle({ method: "GET", pathname: "/api/local/autocut/packages", body: null });
+    const [listed, unavailable] = result.body.packages;
+    assert.equal(listed.name, stored.name);
+    assert.equal(listed.alias, stored.alias);
+    assert.equal(listed.projectId, stored.projectId);
+    assert.deepEqual(listed.identity, {
+      displayName: "Auto-cut-lite1.6.9",
+      pluginVersion: "1.6.9",
+      runtimeVersion: "1.7.0",
+      defaultPrompt: null,
+      zipOutput: null,
+      alias: stored.alias,
+      projectId: stored.projectId,
+    });
+    assert.equal(unavailable.identity, null);
+    const persisted = await store.list();
+    assert.deepEqual(persisted.map(({ alias, name, projectId }) => ({ alias, name, projectId })), [
+      { alias: stored.alias, name: stored.name, projectId: stored.projectId },
+      { alias: missing.alias, name: missing.name, projectId: missing.projectId },
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("local Auto-Cut package API exposes CRUD and catalog discovery", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-api-"));
@@ -41,7 +354,9 @@ test("local Auto-Cut package API exposes CRUD and catalog discovery", async () =
       model: "gpt-test",
       reasoningEffort: "high",
       prompt: "fixture prompt",
+      resourceGroups: [" 剪映主机 ", "剪映主机", "音频工作站"],
     });
+    assert.deepEqual(saved.body.package.resourceGroups, ["剪映主机", "音频工作站"]);
     const enabled = await call("POST", "/api/local/autocut/packages/Auto-cut-api/enable", {
       revision: saved.body.package.revision,
     });

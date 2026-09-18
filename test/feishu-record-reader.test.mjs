@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { selectRecordTitle } from "../src/feishu-record-reader.mjs";
+import {
+  createFeishuControlledContextReader,
+  normalizeCourseNameValue,
+  selectRecordTitle,
+} from "../src/feishu-record-reader.mjs";
 
 const table = {
   titleField: "视频名称",
@@ -85,4 +89,153 @@ test("rejects a failed Feishu record response for the Bridge to handle", async (
     () => resolver({ baseToken: "bas", tableId: "tbl", recordId: "rec", fieldValuesById: {} }, table),
     /RecordIdNotFound/,
   );
+});
+
+test("normalizes a single text element as a course name", () => {
+  assert.equal(
+    normalizeCourseNameValue([{ type: "text", text: "课程001" }], { type: 1, uiType: "Text" }),
+    "课程001",
+  );
+});
+
+test("normalizes a direct text-field string as a course name", () => {
+  assert.equal(
+    normalizeCourseNameValue("课程001", { type: 1, uiType: "Text" }),
+    "课程001",
+  );
+});
+
+test("accepts only a direct textual formula result as a course name", () => {
+  assert.equal(
+    normalizeCourseNameValue("课程公式001", { type: 20, uiType: "Formula" }),
+    "课程公式001",
+  );
+
+  for (const value of [123, [{ type: "text", text: "课程公式001" }], { error: "#ERROR!" }]) {
+    assert.throws(
+      () => normalizeCourseNameValue(value, { type: 20, uiType: "Formula" }),
+      (error) => error.code === "COURSE_NAME_NOT_TEXT",
+    );
+  }
+});
+
+test("blocks empty and path-like course names", () => {
+  assert.throws(
+    () => normalizeCourseNameValue([{ type: "text", text: "  " }], { type: 1, uiType: "Text" }),
+    (error) => error.code === "COURSE_NAME_EMPTY",
+  );
+  assert.throws(
+    () => normalizeCourseNameValue([{ type: "text", text: "../课程001" }], { type: 1, uiType: "Text" }),
+    (error) => error.code === "COURSE_NAME_INVALID",
+  );
+});
+
+test("reads a configured formula course-name field by stable field ID", async () => {
+  const calls = [];
+  const reader = createFeishuControlledContextReader({
+    client: {
+      bitable: { v1: { appTableRecord: { get: async (request) => {
+        calls.push(request);
+        return {
+          code: 0,
+          data: {
+            record: {
+              fields: {
+                fld_course_formula: "课程公式001",
+                fld_legacy_name: [{ type: "text", text: "旧 ZIP 命名" }],
+              },
+            },
+          },
+        };
+      } } } },
+    },
+  });
+
+  const result = await reader.read({
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    namingField: { fieldId: "fld_legacy_name", fieldName: "旧命名", type: 1, uiType: "Text" },
+    metadata: {
+      fields: [{
+        fieldId: "fld_course_formula",
+        fieldName: "课程名称已改名",
+        type: 20,
+        uiType: "Formula",
+        options: [],
+      }],
+    },
+    delivery: { courseNaming: { mode: "field", fieldId: "fld_course_formula" } },
+  }, {
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    recordId: "rec_demo",
+  });
+
+  assert.deepEqual(result, {
+    documentLinks: [],
+    namingDisplayValue: "旧 ZIP 命名",
+    namingValueUnique: false,
+    courseName: "课程公式001",
+  });
+  assert.deepEqual(calls, [{
+    path: { app_token: "bas_demo", table_id: "tbl_demo", record_id: "rec_demo" },
+    params: { text_field_as_array: true },
+  }]);
+});
+
+test("reads a course-name field descriptor carried by the synchronized workflow", async () => {
+  const reader = createFeishuControlledContextReader({
+    client: {
+      bitable: { v1: { appTableRecord: { get: async () => ({
+        code: 0,
+        data: { record: { fields: { fld_course_name: [{ type: "text", text: "课程同步001" }] } } },
+      }) } } },
+    },
+  });
+
+  const result = await reader.read({
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    courseNamingField: {
+      fieldId: "fld_course_name",
+      fieldName: "课程名称",
+      type: 1,
+      uiType: "Text",
+    },
+    delivery: { courseNaming: { mode: "field", fieldId: "fld_course_name" } },
+  }, {
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    recordId: "rec_demo",
+  });
+
+  assert.equal(result.courseName, "课程同步001");
+});
+
+test("uses the matching configured name field for legacy synchronized course naming", async () => {
+  const reader = createFeishuControlledContextReader({
+    client: {
+      bitable: { v1: { appTableRecord: { get: async () => ({
+        code: 0,
+        data: { record: { fields: { fld_course_name: "课程兼容001" } } },
+      }) } } },
+    },
+  });
+
+  const result = await reader.read({
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    namingField: {
+      fieldId: "fld_course_name",
+      fieldName: "课程名称",
+      kind: "text",
+    },
+    delivery: { courseNaming: { mode: "field", fieldId: "fld_course_name" } },
+  }, {
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    recordId: "rec_demo",
+  });
+
+  assert.equal(result.courseName, "课程兼容001");
 });

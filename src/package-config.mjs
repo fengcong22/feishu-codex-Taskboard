@@ -44,6 +44,25 @@ function absolutePath(value, name) {
   return windowsAbsolute && path.sep !== "\\" ? result.replaceAll("/", "\\") : path.normalize(result);
 }
 
+function resourceGroups(value, name) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw packageError("PACKAGE_REGISTRY_INVALID", `${name} must be an array`, 503);
+  }
+  const groups = [];
+  const seen = new Set();
+  for (const [index, entry] of value.entries()) {
+    if (typeof entry !== "string" || entry.includes("\0")) {
+      throw packageError("PACKAGE_REGISTRY_INVALID", `${name}[${index}] must be a string`, 503);
+    }
+    const group = entry.trim();
+    if (!group || seen.has(group)) continue;
+    seen.add(group);
+    groups.push(group);
+  }
+  return groups;
+}
+
 function registrySource(value) {
   const root = plainObject(value, "package registry");
   const versioned = root.version !== undefined;
@@ -91,6 +110,7 @@ export function normalizePackageRegistry(value) {
       projectName: requiredString(entry.projectName ?? entry.name ?? alias, `packages.${alias}.projectName`),
       workspacePath: absolutePath(entry.workspacePath, `packages.${alias}.workspacePath`),
       prompt: requiredString(entry.prompt, `packages.${alias}.prompt`),
+      resourceGroups: resourceGroups(entry.resourceGroups, `packages.${alias}.resourceGroups`),
     };
   }
   return packages;

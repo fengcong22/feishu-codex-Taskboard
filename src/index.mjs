@@ -8,13 +8,14 @@ import { createBridgeServer } from "./server.mjs";
 import { createCompensationWorker } from "./compensation-worker.mjs";
 import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
-import { createFeishuWsListener, loadFeishuSdk } from "./feishu-ws.mjs";
+import { createFeishuWsListener } from "./feishu-ws.mjs";
 import { createFeishuBaseMetadataReader } from "./feishu-base-metadata.mjs";
 import {
   createFeishuControlledContextReader,
   createFeishuNamingSearch,
   createFeishuRecordTitleResolver,
 } from "./feishu-record-reader.mjs";
+import { createFeishuRecordWriter } from "./feishu-record-writer.mjs";
 import { createFeishuApiContext } from "./feishu-api.mjs";
 import { createWorkflowConfigStore } from "./workflow-config-store.mjs";
 import { createWorkflowRuntime } from "./workflow-runtime.mjs";
@@ -36,17 +37,12 @@ function envEnabled(name) {
   );
 }
 const listenerEnabled = envEnabled("FEISHU_LISTENER_ENABLED");
-const apiEnabled = listenerEnabled || envEnabled("FEISHU_READ_ENABLED");
-const sdk = apiEnabled ? await loadFeishuSdk() : null;
-const feishuApi = apiEnabled
-  ? await createFeishuApiContext({
-    appId: process.env.FEISHU_APP_ID,
-    appSecret: process.env.FEISHU_APP_SECRET,
-    listenerEnabled,
-    loadSdk: async () => sdk,
-    createMetadataReader: createFeishuBaseMetadataReader,
-  })
-  : Object.freeze({ sdk: null, client: null, metadataReader: null });
+const feishuApi = await createFeishuApiContext({
+  appId: process.env.FEISHU_APP_ID,
+  appSecret: process.env.FEISHU_APP_SECRET,
+  listenerEnabled,
+  createMetadataReader: createFeishuBaseMetadataReader,
+});
 const apiClient = feishuApi.client;
 const metadataReader = feishuApi.metadataReader;
 const resolveRecordTitle = apiClient
@@ -58,6 +54,9 @@ const controlledContextReader = apiClient
     searchNaming: createFeishuNamingSearch({ client: apiClient }),
     logger: console,
   })
+  : null;
+const recordWriter = apiClient
+  ? createFeishuRecordWriter({ client: apiClient })
   : null;
 const workflowStore = createWorkflowConfigStore({
   filename: process.env.BRIDGE_WORKFLOW_CONFIG
@@ -121,6 +120,8 @@ const app = createBridgeServer({
     return controlledContextReader.read(subject, identity);
   },
   syncSubject: (subject, options) => workflowRuntime.syncSubject(subject, options),
+  resolveWritebackIntent: (claim) => taskboard.resolveFeishuWritebackIntent(claim),
+  recordWriter,
   configSummary: {
     tables: config.tables.map(({
       baseToken,

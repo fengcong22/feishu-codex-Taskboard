@@ -294,6 +294,19 @@ test("reads and normalizes Base, tables, fields and select options using read-on
   ]);
 });
 
+test("rejects a successful metadata response that omits its table items", async () => {
+  const reader = createFeishuBaseMetadataReader({
+    client: fakeClient({
+      tables: { code: 0, data: {} },
+    }),
+  });
+
+  await assert.rejects(
+    () => reader.preview("https://example.feishu.cn/base/bas_demo"),
+    (error) => error.code === "FEISHU_METADATA_INVALID_RESPONSE",
+  );
+});
+
 test("skips select options whose SDK name is blank while preserving valid options", async () => {
   const reader = createFeishuBaseMetadataReader({
     client: fakeClient({
@@ -629,6 +642,55 @@ test("phased metadata requires one unambiguous single-select status field", () =
       || entry.code === "FIELD_TYPE_INVALID"), name);
     assert.throws(() => assertPhasedSubjectMetadata(phasedSubject(), metadata), undefined, name);
   }
+});
+
+test("phased metadata requires a text or formula course naming field", () => {
+  const metadata = phasedMetadata([
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "课程名称", type: 17, uiType: "Attachment", options: [] },
+  ]);
+
+  const subject = phasedSubject({ namingField: { fieldId: "fld_name", fieldName: "课程名称" } });
+  assert.throws(
+    () => assertPhasedSubjectMetadata(subject, metadata),
+    (error) => error.code === "FIELD_TYPE_INVALID" && error.path === "namingField.fieldId",
+  );
+  assert.ok(comparePhasedSubjectMetadata(subject, metadata).some((entry) => (
+    entry.code === "FIELD_TYPE_INVALID"
+      && entry.path === "bases.bas_demo.subjects.tbl_math.namingField.fieldId"
+  )));
+});
+
+test("phased metadata keeps a renamed course naming field valid when its ID is stable", () => {
+  const metadata = phasedMetadata([
+    {
+      fieldId: "fld_status",
+      fieldName: "制作进度",
+      type: 3,
+      uiType: "SingleSelect",
+      options: [
+        { id: "opt_initial", name: "初稿" },
+        { id: "opt_review", name: "初审修改" },
+        { id: "opt_final", name: "终审修改" },
+      ],
+    },
+    { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+    { fieldId: "fld_name", fieldName: "已改名课程字段", type: 20, uiType: "Formula", options: [] },
+  ]);
+  const subject = phasedSubject({ namingField: { fieldId: "fld_name", fieldName: null } });
+
+  assert.equal(assertPhasedSubjectMetadata(subject, metadata), true);
 });
 
 test("phased metadata reports a stale stage trigger field name", () => {

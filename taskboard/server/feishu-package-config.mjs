@@ -1,9 +1,11 @@
-import { chmod, lstat, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, chmod, lstat, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const REGISTRY_VERSION = 1;
 const STATES = new Set(["draft", "enabled", "disabled"]);
 const RESERVED_PACKAGE_ALIASES = new Set(["__proto__", "constructor", "prototype"]);
+const ZIP_OUTPUT_MODES = new Set(["package_default", "custom"]);
 const registryMutationQueues = new Map();
 
 export class PackageConfigError extends Error {
@@ -72,6 +74,43 @@ function positiveInteger(value, name, fallback = 1) {
   return value;
 }
 
+/** Validate an explicitly selected custom ZIP directory without creating it. */
+export async function validateCustomZipOutputDirectory(directory) {
+  if (typeof directory !== "string" || !directory.trim() || directory.includes("\0")) {
+    throw new PackageConfigError("PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID", "Custom ZIP output directory must be a non-empty absolute directory", undefined, 409);
+  }
+  const normalized = path.normalize(directory.trim());
+  if (!path.isAbsolute(normalized)) {
+    throw new PackageConfigError("PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID", "Custom ZIP output directory must be an absolute directory", undefined, 409);
+  }
+  try {
+    if (!(await stat(normalized)).isDirectory()) throw new Error("not a directory");
+    await access(normalized, fsConstants.W_OK);
+  } catch {
+    throw new PackageConfigError("PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID", "Custom ZIP output directory is unavailable or not writable", undefined, 409);
+  }
+  return normalized;
+}
+
+function resourceGroups(value, name) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new PackageConfigError("PACKAGE_INVALID", `${name} must be an array`, undefined, 400);
+  }
+  const groups = [];
+  const seen = new Set();
+  for (const [index, entry] of value.entries()) {
+    if (typeof entry !== "string" || entry.includes("\0")) {
+      throw new PackageConfigError("PACKAGE_INVALID", `${name}[${index}] must be a string`, undefined, 400);
+    }
+    const group = entry.trim();
+    if (!group || seen.has(group)) continue;
+    seen.add(group);
+    groups.push(group);
+  }
+  return groups;
+}
+
 function plainObject(value, name) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new PackageConfigError("PACKAGE_INVALID", `${name} must be an object`, undefined, 400);
@@ -97,6 +136,13 @@ function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false, requireS
     entry.zipSourceDirectory ?? entry.artifactSourcePath,
     `packages.${alias}.zipSourceDirectory`,
   );
+  let zipOutputMode;
+  if (Object.hasOwn(entry, "zipOutputMode")) {
+    if (!ZIP_OUTPUT_MODES.has(entry.zipOutputMode)) {
+      throw new PackageConfigError("PACKAGE_INVALID", `packages.${alias}.zipOutputMode is invalid`, undefined, 400);
+    }
+    zipOutputMode = entry.zipOutputMode;
+  }
   const model = entry.model === undefined || entry.model === null || entry.model === ""
     ? null : requireText(entry.model, `packages.${alias}.model`);
   const reasoningEffort = entry.reasoningEffort === undefined
@@ -117,7 +163,7 @@ function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false, requireS
   }
   const updatedAt = typeof entry.updatedAt === "string" && entry.updatedAt.trim()
     ? entry.updatedAt.trim() : now();
-  return {
+  const record = {
     alias,
     name,
     // Retain the old field while the existing execution path is migrated to
@@ -130,10 +176,13 @@ function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false, requireS
     prompt,
     zipSourceDirectory,
     maxConcurrent: positiveInteger(entry.maxConcurrent, `packages.${alias}.maxConcurrent`),
+    resourceGroups: resourceGroups(entry.resourceGroups, `packages.${alias}.resourceGroups`),
     state,
     revision,
     updatedAt,
   };
+  if (zipOutputMode !== undefined) record.zipOutputMode = zipOutputMode;
+  return record;
 }
 
 /** Normalize a versioned registry or the legacy package map. */
@@ -330,16 +379,25 @@ export function createFeishuPackageStore({
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${aliasFromChanges}' already exists`);
     }
     if (existing) assertRevision(existing, expectedRevision ?? changes.expectedRevision);
-    if (originalAlias && aliasFromChanges !== originalAlias && existing?.state !== "draft") {
-      const refs = await listReferences(originalAlias);
-      if (refs.length > 0) throw new PackageConfigError("PACKAGE_ALIAS_IMMUTABLE", `Package '${originalAlias}' alias is in use`);
-      throw new PackageConfigError("PACKAGE_ALIAS_IMMUTABLE", `Package '${originalAlias}' alias cannot be changed after enabling`);
+    if (existing && originalAlias && aliasFromChanges !== existing.alias) {
+      throw new PackageConfigError("PACKAGE_IDENTITY_IMMUTABLE", `Package '${existing.alias}' routing identity cannot be changed`);
+    }
+    if (existing && originalAlias && changes.projectId !== undefined
+      && requireText(changes.projectId, "package projectId") !== existing.projectId) {
+      throw new PackageConfigError("PACKAGE_IDENTITY_IMMUTABLE", `Package '${existing.alias}' routing identity cannot be changed`);
+    }
+    if (existing && originalAlias && changes.name !== undefined
+      && requireText(changes.name, "package name") !== existing.name) {
+      throw new PackageConfigError("PACKAGE_IDENTITY_IMMUTABLE", `Package '${existing.alias}' routing identity cannot be changed`);
     }
     if (!existing && Object.hasOwn(catalog, aliasFromChanges)) {
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${aliasFromChanges}' already exists`);
     }
     const base = existing ?? { alias: aliasFromChanges, name: aliasFromChanges, projectId: aliasFromChanges, state: "draft" };
     const record = normalizeRecord(aliasFromChanges, { ...base, ...changes, alias: aliasFromChanges }, { now, legacy: false });
+    if (record.zipOutputMode === "custom") {
+      record.zipSourceDirectory = await validateCustomZipOutputDirectory(record.zipSourceDirectory);
+    }
     if (existing && originalAlias && aliasFromChanges !== originalAlias) delete catalog[originalAlias];
     if (existing && record.alias !== existing.alias && Object.hasOwn(catalog, record.alias)) {
       throw new PackageConfigError("PACKAGE_ALIAS_EXISTS", `Package alias '${record.alias}' already exists`);
@@ -360,7 +418,11 @@ export function createFeishuPackageStore({
     await assertDirectory(record.workspacePath, "PACKAGE_ENABLE_INVALID", "workspacePath");
     if (!record.prompt) throw new PackageConfigError("PACKAGE_ENABLE_INVALID", "prompt is required before enabling");
     if (!Number.isSafeInteger(record.maxConcurrent) || record.maxConcurrent <= 0) throw new PackageConfigError("PACKAGE_ENABLE_INVALID", "maxConcurrent must be a positive integer");
-    if (record.zipSourceDirectory) await assertDirectory(record.zipSourceDirectory, "PACKAGE_ENABLE_INVALID", "zipSourceDirectory");
+    if (record.zipOutputMode === "custom") {
+      record.zipSourceDirectory = await validateCustomZipOutputDirectory(record.zipSourceDirectory);
+    } else if (record.zipSourceDirectory) {
+      await assertDirectory(record.zipSourceDirectory, "PACKAGE_ENABLE_INVALID", "zipSourceDirectory");
+    }
     const catalog = options.modelCatalog ?? (typeof options.getModelCatalog === "function"
       ? await options.getModelCatalog(record.workspacePath)
       : typeof getModelCatalog === "function" ? await getModelCatalog(record.workspacePath) : modelCatalog);

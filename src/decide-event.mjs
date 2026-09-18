@@ -53,9 +53,20 @@ function workflowTables(config) {
       const tableId = subject.tableId ?? configuredSubject.tableId;
       if (typeof baseToken !== "string" || !baseToken || typeof tableId !== "string" || !tableId) continue;
       const trigger = subject.trigger ?? {};
+      const statusField = subject.statusField ?? {};
       const execution = subject.execution ?? {};
       const route = subject.packageRoute ?? {};
       const upload = subject.upload ?? {};
+      const finalDirectoryTrigger = subject.delivery?.version === 1
+        && subject.delivery.finalDirectoryTrigger?.enabled === true
+        && typeof subject.delivery.finalDirectoryTrigger.fieldId === "string"
+        && typeof subject.delivery.finalDirectoryTrigger.optionId === "string"
+        ? {
+          enabled: true,
+          fieldId: subject.delivery.finalDirectoryTrigger.fieldId,
+          optionId: subject.delivery.finalDirectoryTrigger.optionId,
+        }
+        : null;
       const normalizedSubjectKey = typeof subject.subjectKey === "string" && subject.subjectKey
         ? subject.subjectKey
         : makeSubjectKey(baseToken, tableId);
@@ -71,16 +82,20 @@ function workflowTables(config) {
         maxConcurrent: execution.maxConcurrent,
         resourceGroups: Array.isArray(execution.resourceGroups) ? [...execution.resourceGroups] : [],
         uploadMode: upload.enqueueMode,
-        triggerField: trigger.fieldName,
-        triggerFieldId: trigger.fieldId,
+        triggerField: trigger.fieldName ?? statusField.fieldName,
+        triggerFieldId: trigger.fieldId ?? statusField.fieldId ?? statusField.field_id,
         triggerValue: trigger.startValue,
         triggerOptionId: trigger.optionId,
+        statusField,
         titleField: subject.title?.fieldName ?? null,
         titleFieldId: subject.title?.fieldId ?? null,
         packageField: null,
         packageFieldId: null,
         defaultPackageAlias: route.packageAlias,
         packageRoute: route,
+        ...(finalDirectoryTrigger ? {
+          delivery: { version: 1, finalDirectoryTrigger },
+        } : {}),
       });
     }
   }
@@ -131,6 +146,61 @@ function subjectTable(subject, stage = null) {
   };
 }
 
+function finalDirectoryDecision(subject, event) {
+  const trigger = subject?.delivery?.version === 1
+    ? subject.delivery.finalDirectoryTrigger
+    : null;
+  if (!trigger || trigger.enabled !== true
+    || typeof trigger.fieldId !== "string" || trigger.fieldId === ""
+    || typeof trigger.optionId !== "string" || trigger.optionId === ""
+    || event?.fieldId !== trigger.fieldId) {
+    return null;
+  }
+  if (!event.beforePresent || !event.afterPresent
+    || !Object.hasOwn(event, "beforeOptionId") || !Object.hasOwn(event, "afterOptionId")
+    || !event.beforeOptionId || !event.afterOptionId) {
+    return {
+      kind: "blocked",
+      reason: "missing_final_directory_edge",
+      reasonCode: "MISSING_FINAL_DIRECTORY_EDGE",
+      subject,
+      table: subjectTable(subject),
+      event,
+    };
+  }
+  if (event.beforeOptionId === event.afterOptionId) {
+    return {
+      kind: "ignored",
+      reason: "already_at_final_directory_trigger",
+      subject,
+      table: subjectTable(subject),
+      event,
+    };
+  }
+  if (event.afterOptionId === trigger.optionId) {
+    return {
+      kind: "directory_operation",
+      operationKind: "ensure_final_directory",
+      subject,
+      table: subjectTable(subject),
+      event,
+      subjectKey: subject.subjectKey ?? (subject.baseToken && subject.tableId
+        ? makeSubjectKey(subject.baseToken, subject.tableId) : undefined),
+      configVersion: subject.configVersion,
+    };
+  }
+  if (event.beforeOptionId === trigger.optionId) {
+    return {
+      kind: "ignored",
+      reason: "left_final_directory_trigger",
+      subject,
+      table: subjectTable(subject),
+      event,
+    };
+  }
+  return null;
+}
+
 function modernDecision(subject, event) {
   if (!subject || !event || typeof event !== "object") {
     return { kind: "ignored", reason: "invalid_event" };
@@ -141,6 +211,8 @@ function modernDecision(subject, event) {
   if (subject.tableId && event.tableId && subject.tableId !== event.tableId) {
     return { kind: "ignored", reason: "unknown_table" };
   }
+  const finalDirectory = finalDirectoryDecision(subject, event);
+  if (finalDirectory) return finalDirectory;
   const statusField = subject.statusField ?? {};
   const statusFieldId = statusField.fieldId ?? statusField.field_id;
   if (statusFieldId && event.fieldId && event.fieldId !== statusFieldId) {

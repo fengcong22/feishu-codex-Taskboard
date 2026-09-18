@@ -369,6 +369,9 @@ export function createFeishuExecutionCoordinator({
       entry.pumping = false;
       return executionResult(entry.task.id);
     }
+    const packageSnapshot = typeof database.getFeishuTaskPackageSnapshot === "function"
+      ? database.getFeishuTaskPackageSnapshot(entry.task.id)
+      : null;
     const request = {
       requestId: entry.task.id,
       concurrencyGroup: `autocut:${alias}`,
@@ -378,7 +381,9 @@ export function createFeishuExecutionCoordinator({
           ? packageConfig.maxConcurrent
           : 1,
       fixedMaxConcurrent: typeof entry.metadata?.stageId === "string",
-      resourceGroups: Array.isArray(entry.metadata.resourceGroups) ? entry.metadata.resourceGroups : [],
+      resourceGroups: Array.isArray(packageSnapshot?.resourceGroups)
+        ? packageSnapshot.resourceGroups
+        : Array.isArray(entry.metadata.resourceGroups) ? entry.metadata.resourceGroups : [],
       queuePolicy: "per-group",
     };
     let leasePromise;

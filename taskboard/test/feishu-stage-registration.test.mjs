@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -25,7 +26,14 @@ function stage(stageId, optionId, value) {
   };
 }
 
-async function fixture({ allowAutomaticExecution = false } = {}) {
+async function fixture({
+  allowAutomaticExecution = false,
+  packageResourceGroups = [],
+  coursePathResolver = null,
+  feishuBridgeUrl = undefined,
+  feishuWorkflowSync = async () => ({ ok: true }),
+  uploadWorker = undefined,
+} = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-stage-registration-"));
   const workspace = path.join(directory, "workspace");
   const zipSourceDirectory = path.join(directory, "zips");
@@ -36,7 +44,10 @@ async function fixture({ allowAutomaticExecution = false } = {}) {
     codexExecutable: process.execPath,
     feishuBridgeSecret: SECRET,
     allowAutomaticExecution,
-    feishuWorkflowSync: async () => ({ ok: true }),
+    feishuWorkflowSync,
+    ...(feishuBridgeUrl ? { feishuBridgeUrl } : {}),
+    ...(coursePathResolver ? { coursePathResolver } : {}),
+    ...(uploadWorker ? { uploadWorker } : {}),
     feishuPackages: {
       packages: {
         "Auto-cut-lite": {
@@ -45,6 +56,7 @@ async function fixture({ allowAutomaticExecution = false } = {}) {
           workspacePath: workspace,
           zipSourceDirectory,
           prompt: "trusted package prompt",
+          resourceGroups: packageResourceGroups,
           state: "enabled",
         },
       },
@@ -70,7 +82,7 @@ async function request(baseUrl, pathname, body, headers = {}) {
   return { response, body: text ? JSON.parse(text) : undefined };
 }
 
-async function enableSubject(fixtureData) {
+async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery = undefined } = {}) {
   const catalog = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog", {
     baseToken: "bas_stage",
     baseName: "阶段 Base",
@@ -92,6 +104,16 @@ async function enableSubject(fixtureData) {
         },
         { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text" },
         { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text" },
+        {
+          fieldId: "fld_final_directory",
+          fieldName: "成片状态",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_final_directory_other", name: "未完成" },
+            { id: "opt_final_directory", name: "已成片" },
+          ],
+        },
       ],
     }],
   });
@@ -120,9 +142,10 @@ async function enableSubject(fixtureData) {
       },
       trigger: { fieldId: "fld_status", fieldName: "流程", startValue: "初稿", optionId: "opt_initial" },
       title: { fieldId: null, fieldName: null },
-      execution: { mode: "automatic", concurrencyGroup: "autocut", maxConcurrent: 3, resourceGroups: [] },
+      execution: { mode: "automatic", concurrencyGroup: "autocut", maxConcurrent: 3, resourceGroups: subjectResourceGroups },
       packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-lite", subjectCodeFieldId: null, branchMap: null },
       upload: {
+        enabled: true,
         enqueueMode: "automatic",
         artifactSourceMode: "driver_report",
         artifactSourcePath: fixtureData.zipSourceDirectory,
@@ -130,6 +153,7 @@ async function enableSubject(fixtureData) {
         targetPath: path.join(fixtureData.directory, "upload"),
         uploadConcurrency: 2,
       },
+      ...(delivery === undefined ? {} : { delivery }),
     }),
   });
   assert.equal(patchResponse.status, 200);
@@ -250,6 +274,298 @@ test("canonical stage registration derives execution policy from the enabled sna
     const replay = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
     assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
     assert.equal(replay.body.task.id, first.body.task.id);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("stage registration accepts a safe optional course name and keeps legacy context compatible", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    const legacy = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject));
+    assert.equal(legacy.response.status, 201, JSON.stringify(legacy.body));
+    assert.deepEqual(legacy.body.task.feishuOrigin.controlledContext, {
+      documentLinks: ["https://guanghe.feishu.cn/docx/opaque-token"],
+      namingDisplayValue: "课程001",
+      namingValueUnique: true,
+    });
+
+    const legacyEmpty = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-stage-empty-course-name", recordId: "rec-empty-course-name" },
+      controlledContext: { courseName: "" },
+    }));
+    assert.equal(legacyEmpty.response.status, 201, JSON.stringify(legacyEmpty.body));
+    assert.equal(Object.hasOwn(legacyEmpty.body.task.feishuOrigin.controlledContext, "courseName"), false);
+
+    const current = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-stage-course-name", recordId: "rec-course-name" },
+      controlledContext: { courseName: "课程001" },
+    }));
+    assert.equal(current.response.status, 201, JSON.stringify(current.body));
+    assert.equal(current.body.task.feishuOrigin.controlledContext.courseName, "课程001");
+    assert.equal(
+      fixtureData.app.database.getFeishuTaskOrigin(current.body.task.id).controlledContext.courseName,
+      "课程001",
+    );
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("a delivery-configured stage freezes its bound course directory without creating it", async () => {
+  const fixtureData = await fixture({
+    coursePathResolver: {
+      classifyDrive: async () => "local",
+      resolveMappedDrive: async () => { throw new Error("local roots do not resolve UNC mappings"); },
+    },
+  });
+  try {
+    const subject = await enableSubject(fixtureData, {
+      delivery: {
+        version: 1,
+        rootPath: "D:\\课程交付",
+        courseNaming: { mode: "reuse_artifact_naming", fieldId: null },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {},
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+    const created = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-stage-course-binding", recordId: "rec-course-binding" },
+      controlledContext: { courseName: "课程001" },
+    }));
+
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    assert.equal(created.body.task.feishuOrigin.stageSnapshot.artifactTargetPath, "D:\\课程交付\\课程001\\01初稿");
+    const binding = fixtureData.app.database.database.prepare(`
+        SELECT course_name, course_path, display_path FROM feishu_course_bindings
+        WHERE base_token = ? AND table_id = ? AND record_id = ?
+      `).get("bas_stage", "tbl_math", "rec-course-binding");
+    assert.deepEqual(
+      { ...binding },
+      {
+        course_name: "课程001",
+        course_path: "D:\\课程交付\\课程001",
+        display_path: "课程交付\\课程001",
+      },
+    );
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("a frozen delivery stage passes its original root, course binding, and run to the ZIP queue", async () => {
+  const fixtureData = await fixture({
+    coursePathResolver: {
+      classifyDrive: async () => "local",
+      resolveMappedDrive: async () => { throw new Error("local roots do not resolve UNC mappings"); },
+    },
+  });
+  try {
+    const subject = await enableSubject(fixtureData, {
+      delivery: {
+        version: 1,
+        rootPath: fixtureData.directory,
+        courseNaming: { mode: "reuse_artifact_naming", fieldId: null },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {},
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+    const created = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-stage-delivery-queue", recordId: "rec-delivery-queue" },
+      controlledContext: { courseName: "课程001" },
+    }));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const task = created.body.task;
+    const run = fixtureData.app.database.createFeishuAutoCutRun({
+      runId: "run-delivery-queue",
+      taskId: task.id,
+      subjectKey: subject.subjectKey,
+      configVersion: subject.configVersion,
+      stageId: "initial",
+      eventId: "evt-stage-delivery-queue",
+      resultPath: path.join(fixtureData.directory, "run-result.json"),
+    });
+    const now = new Date().toISOString();
+    fixtureData.app.database.database.prepare(`
+      INSERT INTO task_artifacts (
+        id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+        source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'application/zip', 1, ?, 'driver_report', 'verified', 1, 'draft', ?, ?)
+    `).run(
+      "artifact-delivery-queue",
+      task.id,
+      run.runId,
+      "storage-delivery-queue",
+      "课程001_初稿.zip",
+      "a".repeat(64),
+      now,
+      now,
+    );
+    fixtureData.app.database.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(task.id);
+
+    const queued = await request(
+      fixtureData.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(task.id)}/upload-queue`,
+      { artifactId: "artifact-delivery-queue" },
+    );
+    assert.equal(queued.response.status, 202, JSON.stringify(queued.body));
+    const stored = fixtureData.app.database.database.prepare(`
+      SELECT target_path, publication_root_path, course_binding_id, run_id
+      FROM artifact_uploads WHERE id = ?
+    `).get(queued.body.upload.id);
+    const binding = fixtureData.app.database.database.prepare(`
+      SELECT id, actual_root FROM feishu_course_bindings
+      WHERE base_token = ? AND table_id = ? AND record_id = ?
+    `).get("bas_stage", "tbl_math", "rec-delivery-queue");
+    assert.deepEqual({ ...stored }, {
+      target_path: path.join(fixtureData.directory, "课程001", "01初稿"),
+      publication_root_path: binding.actual_root,
+      course_binding_id: binding.id,
+      run_id: run.runId,
+    });
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("a real final-directory trigger creates only the bound 00 directory and is idempotent", async () => {
+  const fixtureData = await fixture({
+    coursePathResolver: {
+      classifyDrive: async () => "local",
+      resolveMappedDrive: async () => { throw new Error("local roots do not resolve UNC mappings"); },
+    },
+  });
+  try {
+    const subject = await enableSubject(fixtureData, {
+      delivery: {
+        version: 1,
+        rootPath: fixtureData.directory,
+        courseNaming: { mode: "reuse_artifact_naming", fieldId: null },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {},
+        finalDirectoryTrigger: {
+          enabled: true,
+          fieldId: "fld_final_directory",
+          optionId: "opt_final_directory",
+        },
+      },
+    });
+    const operation = {
+      event: {
+        eventId: "evt-final-directory-real",
+        baseToken: "bas_stage",
+        tableId: "tbl_math",
+        recordId: "rec-final-directory",
+        fieldId: "fld_final_directory",
+        beforeOptionId: "opt_final_directory_other",
+        afterOptionId: "opt_final_directory",
+        occurredAt: Date.now(),
+      },
+      binding: { subjectKey: subject.subjectKey, configVersion: subject.configVersion },
+      controlledContext: {
+        documentLinks: [], namingDisplayValue: "课程001", namingValueUnique: true, courseName: "课程001",
+      },
+    };
+    const created = await request(fixtureData.baseUrl, "/api/local/feishu/directory-operations", operation);
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    assert.equal(created.body.operation.kind, "ensure_final_directory");
+    assert.equal(created.body.operation.state, "succeeded");
+    await access(path.join(fixtureData.directory, "课程001", "00成片"));
+    assert.equal(fixtureData.app.database.listFeishuTasks().length, 0);
+    assert.equal(fixtureData.app.database.listTaskAiStarts().length, 0);
+    assert.equal(fixtureData.app.database.database.prepare("SELECT COUNT(*) AS count FROM feishu_writeback_outbox").get().count, 0);
+
+    const replay = await request(fixtureData.baseUrl, "/api/local/feishu/directory-operations", operation);
+    assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.operation.id, created.body.operation.id);
+
+    const simulated = await request(fixtureData.baseUrl, "/api/local/feishu/directory-operations", {
+      ...operation,
+      event: { ...operation.event, eventId: "evt-final-directory-simulated", deliverySource: "simulation" },
+    });
+    assert.equal(simulated.response.status, 409, JSON.stringify(simulated.body));
+    assert.equal(simulated.body.error.code, "SIMULATION_DIRECTORY_OPERATION_FORBIDDEN");
+    assert.equal(fixtureData.app.database.listFeishuTasks().length, 0);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("stage registration rejects unsafe course names", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    const invalidNames = [
+      "课程/001",
+      "课程\\001",
+      "课程:001",
+      "课程\u001f001",
+      ".",
+      "..",
+      "课程.",
+      "课程 ",
+      "课".repeat(181),
+    ];
+    for (const [index, courseName] of invalidNames.entries()) {
+      const result = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+        event: { eventId: `evt-invalid-course-name-${index}`, recordId: `rec-invalid-course-name-${index}` },
+        controlledContext: { courseName },
+      }));
+      assert.equal(result.response.status, 400, JSON.stringify(result.body));
+      assert.equal(result.body.error.code, "INVALID_FIELD");
+    }
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("new stage tasks freeze resource groups from their Auto-Cut package", async () => {
+  const fixtureData = await fixture({ packageResourceGroups: [" 剪映主机 ", "音频工作站", "剪映主机"] });
+  try {
+    const subject = await enableSubject(fixtureData, { subjectResourceGroups: ["legacy-subject-lock"] });
+    const created = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-package-resource-groups" },
+    }));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    assert.deepEqual(
+      fixtureData.app.database.getFeishuTaskPackageSnapshot(created.body.task.id).resourceGroups,
+      ["剪映主机", "音频工作站"],
+    );
+    assert.deepEqual(created.body.task.feishuOrigin.resourceGroups, ["剪映主机", "音频工作站"]);
+
+    const packageBeforeChange = await fetch(`${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite`)
+      .then((response) => response.json());
+    const changedPackage = await fetch(`${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        revision: packageBeforeChange.package.revision,
+        resourceGroups: ["新资源主机"],
+      }),
+    });
+    assert.equal(changedPackage.status, 200, await changedPackage.text());
+    assert.deepEqual(
+      fixtureData.app.database.getFeishuTaskPackageSnapshot(created.body.task.id).resourceGroups,
+      ["剪映主机", "音频工作站"],
+    );
+
+    const next = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-package-resource-groups-next", recordId: "rec_2" },
+    }));
+    assert.equal(next.response.status, 201, JSON.stringify(next.body));
+    assert.deepEqual(
+      fixtureData.app.database.getFeishuTaskPackageSnapshot(next.body.task.id).resourceGroups,
+      ["新资源主机"],
+    );
   } finally {
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
@@ -511,6 +827,148 @@ test("simulated stage registration is never eligible for automatic execution", a
     assert.equal(fixtureData.app.database.getFeishuExecution(stored.id), null);
   } finally {
     await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("a simulated stage task cannot enqueue a verified ZIP for publication", async () => {
+  const fixtureData = await fixture();
+  try {
+    const subject = await enableSubject(fixtureData);
+    const simulated = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, { event: { eventId: "evt-stage-simulated-upload", deliverySource: "simulation" } }),
+    );
+    assert.equal(simulated.response.status, 201, JSON.stringify(simulated.body));
+    const task = simulated.body.task;
+    const timestamp = new Date().toISOString();
+    fixtureData.app.database.database.prepare(`
+      INSERT INTO task_artifacts (
+        id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+        source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+      ) VALUES (?, ?, NULL, ?, ?, 'application/zip', 1, ?, 'manual_select', 'verified', 1, 'draft', ?, ?)
+    `).run(
+      "artifact-simulated-upload",
+      task.id,
+      "storage-simulated-upload",
+      "课程001_初稿.zip",
+      "b".repeat(64),
+      timestamp,
+      timestamp,
+    );
+    fixtureData.app.database.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(task.id);
+
+    const queued = await request(
+      fixtureData.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(task.id)}/upload-queue`,
+      { artifactId: "artifact-simulated-upload" },
+    );
+    assert.equal(queued.response.status, 409, JSON.stringify(queued.body));
+    assert.equal(queued.body.error.code, "SIMULATION_UPLOAD_FORBIDDEN");
+    assert.equal(fixtureData.app.database.database.prepare("SELECT COUNT(*) AS count FROM artifact_uploads").get().count, 0);
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("a legacy failed upload for a simulated stage task cannot be retried", async () => {
+  const fixtureData = await fixture({
+    uploadWorker: { start() {}, wake() {}, async close() {} },
+  });
+  try {
+    const subject = await enableSubject(fixtureData);
+    const simulated = await request(
+      fixtureData.baseUrl,
+      "/api/local/feishu/tasks",
+      registration(subject, { event: { eventId: "evt-stage-simulated-retry", deliverySource: "simulation" } }),
+    );
+    assert.equal(simulated.response.status, 201, JSON.stringify(simulated.body));
+    const task = simulated.body.task;
+    const timestamp = new Date().toISOString();
+    fixtureData.app.database.database.prepare(`
+      INSERT INTO task_artifacts (
+        id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+        source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+      ) VALUES (?, ?, NULL, ?, ?, 'application/zip', 1, ?, 'manual_select', 'verified', 1, 'draft', ?, ?)
+    `).run(
+      "artifact-simulated-retry",
+      task.id,
+      "storage-simulated-retry",
+      "课程001_初稿.zip",
+      "c".repeat(64),
+      timestamp,
+      timestamp,
+    );
+    const upload = fixtureData.app.database.createArtifactUpload({
+      taskId: task.id,
+      artifactId: "artifact-simulated-retry",
+      subjectKey: SUBJECT_KEY,
+      storageKey: "storage-simulated-retry",
+      targetId: "target",
+      targetPath: path.join(fixtureData.directory, "upload"),
+      filename: "课程001_初稿.zip",
+      sha256: "c".repeat(64),
+      uploadConcurrency: 1,
+    });
+    fixtureData.app.database.database.prepare(`
+      UPDATE artifact_uploads SET status = 'failed', error_code = 'FIXTURE_FAILED' WHERE id = ?
+    `).run(upload.id);
+
+    const retried = await request(
+      fixtureData.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(task.id)}/upload/retry`,
+      { uploadId: upload.id },
+    );
+
+    assert.equal(retried.response.status, 409, JSON.stringify(retried.body));
+    assert.equal(retried.body.error.code, "SIMULATION_UPLOAD_FORBIDDEN");
+    assert.equal(fixtureData.app.database.getArtifactUpload(upload.id).status, "failed");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("workflow synchronization carries the selected course-name field descriptor", async () => {
+  let synchronized = null;
+  const bridge = createServer(async (incoming, response) => {
+    let body = "";
+    for await (const chunk of incoming) body += chunk;
+    if (incoming.method !== "POST" || incoming.url !== "/api/feishu/workflow/sync") {
+      response.writeHead(404).end();
+      return;
+    }
+    synchronized = JSON.parse(body);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ subject: synchronized.subject }));
+  });
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  const fixtureData = await fixture({
+    feishuBridgeUrl: `http://127.0.0.1:${bridge.address().port}`,
+    feishuWorkflowSync: null,
+  });
+  try {
+    await enableSubject(fixtureData, {
+      delivery: {
+        version: 1,
+        rootPath: "D:\\课程交付",
+        courseNaming: { mode: "field", fieldId: "fld_name" },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {},
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+    assert.deepEqual(synchronized?.subject.courseNamingField, {
+      fieldId: "fld_name",
+      fieldName: "命名",
+      type: 1,
+      uiType: "Text",
+    });
+  } finally {
+    await fixtureData.app.close();
+    await new Promise((resolve) => bridge.close(resolve));
     await rm(fixtureData.directory, { recursive: true, force: true });
   }
 });

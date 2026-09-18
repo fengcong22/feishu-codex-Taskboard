@@ -81,7 +81,7 @@ test("board stage label API exposes global settings and preserves internal task 
   }
 });
 
-test("stage label UI is global and keeps internal status IDs stable", async () => {
+test("stage label compatibility does not mount its editor in the Auto-Cut package view", async () => {
   const [component, i18n, app, types, api] = await Promise.all([
     readFile(new URL("../web/src/components/BoardStageSettings.tsx", import.meta.url), "utf8"),
     readFile(new URL("../web/src/i18n.tsx", import.meta.url), "utf8"),
@@ -96,7 +96,7 @@ test("stage label UI is global and keeps internal status IDs stable", async () =
   assert.match(component, /TASK_STATUSES\.map/);
   assert.match(i18n, /statusLabel/);
   assert.match(i18n, /BoardStageLabels/);
-  assert.match(app, /<BoardStageSettings/);
+  assert.doesNotMatch(app, /<BoardStageSettings/);
   assert.match(app, /boardStageLabels/);
   assert.match(types, /interface BoardStageLabels/);
   assert.match(api, /\/api\/local\/board-stage-labels/);

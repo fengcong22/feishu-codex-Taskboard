@@ -44,6 +44,8 @@ import type {
   AutoCutPackageDraft,
   FeishuPackage,
   FeishuPackageSummary,
+  FeishuPackageZipOutput,
+  FeishuPackageWorkspaceInspection,
   FeishuAutoCutRun,
   CreateUnifiedWorkflowViewInput,
   StageDisplayOverride,
@@ -90,6 +92,26 @@ export class ApiError extends Error {
     this.code = body.error?.code ?? "REQUEST_FAILED";
     this.details = body.error?.details;
   }
+}
+
+const PACKAGE_READ_TIMEOUT_MS = 15_000;
+
+function abortError(): Error {
+  return typeof DOMException === "function"
+    ? new DOMException("The operation was aborted.", "AbortError")
+    : Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+}
+
+function packageReadTimeoutError(): ApiError {
+  return new ApiError(0, {
+    error: {
+      code: "PACKAGE_REQUEST_TIMEOUT",
+      message: apiText(
+        "读取 Auto-Cut 包超时，请检查本机服务后重试。",
+        "Reading the Auto-Cut package timed out. Check the local service and try again.",
+      ),
+    },
+  });
 }
 
 export function resolveTaskboardUrl(path: string): string {
@@ -165,6 +187,47 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) throw new ApiError(response.status, body);
   return body;
+}
+
+/** Bounds package reads and directory preparation, including a response body that never resolves. */
+async function requestPackageBounded<T>(
+  path: string,
+  init: RequestInit = {},
+  timeoutError: () => ApiError = packageReadTimeoutError,
+): Promise<T> {
+  const externalSignal = init.signal;
+  if (externalSignal?.aborted) throw abortError();
+
+  const controller = new AbortController();
+  let timedOut = false;
+  let rejectOnTimeout!: (reason?: unknown) => void;
+  let rejectOnExternalAbort!: (reason?: unknown) => void;
+  const timeout = new Promise<never>((_, reject) => { rejectOnTimeout = reject; });
+  const externalAbort = new Promise<never>((_, reject) => { rejectOnExternalAbort = reject; });
+  const onExternalAbort = () => {
+    controller.abort();
+    rejectOnExternalAbort(abortError());
+  };
+  externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    rejectOnTimeout(timeoutError());
+  }, PACKAGE_READ_TIMEOUT_MS);
+
+  try {
+    return await Promise.race([
+      request<T>(path, { ...init, signal: controller.signal }),
+      timeout,
+      externalAbort,
+    ]);
+  } catch (error) {
+    if (timedOut) throw timeoutError();
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", onExternalAbort);
+  }
 }
 
 export async function listProjects(options: { includeArchived?: boolean; signal?: AbortSignal } | AbortSignal = {}): Promise<Project[]> {
@@ -711,7 +774,7 @@ export async function listFeishuWorkflowCatalog(signal?: AbortSignal): Promise<F
 }
 
 export async function listFeishuPackages(signal?: AbortSignal): Promise<FeishuPackageSummary[]> {
-  const data = await request<{ packages: FeishuPackageSummary[] }>("/api/local/autocut/packages", { signal });
+  const data = await requestPackageBounded<{ packages: FeishuPackageSummary[] }>("/api/local/autocut/packages", { signal });
   return data.packages;
 }
 
@@ -754,6 +817,47 @@ export async function removeFeishuPackage(alias: string, revision: number): Prom
 
 export async function discoverFeishuPackageModels(workspacePath: string): Promise<AiChatCatalog> {
   return request(`/api/local/autocut/packages/catalog`, { method: "POST", body: JSON.stringify({ workspacePath }) });
+}
+
+export async function inspectFeishuPackageWorkspace(
+  workspacePath: string,
+  signal?: AbortSignal,
+): Promise<FeishuPackageWorkspaceInspection> {
+  const data = await requestPackageBounded<{ inspection: FeishuPackageWorkspaceInspection }>("/api/local/autocut/packages/inspect-workspace", {
+    method: "POST",
+    body: JSON.stringify({ workspacePath }),
+    signal,
+  });
+  return data.inspection;
+}
+
+export async function prepareFeishuPackageOutputDirectory(
+  workspacePath: string,
+): Promise<FeishuPackageZipOutput> {
+  const data = await requestPackageBounded<{ zipOutput: FeishuPackageZipOutput }>(
+    "/api/local/autocut/packages/prepare-output-directory",
+    { method: "POST", body: JSON.stringify({ workspacePath }) },
+    () => new ApiError(0, { error: {
+      code: "PACKAGE_OUTPUT_PREPARATION_TIMEOUT",
+      message: apiText(
+        "准备 ZIP 生成目录超时，请检查本机服务和目录访问权限后重试。",
+        "Preparing the ZIP output directory timed out. Check the local service and directory permissions, then try again.",
+      ),
+    } }),
+  );
+  return data.zipOutput;
+}
+
+export async function validateFeishuPackageOutputDirectory(directory: string): Promise<string> {
+  const data = await requestPackageBounded<{ directory: string }>(
+    "/api/local/autocut/packages/validate-output-directory",
+    { method: "POST", body: JSON.stringify({ directory }) },
+    () => new ApiError(0, { error: {
+      code: "PACKAGE_OUTPUT_VALIDATION_TIMEOUT",
+      message: apiText("校验 ZIP 生成目录超时，请检查目录访问权限后重试。", "ZIP directory validation timed out. Check directory permissions and try again."),
+    } }),
+  );
+  return data.directory;
 }
 
 export async function upsertFeishuBasePreview(preview: unknown): Promise<FeishuBaseCatalog> {
@@ -805,6 +909,14 @@ export async function removeFeishuBase(baseToken: string): Promise<FeishuBaseCat
     body: JSON.stringify({}),
   });
   return data.catalog;
+}
+
+export async function refreshFeishuBaseFields(baseToken: string): Promise<FeishuBaseCatalog> {
+  const data = await request<{ base: FeishuBaseCatalog }>(
+    `/api/local/feishu/workflow/bases/${encodeURIComponent(baseToken)}/refresh-metadata`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  return data.base;
 }
 
 export async function removeFeishuSubject(subjectKey: string): Promise<FeishuBaseCatalog[]> {

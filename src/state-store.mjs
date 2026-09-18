@@ -21,7 +21,7 @@ const DELIVERY_STATES = new Set([
   "succeeded",
   "dead_letter",
 ]);
-const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting"]);
+const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting", "directory_operation"]);
 const DECISION_SNAPSHOT_VERSION = 1;
 const LEGACY_DECISION_SNAPSHOT_ACTIONS = new Set(["create", "archive"]);
 const LEGACY_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
@@ -57,6 +57,7 @@ const PHASED_DECISION_SNAPSHOT_ACTIONS = new Set([
   "blocked",
   "ignored",
   "archive_waiting",
+  "directory_operation",
 ]);
 const PHASED_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
   "version",
@@ -80,6 +81,7 @@ const CONTROLLED_CONTEXT_FIELDS = new Set([
   "documentLinks",
   "namingDisplayValue",
   "namingValueUnique",
+  "courseName",
 ]);
 const MAX_FAILURE_HISTORY = 10;
 const DELIVERY_PROVENANCE_VERSION = 1;
@@ -198,6 +200,20 @@ function snapshotString(value, name, { optional = false } = {}) {
   return result;
 }
 
+function snapshotCourseName(value) {
+  if (value === undefined) return "";
+  if (typeof value !== "string") {
+    throw snapshotInvalid("snapshot.controlledContext.courseName is invalid");
+  }
+  const result = value.trim();
+  if (result === "") return "";
+  if (result.length > 180 || /[\u0000-\u001f\u007f<>:"/\\|?*]/u.test(result)
+    || result === "." || result === ".." || /[. ]$/u.test(result)) {
+    throw snapshotInvalid("snapshot.controlledContext.courseName is invalid");
+  }
+  return result;
+}
+
 function assertSnapshotKeys(value, allowed, name) {
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw snapshotInvalid(`${name}.${key} is not supported`);
@@ -244,6 +260,7 @@ function normalizeControlledContext(value) {
     documentLinks,
     namingDisplayValue: value.namingDisplayValue,
     namingValueUnique: value.namingValueUnique,
+    courseName: snapshotCourseName(value.courseName),
   };
 }
 
@@ -578,7 +595,18 @@ function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {
     if (typeof value[field] !== "string" || value[field].trim() === "") return null;
     outcome[field] = value[field];
   }
-  const noTaskOutcome = value.kind === "ignored" || value.kind === "archive_waiting" || value.kind === "blocked";
+  if (value.kind === "directory_operation") {
+    if (value.operationKind !== "ensure_final_directory") return null;
+    if (typeof value.operationId !== "string" || value.operationId.trim() === "") return null;
+    if (!Number.isSafeInteger(value.configVersion) || value.configVersion < 1) return null;
+    outcome.operationKind = "ensure_final_directory";
+    outcome.operationId = value.operationId.trim();
+    outcome.configVersion = value.configVersion;
+  }
+  const noTaskOutcome = value.kind === "ignored"
+    || value.kind === "archive_waiting"
+    || value.kind === "blocked"
+    || value.kind === "directory_operation";
   if (!noTaskOutcome && !outcome.taskId && !outcome.taskIdentifier) return null;
   if (requireTaskIdentifier && !noTaskOutcome && (!outcome.taskId || !outcome.taskIdentifier)) return null;
   return outcome;

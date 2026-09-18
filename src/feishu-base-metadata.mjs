@@ -153,7 +153,6 @@ function responseItems(response) {
     throw fail("Feishu metadata response is invalid", "FEISHU_METADATA_INVALID_RESPONSE");
   }
   const items = data.items;
-  if (items === undefined) return [];
   if (!Array.isArray(items)) {
     throw fail("Feishu metadata response is invalid", "FEISHU_METADATA_INVALID_RESPONSE");
   }
@@ -600,14 +599,18 @@ function normalizedMetadataUiType(value) {
 function strictMetadataFieldType(field, numericType, uiTypes) {
   const hasType = field?.type !== null && field?.type !== undefined && field?.type !== "";
   const hasUiType = field?.uiType !== null && field?.uiType !== undefined && field?.uiType !== "";
-  if (!hasType && !hasUiType) return false;
-  if (hasType && normalizedMetadataType(field.type) !== numericType) return false;
+  if (!hasType || normalizedMetadataType(field.type) !== numericType) return false;
   if (hasUiType && !uiTypes.has(normalizedMetadataUiType(field.uiType))) return false;
   return true;
 }
 
 function isSingleSelectField(field) {
   return strictMetadataFieldType(field, 3, new Set(["singleselect", "select"]));
+}
+
+function isCourseNamingField(field) {
+  return strictMetadataFieldType(field, 1, new Set(["text"]))
+    || strictMetadataFieldType(field, 20, new Set(["formula"]));
 }
 
 function phasedField(subject, metadata, descriptor, pathName) {
@@ -814,7 +817,14 @@ function phasedSubjectErrors(subject, metadata, table) {
     ));
   }
   readField(subject?.documentField, "documentField");
-  readField(subject?.namingField, "namingField");
+  const naming = readField(subject?.namingField, "namingField");
+  if (naming && !isCourseNamingField(naming)) {
+    errors.push(phasedValidationError(
+      "namingField must be a text or formula field",
+      "FIELD_TYPE_INVALID",
+      "namingField.fieldId",
+    ));
+  }
 
   let options = [];
   let optionsUsable = false;

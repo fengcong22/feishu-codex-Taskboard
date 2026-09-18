@@ -12,6 +12,7 @@ import {
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 import { UNIFIED_WORKFLOW_STAGES } from "../shared/unified-workflow-stages.mjs";
 import { originFingerprint, registrationFingerprint } from "./feishu-deleted-event.mjs";
+import { CONTROLLED_CONTEXT_FIELDS, normalizeOptionalCourseName } from "./feishu-controlled-context.mjs";
 import { feishuTaskDisplayTitle } from "./feishu-task-title.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -477,12 +478,17 @@ function normalizeFeishuTaskOrigin(value) {
   }
   if (origin.controlledContext !== undefined) {
     const context = origin.controlledContext;
-    if (!Array.isArray(context.documentLinks)
+    const courseName = normalizeOptionalCourseName(context.courseName);
+    if (Object.keys(context).some((key) => !CONTROLLED_CONTEXT_FIELDS.includes(key))
+      || !Array.isArray(context.documentLinks)
       || context.documentLinks.some((link) => typeof link !== "string" || link.length > 2048)
       || typeof context.namingDisplayValue !== "string"
-      || typeof context.namingValueUnique !== "boolean") {
+      || typeof context.namingValueUnique !== "boolean"
+      || courseName === null) {
       throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu controlled context is invalid");
     }
+    if (courseName === undefined) delete context.courseName;
+    else context.courseName = courseName;
   }
   return origin;
 }
@@ -522,6 +528,29 @@ function normalizeFeishuPackageSnapshot(value) {
     throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot maxConcurrent is invalid");
   }
   if (value.maxConcurrent !== undefined) snapshot.maxConcurrent = value.maxConcurrent;
+  if (value.resourceGroups !== undefined) {
+    if (!Array.isArray(value.resourceGroups)) {
+      throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot resourceGroups must be an array");
+    }
+    const resourceGroups = [];
+    const seen = new Set();
+    for (const [index, group] of value.resourceGroups.entries()) {
+      if (typeof group !== "string" || group.includes("\0")) {
+        throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", `Package snapshot resourceGroups[${index}] is invalid`);
+      }
+      const normalized = group.trim();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      resourceGroups.push(normalized);
+    }
+    snapshot.resourceGroups = resourceGroups;
+  }
+  if (value.zipOutputMode !== undefined) {
+    if (!["package_default", "custom"].includes(value.zipOutputMode)) {
+      throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot zipOutputMode is invalid");
+    }
+    snapshot.zipOutputMode = value.zipOutputMode;
+  }
   return snapshot;
 }
 
@@ -757,6 +786,9 @@ function artifactUploadWorkFromRow(row) {
     ...artifactUploadFromRow(row),
     storageKey: row.storage_key,
     targetPath: row.target_path,
+    publicationRootPath: row.publication_root_path ?? null,
+    courseBindingId: row.course_binding_id ?? null,
+    runId: row.run_id ?? null,
     uploadConcurrency: row.upload_concurrency,
     claimToken: row.claim_token,
   };
@@ -1227,6 +1259,10 @@ export class TaskboardDatabase {
         storage_key TEXT NOT NULL,
         target_id TEXT,
         target_path TEXT NOT NULL,
+        publication_root_path TEXT,
+        course_binding_id TEXT REFERENCES feishu_course_bindings(id) ON DELETE RESTRICT,
+        run_id TEXT REFERENCES feishu_autocut_runs(run_id) ON DELETE RESTRICT,
+        published_path TEXT,
         filename TEXT NOT NULL,
         sha256 TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('queued', 'uploading', 'uploaded', 'failed')),
@@ -1288,6 +1324,95 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS feishu_autocut_runs_binding
         ON feishu_autocut_runs(subject_key, config_version, stage_id, event_id);
+
+      CREATE TABLE IF NOT EXISTS feishu_course_bindings (
+        id TEXT PRIMARY KEY,
+        base_token TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        first_config_version INTEGER NOT NULL CHECK (first_config_version > 0),
+        course_name TEXT NOT NULL,
+        actual_root TEXT NOT NULL,
+        course_path TEXT NOT NULL,
+        display_path TEXT NOT NULL,
+        canonical_location_key TEXT NOT NULL UNIQUE,
+        path_kind TEXT NOT NULL CHECK (path_kind IN ('local', 'network', 'unc')),
+        first_event_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(base_token, table_id, record_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_course_bindings_record
+        ON feishu_course_bindings(base_token, table_id, record_id);
+
+      CREATE TABLE IF NOT EXISTS feishu_delivery_facts (
+        id TEXT PRIMARY KEY,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('course_path', 'stage_uploaded', 'processing')),
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+        run_id TEXT NOT NULL REFERENCES feishu_autocut_runs(run_id) ON DELETE RESTRICT,
+        course_binding_id TEXT REFERENCES feishu_course_bindings(id) ON DELETE RESTRICT,
+        artifact_id TEXT REFERENCES task_artifacts(id) ON DELETE RESTRICT,
+        artifact_upload_id TEXT REFERENCES artifact_uploads(id) ON DELETE RESTRICT,
+        snapshot_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_delivery_facts_run
+        ON feishu_delivery_facts(run_id, kind, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS feishu_directory_operations (
+        id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        subject_key TEXT NOT NULL,
+        config_version INTEGER NOT NULL CHECK (config_version > 0),
+        base_token TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        field_id TEXT NOT NULL,
+        before_option_id TEXT NOT NULL,
+        after_option_id TEXT NOT NULL,
+        course_binding_id TEXT NOT NULL REFERENCES feishu_course_bindings(id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK (kind = 'ensure_final_directory'),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'succeeded')),
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_directory_operations_record
+        ON feishu_directory_operations(base_token, table_id, record_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS feishu_writeback_outbox (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+        run_id TEXT NOT NULL REFERENCES feishu_autocut_runs(run_id) ON DELETE RESTRICT,
+        course_binding_id TEXT REFERENCES feishu_course_bindings(id) ON DELETE RESTRICT,
+        operation_type TEXT NOT NULL CHECK (operation_type IN ('single_select', 'text')),
+        payload_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'processing', 'retry_wait', 'succeeded', 'conflict', 'dead_letter'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_attempt_at TEXT NOT NULL,
+        error_code TEXT,
+        error_message TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        claim_token TEXT,
+        lease_until TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS feishu_writeback_outbox_ready
+        ON feishu_writeback_outbox(state, next_attempt_at, created_at, id);
+
+      CREATE INDEX IF NOT EXISTS feishu_writeback_outbox_run
+        ON feishu_writeback_outbox(run_id, created_at, id);
 
       CREATE TABLE IF NOT EXISTS feishu_unified_view_sets (
         subject_key TEXT PRIMARY KEY REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
@@ -1468,6 +1593,22 @@ export class TaskboardDatabase {
     if (!artifactUploadColumns.some((column) => column.name === "upload_concurrency")) {
       this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN upload_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (upload_concurrency > 0)");
     }
+    if (!artifactUploadColumns.some((column) => column.name === "publication_root_path")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN publication_root_path TEXT");
+    }
+    if (!artifactUploadColumns.some((column) => column.name === "course_binding_id")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN course_binding_id TEXT");
+    }
+    if (!artifactUploadColumns.some((column) => column.name === "run_id")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN run_id TEXT");
+    }
+    if (!artifactUploadColumns.some((column) => column.name === "published_path")) {
+      this.database.exec("ALTER TABLE artifact_uploads ADD COLUMN published_path TEXT");
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS artifact_uploads_run
+        ON artifact_uploads(run_id, created_at, id)
+    `);
 
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
@@ -3918,6 +4059,7 @@ export class TaskboardDatabase {
       if (packageSnapshot) {
         task.feishuPackageSnapshot = {
           zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
+          ...(packageSnapshot.zipOutputMode ? { zipOutputMode: packageSnapshot.zipOutputMode } : {}),
         };
       }
       return task;
@@ -3944,6 +4086,7 @@ export class TaskboardDatabase {
     if (packageSnapshot) {
       enriched.feishuPackageSnapshot = {
         zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
+        ...(packageSnapshot.zipOutputMode ? { zipOutputMode: packageSnapshot.zipOutputMode } : {}),
       };
     }
     return enriched;
@@ -5767,6 +5910,18 @@ export class TaskboardDatabase {
           "The task cannot be deleted while a ZIP upload is queued or uploading",
         );
       }
+      const activeWriteback = this.database.prepare(`
+        SELECT 1 FROM feishu_writeback_outbox
+        WHERE task_id = ? AND state = 'processing'
+        LIMIT 1
+      `).get(current.id);
+      if (activeWriteback) {
+        throw new ApiError(
+          409,
+          "FEISHU_WRITEBACK_ACTIVE",
+          "The task cannot be deleted while a Feishu writeback is processing",
+        );
+      }
       const attachmentIds = this.database.prepare(
         "SELECT id FROM attachments WHERE task_id = ? ORDER BY created_at, id",
       ).all(current.id).map((attachment) => attachment.id);
@@ -5796,9 +5951,16 @@ export class TaskboardDatabase {
           this.database.prepare(`INSERT INTO feishu_task_deletions
             (event_id, origin_sha256, registration_sha256, deleted_at) VALUES (?, ?, ?, ?)
             ON CONFLICT(event_id) DO NOTHING`)
-            .run(metadata.eventId, originFingerprint(metadata), registrationFingerprint(metadata), now());
+          .run(metadata.eventId, originFingerprint(metadata), registrationFingerprint(metadata), now());
         }
       }
+      // These rows deliberately restrict deletion while a delivery is live.
+      // Once all active work has been ruled out above, remove the completed
+      // delivery history before cascading the archived task itself.
+      this.database.prepare("DELETE FROM feishu_writeback_outbox WHERE task_id = ?").run(current.id);
+      this.database.prepare("DELETE FROM feishu_delivery_facts WHERE task_id = ?").run(current.id);
+      this.database.prepare("DELETE FROM artifact_uploads WHERE task_id = ?").run(current.id);
+      this.database.prepare("DELETE FROM feishu_autocut_runs WHERE task_id = ?").run(current.id);
       const result = this.database.prepare(
         "DELETE FROM tasks WHERE id = ? AND version = ? AND archived_at IS NOT NULL",
       ).run(current.id, version);
@@ -6527,13 +6689,45 @@ export class TaskboardDatabase {
       if (!Number.isSafeInteger(uploadConcurrency) || uploadConcurrency < 1) {
         throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "The subject upload concurrency is invalid");
       }
+      const publicationRootPath = typeof input.publicationRootPath === "string" && input.publicationRootPath.trim()
+        ? input.publicationRootPath.trim()
+        : null;
+      const courseBindingId = typeof input.courseBindingId === "string" && input.courseBindingId.trim()
+        ? input.courseBindingId.trim()
+        : null;
+      const runId = typeof input.runId === "string" && input.runId.trim()
+        ? input.runId.trim()
+        : null;
+      if (courseBindingId !== null || runId !== null || publicationRootPath !== null) {
+        const artifact = this.database.prepare(`
+          SELECT task_id, run_id FROM task_artifacts WHERE id = ?
+        `).get(input.artifactId);
+        const run = runId === null ? null : this.database.prepare(`
+          SELECT task_id FROM feishu_autocut_runs WHERE run_id = ?
+        `).get(runId);
+        const binding = courseBindingId === null ? null : this.database.prepare(`
+          SELECT base_token, table_id, record_id FROM feishu_course_bindings WHERE id = ?
+        `).get(courseBindingId);
+        const origin = this.database.prepare(`
+          SELECT base_token, table_id, record_id FROM feishu_task_origins WHERE task_id = ?
+        `).get(input.taskId);
+        if (!artifact || artifact.task_id !== input.taskId || artifact.run_id !== runId
+          || !run || run.task_id !== input.taskId || !binding || !origin
+          || binding.base_token !== origin.base_token
+          || binding.table_id !== origin.table_id
+          || binding.record_id !== origin.record_id
+          || publicationRootPath === null) {
+          throw new ApiError(409, "ARTIFACT_DELIVERY_BINDING_INVALID", "The ZIP is not bound to one delivery run and course");
+        }
+      }
       const id = randomUUID();
       this.database.prepare(`
         INSERT INTO artifact_uploads (
           id, task_id, artifact_id, subject_key, storage_key, target_id, target_path,
+          publication_root_path, course_binding_id, run_id, published_path,
           filename, sha256, status, attempt_count, error_code, error_message, upload_concurrency,
           created_at, started_at, completed_at, updated_at, claim_token, lease_until
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, ?, ?, NULL, NULL, ?, NULL, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'queued', 0, NULL, NULL, ?, ?, NULL, NULL, ?, NULL, NULL)
       `).run(
         id,
         input.taskId,
@@ -6542,6 +6736,9 @@ export class TaskboardDatabase {
         input.storageKey,
         input.targetId,
         input.targetPath,
+        publicationRootPath,
+        courseBindingId,
+        runId,
         input.filename,
         input.sha256,
         uploadConcurrency,
@@ -6568,6 +6765,11 @@ export class TaskboardDatabase {
       const row = this.database.prepare(`
         SELECT queued.* FROM artifact_uploads AS queued
         WHERE queued.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM feishu_task_origins AS origin
+            WHERE origin.task_id = queued.task_id
+              AND json_extract(origin.metadata_json, '$.deliverySource') = 'simulation'
+          )
           AND (
             SELECT COUNT(*) FROM artifact_uploads AS active
             WHERE active.subject_key = queued.subject_key
@@ -6627,7 +6829,7 @@ export class TaskboardDatabase {
     }
   }
 
-  markArtifactUploadUploaded(id, claimToken, validateTask = null) {
+  markArtifactUploadUploaded(id, claimToken, validateTask = null, { publication = null } = {}) {
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -6655,15 +6857,92 @@ export class TaskboardDatabase {
           return artifactUploadFromRow(failed);
         }
       }
+      if (current.run_id !== null || current.course_binding_id !== null || current.publication_root_path !== null) {
+        if (!publication || typeof publication !== "object" || Array.isArray(publication)
+          || typeof publication.destination !== "string" || typeof publication.sha256 !== "string"
+          || publication.sha256 !== current.sha256) {
+          throw new ApiError(409, "ARTIFACT_PUBLICATION_INVALID", "The ZIP publication result is invalid");
+        }
+        const targetPath = path.resolve(current.target_path);
+        const destination = path.resolve(publication.destination);
+        const rootPath = path.resolve(current.publication_root_path ?? "");
+        const relativeToRoot = path.relative(rootPath, targetPath);
+        if (
+          path.dirname(destination) !== targetPath
+          || path.basename(destination) !== current.filename
+          || destination !== path.join(targetPath, current.filename)
+          || relativeToRoot === ""
+          || relativeToRoot === ".."
+          || relativeToRoot.startsWith(`..${path.sep}`)
+          || path.isAbsolute(relativeToRoot)
+        ) {
+          throw new ApiError(409, "ARTIFACT_PUBLICATION_INVALID", "The ZIP publication result is outside its frozen target");
+        }
+        const run = this.database.prepare(`
+          SELECT task_id, stage_id FROM feishu_autocut_runs WHERE run_id = ?
+        `).get(current.run_id);
+        const artifact = this.database.prepare(`
+          SELECT task_id, run_id, sha256 FROM task_artifacts WHERE id = ?
+        `).get(current.artifact_id);
+        const binding = this.database.prepare(`
+          SELECT id FROM feishu_course_bindings WHERE id = ?
+        `).get(current.course_binding_id);
+        if (!run || !artifact || !binding
+          || run.task_id !== current.task_id
+          || artifact.task_id !== current.task_id
+          || artifact.run_id !== current.run_id
+          || artifact.sha256 !== current.sha256) {
+          throw new ApiError(409, "ARTIFACT_DELIVERY_BINDING_INVALID", "The ZIP no longer belongs to its delivery run");
+        }
+      } else if (publication !== null) {
+        throw new ApiError(409, "ARTIFACT_PUBLICATION_INVALID", "Legacy uploads cannot accept a delivery publication result");
+      }
       const result = this.database.prepare(`
         UPDATE artifact_uploads
         SET status = 'uploaded', error_code = NULL, error_message = NULL,
-            completed_at = ?, updated_at = ?, claim_token = NULL, lease_until = NULL
+            published_path = ?, completed_at = ?, updated_at = ?, claim_token = NULL, lease_until = NULL
         WHERE id = ? AND status = 'uploading' AND claim_token = ?
-      `).run(timestamp, timestamp, id, claimToken);
+      `).run(publication?.destination ?? null, timestamp, timestamp, id, claimToken);
       const uploaded = result.changes === 1
         ? this.database.prepare("SELECT * FROM artifact_uploads WHERE id = ?").get(id)
         : null;
+      if (uploaded?.run_id && uploaded.course_binding_id) {
+        const insertFact = this.database.prepare(`
+          INSERT INTO feishu_delivery_facts (
+            id, dedupe_key, kind, task_id, run_id, course_binding_id,
+            artifact_id, artifact_upload_id, snapshot_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(dedupe_key) DO NOTHING
+        `);
+        const snapshot = JSON.stringify({
+          publishedPath: publication.destination,
+          sha256: uploaded.sha256,
+        });
+        insertFact.run(
+          randomUUID(),
+          `course-path:${uploaded.course_binding_id}`,
+          "course_path",
+          uploaded.task_id,
+          uploaded.run_id,
+          uploaded.course_binding_id,
+          uploaded.artifact_id,
+          uploaded.id,
+          snapshot,
+          timestamp,
+        );
+        insertFact.run(
+          randomUUID(),
+          `stage-uploaded:${uploaded.run_id}`,
+          "stage_uploaded",
+          uploaded.task_id,
+          uploaded.run_id,
+          uploaded.course_binding_id,
+          uploaded.artifact_id,
+          uploaded.id,
+          snapshot,
+          timestamp,
+        );
+      }
       this.database.exec("COMMIT");
       return uploaded ? artifactUploadFromRow(uploaded) : null;
     } catch (error) {

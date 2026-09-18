@@ -101,8 +101,6 @@ import { TaskDetail } from "./components/TaskDetail";
 import { FeishuBaseNavigator } from "./components/FeishuBaseNavigator";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { FeishuPackageManager } from "./components/FeishuPackageManager";
-import { BoardStageSettings } from "./components/BoardStageSettings";
-import { UnifiedWorkflowStageSettings } from "./components/UnifiedWorkflowStageSettings";
 import { UnifiedWorkflowViewControls } from "./components/UnifiedWorkflowViewControls";
 import {
   addFeishuBaseFromUrl,
@@ -5082,11 +5080,6 @@ export function App() {
               refreshKey={autoCutPackagesRevision}
               onError={(message) => setActionError(message)}
             />
-            <BoardStageSettings
-              value={boardStageLabels}
-              onUpdated={setBoardStageLabels}
-              onError={(message) => setActionError(message)}
-            />
           </div>
         ) : detailTask && selectedProject ? (
           <TaskDetail
@@ -5355,21 +5348,6 @@ export function App() {
               onSubjectChange={updateFeishuSubject}
               onError={(message) => setActionError(message)}
             />
-            {selectedFeishuSubjectKey && unifiedStageDisplaysLoadedFor === selectedFeishuSubjectKey ? (
-              <UnifiedWorkflowStageSettings
-                subjectKey={selectedFeishuSubjectKey}
-                overrides={unifiedStageDisplays}
-                onChange={(override) => setUnifiedStageDisplays((current) => [
-                  ...current.filter((item) => !(
-                    item.subjectKey === override.subjectKey && item.stageId === override.stageId
-                  )),
-                  override,
-                ])}
-                onError={setActionError}
-              />
-            ) : selectedFeishuSubjectKey ? (
-              <div className="workflow-board-loading">{text("正在加载流程显示设置…", "Loading stage display settings…")}</div>
-            ) : null}
           </div>
         ) : boardView === "workflow" && !isSelectedFeishuProject ? (
           <div className="workflow-view-stack">

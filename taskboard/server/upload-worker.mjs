@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { link, mkdir, open, stat, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -60,6 +60,57 @@ async function destinationHash(filename) {
   return hashFile(filename);
 }
 
+async function requireSafeDirectory(filename, code, fileSystem = {}) {
+  const inspect = fileSystem.lstat ?? lstat;
+  let entry;
+  try {
+    entry = await inspect(filename);
+  } catch {
+    throw new UploadFailure(code, "The delivery directory is unavailable");
+  }
+  if (!entry?.isDirectory?.() || entry.isSymbolicLink?.()) {
+    throw new UploadFailure(code, "The delivery directory is not a safe directory");
+  }
+}
+
+async function ensureDeliveryTargetDirectory(upload, targetDirectory, fileSystem = {}) {
+  if (typeof upload.publicationRootPath !== "string" || upload.publicationRootPath === "") {
+    try {
+      await (fileSystem.mkdir ?? mkdir)(targetDirectory, { recursive: true });
+    } catch {
+      throw new UploadFailure("TARGET_DIRECTORY_UNAVAILABLE", "The upload destination is unavailable");
+    }
+    return;
+  }
+
+  const rootDirectory = path.resolve(upload.publicationRootPath);
+  const relative = path.relative(rootDirectory, targetDirectory);
+  if (
+    relative === ""
+    || relative === ".."
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+  ) {
+    throw new UploadFailure("TARGET_PATH_INVALID", "The configured upload destination is invalid");
+  }
+
+  await requireSafeDirectory(rootDirectory, "DELIVERY_ROOT_UNAVAILABLE", fileSystem);
+  const createDirectory = fileSystem.mkdir ?? mkdir;
+  let current = rootDirectory;
+  for (const segment of relative.split(path.sep)) {
+    if (!segment) continue;
+    current = path.join(current, segment);
+    try {
+      await createDirectory(current);
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw new UploadFailure("TARGET_DIRECTORY_UNAVAILABLE", "The upload destination is unavailable");
+      }
+    }
+    await requireSafeDirectory(current, "TARGET_DIRECTORY_UNAVAILABLE", fileSystem);
+  }
+}
+
 async function writeStreamToTemporary(artifactService, storageKey, temporaryPath) {
   let handle;
   try {
@@ -104,6 +155,12 @@ async function promoteTemporaryFile(temporary, destination, expectedHash, fileSy
     if (concurrentHash !== null) {
       throw new UploadFailure("TARGET_FILE_CONFLICT", "The destination already contains a different ZIP");
     }
+    if (hardLinkIsUnsupported(error)) {
+      throw new UploadFailure(
+        "TARGET_ATOMIC_PUBLISH_UNSUPPORTED",
+        "The upload destination does not support safe atomic ZIP publication",
+      );
+    }
     throw error;
   }
 }
@@ -126,11 +183,7 @@ async function copyArtifact(upload, artifactService, fileSystem = {}) {
     throw new UploadFailure("INVALID_ARTIFACT_FILENAME", "The artifact filename is invalid");
   }
 
-  try {
-    await mkdir(targetDirectory, { recursive: true });
-  } catch {
-    throw new UploadFailure("TARGET_DIRECTORY_UNAVAILABLE", "The upload destination is unavailable");
-  }
+  await ensureDeliveryTargetDirectory(upload, targetDirectory, fileSystem);
 
   let existingHash;
   try {
@@ -195,6 +248,7 @@ export function createArtifactUploadWorker({
   database,
   artifactService,
   onUpdate = () => {},
+  onPublished = () => {},
   validateTaskForCompletion = null,
   now = Date.now,
   setTimer = setTimeout,
@@ -232,11 +286,28 @@ export function createArtifactUploadWorker({
     const renewal = startLeaseRenewal(upload);
     try {
       const publication = await copyArtifact(upload, artifactService, fileSystem);
+      const deliveryPublication = upload.runId && upload.courseBindingId && upload.publicationRootPath
+        ? {
+          publication: {
+            destination: publication.destination,
+            sha256: upload.sha256,
+            created: publication.created,
+          },
+        }
+        : undefined;
       const completed = database.markArtifactUploadUploaded(
         upload.id,
         upload.claimToken,
         validateTaskForCompletion,
+        deliveryPublication,
       );
+      if (completed?.status === "uploaded" && deliveryPublication) {
+        try {
+          onPublished({ upload, completed, publication });
+        } catch (error) {
+          console.error(`Artifact publication subscriber failed: ${error?.code ?? "PUBLISH_SUBSCRIBER_FAILED"}`);
+        }
+      }
       if (completed?.status === "failed" && completed.errorCode === "TASK_PROVENANCE_CHANGED") {
         await removePublishedFile(publication, upload.sha256, fileSystem);
       }

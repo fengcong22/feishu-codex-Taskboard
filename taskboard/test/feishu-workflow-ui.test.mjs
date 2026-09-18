@@ -48,8 +48,9 @@ test("adding a Base refreshes the project catalog before selecting its subject",
   assert.match(app, /onAddBase=\{[^}]*addFeishuBase/);
 });
 
-test("subject settings expose ZIP source, upload policy, and execution routing controls", async () => {
+test("subject settings keep delivery routing while package settings own execution resources", async () => {
   const panel = await source("web/src/components/FeishuWorkflowPanel.tsx");
+  const packageManager = await source("web/src/components/FeishuPackageManager.tsx");
   for (const field of [
     "artifactSourceMode",
     "artifactSourcePath",
@@ -58,11 +59,14 @@ test("subject settings expose ZIP source, upload policy, and execution routing c
     "targetPath",
     "uploadConcurrency",
     "packageAlias",
-    "concurrencyGroup",
-    "resourceGroups",
   ]) {
     assert.match(panel, new RegExp(field));
   }
+  assert.doesNotMatch(panel, /concurrencyGroup/);
+  assert.doesNotMatch(panel, /resourceGroups/);
+  assert.match(packageManager, /maxConcurrent/);
+  assert.match(packageManager, /resourceGroups/);
+  assert.match(packageManager, /资源组/);
   assert.match(panel, /<option value="manual_select">手动选择<\/option>/);
   assert.match(panel, /<option value="watch_directory" disabled>/);
   assert.match(panel, /<option value="driver_report">Auto-Cut 上报<\/option>/);
@@ -122,9 +126,10 @@ test("hidden subject selection stays in configuration while visible subjects ope
   assert.match(app, /setFeishuConfigurationOpen\(!openProject\)/);
 });
 
-test("draft subjects can stop an older Bridge snapshot before re-enabling", async () => {
+test("subject lifecycle actions use standard labels and track an actually active configuration", async () => {
   const panel = await source("web/src/components/FeishuWorkflowPanel.tsx");
-  assert.match(panel, /停用旧 Bridge 快照/);
+  assert.doesNotMatch(panel, /停用旧 Bridge 快照/);
+  assert.match(panel, /activeConfigVersion/);
   assert.match(panel, /transition\("disable"\)/);
 });
 

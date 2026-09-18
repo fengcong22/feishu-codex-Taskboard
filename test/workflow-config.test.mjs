@@ -108,6 +108,35 @@ test("validateWorkflowConfig normalizes a custom start value and preserves field
   assert.equal(normalized.bases[0].subjects[0].execution.maxConcurrent, 2);
 });
 
+test("preserves a synchronized course naming field descriptor", () => {
+  const subject = validSubject({
+    delivery: {
+      version: 1,
+      rootPath: null,
+      courseNaming: { mode: "field", fieldId: "fld_title" },
+      coursePathWriteback: { enabled: false, fieldId: null },
+      writeback: {},
+      finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+    },
+    courseNamingField: {
+      fieldId: "fld_title",
+      fieldName: "脚本名称",
+      type: 1,
+      uiType: "Text",
+    },
+  });
+  const normalized = validateWorkflowConfig(validConfig({
+    bases: [{ ...validConfig().bases[0], subjects: [subject] }],
+  }));
+
+  assert.deepEqual(normalized.bases[0].subjects[0].courseNamingField, {
+    fieldId: "fld_title",
+    fieldName: "脚本名称",
+    type: 1,
+    uiType: "Text",
+  });
+});
+
 test("package aliases may use controlled Chinese names but never paths or shell delimiters", () => {
   const input = validConfig();
   input.bases[0].subjects[0].packageRoute.packageAlias = "Auto-cut-小学语文";

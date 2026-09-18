@@ -1300,7 +1300,13 @@ function OptionMenu({
   );
 }
 
-function AutoCutExecution({ snapshot }: { snapshot: AiChatThreadSnapshot }) {
+function AutoCutExecution({
+  snapshot,
+  onInterrupt,
+}: {
+  snapshot: AiChatThreadSnapshot;
+  onInterrupt: () => void;
+}) {
   const { text } = useTaskboardI18n();
   const latestRun = snapshot.runs.at(-1) ?? snapshot.thread.currentRun;
   const status = latestRun?.status ?? (snapshot.thread.status === "running" ? "running" : null);
@@ -1333,6 +1339,19 @@ function AutoCutExecution({ snapshot }: { snapshot: AiChatThreadSnapshot }) {
         {status === "running" && <span className="ai-chat-spinner" />}
         {label}
       </div>
+      {status === "running" && (
+        <div className="ai-chat-autocut-actions">
+          <button
+            className="ai-chat-autocut-stop"
+            type="button"
+            title={text("停止 Auto-Cut", "Stop Auto-Cut")}
+            onClick={onInterrupt}
+          >
+            <span className="ai-chat-stop-mark" aria-hidden="true" />
+            {text("停止", "Stop")}
+          </button>
+        </div>
+      )}
       {status === "failed" || status === "interrupted" ? (
         <div className="ai-chat-autocut-error">
           {latestRun?.error && <p>{latestRun.error}</p>}
@@ -2962,7 +2981,7 @@ export function AiChat({
   }
 
   async function stopRun(run: AiChatRun | null) {
-    if (!run || localAutoCut) return;
+    if (!run) return;
     try {
       await interruptAiChatRun(run.id);
       if (selectedThreadRef.current === run.threadId) {
@@ -3154,7 +3173,7 @@ export function AiChat({
               </div>
             ) : snapshot ? (
               <>
-                {localAutoCut ? <AutoCutExecution snapshot={snapshot} /> : <MessageTimeline
+                {localAutoCut ? <AutoCutExecution snapshot={snapshot} onInterrupt={() => void stopRun(currentRun)} /> : <MessageTimeline
                   activeRunId={currentRun?.id ?? null}
                   events={snapshot.events}
                   skills={activeCatalog?.skills ?? []}

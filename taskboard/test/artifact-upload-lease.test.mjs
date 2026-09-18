@@ -19,7 +19,11 @@ const actor = {
   avatarUrl: null,
 };
 
-async function createUploadLeaseFixture({ count = 8, uploadConcurrency = 7 } = {}) {
+async function createUploadLeaseFixture({
+  count = 8,
+  uploadConcurrency = 7,
+  simulatedQueueIndexes = [],
+} = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-upload-lease-"));
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   database.createProject({ id: "lease-project", name: "Lease Project", workspacePath: null });
@@ -45,6 +49,7 @@ async function createUploadLeaseFixture({ count = 8, uploadConcurrency = 7 } = {
     timestamp,
   );
 
+  const simulatedIndexes = new Set(simulatedQueueIndexes);
   const uploads = [];
   for (let index = 0; index < count; index += 1) {
     const task = database.createTask({
@@ -61,6 +66,16 @@ async function createUploadLeaseFixture({ count = 8, uploadConcurrency = 7 } = {
       startDate: null,
       dueDate: null,
       recurrence: null,
+      ...(simulatedIndexes.has(index) ? {
+        feishuOrigin: {
+          source: "feishu-base",
+          eventId: `lease-simulation-${index}`,
+          baseToken: "base-lease",
+          tableId: "table-lease",
+          recordId: `record-simulation-${index}`,
+          deliverySource: "simulation",
+        },
+      } : {}),
     });
     const artifact = database.createTaskArtifact(task.id, {
       id: `artifact-${index}`,
@@ -100,6 +115,22 @@ async function createUploadLeaseFixture({ count = 8, uploadConcurrency = 7 } = {
     },
   };
 }
+
+test("claim skips legacy queued uploads owned by simulated Feishu tasks", async () => {
+  const fixture = await createUploadLeaseFixture({
+    count: 2,
+    uploadConcurrency: 2,
+    simulatedQueueIndexes: [0],
+  });
+  try {
+    const claimed = fixture.database.claimNextArtifactUpload();
+
+    assert.equal(claimed.id, fixture.uploads[1].id);
+    assert.equal(fixture.database.getArtifactUpload(fixture.uploads[0].id).status, "queued");
+  } finally {
+    await fixture.close();
+  }
+});
 
 test("invalid, missing, expired, and unreasonably future upload leases release subject slots", async () => {
   const fixture = await createUploadLeaseFixture();
@@ -538,7 +569,7 @@ test("unsupported atomic publication never exposes a partial destination ZIP", a
   });
   try {
     await worker.start();
-    assert.equal(failure?.code, "UPLOAD_COPY_FAILED");
+    assert.equal(failure?.code, "TARGET_ATOMIC_PUBLISH_UNSUPPORTED");
     assert.equal(copyCount, 0);
     await assert.rejects(access(path.join(targetPath, "fallback.zip")));
   } finally {

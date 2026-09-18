@@ -79,6 +79,7 @@ test("preserves explicitly approved local and Bridge error codes", () => {
     "EVENT_RECORD_INVALID",
     "EVENT_SNAPSHOT_MISSING",
     "FEISHU_TITLE_LOOKUP_TIMEOUT",
+    "COURSE_NAME_UNAVAILABLE",
     "STATE_FILE_INVALID",
     "TASKBOARD_INVALID_RESPONSE",
     "TASKBOARD_UNAVAILABLE",

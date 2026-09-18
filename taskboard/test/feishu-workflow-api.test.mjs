@@ -9,7 +9,7 @@ import { createBridgeServer } from "../../src/server.mjs";
 import { createWorkflowConfigStore } from "../../src/workflow-config-store.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 
-async function fixture() {
+async function fixture(options = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-api-"));
   const app = createTaskboardServer({
     dataDirectory: directory,
@@ -24,10 +24,135 @@ async function fixture() {
       },
     },
     feishuWorkflowSync: async () => ({ ok: true }),
+    ...options,
   });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   return { app, baseUrl: `http://127.0.0.1:${address.port}`, directory };
 }
+
+async function metadataRefreshFixture() {
+  const bridgeSecret = "metadata-refresh-secret";
+  const requests = [];
+  let reply = {
+    status: 200,
+    body: {
+      baseToken: "bas_refresh",
+      baseName: "课程表",
+      tables: [{ tableId: "tbl_math", tableName: "数学", fields: [] }],
+    },
+  };
+  const bridge = createServer(async (incoming, response) => {
+    const chunks = [];
+    for await (const chunk of incoming) chunks.push(chunk);
+    requests.push({
+      route: incoming.url,
+      client: incoming.headers["x-feishu-bridge-client"],
+      secret: incoming.headers["x-feishu-bridge-secret"],
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    });
+    response.writeHead(reply.status, { "content-type": "application/json" });
+    response.end(JSON.stringify(reply.body));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const testFixture = await fixture({
+    feishuBridgeUrl: `http://127.0.0.1:${bridge.address().port}`,
+    feishuBridgeSecret: bridgeSecret,
+  });
+  const seeded = await request(testFixture.baseUrl, "/api/local/feishu/workflow/catalog", {
+    method: "POST",
+    body: { ...reply.body, sourceUrlLabel: "https://example.feishu.cn/wiki/wik_original" },
+  });
+  assert.equal(seeded.response.status, 201);
+  return {
+    ...testFixture,
+    requests,
+    setReply: (next) => { reply = next; },
+    close: async () => {
+      await testFixture.app.close();
+      await new Promise((resolve) => bridge.close(resolve));
+      await rm(testFixture.directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test("refresh metadata reads the saved Base directly with Bridge authentication", async () => {
+  const data = await metadataRefreshFixture();
+  try {
+    const field = {
+      fieldId: "fld_new", fieldName: "新增状态", type: 3, uiType: "SingleSelect",
+      options: [{ id: "opt_new", name: "新选项" }],
+    };
+    data.setReply({ status: 200, body: {
+      baseToken: "bas_refresh", baseName: "更新后的课程表",
+      tables: [{ tableId: "tbl_math", tableName: "数学", fields: [field] }],
+    } });
+    const before = Date.now();
+    const result = await request(data.baseUrl, "/api/local/feishu/workflow/bases/bas_refresh/refresh-metadata", {
+      method: "POST", body: {},
+    });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(data.requests, [{
+      route: "/api/feishu/base-preview", client: "taskboard", secret: "metadata-refresh-secret",
+      body: { url: "https://feishu.cn/base/bas_refresh" },
+    }]);
+    assert.equal(result.body.base.baseName, "更新后的课程表");
+    assert.equal(result.body.base.sourceUrlLabel, "https://example.feishu.cn/wiki/wik_original");
+    assert.ok(result.body.base.metadataRefreshedAt >= before);
+    assert.deepEqual(result.body.base.subjects[0].metadata.fields, [field]);
+    assert.doesNotMatch(JSON.stringify(result.body), /metadata-refresh-secret/);
+  } finally {
+    await data.close();
+  }
+});
+
+test("refresh metadata rejects unknown Bases and unrecognized inputs before reading Feishu", async () => {
+  const data = await metadataRefreshFixture();
+  try {
+    const route = "/api/local/feishu/workflow/bases/bas_refresh/refresh-metadata";
+    for (const [pathname, options, status, code] of [
+      [route.replace("bas_refresh", "bas_unknown"), { method: "POST", body: {} }, 404, "BASE_NOT_FOUND"],
+      [route, { method: "POST", body: { url: "https://feishu.cn/base/bas_other" } }, 400, "UNKNOWN_FIELD"],
+      [`${route}?table=tbl_other`, { method: "POST", body: {} }, 400, "UNKNOWN_QUERY_PARAMETER"],
+      [route, { method: "POST", body: [] }, 400, "INVALID_BODY"],
+      [route, { method: "GET" }, 405, "METHOD_NOT_ALLOWED"],
+    ]) {
+      const result = await request(data.baseUrl, pathname, options);
+      assert.equal(result.response.status, status);
+      assert.equal(result.body.error.code, code);
+    }
+    assert.equal(data.requests.length, 0);
+  } finally {
+    await data.close();
+  }
+});
+
+test("refresh metadata keeps cached configuration after a Bridge failure or mismatched Base", async () => {
+  const data = await metadataRefreshFixture();
+  try {
+    const previous = await request(data.baseUrl, "/api/local/feishu/workflow/catalog");
+    for (const reply of [
+      { status: 502, body: { error: { code: "FEISHU_METADATA_READ_FAILED", message: "private detail" } } },
+      { status: 200, body: { baseToken: "bas_other", baseName: "错误表格", tables: [] } },
+      { status: 200, body: { baseToken: "bas_refresh", baseName: "错误格式", tables: [{}] } },
+      { status: 200, body: { baseToken: "bas_refresh", baseName: "错误格式", tables: [{ tableId: "tbl_math", tableName: "数学", fields: null }] } },
+      { status: 200, body: { baseToken: "bas_refresh", baseName: "错误格式", tables: [{ tableId: "tbl_math", tableName: "数学" }] } },
+    ]) {
+      data.setReply(reply);
+      const result = await request(data.baseUrl, "/api/local/feishu/workflow/bases/bas_refresh/refresh-metadata", {
+        method: "POST", body: {},
+      });
+      assert.equal(result.response.status, 502);
+      assert.doesNotMatch(JSON.stringify(result.body), /private detail/);
+      const current = await request(data.baseUrl, "/api/local/feishu/workflow/catalog");
+      assert.deepEqual(current.body, previous.body);
+    }
+  } finally {
+    await data.close();
+  }
+});
 
 async function request(baseUrl, route, options = {}) {
   const response = await fetch(`${baseUrl}${route}`, {

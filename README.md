@@ -22,6 +22,10 @@ flowchart LR
 
 ## Auto-Cut 执行环境与制品登记
 
+Auto-Cut 包管理中的 **ZIP 生成目录** 支持读取工作区根目录 `PACKAGE-MANIFEST.json` 的可选声明 `interface.zipOutput.relativeDirectory`，例如 `"output"`。填写工作区后点击 **验证并读取**，Taskboard 只读清单，预览并带入工作区内的绝对目录；此时不会创建目录或保存配置。之后显式 **保存草稿 / 启用** 才会重新读取声明并准备目录，再保存用户确认的设置。声明不能是绝对路径、盘符或 UNC 路径，不能包含空段、`.`、`..`、Windows 非法名称或越出工作区的目录链接；无权限等失败会显示错误并阻止后续保存。接口为 `POST /api/local/autocut/packages/prepare-output-directory`，只接受 `workspacePath`，目录由服务端清单决定。
+
+旧包没有该声明时继续保留手动配置，不猜测默认目录。页面提供“Auto-Cut-Lite 默认目录 / 自定义目录”选择：默认模式读取并在保存或启用时创建清单目录；自定义模式要求填写本机可访问、已存在且可写的绝对目录，Taskboard 只读校验，不替你创建任意自定义目录。页面加载和软件升级不会重写已有路径、包别名、项目 ID 或任务快照；主动验证带入的新路径在保存前仍是未保存配置。ZIP 生成目录是本机剪辑产物的来源，课程目录及 NAS 上传目标仍由学科的存储配置决定。每次运行的准确 ZIP 路径继续由 Taskboard 通过 `CODEX_AUTOCUT_PACKAGE_ZIP_PATH` 指定，Auto-Cut-Lite 必须生成并上报这一文件；不扫描目录或推断“最新 ZIP”。
+
 phased 任务的 ZIP 根目录优先使用任务冻结包快照中的 `zipSourceDirectory`（兼容 `artifactSourcePath`）。包未配置该可选字段时，使用同一任务 `configVersion` 冻结学科配置中 `upload.artifactSourceMode = driver_report` 的 `upload.artifactSourcePath`。生成和制品登记使用同一规则，显式无效路径仍会阻断，登记仍要求 ZIP 根目录与该冻结学科来源一致；不会改用当前配置、工作区或上传目标路径，也不会改写旧任务快照。
 
 通过所有自动执行门禁的 phased 任务（包含重启恢复的预约）直接使用 Taskboard 已有的本机 Auto-Cut runner。runner 读取当前 Windows 用户 `%LOCALAPPDATA%/Auto-Cut/auto-cut-lite/deployment-report.json`，核对 `workspace_root` 与白名单项目包相符，使用报告内固定 Python 和 runtime 中的 `scripts/jy_wrapper.py`。已有双项授权重试也使用该 runner；手动启动和未携带授权的重试仍走原 Codex 流程。
@@ -71,19 +75,19 @@ phased 任务的 ZIP 根目录优先使用任务冻结包快照中的 `zipSource
 
 ### 学科的自动 / 手动剪辑开关
 
-在 Taskboard 的飞书工作流配置中选中学科，打开三阶段配置上方的 **通用执行设置 → 剪辑模式**，选择“自动”或“手动”。每个学科只有一个剪辑模式，初稿、初审修改、终审修改共用；并发组、并发数和资源组也在这里设置。
+在 Taskboard 的飞书工作流配置中选中学科，打开三阶段配置上方的 **通用执行设置 → 剪辑模式**，选择“自动”或“手动”。每个学科只有一个剪辑模式，初稿、初审修改、终审修改共用；并发数和资源组由所选 Auto-Cut 包管理，阶段任务始终按同一包串行执行。
 
 读取或刷新 Base 元数据时首次发现的学科（例如新建的“高中历史副本”子表）默认生成“自动”草稿，补齐字段、Auto-Cut 包和阶段目录等必要设置后，仍须 **保存草稿 → 启用** 才会生效。现有学科都显示这个开关，并保留原来的自动或手动值；刷新、移除后恢复不会批量改为自动。历史配置修复及共享配置导入缺少执行模式时，继续保守使用手动。
 
 页面右上角“本机设置 → 允许本机自动剪辑”提供可点击的总开关，学科配置页也可通过“修改本机总开关”进入。设置立即生效并在本机数据库中保存，重启后保留；默认关闭。只有尚未保存设置时，`CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION` 才提供初始值，之后界面保存的选择优先（包括关闭）。关闭取消尚未开始的自动延迟或排队预约，排队任务回到待处理，正在执行的剪辑与手动任务继续；重新开启本身不会补跑历史任务。学科选择“自动”不会改变总开关。新任务还必须满足可信 Bridge 登记、已启用活动配置和本机启用包白名单等条件，模拟来源不能自动执行。保存草稿期间原活动配置继续有效，点击启用后由新配置处理后续触发；已有任务的模式和运行状态不会追溯修改，也不会自动重跑。ZIP 与上传中的“上传入队”仍单独控制。
 
-- 三阶段工作流的上传位置分别由初稿、初审修改、终审修改的 **ZIP 目标目录** 决定；“ZIP 与上传”只配置 ZIP 获取方式、来源根目录、上传入队和并发数，不再显示公共上传路径或上传目标别名。自动上传要求每个已启用阶段填写目标目录，关闭的阶段可以留空；ZIP 来源根目录用于获取生成的 ZIP，与上传目标目录用途不同。旧版工作流继续使用公共上传路径，历史路径和别名保留兼容；已有三阶段任务继续使用创建时保存的阶段目录，后续改配置不会改变其上传位置。
+- 三阶段工作流可使用课程交付目录策略：阶段任务首次绑定课程名后冻结总路径和 `01初稿`、`02初审`、`03终审` 之一的绝对上传目标。上传只从已校验并登记的单个 ZIP 制品读取；总路径必须已存在，课程和阶段子目录仅在 ZIP 哈希验证后实际发布时创建。目标同名同哈希视为已发布，同名不同哈希保持冲突且不覆盖；不支持无覆盖原子发布的 NAS 目标会被阻断。首次成功发布会持久化课程与阶段交付事实，供独立的飞书回写队列处理；上传、目录创建和回写均不会进入 Auto-Cut-Lite manifest。旧版工作流继续使用已冻结的公共或阶段上传路径，后续改配置不会改变历史任务的位置。
 - 旧版 `tables` 配置只登记允许接收事件的 Base、表、触发字段、单一可开始值和标题字段。Taskboard 管理的新工作流则保存活动 subject 快照，并分别配置 `initial`、`first_review`、`final_review` 三个阶段；两种配置都不启用飞书状态到 Taskboard 各流程列的通用映射。
 - 每个新导入的子表都会按自己的 `baseToken:tableId` 和当前字段/选项 metadata 创建完整的 phased 草稿，包含字段来源、初稿、初审修改、终审修改、Auto-Cut 路由及 ZIP/上传设置；不同子表不会共享字段或选项绑定。已有 legacy subject 刷新时只补齐缺失的 phased 结构，并保留原有触发、执行、包路由、上传、显示和本机路径设置；已停用的 legacy subject 仍保持停用，只有已启用 subject 才会因元数据刷新降为草稿。
-- 刷新 Base 元数据会把已启用学科降为待确认草稿，但不会覆盖用户尚未保存的音频标题、附件选择、时长误差或命名后缀。字段或状态选项仅改名且稳定 ID 唯一时，面板显示新名称并要求先保存草稿再启用；ID 缺失或重复时，保存和启用都会阻断，不能猜测或静默换绑。元数据刷新、修复保存和共享配置导入等草稿写入不会提前关闭 Bridge 正在使用的已启用版本；只有显式重新启用或禁用才切换或关闭该活动版本。
-- Auto-Cut 包 registry（默认 `config/taskboard-feishu-packages.json`，可由 `CODEX_FEISHU_PACKAGES_PATH` 覆盖）只登记受控的项目包别名，以及固定的 `projectId`、绝对 `workspacePath` 和提示词。只有 `state` 为 `enabled` 的包会被 Bridge 接收；草稿/禁用包仍可由 Taskboard 保存，但不会路由新事件。飞书单元格只能选择别名，不能传路径、命令或提示词。
+- 在学科配置标题栏点击 **刷新字段** 可手动更新当前已关联 Base 的字段和单选项；它不会新增学科、恢复已删除学科、删除飞书字段或改动飞书记录。新增字段和单选项会立即出现在下拉列表中；已配置但已在 Base 删除或改名的字段和单选项会清空为“请选择”，不会自动换绑到同名项。刷新不会覆盖用户尚未保存的音频标题、附件选择、时长误差或命名后缀。字段或状态选项改名后，操作人员必须在下拉菜单重新选择后才能保存草稿并启用；ID 重复时，保存和启用都会阻断。已启用学科刷新后生成待确认草稿，旧启用快照继续处理已有和正在运行的任务，直到用户保存草稿并重新启用后才切换后续触发。
+- Auto-Cut 包 registry（默认 `config/taskboard-feishu-packages.json`，可由 `CODEX_FEISHU_PACKAGES_PATH` 覆盖）只登记受控的项目包别名，以及固定的显示名称、`projectId`、绝对 `workspacePath`、提示词、ZIP 来源目录、并发数和资源组。首次保存后，显示名称、包别名和 `projectId` 都不可修改；更改工作区或版本只更新界面的只读清单版本，不会改写它们，因此已有学科、任务快照和历史记录保持可用。每个新任务冻结包的 ZIP 来源与资源组；旧任务保留自己的历史快照或来源锁。只有 `state` 为 `enabled` 的包会被 Bridge 接收；草稿/禁用包仍可由 Taskboard 保存，但不会路由新事件。飞书单元格只能选择别名，不能传路径、命令或提示词。
 - Bridge 到 Taskboard 的任务登记还需要本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。`start-local.ps1` 会在未设置时为本次启动生成随机值，并同时注入两个服务；如果单独启动 Bridge/Taskboard，请在 `.env.local` 中配置同一个随机值。该值不会写入配置导出、任务描述或日志。
-- Taskboard 导入 Base 时调用本机 Bridge 的 `POST /api/feishu/base-preview`。请求体中的 `url` 可使用直接 `/base/{base_token}[?table=<table_id>]` 链接，也可使用知识库中的 `/wiki/{wiki_token}[?table=<table_id>]` 链接；Wiki 链接会先通过飞书官方 SDK 确认节点类型为 `bitable`，再使用返回的真实 Base token，绝不把 Wiki token 直接当作 Base token。当前只支持没有嵌入账号信息的标准 `https://*.feishu.cn` 链接；接口只读取 Wiki 节点及 Base/子表/字段元数据，不读取记录、不写入飞书；`/base/workspace/{token}` 仍不支持。只要 `.env.local` 中配置了完整的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，即使 `FEISHU_LISTENER_ENABLED` 未开启也可以预览；Wiki 链接还要求该飞书应用具有 Wiki 节点只读权限并能访问对应节点。预览不会构造或启动 WebSocket 监听器，且 SDK 原始错误日志会被抑制。凭据或权限缺失时接口返回受控的脱敏错误，不回显链接、凭据或 SDK 原文。
+- Taskboard 导入 Base 或点击学科标题栏的“刷新字段”时，都会调用本机 Bridge 的 `POST /api/feishu/base-preview`。请求体中的 `url` 可使用直接 `/base/{base_token}[?table=<table_id>]` 链接，也可使用知识库中的 `/wiki/{wiki_token}[?table=<table_id>]` 链接；Wiki 链接会先通过飞书官方 SDK 确认节点类型为 `bitable`，再使用返回的真实 Base token，绝不把 Wiki token 直接当作 Base token。当前只支持没有嵌入账号信息的标准 `https://*.feishu.cn` 链接；接口只读取 Wiki 节点及 Base/子表/字段元数据，不读取记录、不写入飞书；`/base/workspace/{token}` 仍不支持。只要 `.env.local` 中配置了完整的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，普通 `start-local.ps1` 启动就支持预览和刷新字段；这不启动 WebSocket 监听器。真实事件监听仍只由 `start-local.ps1 -EnableFeishu` 开启。Wiki 链接还要求该飞书应用具有 Wiki 节点只读权限并能访问对应节点。预览不会构造或启动 WebSocket 监听器，且 SDK 原始错误日志会被抑制。凭据或权限缺失时接口返回受控的脱敏错误，不回显链接、凭据或 SDK 原文。
 - Bridge 读取已配置字段的受控记录上下文时，会请求飞书返回结构化文本，以保留文本中的 Docx/Wiki mention 链接；未配置的记录字段不会进入任务上下文。
 - Bridge 的工作流同步、共享配置导入和模拟事件写接口会校验 loopback `Host`；`Origin` 可以缺失，但出现时也必须指向 loopback。请求必须使用 `application/json`；同步请求还必须携带 `x-feishu-bridge-client: taskboard` 和本机共享密钥，漏配密钥时 fail-closed。导入和模拟请求携带 `x-feishu-bridge-client: local-operator`，`simulate-ready.ps1` 已固定发送后一个值。跨站页面、普通表单和缺少专用 header 的本机请求不能写入工作流配置或注入模拟事件；模拟事件经 Bridge 登记时会保留测试来源且不得触发自动执行。工作流生命周期同步使用期望版本比较交换；如果 Taskboard 因本地提交失败而重放一份版本、生命周期和脱敏配置完全相同的请求，Bridge 会直接返回已保存结果且不重写配置；同版本但内容不同的请求仍返回版本冲突。
 - 本地 Taskboard 源码固定收纳在本仓库的 `taskboard` 子目录。双击入口默认只使用这份源码，不再搜索相邻 worktree 或 `D:\codex\dashi-taskboard`；每次启动都会先运行 `npm run build:web`，再从最新的 `dist\web` 打开页面。Taskboard 依赖安装在 `taskboard\node_modules`，运行数据仍统一保存在本仓库被 Git 忽略的 `.runtime\taskboard`。显式传入 `-TaskboardRoot <绝对路径>` 仍可用于诊断；启动前会校验所选目录同时包含 `server\index.mjs` 与已构建的 `dist\web\index.html`，并把同一个包 registry 路径注入两个服务。停止脚本继续用进程身份与脚本命令行校验，避免匹配错误进程。
@@ -242,7 +246,7 @@ npm install
 .\scripts\start-local.ps1 -EnableFeishu
 ```
 
-健康状态可从 <http://127.0.0.1:47824/health> 查看。监听器注册的事件为 `drive.file.bitable_record_changed_v1`，由官方 SDK 管理断线自动重连；收到事件后 Bridge 只按生命周期规则创建或归档受控任务，不会自行启动 Codex，也不会回写飞书记录。若可信任务同时满足显式自动执行开关、活动 `automatic` 配置快照和本机包白名单，Taskboard 可在登记后启动 Auto-Cut。`sdk_managed` 表示 SDK 已接管生命周期，不代表应用拿到了公开的物理 socket 状态。
+健康状态可从 <http://127.0.0.1:47824/health> 查看。监听器注册的事件为 `drive.file.bitable_record_changed_v1`，由官方 SDK 管理断线自动重连；收到事件后 Bridge 只按生命周期规则创建或归档受控任务，不会自行启动 Codex。若可信任务同时满足显式自动执行开关、活动 `automatic` 配置快照和本机包白名单，Taskboard 可在登记后启动 Auto-Cut；真实受控运行确认启动后才会生成“处理中”回写意图，唯一 ZIP 成功发布后再生成阶段完成及首个课程路径回写意图，最终由认证的本机 Bridge 专用接口写入飞书已有字段/选项。模拟事件、普通任务和伪造标签不会触发目录、上传或回写。`sdk_managed` 表示 SDK 已接管生命周期，不代表应用拿到了公开的物理 socket 状态。
 
 ## 停止服务
 
@@ -257,7 +261,7 @@ npm install
 - Bridge 已支持：模拟事件、真实事件标准化、官方 SDK 长连接入口、旧版单可开始值配置、Taskboard 管理的三阶段活动配置、字段 ID 匹配、任务标题字段回退、受控项目包路由、离开值/阶段时归档未认领任务，以及幂等去重。
 - Taskboard 已支持手动启动、拖拽启动和受策略门控制的自动执行，以及 Auto-Cut、产物校验和上传生命周期；自动执行默认关闭，模拟任务不得自动执行。
 - Bridge 不会自动启动或停止 Codex；它只把经过筛选的事件登记为受控任务。执行发生在 Taskboard 中。
-- 课程交付配置可以在草稿中保存上传开关、课程命名字段、已有单选项回写规则与 `00成片` 触发条件；启用前会重新检查字段与选项。配置共享只保留字段/选项 ID，课程总路径始终是本机绑定。实际 ZIP 发布、目录创建和飞书回写由后续交付 worker 执行，不能由普通任务或模拟事件触发。
+- 课程交付配置可以在草稿中保存上传开关、课程命名字段、已有单选项回写规则与 `00成片` 触发条件；启用前会重新检查字段与选项。配置共享只保留字段/选项 ID，课程总路径始终是本机绑定。实际 ZIP 发布、目录创建和飞书回写由交付 worker 执行，不能由普通任务或模拟事件触发。
 - 当前 SDK 没有公开的物理 socket 确认或连接生命周期回调；健康接口不会伪造 `connected` 状态。
 - 暂无人工 `dead_letter` 重试 endpoint；需要人工处理时先依据队列计数和脱敏日志定位，并按评审流程操作。
 - 不提供多实例高可用（HA）；补偿 worker 在单个 Bridge 进程内串行运行。

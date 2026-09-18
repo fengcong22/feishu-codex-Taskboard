@@ -20,6 +20,13 @@ const fields = [
       { id: "opt_initial_ready", name: "初稿完成" },
     ],
   },
+  {
+    fieldId: "fld_final_directory",
+    fieldName: "成片状态",
+    type: 3,
+    uiType: "SingleSelect",
+    options: [{ id: "opt_final_directory", name: "成片" }],
+  },
   { fieldId: "fld_attachment", fieldName: "视频", type: 17, uiType: "Attachment" },
 ];
 
@@ -117,6 +124,53 @@ test("activation accepts a text or formula course naming field", () => {
     uploadEnabled: true,
   });
   assert.deepEqual(formula.issues, []);
+});
+
+test("activation permits an enabled final-directory trigger without ZIP upload", () => {
+  const result = validateDeliveryConfig(configuredDelivery({
+    rootPath: "D:\\课程交付",
+    courseNaming: { mode: "field", fieldId: "fld_course_name" },
+    coursePathWriteback: { enabled: false, fieldId: null },
+    writeback: {
+      initial: { onProcessing: [], onUploaded: [] },
+      first_review: { onProcessing: [], onUploaded: [] },
+      final_review: { onProcessing: [], onUploaded: [] },
+    },
+    finalDirectoryTrigger: {
+      enabled: true,
+      fieldId: "fld_final_directory",
+      optionId: "opt_final_directory",
+    },
+  }), {
+    mode: "activation",
+    fields,
+    stages: enabledStages,
+    uploadEnabled: false,
+  });
+  assert.deepEqual(result.issues, []);
+});
+
+test("activation rejects a final-directory trigger that would suppress a stage task", () => {
+  const result = validateDeliveryConfig(configuredDelivery({
+    finalDirectoryTrigger: {
+      enabled: true,
+      fieldId: "fld_status",
+      optionId: "opt_initial_ready",
+    },
+  }), {
+    mode: "activation",
+    fields,
+    stages: {
+      initial: {
+        enabled: true,
+        trigger: { fieldId: "fld_status", optionId: "opt_initial_ready" },
+      },
+      first_review: { enabled: false },
+      final_review: { enabled: false },
+    },
+    uploadEnabled: true,
+  });
+  assert.deepEqual(result.issues.map((issue) => issue.code), ["FINAL_DIRECTORY_TRIGGER_CONFLICT"]);
 });
 
 test("activation validates existing writeback fields and options", () => {

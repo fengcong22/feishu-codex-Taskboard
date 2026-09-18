@@ -111,6 +111,89 @@ test("migrates legacy Feishu schemas before creating their dependent indexes", a
   }
 });
 
+test("migrates legacy artifact uploads before creating the run index", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-artifact-upload-migration-"));
+  const filename = path.join(directory, "taskboard.sqlite");
+  let database = new TaskboardDatabase(filename);
+  try {
+    database.createProject({
+      id: "legacy-upload-project",
+      name: "Legacy Upload Project",
+      workspacePath: directory,
+    });
+    database.close();
+    database = null;
+
+    const legacy = new DatabaseSync(filename);
+    try {
+      legacy.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        DROP INDEX IF EXISTS artifact_uploads_run;
+        CREATE TABLE artifact_uploads_legacy (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          artifact_id TEXT NOT NULL REFERENCES task_artifacts(id) ON DELETE CASCADE,
+          subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+          storage_key TEXT NOT NULL,
+          target_id TEXT,
+          target_path TEXT NOT NULL,
+          filename TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('queued', 'uploading', 'uploaded', 'failed')),
+          attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+          error_code TEXT,
+          error_message TEXT,
+          upload_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (upload_concurrency > 0),
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          updated_at TEXT NOT NULL,
+          claim_token TEXT,
+          lease_until TEXT,
+          UNIQUE(artifact_id, target_path)
+        );
+        INSERT INTO artifact_uploads_legacy (
+          id, task_id, artifact_id, subject_key, storage_key, target_id, target_path,
+          filename, sha256, status, attempt_count, error_code, error_message,
+          upload_concurrency, created_at, started_at, completed_at, updated_at,
+          claim_token, lease_until
+        )
+        SELECT
+          id, task_id, artifact_id, subject_key, storage_key, target_id, target_path,
+          filename, sha256, status, attempt_count, error_code, error_message,
+          upload_concurrency, created_at, started_at, completed_at, updated_at,
+          claim_token, lease_until
+        FROM artifact_uploads;
+        DROP TABLE artifact_uploads;
+        ALTER TABLE artifact_uploads_legacy RENAME TO artifact_uploads;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+    } finally {
+      legacy.close();
+    }
+
+    database = new TaskboardDatabase(filename);
+    assert.equal(database.getProject("legacy-upload-project").name, "Legacy Upload Project");
+    assert.deepEqual(
+      database.database.prepare("PRAGMA table_info(artifact_uploads)").all().map(({ name }) => name),
+      [
+        "id", "task_id", "artifact_id", "subject_key", "storage_key", "target_id", "target_path",
+        "filename", "sha256", "status", "attempt_count", "error_code", "error_message",
+        "upload_concurrency", "created_at", "started_at", "completed_at", "updated_at",
+        "claim_token", "lease_until", "publication_root_path", "course_binding_id", "run_id", "published_path",
+      ],
+    );
+    assert.ok(database.database.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'artifact_uploads_run'",
+    ).get());
+  } finally {
+    database?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("historical duplicate event migration returns the task that owns the idempotency key", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-event-owner-"));
   const filename = path.join(directory, "taskboard.sqlite");

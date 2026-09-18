@@ -35,7 +35,22 @@ test("normalizes a versioned registry to enabled trusted package bindings", () =
     projectName: "演示 Auto-Cut",
     workspacePath: path.normalize(path.resolve("examples/harmless-auto-cut")),
     prompt: "执行无害演示流程。",
+    resourceGroups: [],
   });
+});
+
+test("retains normalized resource groups for enabled package bindings", () => {
+  const packages = normalizePackageRegistry({
+    version: 1,
+    packages: {
+      "Auto-cut-resource-groups": trustedPackage({
+        projectId: "resource-groups",
+        resourceGroups: [" 剪映主机 ", "音频工作站", "剪映主机", "  "],
+      }),
+    },
+  });
+
+  assert.deepEqual(packages["Auto-cut-resource-groups"].resourceGroups, ["剪映主机", "音频工作站"]);
 });
 
 test("accepts the legacy embedded package map while migrating to the registry", () => {

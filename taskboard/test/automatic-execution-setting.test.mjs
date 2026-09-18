@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { createTaskboardServer } from "../server/index.mjs";
+import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 
 const route = "/api/local/settings/automatic-execution";
 async function fixture(t, initial = false) {
@@ -12,7 +13,7 @@ async function fixture(t, initial = false) {
   let app;
   async function start(value = initial) {
     app = createTaskboardServer({ dataDirectory: directory, allowAutomaticExecution: value, codexExecutable: process.execPath });
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     return `http://127.0.0.1:${address.port}`;
   }
   const baseUrl = await start();

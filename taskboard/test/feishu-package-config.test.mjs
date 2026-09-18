@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -8,6 +8,7 @@ import {
   createFeishuPackageStore,
   normalizeFeishuPackages,
   PackageConfigError,
+  validateCustomZipOutputDirectory,
 } from "../server/feishu-package-config.mjs";
 
 test("managed Auto-Cut package store supports draft, enable, snapshot and CAS", async () => {
@@ -67,6 +68,138 @@ test("managed Auto-Cut package store supports draft, enable, snapshot and CAS", 
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("custom ZIP output mode persists only with an existing writable directory", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-custom-output-"));
+  const workspace = path.join(directory, "workspace");
+  const custom = path.join(directory, "custom-output");
+  await mkdir(workspace);
+  await mkdir(custom);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = createFeishuPackageStore({ packages: {} });
+  const draft = await store.saveDraft({
+    alias: "Auto-cut-custom-output",
+    name: "Custom output",
+    projectId: "custom-output",
+    workspacePath: workspace,
+    prompt: "fixture",
+    zipOutputMode: "custom",
+    zipSourceDirectory: custom,
+  });
+  assert.equal(draft.zipOutputMode, "custom");
+  assert.equal(draft.zipSourceDirectory, path.normalize(custom));
+  assert.equal((await store.snapshot(draft.alias)).zipOutputMode, "custom");
+  await assert.rejects(
+    () => store.saveDraft(draft.alias, {
+      zipOutputMode: "custom",
+      zipSourceDirectory: path.join(directory, "missing"),
+    }, draft.revision),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID",
+  );
+});
+
+test("legacy package records omit ZIP output mode and invalid modes are rejected", () => {
+  const legacy = normalizeFeishuPackages({
+    AutoCutLegacy: { projectId: "legacy", zipSourceDirectory: "C:\\legacy-output" },
+  });
+  assert.equal(Object.hasOwn(legacy.AutoCutLegacy, "zipOutputMode"), false);
+  assert.throws(
+    () => normalizeFeishuPackages({ version: 1, packages: {
+      invalid: { projectId: "invalid", state: "draft", zipOutputMode: "other" },
+    } }),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_INVALID",
+  );
+});
+
+test("custom ZIP output validation requires an absolute existing writable directory", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-package-custom-validate-"));
+  const file = path.join(directory, "file");
+  await writeFile(file, "fixture");
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  assert.equal(await validateCustomZipOutputDirectory(directory), path.normalize(directory));
+  for (const value of ["", "relative", path.join(directory, "missing"), file]) {
+    await assert.rejects(
+      () => validateCustomZipOutputDirectory(value),
+      (error) => error instanceof PackageConfigError && error.code === "PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID",
+    );
+  }
+  if (process.platform !== "win32" && typeof process.getuid === "function" && process.getuid() !== 0) {
+    const readOnly = path.join(directory, "read-only");
+    await mkdir(readOnly);
+    await chmod(readOnly, 0o555);
+    try {
+      await assert.rejects(
+        () => validateCustomZipOutputDirectory(readOnly),
+        (error) => error instanceof PackageConfigError && error.code === "PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID",
+      );
+    } finally {
+      await chmod(readOnly, 0o755);
+    }
+  }
+});
+
+test("persisted package identity is immutable while execution settings remain editable", async () => {
+  const store = createFeishuPackageStore({ packages: {} });
+  const created = await store.saveDraft({
+    alias: "auto-cut-lite",
+    name: "Auto-cut-lite1.6.9",
+    projectId: "auto-cut-lite",
+    prompt: "initial prompt",
+  });
+
+  await assert.rejects(
+    () => store.saveDraft(created.alias, { alias: "auto-cut-lite-renamed" }, created.revision),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_IDENTITY_IMMUTABLE",
+  );
+  await assert.rejects(
+    () => store.saveDraft(created.alias, { projectId: "other-package" }, created.revision),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_IDENTITY_IMMUTABLE",
+  );
+  await assert.rejects(
+    () => store.saveDraft(created.alias, { name: "Auto-cut-lite1.7.0" }, created.revision),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_IDENTITY_IMMUTABLE",
+  );
+
+  const updated = await store.saveDraft(created.alias, {
+    name: created.name,
+    prompt: "updated prompt",
+    maxConcurrent: 2,
+  }, created.revision);
+  assert.equal(updated.alias, "auto-cut-lite");
+  assert.equal(updated.projectId, "auto-cut-lite");
+  assert.equal(updated.name, "Auto-cut-lite1.6.9");
+  assert.equal(updated.maxConcurrent, 2);
+});
+
+test("package resource groups trim, deduplicate, and default to an empty list", () => {
+  const packages = normalizeFeishuPackages({
+    version: 1,
+    packages: {
+      "Auto-cut-resource-groups": {
+        projectId: "auto-cut-resource-groups",
+        state: "draft",
+        resourceGroups: [" 剪映主机 ", "音频工作站", "剪映主机", "  "],
+      },
+      "Auto-cut-default-resource-groups": {
+        projectId: "auto-cut-default-resource-groups",
+        state: "draft",
+      },
+    },
+  });
+
+  assert.deepEqual(packages["Auto-cut-resource-groups"].resourceGroups, ["剪映主机", "音频工作站"]);
+  assert.deepEqual(packages["Auto-cut-default-resource-groups"].resourceGroups, []);
+  assert.throws(
+    () => normalizeFeishuPackages({ version: 1, packages: {
+      "Auto-cut-invalid-resource-groups": {
+        projectId: "auto-cut-invalid-resource-groups",
+        state: "draft",
+        resourceGroups: ["剪映主机", 1],
+      },
+    } }),
+    (error) => error instanceof PackageConfigError && error.code === "PACKAGE_INVALID",
+  );
 });
 
 test("package aliases support controlled Chinese subject names", async () => {
@@ -215,8 +348,8 @@ test("concurrent mutations serialize compare-and-swap against the latest revisio
   const store = createFeishuPackageStore({ packages: {} });
   const draft = await store.saveDraft({ alias: "Auto-cut-race", name: "Race", projectId: "auto-cut-race" });
   const results = await Promise.allSettled([
-    store.saveDraft("Auto-cut-race", { name: "first" }, draft.revision),
-    store.saveDraft("Auto-cut-race", { name: "second" }, draft.revision),
+    store.saveDraft("Auto-cut-race", { prompt: "first" }, draft.revision),
+    store.saveDraft("Auto-cut-race", { prompt: "second" }, draft.revision),
   ]);
   assert.equal(results.filter((entry) => entry.status === "fulfilled").length, 1);
   assert.equal(results.filter((entry) => entry.status === "rejected")[0].reason.code, "PACKAGE_REVISION_CONFLICT");
@@ -231,8 +364,8 @@ test("separate stores sharing a registry serialize compare-and-swap", async () =
     const secondStore = createFeishuPackageStore({ filename });
     const draft = await firstStore.saveDraft({ alias: "Auto-cut-shared", name: "Shared", projectId: "shared" });
     const results = await Promise.allSettled([
-      firstStore.saveDraft("Auto-cut-shared", { name: "first" }, draft.revision),
-      secondStore.saveDraft("Auto-cut-shared", { name: "second" }, draft.revision),
+      firstStore.saveDraft("Auto-cut-shared", { prompt: "first" }, draft.revision),
+      secondStore.saveDraft("Auto-cut-shared", { prompt: "second" }, draft.revision),
     ]);
     assert.equal(results.filter((entry) => entry.status === "fulfilled").length, 1);
     assert.equal(results.filter((entry) => entry.status === "rejected")[0].reason.code, "PACKAGE_REVISION_CONFLICT");
@@ -249,7 +382,7 @@ test("separate stores sharing a registry serialize remove and update", async () 
     const secondStore = createFeishuPackageStore({ filename });
     const draft = await firstStore.saveDraft({ alias: "Auto-cut-shared-remove", name: "Shared", projectId: "shared-remove" });
     const results = await Promise.allSettled([
-      secondStore.saveDraft(draft.alias, { name: "updated" }, draft.revision),
+      secondStore.saveDraft(draft.alias, { prompt: "updated" }, draft.revision),
       firstStore.remove(draft.alias, draft.revision),
     ]);
     assert.equal(results.filter((entry) => entry.status === "fulfilled").length, 1);

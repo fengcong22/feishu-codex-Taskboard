@@ -29,8 +29,8 @@ autocut-lite-delivery-<version>/
 
 ## 1. 文档身份与状态标记
 
-- 文档版本：`1.1`。
-- 更新日期：`2026-09-11`。
+- 文档版本：`1.2`。
+- 更新日期：`2026-09-18`。
 - Taskboard 基线分支：`codex/dashboard-feature`；已批准实施计划基线为完整 commit `8fab8a7d17178bc4e02c159709683ed64f03bc68`。当前功能、跨端校验和合同文本的权威实现基线，统一以本文件所在的最终 Git commit 为准，避免后续修订引用过期提交。
 - Taskboard 负责的接口生产者：`taskboard/server/autocut-local-runner.mjs`、`feishu-source-manifest.mjs`、`feishu-run-inputs.mjs`、`app.mjs`、`artifact-service.mjs`、`cli/taskctl.mjs` 和 `shared/codex-environment.mjs`。
 - Auto-Cut Lite 兼容基线：只读核对的源码完整 commit 为 `c950e82bfa1c955f2081e73c5a34cb825f9a2053`，本机已部署包版本为 `1.6.7+codex.20260908133808`，其 `PACKAGE-MANIFEST.json` SHA-256 为 `2bf1d8f766475b2a66faf6d6223f8c7006b397e160cdc04c51c73b34faa13f1c`。该核对未修改、构建或部署 Auto-Cut Lite；本文件描述的 `review-document-run`、Lite ZIP、结果回执和运行时发现契约以此作为 `CURRENT` 兼容参照。
@@ -73,6 +73,27 @@ autocut-lite-delivery-<version>/
 - `replace_original` + `docx_section`：按文档目录读取外部音频，静音视频原音并按正数 `duration_tolerance_seconds` 对齐。
 - `replace_original` + `base_attachment`：按指定附件字段读取唯一音频附件，静音视频原音并按同一时长容差对齐。
 - 外部来源缺失、附件不唯一、下载失败、无法识别媒体类型或时长超过容差时，返回阻塞结果，不回退到视频原音或另一个来源。
+
+### 2.3 ZIP 生成目录声明
+
+`REQUIRED`：Auto-Cut-Lite 在工作区根目录的 `PACKAGE-MANIFEST.json` 增加以下可选能力声明。插件名称和版本仍从 `.codex-plugin/plugin.json` 读取；ZIP 目录不放在该插件身份文件中。
+
+```json
+{
+  "interface": {
+    "zipOutput": {
+      "relativeDirectory": "output"
+    }
+  }
+}
+```
+
+- `relativeDirectory` 是非空的工作区相对目录，可使用 `/` 或 `\\` 分隔；不得使用绝对路径、盘符、UNC、空段、`.`、`..` 或 Windows 非法/保留名称。不允许通过目录链接越出工作区。
+- Taskboard 的“验证并读取”只读取声明、解析绝对目录并显示未保存预览，不执行包代码、不创建目录、不修改包 registry。用户显式保存或启用时才重新读取清单并准备目录；声明失效、目录变化或创建失败时阻断操作并提示重新验证。
+- 没有声明的旧版本继续使用原有手动 ZIP 来源配置。加载列表、刷新页面或升级不会自动替换历史路径，也不会修改已有任务的冻结快照。
+- 声明只提供 ZIP 生成根目录；它不声明 NAS 上传目录、课程目录或各阶段目录。Taskboard 继续生成每次运行唯一的 `CODEX_AUTOCUT_PACKAGE_ZIP_PATH`，位于配置根目录内的 `.taskboard-autocut/<taskId>/<runId>/<artifactName>.zip`。
+- Auto-Cut-Lite 必须优先使用注入的准确 ZIP 路径，生成成功后按照本文现有 `result.json`、receipt 与 artifact report 协议报告同一文件；不得改用默认目录中的另一个文件、扫描目录或选择“最新 ZIP”。仍是一条运行只登记一个 ZIP。
+- Taskboard 也允许用户显式选择一个已存在且可写的本机自定义 ZIP 根目录；该选择保存在包配置和新任务的不可变包快照中。自定义目录可以在工作区外，仍必须由 Taskboard 生成、冻结并通过 `CODEX_AUTOCUT_PACKAGE_ZIP_PATH` 注入。Lite 无需认识目录模式，只需继续校验并使用注入的完整绝对 ZIP 路径。历史任务不因包配置变更而迁移。
 
 ## 3. 两条执行路径
 
@@ -444,7 +465,7 @@ X-Taskboard-Client: taskctl
 - Base 单元格只能提供受控字段值、opaque ID 和包别名；不得提供 workspace path、shell、Codex 参数、prompt、凭据、ZIP 路径或上传目标。
 - 所有路径都由 Taskboard 服务器绑定并做绝对路径、realpath、根目录和精确文件名校验。Auto-Cut Lite 只能写入 `CODEX_AUTOCUT_DRAFTS_ROOT`、`CODEX_AUTOCUT_PACKAGE_ZIP_PATH` 和自身 run 临时目录。
 - `CODEX_AUTOCUT_ARTIFACT_REPORT_TOKEN` 是短期 run capability；不能跨 task/run/stage/config 使用，也不能从评论、飞书单元格或自由文本取得。
-- 模拟事件、普通任务、复制描述标记和 `feishu` 标签不能获得 Auto-Cut 执行资格。Taskboard 不启动 Codex Bridge，也不回写飞书记录。
+- 模拟事件、普通任务、复制描述标记和 `feishu` 标签不能获得 Auto-Cut 执行资格。Taskboard 不启动 Codex Bridge；受控回写只由交付 worker 通过认证的本机 Bridge 专用接口执行，且仅写入已校验的已有字段和选项。
 
 ## 13. 完整验收矩阵
 

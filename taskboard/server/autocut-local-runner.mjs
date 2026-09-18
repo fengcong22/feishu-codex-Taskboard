@@ -177,7 +177,7 @@ async function runProcess(command, args, options, { signal, timeoutMs, timeoutCo
     failure = runnerError(code, message);
     signalProcessTree(child, "SIGTERM");
   };
-  const abort = () => terminate("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted because Taskboard is shutting down");
+  const abort = () => terminate("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted");
   if (signal?.aborted) abort();
   else signal?.addEventListener("abort", abort, { once: true });
   const stdout = collect(child.stdout);
@@ -262,7 +262,7 @@ export async function runLocalAutoCut({
     env: runtimeEnv,
   }, { signal, timeoutMs: runTimeoutMs, timeoutCode: "AUTOCUT_RUN_TIMEOUT", preflightTimeoutMs, onProgress });
   if (signal?.aborted) {
-    throw runnerError("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted because Taskboard is shutting down");
+    throw runnerError("AUTOCUT_RUN_INTERRUPTED", "Auto-Cut was interrupted");
   }
   if (result.exitCode !== 0) {
     throw runnerError(

@@ -398,6 +398,21 @@ export interface Project {
 
 export type FeishuPackageState = "draft" | "enabled" | "disabled";
 
+export interface FeishuPackageZipOutput {
+  relativeDirectory: string;
+  directory: string;
+}
+
+export interface FeishuPackageWorkspaceInspection {
+  displayName: string;
+  pluginVersion: string;
+  runtimeVersion: string | null;
+  defaultPrompt: string | null;
+  alias: string;
+  projectId: string;
+  zipOutput?: FeishuPackageZipOutput | null;
+}
+
 export interface AutoCutPackageDraft {
   alias: string;
   name: string;
@@ -407,7 +422,9 @@ export interface AutoCutPackageDraft {
   reasoningEffort: string | null;
   prompt: string | null;
   zipSourceDirectory: string | null;
+  zipOutputMode?: "package_default" | "custom";
   maxConcurrent: number;
+  resourceGroups: string[];
 }
 
 export interface FeishuPackage extends AutoCutPackageDraft {
@@ -437,6 +454,8 @@ export type AutoCutPackageReference =
   };
 
 export interface FeishuPackageSummary extends FeishuPackage {
+  /** Read-only manifest metadata. It never changes the saved routing identity. */
+  identity?: FeishuPackageWorkspaceInspection | null;
   referenceCount: number;
   references: AutoCutPackageReference[];
 }
@@ -486,6 +505,23 @@ export interface FeishuStageConfig {
 
 export type FeishuStageConfigMap = Record<FeishuStageId, FeishuStageConfig>;
 
+export interface FeishuDeliveryAssignment {
+  fieldId: string | null;
+  optionId: string | null;
+}
+
+export interface FeishuDeliveryConfig {
+  version: 1;
+  rootPath: string | null;
+  courseNaming: { mode: "reuse_artifact_naming" | "field"; fieldId: string | null };
+  coursePathWriteback: { enabled: boolean; fieldId: string | null };
+  writeback: Record<FeishuStageId, {
+    onProcessing: FeishuDeliveryAssignment[];
+    onUploaded: FeishuDeliveryAssignment[];
+  }>;
+  finalDirectoryTrigger: { enabled: boolean; fieldId: string | null; optionId: string | null };
+}
+
 export interface FeishuAutoCutRun {
   runId: string;
   taskId: string;
@@ -512,10 +548,13 @@ export interface FeishuSubjectConfig {
   displayEnabled: boolean;
   lifecycle: "draft" | "enabled" | "disabled";
   configVersion: number;
+  /** Server-owned active version; a newer draft may coexist with it. */
+  readonly activeConfigVersion?: number | null;
   statusField?: { fieldId: string; fieldName: string; type?: string; options?: FeishuFieldOption[] };
   documentField?: { fieldId: string; fieldName: string; kind?: string };
   namingField?: { fieldId: string; fieldName: string; kind?: string };
   stages?: FeishuStageConfigMap;
+  delivery?: FeishuDeliveryConfig | null;
   trigger?: { fieldId: string; fieldName: string; startValue: string; optionId: string | null };
   title?: { fieldId: string | null; fieldName: string | null };
   execution?: { mode: "manual" | "automatic"; concurrencyGroup: string; maxConcurrent: number; resourceGroups: string[] };
@@ -828,6 +867,7 @@ export interface FeishuTaskOrigin {
 
 export interface FeishuTaskPackageSnapshot {
   zipSourceDirectory: string | null;
+  zipOutputMode?: "package_default" | "custom";
 }
 
 export interface ArtifactUpload {

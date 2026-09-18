@@ -11,6 +11,7 @@
       "reasoningEffort": null,
       "zipSourceDirectory": null,
       "maxConcurrent": 1,
+      "resourceGroups": [],
       "state": "enabled"
     }
   }
