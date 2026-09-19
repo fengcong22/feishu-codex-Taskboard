@@ -11,6 +11,7 @@ import { createArtifactService } from "../server/artifact-service.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
 import { createArtifactUploadWorker } from "../server/upload-worker.mjs";
 import { createStoredZip } from "./stored-zip-fixture.mjs";
+import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 
 const TEST_FEISHU_BRIDGE_SECRET = "fixture-feishu-bridge-secret-2026";
 const createTaskboardServer = (options = {}) => createTaskboardServerBase({
@@ -171,7 +172,7 @@ async function createDriverReportFixture(prefix, optionOverrides = {}) {
   const fixture = { app: null, baseUrl: null, directory, options, taskSequence: 0 };
   fixture.start = async () => {
     fixture.app = createTaskboardServer(options);
-    const address = await fixture.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(fixture.app);
     fixture.baseUrl = `http://127.0.0.1:${address.port}`;
   };
   fixture.restart = async () => {
@@ -1046,7 +1047,7 @@ test("a manual Feishu task copies a verified Jianying ZIP through the local uplo
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1209,7 +1210,7 @@ test("automatic upload mode follows ZIP verification and manual acceptance witho
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1349,7 +1350,7 @@ test("automatic upload enqueue is recovered from completed tasks after a restart
   let app;
   try {
     app = createTaskboardServer(options);
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1411,7 +1412,7 @@ test("automatic upload enqueue is recovered from completed tasks after a restart
     assert.deepEqual((await request(baseUrl, `/api/local/tasks/${task.id}/upload`)).body.uploads, []);
     await app.close();
     app = createTaskboardServer(options);
-    const restartedAddress = await app.listen({ host: "127.0.0.1", port: 0 });
+    const restartedAddress = await listenTaskboardOnFetchSafePort(app);
     const restartedUrl = `http://127.0.0.1:${restartedAddress.port}`;
     const uploads = await request(restartedUrl, `/api/local/tasks/${task.id}/upload`);
     assert.equal(uploads.response.status, 200);
@@ -1440,7 +1441,7 @@ test("a task keeps the upload target and concurrency from its creation-time subj
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1543,7 +1544,7 @@ test("a completed task created before upload setup can use the current target", 
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1631,7 +1632,7 @@ test("a manual task cannot enter the upload queue before review approval", async
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1705,7 +1706,7 @@ test("upload queue is idempotent for the same artifact and destination", async (
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -1826,7 +1827,7 @@ test("a different ZIP with the same destination filename is rejected without ove
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", { method: "POST", json: { baseToken: "bas_conflict", baseName: "剪辑学科", tables: [{ tableId: "tbl_subject", tableName: "语文", fields: [] }] } });
     const subject = catalog.body.catalog[0].subjects[0];
@@ -1889,7 +1890,7 @@ test("missing artifact content fails safely and can be retried after restoration
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", { method: "POST", json: { baseToken: "bas_retry", baseName: "剪辑学科", tables: [{ tableId: "tbl_subject", tableName: "语文", fields: [] }] } });
     const subject = catalog.body.catalog[0].subjects[0];
@@ -1973,7 +1974,7 @@ async function assertUploadCompletionRechecksTrustedFeishuProvenance({ baseToken
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -2101,7 +2102,7 @@ test("editing a trusted Feishu task revokes upload queue access and retry", asyn
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", {
       method: "POST",
@@ -2202,7 +2203,7 @@ test("an archived task cannot be permanently deleted while its ZIP upload is que
     feishuWorkflowSync: async () => ({ ok: true }),
   });
   try {
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenTaskboardOnFetchSafePort(app);
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const catalog = await request(baseUrl, "/api/local/feishu/workflow/catalog", { method: "POST", json: { baseToken: "bas_delete", baseName: "剪辑学科", tables: [{ tableId: "tbl_subject", tableName: "语文", fields: [] }] } });
     const subject = catalog.body.catalog[0].subjects[0];

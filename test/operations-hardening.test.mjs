@@ -515,12 +515,20 @@ test("root npm test enforces the bundled Taskboard quality gates", async () => {
   assert.match(command, /npm --prefix taskboard run test:components/);
 });
 
-test("root CI installs both workspaces and runs the complete root gate", async () => {
+test("root CI installs both workspaces and runs the stable complete gate", async () => {
   const source = await readFile(rootCheckWorkflowUrl, "utf8");
+  const packageJson = JSON.parse(await readFile(packageUrl, "utf8"));
+  const command = packageJson.scripts?.["test:ci"] ?? "";
   assert.match(source, /runs-on:\s*windows-latest/);
   assert.match(source, /npm ci\s*$/m);
   assert.match(source, /npm ci --prefix taskboard/);
-  assert.match(source, /npm test\s*$/m);
+  assert.match(source, /^\s*run:\s*npm run test:ci\s*$/m);
+  assert.deepEqual(command.split(/\s*&&\s*/), [
+    "node --test --test-concurrency=1",
+    "npm --prefix taskboard run typecheck",
+    "npm --prefix taskboard run build:web",
+    "npm --prefix taskboard run test:components",
+  ]);
 });
 
 test("README points team members to the operating contract", async () => {
