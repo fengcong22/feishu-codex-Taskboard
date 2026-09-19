@@ -112,6 +112,7 @@ async function createFixture({
   processEnvironmentOverrides = {},
   packageZipSourceDirectory = undefined,
   packageZipOutputMode = undefined,
+  coursePathResolver = undefined,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-autocut-lifecycle-"));
   const workspacePath = path.join(directory, "workspace");
@@ -194,6 +195,7 @@ if (args[0] === "debug") {
     allowAutomaticExecution,
     autoCutRunner,
     localAutoCutArtifactReportTimeoutMs,
+    ...(coursePathResolver ? { coursePathResolver } : {}),
   };
   const app = createTaskboardServer(serverOptions);
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
@@ -1361,7 +1363,15 @@ test("a real running phased Auto-Cut run persists its processing writeback inten
     namingValueUnique: true,
     courseName: "课程处理中",
   };
-  const fixture = await createFixture({ controlledContext });
+  const fixture = await createFixture({
+    controlledContext,
+    // This lifecycle test exercises processing writeback, not the host's
+    // Windows Management Instrumentation. Keep the course path deterministic.
+    coursePathResolver: {
+      classifyDrive: async () => "local",
+      resolveMappedDrive: async () => { throw new Error("local roots do not resolve UNC mappings"); },
+    },
+  });
   try {
     const subject = await registerSubject(fixture, {
       delivery: {
@@ -1618,7 +1628,16 @@ test("a custom package ZIP directory is frozen and accepted independently of the
     const started = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
     assert.equal(started.response.status, 202, JSON.stringify(started.body));
     const run = await waitForRun(fixture.app, created.body.task.id);
-    assert.equal(path.relative(customRoot, run.packageZipPath).startsWith(".."), false);
+    // prepareFeishuRunInputs canonicalizes the configured root. Windows hosted
+    // runners can expose their temporary directory through a junction, so
+    // compare against the same canonical root instead of its input spelling.
+    const relativePackageZipPath = path.relative(await realpath(customRoot), run.packageZipPath);
+    assert.equal(
+      path.isAbsolute(relativePackageZipPath)
+        || relativePackageZipPath === ".."
+        || relativePackageZipPath.startsWith(`..${path.sep}`),
+      false,
+    );
     await rm(fixture.zipSourceDirectory, { recursive: true, force: true });
     const archiveSha256 = await writePassingRunResult(run);
     const reported = await reportRunArtifact(fixture, run, { sha256: archiveSha256 });
