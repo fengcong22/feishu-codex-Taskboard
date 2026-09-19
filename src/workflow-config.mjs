@@ -61,6 +61,7 @@ const SUBJECT_KEYS = new Set([
   "packageRoute",
   "upload",
   "statusField",
+  "reviewStatusField",
   "documentField",
   "namingField",
   "courseNamingField",
@@ -353,22 +354,23 @@ export function normalizeStage(value, metadata = {}, stageId = "stage") {
   };
 }
 
-function normalizeStages(value, statusField) {
+function normalizeStages(value, statusField, reviewStatusField = statusField) {
   const input = plainObject(value, "stages");
   const unknown = Object.keys(input).find((stageId) => !STAGE_IDS.includes(stageId));
   if (unknown) fail(`stages.${unknown} is not supported`);
   const result = {};
   for (const stageId of STAGE_IDS) {
     if (!Object.hasOwn(input, stageId)) fail(`stages.${stageId} is required`);
-    result[stageId] = normalizeStage(input[stageId], { statusField }, stageId);
+    result[stageId] = normalizeStage(input[stageId], { statusField: stageId === "initial" ? statusField : reviewStatusField }, stageId);
   }
   const enabled = STAGE_IDS.filter((stageId) => result[stageId].enabled);
   if (enabled.length === 0) fail("at least one stage must be enabled");
-  const optionIds = enabled.map((stageId) => result[stageId].trigger.optionId);
+  const optionIds = enabled.map((stageId) => JSON.stringify([result[stageId].trigger.fieldId, result[stageId].trigger.optionId]));
   if (new Set(optionIds).size !== optionIds.length) fail("enabled stage trigger options must be unique");
-  const knownOptions = new Map((statusField.options ?? []).map((entry) => [entry.optionId, entry.value]));
   for (const stageId of enabled) {
     const stage = result[stageId];
+    const descriptor = stageId === "initial" ? statusField : reviewStatusField;
+    const knownOptions = new Map((descriptor.options ?? []).map((entry) => [entry.optionId, entry.value]));
     if (knownOptions.size && !knownOptions.has(stage.trigger.optionId)) {
       fail(`stages.${stageId}.trigger.optionId is not present in statusField options`);
     }
@@ -474,7 +476,7 @@ function normalizeUpload(value, name = "upload") {
 
 function isPhasedSubject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
-    && (value.statusField || value.documentField || value.namingField || value.stages));
+    && (value.statusField || value.reviewStatusField || value.documentField || value.namingField || value.stages));
 }
 
 /**
@@ -499,6 +501,10 @@ export function validateSubjectConfig(value) {
     fail("subject.subjectKey does not match baseToken/tableId");
   }
   const statusField = normalizeStatusField(input.statusField);
+  const reviewStatusField = input.reviewStatusField == null
+    ? statusField : normalizeStatusField(input.reviewStatusField, "reviewStatusField");
+  const stages = normalizeStages(input.stages, statusField, reviewStatusField);
+  const firstTrigger = STAGE_IDS.map((stageId) => stages[stageId]).find((stage) => stage.enabled).trigger;
   const execution = normalizeExecution(input.execution ?? {
     mode: input.mode ?? "manual",
     concurrencyGroup: "default",
@@ -529,18 +535,17 @@ export function validateSubjectConfig(value) {
     ...(input.enabledAt !== undefined ? { enabledAt: timestamp(input.enabledAt, "subject.enabledAt") } : {}),
     ...(input.closedAt !== undefined ? { closedAt: timestamp(input.closedAt, "subject.closedAt") } : {}),
     trigger: input.trigger ? normalizeTrigger(input.trigger, "subject.trigger") : {
-      fieldId: statusField.fieldId,
-      fieldName: statusField.fieldName,
-      startValue: STAGE_IDS.map((stageId) => input.stages?.[stageId])
-        .find((stage) => stage?.enabled)?.trigger?.value ?? "phased",
-      optionId: STAGE_IDS.map((stageId) => input.stages?.[stageId])
-        .find((stage) => stage?.enabled)?.trigger?.optionId ?? null,
+      fieldId: firstTrigger.fieldId,
+      fieldName: firstTrigger.fieldName,
+      startValue: firstTrigger.value,
+      optionId: firstTrigger.optionId,
     },
     title: normalizeTitle(input.title),
     statusField,
+    ...(input.reviewStatusField == null ? {} : { reviewStatusField }),
     documentField: normalizeConfiguredField(input.documentField, "documentField", "docx"),
     namingField: normalizeConfiguredField(input.namingField, "namingField", input.namingField?.kind ?? "text"),
-    stages: normalizeStages(input.stages, statusField),
+    stages,
     execution,
     packageRoute: normalizePackageRoute(input.packageRoute ?? { packageAlias: input.defaultPackageAlias }),
     upload,

@@ -397,6 +397,40 @@ test("partial ephemeral restart stops the surviving identity match and clears it
   }
 });
 
+test("ephemeral restart clears a stale partial marker after confirming its PID is absent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-ephemeral-stale-marker-"));
+  const pidFile = join(directory, "bridge.pid");
+  const identityFile = join(directory, "bridge.process.json");
+  const modeFile = join(directory, "bridge.feishu-mode");
+  try {
+    await writeFile(pidFile, "4242", "utf8");
+    const command = [
+      `$source = Get-Content -LiteralPath ${powershellLiteral(fileURLToPath(files.start))} -Raw`,
+      "$tokens = $null",
+      "$errors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)",
+      "foreach ($name in @('Remove-ProcessMarkerFilesIfUnchanged', 'Stop-ExistingLocalNodeForEphemeralSecret')) { $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true); if (-not $definition) { throw \"$name definition is missing\" }; Invoke-Expression $definition.Extent.Text }",
+      "$global:node = 'node.exe'",
+      "$global:queriedPid = $null",
+      "function global:Get-ProcessMarkerFileSnapshot { param([string]$Path) if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]@{ Exists = $false; Bytes = $null } }; return [pscustomobject]@{ Exists = $true; Bytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) } }",
+      "function global:Test-ProcessMarkerFileSnapshot { param([string]$Path, [object]$Expected) $current = Get-ProcessMarkerFileSnapshot $Path; return $current -and $Expected -and [bool]$current.Exists -eq [bool]$Expected.Exists -and [string]$current.Bytes -eq [string]$Expected.Bytes }",
+      "function global:Read-PersistedProcessId { return 4242 }",
+      "function global:Read-PersistedProcessIdentity { return $null }",
+      "function global:Get-ProcessQueryResult { param([int]$ProcessId) $global:queriedPid = $ProcessId; return [pscustomobject]@{ Succeeded = $true; Process = $null; Error = $null } }",
+      "function global:Get-CimInstance { return @() }",
+      `Stop-ExistingLocalNodeForEphemeralSecret 'Feishu Bridge' ${powershellLiteral(pidFile)} ${powershellLiteral(identityFile)} 'C:\\bridge\\src\\index.mjs' ${powershellLiteral(modeFile)} 47824`,
+      "if ($global:queriedPid -ne 4242) { throw 'the stale PID was not queried before cleanup' }",
+      `if (Test-Path -LiteralPath ${powershellLiteral(pidFile)}) { throw 'the stale PID marker was not removed' }`,
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("ephemeral startup refuses a process that appears after paired preflight", async () => {
   const source = await readFile(files.start, "utf8");
   assert.match(source, /\[switch\]\$RequireFresh/);

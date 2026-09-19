@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   WORKFLOW_SCHEMA_VERSION,
   subjectKey,
+  validateSubjectConfig,
   validateWorkflowConfig,
 } from "../src/workflow-config.mjs";
 import { validateConfig as validateBridgeConfig } from "../src/config.mjs";
@@ -70,6 +71,80 @@ function validConfig(overrides = {}) {
     ...overrides,
   };
 }
+
+function twoFieldSubject() {
+  const stage = (fieldId, fieldName, optionId, value) => ({
+    enabled: true,
+    trigger: { fieldId, fieldName, optionId, value },
+    videoSource: { kind: "docx_section", anchorText: `${value} video` },
+    reviewSource: { kind: "docx_section", anchorText: `${value} review` },
+    audio: { mode: "video_original" },
+    artifactTargetPath: null,
+  });
+  return validSubject({
+    statusField: { fieldId: "fld_progress", fieldName: "Initial", options: [{ optionId: "opt_ready", value: "Ready" }] },
+    reviewStatusField: {
+      fieldId: "fld_review", fieldName: "Review", options: [
+        { optionId: "opt_ready", value: "First" },
+        { optionId: "opt_final", value: "Final" },
+      ],
+    },
+    documentField: { fieldId: "fld_document", fieldName: "Document" },
+    namingField: { fieldId: "fld_title", fieldName: "Title" },
+    stages: {
+      initial: stage("fld_progress", "Initial", "opt_ready", "Ready"),
+      first_review: stage("fld_review", "Review", "opt_ready", "First"),
+      final_review: stage("fld_review", "Review", "opt_final", "Final"),
+    },
+  });
+}
+
+test("two trigger fields accept option IDs reused in separate fields and reject same-field duplicates", () => {
+  const subject = twoFieldSubject();
+  const normalized = validateSubjectConfig(subject);
+  assert.equal(normalized.reviewStatusField.fieldId, "fld_review");
+  assert.deepEqual(normalized.stages.first_review.audio, subject.stages.first_review.audio);
+  subject.stages.final_review.trigger = { ...subject.stages.first_review.trigger };
+  assert.throws(() => validateSubjectConfig(subject), /unique/u);
+});
+
+test("two trigger fields reject wrong-stage fields and project a review-only legacy trigger", () => {
+  const subject = twoFieldSubject();
+  subject.stages.first_review.trigger.fieldId = subject.statusField.fieldId;
+  assert.throws(() => validateSubjectConfig(subject), /fieldId must match/u);
+  subject.stages.first_review.trigger.fieldId = subject.reviewStatusField.fieldId;
+  subject.stages.initial.enabled = false;
+  delete subject.trigger;
+  assert.equal(validateSubjectConfig(subject).trigger.fieldId, "fld_review");
+});
+
+test("two trigger fields survive share export/import and lifecycle synchronization", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-two-fields-"));
+  try {
+    const subject = twoFieldSubject();
+    const store = createWorkflowConfigStore({ filename: path.join(directory, "source.json"), initial: validConfig({
+      bases: [{ ...validConfig().bases[0], subjects: [subject] }],
+    }) });
+    const shared = await store.exportShareable();
+    const target = createWorkflowConfigStore({ filename: path.join(directory, "target.json") });
+    const imported = await target.importShareable(shared);
+    assert.equal(imported.bases[0].subjects[0].reviewStatusField.fieldId, "fld_review");
+    const sync = createWorkflowConfigStore({ filename: path.join(directory, "sync.json"), packageAliases: ["Auto-cut-copyA"] });
+    const enabled = await sync.syncSubject({ ...subject, configVersion: 2 }, { lifecycle: "enabled", expectedVersion: 1 });
+    assert.equal(enabled.reviewStatusField.fieldId, "fld_review");
+    const legacy = structuredClone(subject);
+    legacy.reviewStatusField = null;
+    legacy.statusField.options.push(...subject.reviewStatusField.options.map((option) => ({ ...option, optionId: `review_${option.optionId}` })));
+    for (const stageId of ["first_review", "final_review"]) {
+      legacy.stages[stageId].trigger = { ...legacy.stages[stageId].trigger, fieldId: "fld_progress", fieldName: "Initial", optionId: `review_${legacy.stages[stageId].trigger.optionId}` };
+    }
+    const updated = await sync.syncSubject({ ...legacy, configVersion: 3 }, { lifecycle: "enabled", expectedVersion: 2 });
+    assert.equal(updated.reviewStatusField, null);
+    assert.equal(updated.stages.first_review.trigger.fieldId, "fld_progress");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function waitForFile(filename) {
   for (let attempt = 0; attempt < 250; attempt += 1) {

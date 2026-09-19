@@ -35,6 +35,7 @@ export const WORKFLOW_SCHEMA_VERSION = 1;
 const PENDING_IDENTIFIERS = new Set([
   "pending",
   "pending_status_field",
+  "pending_review_status_field",
   "pending_document_field",
   "pending_naming_field",
   "pending_initial_option",
@@ -96,7 +97,7 @@ function isPendingIdentifier(value) {
 }
 
 function isPendingPhasedDefaults(subject) {
-  return [subject?.statusField, subject?.documentField, subject?.namingField]
+  return [subject?.statusField, subject?.reviewStatusField, subject?.documentField, subject?.namingField]
     .some((field) => isPendingIdentifier(field?.fieldId))
     || isPendingIdentifier(subject?.trigger?.fieldId)
     || isPendingIdentifier(subject?.trigger?.optionId)
@@ -171,10 +172,15 @@ function repairStageDefaults(defaultStage, existingStage, stageId) {
     const value = clone(source[sourceKey]);
     // Placeholders are intentionally replaced by the metadata-derived default
     // when a later refresh supplies real field/option identifiers.
-    if (key === "trigger"
-      && (isPendingIdentifier(value?.fieldId ?? value?.field_id)
-        || isPendingIdentifier(value?.optionId ?? value?.option_id)
-        || (value?.fieldId ?? value?.field_id) !== defaultStage.trigger.fieldId)) continue;
+    if (key === "trigger") {
+      const triggerFieldId = value?.fieldId ?? value?.field_id;
+      // A pending field means the table was first discovered without usable
+      // metadata, so a later refresh may bind it from the new metadata.  A
+      // pending option on an otherwise still-selected field is different: it
+      // records a deleted or renamed Feishu option and must stay empty until
+      // the operator chooses an option again.
+      if (isPendingIdentifier(triggerFieldId) || triggerFieldId !== defaultStage.trigger.fieldId) continue;
+    }
     const candidate = { ...repaired, [key]: value };
     try {
       const normalized = normalizeStage(candidate, null, stageId);
@@ -263,7 +269,7 @@ function phasedDefaultsForSubject({
     : null;
   const hasPersistedPhasedShape = Boolean(
     existing
-    && ["statusField", "documentField", "namingField", "stages"]
+    && ["statusField", "reviewStatusField", "documentField", "namingField", "stages"]
       .some((key) => existing[key] !== undefined && existing[key] !== null),
   );
   const migratingLegacySubject = Boolean(existing && !hasPersistedPhasedShape);
@@ -301,8 +307,8 @@ function phasedDefaultsForSubject({
     ))
     : [];
   const existingTriggerFieldIds = [
-    existing?.trigger?.fieldId ?? existing?.trigger?.field_id,
-    ...STAGE_IDS.map((stageId) => (
+    ...(existing?.reviewStatusField == null ? [existing?.trigger?.fieldId ?? existing?.trigger?.field_id] : []),
+    ...(existing?.reviewStatusField == null ? STAGE_IDS : ["initial"]).map((stageId) => (
       existing?.stages?.[stageId]?.trigger?.fieldId
       ?? existing?.stages?.[stageId]?.trigger?.field_id
     )),
@@ -355,6 +361,10 @@ function phasedDefaultsForSubject({
       : fallback;
   };
   const statusField = reusableDescriptor(existing?.statusField, defaultStatusField);
+  const reviewStatusField = existing?.reviewStatusField == null ? existing?.reviewStatusField
+    : reusableDescriptor(existing.reviewStatusField, metadataDescriptor(null, "pending_review_status_field"));
+  const reviewStatusCandidate = reviewStatusField == null ? statusCandidate
+    : fields.find((field) => metadataFieldId(field) === reviewStatusField.fieldId);
   const documentField = reusableDescriptor(existing?.documentField, defaultDocumentField);
   const namingField = reusableDescriptor(existing?.namingField, defaultNamingField);
   const initialStageHasIntent = Boolean(
@@ -368,7 +378,9 @@ function phasedDefaultsForSubject({
     existing && !hasUsableStageTrigger(existing?.stages?.initial, statusField.fieldId),
   );
   const defaultStages = Object.fromEntries(STAGE_IDS.map((stageId, index) => {
-    let option = metadataOption(statusCandidate, index);
+    const stageStatusField = stageId === "initial" ? statusField : reviewStatusField ?? statusField;
+    const stageStatusCandidate = stageId === "initial" ? statusCandidate : reviewStatusCandidate;
+    let option = metadataOption(stageStatusCandidate, reviewStatusField && stageId !== "initial" ? index - 1 : index);
     const topLevelTriggerFieldId = validIdentifier(existingTrigger?.fieldId);
     if (
       stageId === "initial"
@@ -440,8 +452,8 @@ function phasedDefaultsForSubject({
     }
     const enabled = index === 0;
     const trigger = {
-      fieldId: statusField.fieldId,
-      fieldName: statusField.fieldName,
+      fieldId: stageStatusField.fieldId,
+      fieldName: stageStatusField.fieldName,
       optionId: option?.id ?? (enabled ? "pending_initial_option" : null),
       value: option?.name ?? (enabled ? "待配置" : ""),
     };
@@ -553,6 +565,7 @@ function phasedDefaultsForSubject({
     }),
     ...(existing?.delivery === undefined ? {} : { delivery: clone(existing.delivery) }),
     statusField,
+    ...(reviewStatusField === undefined ? {} : { reviewStatusField }),
     documentField,
     namingField,
     stages,
@@ -791,6 +804,9 @@ function clearDeletedMetadataBindings(value, metadata, previousMetadata = null) 
   };
 
   next.statusField = repairDescriptor(next.statusField, "pending_status_field");
+  if (next.reviewStatusField != null) {
+    next.reviewStatusField = repairDescriptor(next.reviewStatusField, "pending_review_status_field");
+  }
   next.documentField = repairDescriptor(next.documentField, "pending_document_field");
   next.namingField = repairDescriptor(next.namingField, "pending_naming_field");
   if (next.title && fieldRequiresReselection(fields, previousFields, next.title.fieldId, next.title.fieldName)) {
@@ -825,13 +841,13 @@ function clearDeletedMetadataBindings(value, metadata, previousMetadata = null) 
       startValue: "待配置",
     };
   }
-  const statusWasCleared = isPendingIdentifier(next.statusField?.fieldId);
-
   if (next.stages && typeof next.stages === "object") {
     next.stages = Object.fromEntries(STAGE_IDS.map((stageId) => {
       const stage = clone(next.stages[stageId]);
       if (!stage) return [stageId, stage];
       const trigger = stage.trigger ?? {};
+      const statusField = stageId === "initial" ? next.statusField : next.reviewStatusField ?? next.statusField;
+      const statusWasCleared = isPendingIdentifier(statusField?.fieldId);
       const stageFieldMissing = fieldRequiresReselection(fields, previousFields, trigger.fieldId, trigger.fieldName);
       const currentTriggerField = uniqueMetadataField(fields, trigger.fieldId);
       const triggerField = statusWasCleared || stageFieldMissing
@@ -847,8 +863,8 @@ function clearDeletedMetadataBindings(value, metadata, previousMetadata = null) 
       if (statusWasCleared || stageFieldMissing || triggerOptionMissing) {
         stage.trigger = {
           ...trigger,
-          fieldId: next.statusField.fieldId,
-          fieldName: next.statusField.fieldName,
+          fieldId: statusField.fieldId,
+          fieldName: statusField.fieldName,
           optionId: PENDING_STAGE_OPTION_IDS[stageId],
           value: "待配置",
         };
@@ -986,6 +1002,7 @@ function shareableSubject(subject, { forceDraft = false } = {}) {
     lifecycle: subject.lifecycle,
     configVersion: subject.configVersion,
     ...(subject.statusField ? { statusField: clone(subject.statusField) } : {}),
+    ...(subject.reviewStatusField === undefined ? {} : { reviewStatusField: clone(subject.reviewStatusField) }),
     ...(subject.documentField ? { documentField: clone(subject.documentField) } : {}),
     ...(subject.namingField ? { namingField: clone(subject.namingField) } : {}),
     ...(subject.stages ? {
@@ -1076,13 +1093,13 @@ function validateShareDocument(value) {
       const subjectAllowed = new Set([
         "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId", "displayEnabled",
         "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title", "execution",
-        "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages", "delivery",
+        "packageRoute", "upload", "metadata", "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery",
       ]);
       const subjectUnknown = Object.keys(inputSubject).find((key) => !subjectAllowed.has(key));
       if (subjectUnknown) {
         throw new ApiError(400, "UNKNOWN_FIELD", `configuration.bases[${baseIndex}].subjects[${subjectIndex}].${subjectUnknown} is not supported`);
       }
-      const hasExplicitPhasedShape = ["statusField", "documentField", "namingField", "stages"]
+      const hasExplicitPhasedShape = ["statusField", "reviewStatusField", "documentField", "namingField", "stages"]
         .some((keyName) => inputSubject[keyName] !== undefined && inputSubject[keyName] !== null);
       const tableId = identifier(inputSubject.tableId, `configuration.bases[${baseIndex}].subjects[${subjectIndex}].tableId`);
       const key = `${baseToken}:${tableId}`;
@@ -1115,6 +1132,7 @@ function validateShareDocument(value) {
         upload: clone(inputSubject.upload),
         ...(inputSubject.delivery === undefined ? {} : { delivery: clone(inputSubject.delivery) }),
         statusField: clone(inputSubject.statusField),
+        ...(inputSubject.reviewStatusField === undefined ? {} : { reviewStatusField: clone(inputSubject.reviewStatusField) }),
         documentField: clone(inputSubject.documentField),
         namingField: clone(inputSubject.namingField),
         stages: inputSubject.stages && typeof inputSubject.stages === "object" && !Array.isArray(inputSubject.stages)
@@ -1205,7 +1223,7 @@ function validateShareDocument(value) {
 
 const SUBJECT_PATCH_KEYS = new Set([
   "displayEnabled", "trigger", "title", "execution", "packageRoute", "upload",
-  "statusField", "documentField", "namingField", "stages", "delivery", "expectedVersion",
+  "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery", "expectedVersion",
 ]);
 
 export function validateSubjectConfig(value, { projectLegacyTrigger = false } = {}) {
@@ -1215,7 +1233,7 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
   const allowedTopLevel = new Set([
     "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId",
     "displayEnabled", "lifecycle", "configVersion", "trigger", "title", "execution",
-    "packageRoute", "upload", "metadata", "statusField", "documentField", "namingField", "stages", "delivery",
+    "packageRoute", "upload", "metadata", "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery",
     "createdAt", "updatedAt",
   ]);
   const unknownTopLevel = Object.keys(value).find((key) => !allowedTopLevel.has(key));
@@ -1298,6 +1316,7 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
         }
       }
       for (const key of ["statusField", "documentField", "namingField", "stages"]) value[key] = normalized[key];
+      if (normalized.reviewStatusField !== undefined) value.reviewStatusField = normalized.reviewStatusField;
       if (projectLegacyTrigger) {
         const firstEnabledStage = STAGE_IDS
           .map((stageId) => normalized.stages[stageId])
@@ -1957,7 +1976,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           lifecycle: "draft",
           configVersion: current.config_version + 1,
         };
-        const phasedPatch = ["statusField", "documentField", "namingField", "stages"]
+        const phasedPatch = ["statusField", "reviewStatusField", "documentField", "namingField", "stages"]
           .some((field) => Object.hasOwn(rawChanges, field));
         if (
           !phasedPatch
@@ -1977,6 +1996,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           // may save non-binding fields before selecting phased bindings.
           const phasedDefaults = {
             statusField: clone(merged.statusField),
+            ...(merged.reviewStatusField === undefined ? {} : { reviewStatusField: clone(merged.reviewStatusField) }),
             documentField: clone(merged.documentField),
             namingField: clone(merged.namingField),
             stages: clone(merged.stages),

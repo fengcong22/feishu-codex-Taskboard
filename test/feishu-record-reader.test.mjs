@@ -105,16 +105,28 @@ test("normalizes a direct text-field string as a course name", () => {
   );
 });
 
-test("accepts only a direct textual formula result as a course name", () => {
+test("accepts direct or structured textual formula results as a course name", () => {
   assert.equal(
     normalizeCourseNameValue("课程公式001", { type: 20, uiType: "Formula" }),
     "课程公式001",
   );
 
-  for (const value of [123, [{ type: "text", text: "课程公式001" }], { error: "#ERROR!" }]) {
+  assert.equal(
+    normalizeCourseNameValue([{ type: "text", text: "课程公式001" }], { type: 20, uiType: "Formula" }),
+    "课程公式001",
+  );
+
+  for (const value of [
+    123,
+    { error: "#ERROR!" },
+    [{ type: "text", text: "#ERROR!" }],
+    [{ type: "text", text: " " }],
+    [{ type: "text", text: "../课程公式001" }],
+    [{ type: "text", text: "课程公式001" }, { type: "text", text: "课程公式002" }],
+  ]) {
     assert.throws(
       () => normalizeCourseNameValue(value, { type: 20, uiType: "Formula" }),
-      (error) => error.code === "COURSE_NAME_NOT_TEXT",
+      (error) => ["COURSE_NAME_NOT_TEXT", "COURSE_NAME_EMPTY", "COURSE_NAME_INVALID"].includes(error.code),
     );
   }
 });

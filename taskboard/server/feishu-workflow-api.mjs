@@ -77,7 +77,13 @@ function stageDisplaySubjectKeyFromQuery(query) {
   return values[0];
 }
 
-export function createFeishuWorkflowApi({ database, store, previewBase = null, inspectShareImport = null }) {
+export function createFeishuWorkflowApi({
+  database,
+  store,
+  previewBase = null,
+  inspectShareImport = null,
+  manageBaseSubscription = null,
+}) {
   return {
     async handle({ method, pathname, body, query = new URLSearchParams() }) {
       if (pathname === "/api/local/feishu/workflow/stage-displays") {
@@ -273,6 +279,29 @@ export function createFeishuWorkflowApi({ database, store, previewBase = null, i
           metadataRefreshedAt: Date.now(),
         }, { refreshExistingOnly: true });
         return { status: 200, body: { base } };
+      }
+      const baseSubscriptionMatch = pathname.match(/^\/api\/local\/feishu\/workflow\/bases\/([^/]+)\/subscription$/);
+      if (baseSubscriptionMatch) {
+        if (!["GET", "POST", "DELETE"].includes(method)) {
+          throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+        }
+        assertNoQuery(query, "Base subscription");
+        if (method !== "GET") {
+          requireObjectBody(body, "Base subscription");
+          assertBodyKeys(body, new Set(), "Base subscription");
+        }
+        let baseToken;
+        try { baseToken = decodeURIComponent(baseSubscriptionMatch[1]); } catch { throw new ApiError(400, "INVALID_PATH", "Base token contains invalid encoding"); }
+        await store.getBase(baseToken);
+        if (typeof manageBaseSubscription !== "function") {
+          throw new ApiError(503, "FEISHU_SUBSCRIPTION_UNAVAILABLE", "Feishu Base subscription is unavailable");
+        }
+        const operation = method === "GET" ? "get" : method === "POST" ? "subscribe" : "unsubscribe";
+        const subscription = await manageBaseSubscription(baseToken, operation);
+        if (!subscription || typeof subscription.subscribed !== "boolean") {
+          throw new ApiError(502, "FEISHU_SUBSCRIPTION_INVALID_RESPONSE", "Feishu Base subscription response is invalid");
+        }
+        return { status: 200, body: { subscription: { subscribed: subscription.subscribed } } };
       }
       const baseMatch = pathname.match(/^\/api\/local\/feishu\/workflow\/bases\/([^/]+)$/);
       if (baseMatch) {

@@ -53,12 +53,13 @@ phased 任务的 ZIP 根目录优先使用任务冻结包快照中的 `zipSource
 | 幂等去重 | 已持久化成功的同一 `event_id` 重放会返回 `duplicate`，正常重放不会再次创建；整体投递语义仍是至少一次。 |
 | 任务标题回退 | 优先读取“视频名称”，其次“集合文档”，失败时回退到飞书记录 ID。 |
 | Taskboard 集成 | 通过本机 Bridge 专用来源登记接口创建待办；记录离开可开始值时只归档匹配的 `todo` 任务，不改动处理中或已完成任务；Bridge 不启动 Codex。Taskboard 自动执行策略默认关闭。 |
-| 三阶段工作流 | Taskboard 管理的活动配置可分别启用 `initial`、`first_review`、`final_review`；Bridge 只在记录从其他 option 进入已启用阶段 option 时登记该阶段任务。 |
+| 三阶段工作流 | Taskboard 管理的活动配置可分别启用 `initial`、`first_review`、`final_review`；“初稿触发字段”用于初稿，“审核修改触发字段”共用于初审修改和终审修改。审核字段未单独选择时兼容使用初稿字段。Bridge 只在记录从其他 option 进入已启用阶段 option 时登记该阶段任务。 |
 | Auto-Cut 与产物 | Taskboard 负责统一执行入口、并发控制、Auto-Cut 调用、剪映草稿/ZIP 校验以及本地或 NAS 上传；这些能力不在 Bridge 进程中执行。 |
 | 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
 | 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
 | 状态文件保护 | 损坏的状态文件、无效租约或不完整快照会安全停留在可诊断状态；读写（包括健康队列统计）使用同一稳定路径校验和操作系统本机互斥锁，写入使用原子替换，崩溃后可安全恢复。状态文件必须是稳定的普通文件，不接受符号链接或硬链接别名。 |
 | Base 元数据预览 | `POST /api/feishu/base-preview` 只接受携带 `x-feishu-bridge-client: taskboard` 和本机共享密钥的 Taskboard 请求；在本机配置飞书凭据后，它仅执行只读 metadata 操作，按 Base 链接读取 Base、子表、字段和单选项元数据。即使长连接监听关闭，预览仍可使用，且不会启用子表或接收事件。 |
+| Base 事件订阅 | Taskboard 左侧多维表格目录可读取、订阅或取消一个 Base 的记录变更事件订阅。操作由 Bridge 通过飞书官方 SDK 完成，浏览器不会获得飞书凭据；订阅管理要求操作者拥有该飞书文档。 |
 | 工作流共享配置 | `GET /api/feishu/workflow/share/export` 导出脱敏配置；`POST /api/feishu/workflow/share/import` 的 `dryRun` 会在不写入配置的前提下校验实时 Base/子表/字段，并报告本机缺失的包别名、工作区、ZIP 获取和上传路径绑定。Taskboard 调用 Bridge 检查时只发送 Bridge schema 明确允许的字段，不传 Taskboard 专用项目 ID 或缓存 metadata。实时校验要求 Base/子表名称一致、状态字段为唯一的单选字段，并拒绝重复字段/选项 ID 和互相冲突的字段类型。导入只创建草稿，不自动启用子表；共享内容和诊断不会回显绝对路径、来源 URL、凭据或 SDK 原始错误。 |
 | SDK-managed 监听 | 显式启用官方 SDK 自动重连；健康状态使用 `sdk_managed`，不伪造物理连接确认。 |
 | 健康检查 | 一条命令检查 Node、配置、Taskboard、Bridge、监听器状态和 pending/retry/dead-letter 队列计数。 |
@@ -81,12 +82,18 @@ phased 任务的 ZIP 根目录优先使用任务冻结包快照中的 `zipSource
 
 页面右上角“本机设置 → 允许本机自动剪辑”提供可点击的总开关，学科配置页也可通过“修改本机总开关”进入。设置立即生效并在本机数据库中保存，重启后保留；默认关闭。只有尚未保存设置时，`CODEX_TASKBOARD_ALLOW_AUTOMATIC_EXECUTION` 才提供初始值，之后界面保存的选择优先（包括关闭）。关闭取消尚未开始的自动延迟或排队预约，排队任务回到待处理，正在执行的剪辑与手动任务继续；重新开启本身不会补跑历史任务。学科选择“自动”不会改变总开关。新任务还必须满足可信 Bridge 登记、已启用活动配置和本机启用包白名单等条件，模拟来源不能自动执行。保存草稿期间原活动配置继续有效，点击启用后由新配置处理后续触发；已有任务的模式和运行状态不会追溯修改，也不会自动重跑。ZIP 与上传中的“上传入队”仍单独控制。
 
+### Base 事件订阅
+
+在左侧 **多维表格** 目录展开一个 Base 后，名称旁会显示“事件已订阅”“事件未订阅”或“读取失败”。点击该 Base 的更多菜单可 **刷新订阅状态**，或按当前状态选择 **订阅事件** / **取消订阅**。订阅是整个 Base 级别的能力，会覆盖其下所有已启用学科；取消订阅只停止之后的飞书记录变更通知，不会暂停、归档或删除已有 Taskboard 任务，也不会修改飞书记录。
+
+订阅状态与本机监听器状态相互独立。订阅成功后，仍须以 `start-local.ps1 -EnableFeishu` 启动本机官方 SDK 长连接，Taskboard 才会接收后续事件；启动监听器本身不会替你创建飞书订阅。飞书要求操作者拥有该文档才能管理订阅，权限不足时页面会显示受控错误，不会回显飞书 SDK 或凭据详情。
+
 - 三阶段工作流可使用课程交付目录策略：阶段任务首次绑定课程名后冻结总路径和 `01初稿`、`02初审`、`03终审` 之一的绝对上传目标。上传只从已校验并登记的单个 ZIP 制品读取；总路径必须已存在，课程和阶段子目录仅在 ZIP 哈希验证后实际发布时创建。目标同名同哈希视为已发布，同名不同哈希保持冲突且不覆盖；不支持无覆盖原子发布的 NAS 目标会被阻断。首次成功发布会持久化课程与阶段交付事实，供独立的飞书回写队列处理；上传、目录创建和回写均不会进入 Auto-Cut-Lite manifest。旧版工作流继续使用已冻结的公共或阶段上传路径，后续改配置不会改变历史任务的位置。
 - 旧版 `tables` 配置只登记允许接收事件的 Base、表、触发字段、单一可开始值和标题字段。Taskboard 管理的新工作流则保存活动 subject 快照，并分别配置 `initial`、`first_review`、`final_review` 三个阶段；两种配置都不启用飞书状态到 Taskboard 各流程列的通用映射。
-- 每个新导入的子表都会按自己的 `baseToken:tableId` 和当前字段/选项 metadata 创建完整的 phased 草稿，包含字段来源、初稿、初审修改、终审修改、Auto-Cut 路由及 ZIP/上传设置；不同子表不会共享字段或选项绑定。已有 legacy subject 刷新时只补齐缺失的 phased 结构，并保留原有触发、执行、包路由、上传、显示和本机路径设置；已停用的 legacy subject 仍保持停用，只有已启用 subject 才会因元数据刷新降为草稿。
+- 每个新导入的子表都会按自己的 `baseToken:tableId` 和当前字段/选项 metadata 创建完整的 phased 草稿，包含字段来源、初稿、初审修改、终审修改、Auto-Cut 路由及 ZIP/上传设置；不同子表不会共享字段或选项绑定。已有 legacy subject 刷新时只补齐缺失的 phased 结构，并保留原有触发、执行、包路由、上传、显示和本机路径设置；已停用的 legacy subject 仍保持停用，只有已启用 subject 才会因元数据刷新降为草稿。选择新的初稿或审核修改触发字段时，只清空该字段负责阶段的单选项，素材、音频、目录和另一个字段的阶段配置会保留。
 - 在学科配置标题栏点击 **刷新字段** 可手动更新当前已关联 Base 的字段和单选项；它不会新增学科、恢复已删除学科、删除飞书字段或改动飞书记录。新增字段和单选项会立即出现在下拉列表中；已配置但已在 Base 删除或改名的字段和单选项会清空为“请选择”，不会自动换绑到同名项。刷新不会覆盖用户尚未保存的音频标题、附件选择、时长误差或命名后缀。字段或状态选项改名后，操作人员必须在下拉菜单重新选择后才能保存草稿并启用；ID 重复时，保存和启用都会阻断。已启用学科刷新后生成待确认草稿，旧启用快照继续处理已有和正在运行的任务，直到用户保存草稿并重新启用后才切换后续触发。
 - Auto-Cut 包 registry（默认 `config/taskboard-feishu-packages.json`，可由 `CODEX_FEISHU_PACKAGES_PATH` 覆盖）只登记受控的项目包别名，以及固定的显示名称、`projectId`、绝对 `workspacePath`、提示词、ZIP 来源目录、并发数和资源组。首次保存后，显示名称、包别名和 `projectId` 都不可修改；更改工作区或版本只更新界面的只读清单版本，不会改写它们，因此已有学科、任务快照和历史记录保持可用。每个新任务冻结包的 ZIP 来源与资源组；旧任务保留自己的历史快照或来源锁。只有 `state` 为 `enabled` 的包会被 Bridge 接收；草稿/禁用包仍可由 Taskboard 保存，但不会路由新事件。飞书单元格只能选择别名，不能传路径、命令或提示词。
-- Bridge 到 Taskboard 的任务登记还需要本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。`start-local.ps1` 会在未设置时为本次启动生成随机值，并同时注入两个服务；如果单独启动 Bridge/Taskboard，请在 `.env.local` 中配置同一个随机值。该值不会写入配置导出、任务描述或日志。
+- Bridge 到 Taskboard 的任务登记还需要本机共享密钥 `CODEX_FEISHU_BRIDGE_SECRET`。`start-local.ps1` 会在未设置时为本次启动生成随机值，并同时注入两个服务；如果单独启动 Bridge/Taskboard，请在 `.env.local` 中配置同一个随机值。若前一次启动在写完 PID 标记前中断，脚本只会在系统已确认记录的 PID 不存在时清理该不完整标记；PID 仍在运行、无法查询或身份不匹配时仍会拒绝重启。该值不会写入配置导出、任务描述或日志。
 - Taskboard 导入 Base 或点击学科标题栏的“刷新字段”时，都会调用本机 Bridge 的 `POST /api/feishu/base-preview`。请求体中的 `url` 可使用直接 `/base/{base_token}[?table=<table_id>]` 链接，也可使用知识库中的 `/wiki/{wiki_token}[?table=<table_id>]` 链接；Wiki 链接会先通过飞书官方 SDK 确认节点类型为 `bitable`，再使用返回的真实 Base token，绝不把 Wiki token 直接当作 Base token。当前只支持没有嵌入账号信息的标准 `https://*.feishu.cn` 链接；接口只读取 Wiki 节点及 Base/子表/字段元数据，不读取记录、不写入飞书；`/base/workspace/{token}` 仍不支持。只要 `.env.local` 中配置了完整的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，普通 `start-local.ps1` 启动就支持预览和刷新字段；这不启动 WebSocket 监听器。真实事件监听仍只由 `start-local.ps1 -EnableFeishu` 开启。Wiki 链接还要求该飞书应用具有 Wiki 节点只读权限并能访问对应节点。预览不会构造或启动 WebSocket 监听器，且 SDK 原始错误日志会被抑制。凭据或权限缺失时接口返回受控的脱敏错误，不回显链接、凭据或 SDK 原文。
 - Bridge 读取已配置字段的受控记录上下文时，会请求飞书返回结构化文本，以保留文本中的 Docx/Wiki mention 链接；未配置的记录字段不会进入任务上下文。
 - Bridge 的工作流同步、共享配置导入和模拟事件写接口会校验 loopback `Host`；`Origin` 可以缺失，但出现时也必须指向 loopback。请求必须使用 `application/json`；同步请求还必须携带 `x-feishu-bridge-client: taskboard` 和本机共享密钥，漏配密钥时 fail-closed。导入和模拟请求携带 `x-feishu-bridge-client: local-operator`，`simulate-ready.ps1` 已固定发送后一个值。跨站页面、普通表单和缺少专用 header 的本机请求不能写入工作流配置或注入模拟事件；模拟事件经 Bridge 登记时会保留测试来源且不得触发自动执行。工作流生命周期同步使用期望版本比较交换；如果 Taskboard 因本地提交失败而重放一份版本、生命周期和脱敏配置完全相同的请求，Bridge 会直接返回已保存结果且不重写配置；同版本但内容不同的请求仍返回版本冲突。
@@ -154,7 +161,7 @@ Set-Location ..
 ### 任务生命周期边界
 
 - 旧版 `tables`：其他值 → 配置的可开始值（当前示例为 `待剪辑`）时创建任务；离开该值时按 Base、表、记录和触发字段身份匹配，只归档仍为 `todo` 且未归档的任务。
-- Taskboard 受控三阶段配置：从其他 option 进入已启用的 `initial`、`first_review` 或 `final_review` option 时创建对应阶段任务；离开阶段或进入下一已启用阶段时，只归档上一阶段仍为 `todo` 的任务；保持在同一阶段或只修改备注等无关字段时，不创建也不归档任务。
+- Taskboard 受控三阶段配置：从其他 option 进入已启用的 `initial`、`first_review` 或 `final_review` option 时创建对应阶段任务；初稿按初稿触发字段匹配，两个审核阶段按审核修改触发字段匹配。离开阶段或进入下一已启用阶段时，只归档同一触发字段、同一阶段仍为 `todo` 的任务；保持在同一阶段或只修改备注等无关字段时，不创建也不归档任务。
 - 已进入 `in_progress`（处理中）、`in_review`（等你确认）、`done` 或其他非 `todo` 状态：保持不动，由 Taskboard/Codex 管理。
 - 再次进入同一可开始值或阶段：允许创建新任务；归档任务仍可在 Taskboard 的归档区域查看和恢复。
 - 已归档且没有待执行、运行中操作或排队/进行中 ZIP 上传的任务，可以在归档区域确认后永久删除，包括由 Bridge 登记的飞书任务。删除会清理任务、评论以及 Taskboard 保存的附件和 ZIP 副本；工作区源文件和已上传的文件保留。任务有活动执行时返回 `TASK_EXECUTION_ACTIVE`，应等待执行结束或先停止执行；有活动上传时返回 `ARTIFACT_UPLOAD_ACTIVE`，应等待上传结束后再删除。

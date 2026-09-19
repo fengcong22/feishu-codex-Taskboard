@@ -242,9 +242,13 @@ function Remove-ProcessMarkerFilesIfUnchanged(
     return $false
   }
   try {
-    Remove-Item -LiteralPath $PidFile -Force -ErrorAction Stop
-    Remove-Item -LiteralPath $IdentityFile -Force -ErrorAction Stop
-    if (-not [string]::IsNullOrWhiteSpace($ModeFile)) {
+    if ([bool]$PidSnapshot.Exists) {
+      Remove-Item -LiteralPath $PidFile -Force -ErrorAction Stop
+    }
+    if ([bool]$IdentitySnapshot.Exists) {
+      Remove-Item -LiteralPath $IdentityFile -Force -ErrorAction Stop
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ModeFile) -and [bool]$ModeSnapshot.Exists) {
       Remove-Item -LiteralPath $ModeFile -Force -ErrorAction Stop
     }
     return $true
@@ -269,6 +273,8 @@ function Stop-ExistingLocalNodeForEphemeralSecret(
 ) {
   $pidPathPresent = Test-Path -LiteralPath $PidFile
   $identityPathPresent = Test-Path -LiteralPath $IdentityFile
+  $pidSnapshot = Get-ProcessMarkerFileSnapshot $PidFile
+  $identitySnapshot = Get-ProcessMarkerFileSnapshot $IdentityFile
   $modeSnapshot = if ([string]::IsNullOrWhiteSpace($ModeFile)) { $null } else { Get-ProcessMarkerFileSnapshot $ModeFile }
 
   if ($pidPathPresent -or $identityPathPresent) {
@@ -276,27 +282,39 @@ function Stop-ExistingLocalNodeForEphemeralSecret(
     $persistedIdentity = Read-PersistedProcessIdentity $IdentityFile
     if ($null -eq $persistedPid -or -not $persistedIdentity -or
       [int]$persistedIdentity.Pid -ne [int]$persistedPid) {
-      throw "Cannot safely restart $Name for an ephemeral Bridge secret because its process markers are missing or invalid."
-    }
-
-    $query = Get-ProcessQueryResult $persistedPid
-    if (-not $query.Succeeded) {
-      throw "Cannot safely query $Name PID $persistedPid before the paired restart. ($($query.Error))"
-    }
-    if ($query.Process) {
-      if (-not (Test-PersistedProcessIdentity $query.Process $persistedIdentity) -or
-        -not (Test-NodeScriptProcess $query.Process $Script $node)) {
-        throw "Cannot safely restart $Name because its persisted process identity does not match."
+      if ($null -eq $persistedPid) {
+        throw "Cannot safely restart $Name for an ephemeral Bridge secret because its process markers are missing or invalid."
       }
-      Stop-ValidatedNode $query.Process $Script $persistedIdentity $node
-    }
+      $query = Get-ProcessQueryResult $persistedPid
+      if (-not $query.Succeeded) {
+        throw "Cannot safely query $Name PID $persistedPid before the paired restart. ($($query.Error))"
+      }
+      if ($query.Process) {
+        throw "Cannot safely restart $Name for an ephemeral Bridge secret because its process markers are missing or invalid."
+      }
+      if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidSnapshot $identitySnapshot $modeSnapshot)) {
+        throw "Could not clear stale $Name process markers after confirming PID $persistedPid is absent."
+      }
+    } else {
+      $query = Get-ProcessQueryResult $persistedPid
+      if (-not $query.Succeeded) {
+        throw "Cannot safely query $Name PID $persistedPid before the paired restart. ($($query.Error))"
+      }
+      if ($query.Process) {
+        if (-not (Test-PersistedProcessIdentity $query.Process $persistedIdentity) -or
+          -not (Test-NodeScriptProcess $query.Process $Script $node)) {
+          throw "Cannot safely restart $Name because its persisted process identity does not match."
+        }
+        Stop-ValidatedNode $query.Process $Script $persistedIdentity $node
+      }
 
-    $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
-    $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeSnapshot) }
-    if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
-      throw "Could not clear $Name process markers after the paired restart check."
+      $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
+      $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeSnapshot) }
+      if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
+        throw "Could not clear $Name process markers after the paired restart check."
+      }
+      return
     }
-    return
   }
 
   $existing = Get-CimInstance Win32_Process |

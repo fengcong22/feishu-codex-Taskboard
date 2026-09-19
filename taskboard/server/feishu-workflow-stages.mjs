@@ -167,8 +167,8 @@ export function canonicalizePhasedSubjectPatch(value) {
   plainObject(value, "Subject patch");
   const result = { ...value };
   if (Object.hasOwn(result, "trigger")) result.trigger = canonicalizeLegacyTrigger(result.trigger, "trigger");
-  for (const fieldNameValue of ["statusField", "documentField", "namingField"]) {
-    if (Object.hasOwn(result, fieldNameValue)) {
+  for (const fieldNameValue of ["statusField", "reviewStatusField", "documentField", "namingField"]) {
+    if (Object.hasOwn(result, fieldNameValue) && result[fieldNameValue] != null) {
       result[fieldNameValue] = canonicalizeFieldDescriptor(result[fieldNameValue], fieldNameValue);
     }
   }
@@ -409,6 +409,8 @@ export function validatePhasedSubjectConfig(value) {
   const metadata = value.metadata ?? null;
   const statusField = validateMetadataField(metadata, value.statusField, "statusField", isSingleSelectMetadataField);
   if (!statusField.fieldId) throw fail("statusField is required");
+  const reviewStatusField = value.reviewStatusField == null ? statusField
+    : validateMetadataField(metadata, value.reviewStatusField, "reviewStatusField", isSingleSelectMetadataField);
   const documentField = validateMetadataField(metadata, value.documentField, "documentField", null);
   if (!documentField.fieldId) throw fail("documentField is required");
   const namingField = validateMetadataField(metadata, value.namingField, "namingField", null);
@@ -419,8 +421,10 @@ export function validatePhasedSubjectConfig(value) {
   const stages = {};
   for (const stageId of STAGE_IDS) {
     stages[stageId] = normalizeStage(stagesValue[stageId], metadata, stageId);
-    if (stages[stageId].trigger.fieldId !== null && stages[stageId].trigger.fieldId !== statusField.fieldId) {
-      throw fail(`stages.${stageId}.trigger.fieldId must match statusField.fieldId`);
+    const descriptorName = stageId === "initial" || value.reviewStatusField == null ? "statusField" : "reviewStatusField";
+    const descriptor = stageId === "initial" ? statusField : reviewStatusField;
+    if (stages[stageId].trigger.fieldId !== null && stages[stageId].trigger.fieldId !== descriptor.fieldId) {
+      throw fail(`stages.${stageId}.trigger.fieldId must match ${descriptorName}.fieldId`);
     }
     if (stages[stageId].enabled && stages[stageId].trigger.optionId === null) {
       throw fail(`stages.${stageId}.trigger.optionId is required`);
@@ -428,18 +432,14 @@ export function validatePhasedSubjectConfig(value) {
   }
   const enabled = STAGE_IDS.filter((stageId) => stages[stageId].enabled);
   if (enabled.length === 0) throw fail("at least one stage must be enabled");
-  const optionIds = enabled.map((stageId) => stages[stageId].trigger.optionId);
+  const optionIds = enabled.map((stageId) => JSON.stringify([stages[stageId].trigger.fieldId, stages[stageId].trigger.optionId]));
   if (new Set(optionIds).size !== optionIds.length) throw fail("enabled stage trigger options must be unique");
-  const field = metadataField(metadata, statusField.fieldId);
-  const statusFieldMatches = metadataFieldMatches(metadata, statusField.fieldId);
-  if (statusFieldMatches.length > 1) {
-    throw fail("statusField.fieldId is not unique in metadata", "FIELD_NOT_UNIQUE");
-  }
-  if (field && !Array.isArray(field.options)) {
-    throw fail("status field options are unavailable in metadata", "TRIGGER_OPTION_NOT_FOUND");
-  }
-  if (field && Array.isArray(field.options)) {
-    for (const stageId of enabled) {
+  for (const stageId of enabled) {
+    const field = metadataField(metadata, stages[stageId].trigger.fieldId);
+    if (field && !Array.isArray(field.options)) {
+      throw fail("status field options are unavailable in metadata", "TRIGGER_OPTION_NOT_FOUND");
+    }
+    if (field && Array.isArray(field.options)) {
       const matches = field.options.filter((candidate) => candidate?.id === stages[stageId].trigger.optionId);
       if (matches.length === 0) throw fail(`stages.${stageId}.trigger.optionId is not present in metadata`, "TRIGGER_OPTION_NOT_FOUND");
       if (matches.length > 1) throw fail(`stages.${stageId}.trigger.optionId is not unique in metadata`, "TRIGGER_OPTION_NOT_UNIQUE");
@@ -449,9 +449,13 @@ export function validatePhasedSubjectConfig(value) {
       }
     }
   }
+  const normalizedInput = value.reviewStatusField == null
+    ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== "reviewStatusField"))
+    : value;
   return {
-    ...value,
+    ...normalizedInput,
     statusField,
+    ...(value.reviewStatusField == null ? {} : { reviewStatusField }),
     documentField,
     namingField,
     stages,
@@ -459,7 +463,7 @@ export function validatePhasedSubjectConfig(value) {
 }
 
 export function isPhasedSubject(value) {
-  return Boolean(value && typeof value === "object" && (value.stages || value.statusField || value.documentField || value.namingField));
+  return Boolean(value && typeof value === "object" && (value.stages || value.statusField || value.reviewStatusField || value.documentField || value.namingField));
 }
 
 export function portablePhasedSubject(value) {

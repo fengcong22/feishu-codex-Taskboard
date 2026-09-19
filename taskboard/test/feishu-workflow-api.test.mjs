@@ -78,6 +78,75 @@ async function metadataRefreshFixture() {
   };
 }
 
+async function subscriptionFixture() {
+  const bridgeSecret = "subscription-bridge-secret";
+  const requests = [];
+  const bridge = createServer(async (incoming, response) => {
+    const chunks = [];
+    for await (const chunk of incoming) chunks.push(chunk);
+    requests.push({
+      route: incoming.url,
+      method: incoming.method,
+      client: incoming.headers["x-feishu-bridge-client"],
+      secret: incoming.headers["x-feishu-bridge-secret"],
+      body: Buffer.concat(chunks).toString("utf8"),
+    });
+    const subscribed = incoming.method === "POST";
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ subscription: { subscribed } }));
+  });
+  await new Promise((resolve, reject) => {
+    bridge.once("error", reject);
+    bridge.listen(0, "127.0.0.1", resolve);
+  });
+  const testFixture = await fixture({
+    feishuBridgeUrl: `http://127.0.0.1:${bridge.address().port}`,
+    feishuBridgeSecret: bridgeSecret,
+  });
+  const seeded = await request(testFixture.baseUrl, "/api/local/feishu/workflow/catalog", {
+    method: "POST",
+    body: {
+      baseToken: "bas_subscription",
+      baseName: "订阅测试表",
+      tables: [{ tableId: "tbl_subscription", tableName: "课程", fields: [] }],
+    },
+  });
+  assert.equal(seeded.response.status, 201);
+  return {
+    ...testFixture,
+    requests,
+    close: async () => {
+      await testFixture.app.close();
+      await new Promise((resolve) => bridge.close(resolve));
+      await rm(testFixture.directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test("proxies subscription reads and mutations for configured Bases only", async () => {
+  const data = await subscriptionFixture();
+  try {
+    const route = "/api/local/feishu/workflow/bases/bas_subscription/subscription";
+    for (const [method, expected] of [["GET", false], ["POST", true], ["DELETE", false]]) {
+      const result = await request(data.baseUrl, route, method === "GET" ? {} : { method, body: {} });
+      assert.equal(result.response.status, 200);
+      assert.deepEqual(result.body, { subscription: { subscribed: expected } });
+    }
+    assert.deepEqual(data.requests, [
+      { route: "/api/feishu/workflow/bases/bas_subscription/subscription", method: "GET", client: "taskboard", secret: "subscription-bridge-secret", body: "" },
+      { route: "/api/feishu/workflow/bases/bas_subscription/subscription", method: "POST", client: "taskboard", secret: "subscription-bridge-secret", body: "{}" },
+      { route: "/api/feishu/workflow/bases/bas_subscription/subscription", method: "DELETE", client: "taskboard", secret: "subscription-bridge-secret", body: "{}" },
+    ]);
+
+    const unknown = await request(data.baseUrl, "/api/local/feishu/workflow/bases/bas_unknown/subscription");
+    assert.equal(unknown.response.status, 404);
+    assert.equal(unknown.body.error.code, "BASE_NOT_FOUND");
+    assert.equal(data.requests.length, 3);
+  } finally {
+    await data.close();
+  }
+});
+
 test("refresh metadata reads the saved Base directly with Bridge authentication", async () => {
   const data = await metadataRefreshFixture();
   try {

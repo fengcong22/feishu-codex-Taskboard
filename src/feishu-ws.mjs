@@ -117,16 +117,19 @@ export function createFeishuWsListener({
     notifyStatus(state, lastError);
   }
 
+  function logCallbackRoutingDiagnostic(tableCount, tableIdCount, matchingCount, normalizedCount) {
+    try {
+      logger.info?.(
+        `Feishu record callback: tables=${tableCount} table_ids=${tableIdCount} matching=${matchingCount} normalized=${normalizedCount}`,
+      );
+    } catch {
+      // Diagnostics must not interrupt callback delivery.
+    }
+  }
+
   const eventDispatcher = new sdkModule.EventDispatcher({}).register({
     [BITABLE_RECORD_CHANGED_EVENT]: async (payload) => {
       const processing = queue.then(async () => {
-        let currentTables;
-        try {
-          currentTables = typeof getTables === "function" ? await getTables() : tables;
-        } catch (cause) {
-          throw workflowConfigUnavailable(cause);
-        }
-        if (!Array.isArray(currentTables) || currentTables.length === 0) return;
         const source = sourceEvent(payload) ?? {};
         const header = sourceHeader(payload);
         const fileToken = source.file_token
@@ -145,6 +148,17 @@ export function createFeishuWsListener({
             ? source.action_list.flatMap((action) => [action?.table_id, action?.tableId])
             : []),
         ].filter((value) => typeof value === "string" && value));
+        let currentTables;
+        try {
+          currentTables = typeof getTables === "function" ? await getTables() : tables;
+        } catch (cause) {
+          logCallbackRoutingDiagnostic("unavailable", tableIds.size, 0, 0);
+          throw workflowConfigUnavailable(cause);
+        }
+        if (!Array.isArray(currentTables) || currentTables.length === 0) {
+          logCallbackRoutingDiagnostic(0, tableIds.size, 0, 0);
+          return;
+        }
         const tokenTables = currentTables.filter((table) => (
           !table.baseToken || !fileToken || table.baseToken === fileToken
         ));
@@ -157,6 +171,7 @@ export function createFeishuWsListener({
           ? (!fileToken && duplicateTableId ? [] : idMatches)
           : tokenTables.length === 1 ? tokenTables : [];
         const events = matchingTables.flatMap((table) => normalizeBitableRecordChanged(payload, table));
+        logCallbackRoutingDiagnostic(currentTables.length, tableIds.size, matchingTables.length, events.length);
         if (events.length === 0) return;
         lastEventAt = Date.now();
         for (const event of events) await handleEvent(event);

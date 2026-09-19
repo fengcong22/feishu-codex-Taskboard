@@ -2233,6 +2233,162 @@ function phasedPatch() {
   };
 }
 
+function twoFieldStoreFixture() {
+  const metadata = phasedPreview();
+  metadata.tables[0].fields.push({ fieldId: "fld_review", fieldName: "Review", type: 3, uiType: "SingleSelect", options: [{ id: "opt_ready", name: "First" }, { id: "opt_final", name: "Final" }] });
+  const patch = phasedPatch();
+  patch.reviewStatusField = { fieldId: "fld_review", fieldName: "Review" };
+  for (const [stageId, optionId, value] of [["first_review", "opt_ready", "First"], ["final_review", "opt_final", "Final"]]) {
+    patch.stages[stageId] = phasedStage(stageId, optionId, value);
+    patch.stages[stageId].trigger.fieldId = "fld_review";
+    patch.stages[stageId].trigger.fieldName = "Review";
+  }
+  return { metadata, patch };
+}
+
+test("two trigger fields persist through save enable and share round-trip with material sources intact", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const { metadata, patch } = twoFieldStoreFixture();
+    await store.upsertBasePreview(metadata);
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    const enabled = await store.enableSubject(draft.subjectKey, draft.configVersion);
+    assert.deepEqual(enabled.reviewStatusField, patch.reviewStatusField);
+    assert.deepEqual(enabled.stages, draft.stages);
+    const shared = await store.exportShareable();
+    assert.deepEqual(shared.bases[0].subjects[0].reviewStatusField, patch.reviewStatusField);
+    const imported = await store.importShareable(shared);
+    const importedSubject = imported.catalog[0].subjects[0];
+    assert.deepEqual(importedSubject.reviewStatusField, patch.reviewStatusField);
+    assert.deepEqual(importedSubject.stages.first_review.audio, draft.stages.first_review.audio);
+    assert.equal(importedSubject.stages.first_review.trigger.fieldId, "fld_review");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("two trigger fields can return to the legacy shared field by explicitly clearing reviewStatusField", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const { metadata, patch } = twoFieldStoreFixture();
+    for (const option of metadata.tables[0].fields.find((field) => field.fieldId === "fld_review").options) {
+      metadata.tables[0].fields[0].options.push({ id: `shared_${option.id}`, name: option.name });
+    }
+    await store.upsertBasePreview(metadata);
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    const stages = structuredClone(draft.stages);
+    for (const stageId of ["first_review", "final_review"]) {
+      stages[stageId].trigger = {
+        ...stages[stageId].trigger,
+        fieldId: "fld_status",
+        fieldName: "待制作",
+        optionId: `shared_${stages[stageId].trigger.optionId}`,
+      };
+    }
+    const shared = await store.saveSubjectDraft(draft.subjectKey, {
+      expectedVersion: draft.configVersion,
+      reviewStatusField: null,
+      stages,
+    });
+    assert.equal(shared.reviewStatusField, null);
+    assert.equal(shared.stages.first_review.trigger.fieldId, "fld_status");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("two trigger fields clear only stages bound to a deleted or renamed field", async () => {
+  for (const descriptor of ["statusField", "reviewStatusField"]) {
+    for (const mutation of ["rename", "delete"]) {
+      const { directory, database, store } = await fixture();
+      try {
+        const { metadata, patch } = twoFieldStoreFixture();
+        await store.upsertBasePreview(metadata);
+        const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+        const enabled = await store.enableSubject(draft.subjectKey, draft.configVersion);
+        const targetId = patch[descriptor].fieldId;
+        if (mutation === "rename") metadata.tables[0].fields.find((field) => field.fieldId === targetId).fieldName = "Renamed";
+        else metadata.tables[0].fields = metadata.tables[0].fields.filter((field) => field.fieldId !== targetId);
+        const refreshed = (await store.upsertBasePreview(metadata, { refreshExistingOnly: true })).subjects[0];
+        assert.match(refreshed[descriptor].fieldId, /^pending_/u);
+        for (const stageId of STAGE_IDS) {
+          if (patch.stages[stageId].trigger.fieldId === targetId) {
+            assert.match(refreshed.stages[stageId].trigger.optionId, /^pending_/u);
+            assert.equal(refreshed.stages[stageId].trigger.fieldId, refreshed[descriptor].fieldId);
+          } else assert.deepEqual(refreshed.stages[stageId].trigger, draft.stages[stageId].trigger);
+          assert.deepEqual(refreshed.stages[stageId].audio, draft.stages[stageId].audio);
+        }
+        assert.equal(refreshed.activeConfigVersion, enabled.configVersion);
+        await assert.rejects(() => store.enableSubject(refreshed.subjectKey, refreshed.configVersion));
+      } finally {
+        database.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("two trigger fields clear a renamed review option without clearing the initial same-ID option", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const { metadata, patch } = twoFieldStoreFixture();
+    await store.upsertBasePreview(metadata);
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    metadata.tables[0].fields.find((field) => field.fieldId === "fld_review").options[0].name = "Renamed";
+    const refreshed = (await store.upsertBasePreview(metadata, { refreshExistingOnly: true })).subjects[0];
+    assert.equal(refreshed.stages.first_review.trigger.optionId, "pending_first_review_option");
+    assert.deepEqual(refreshed.stages.initial.trigger, draft.stages.initial.trigger);
+    assert.deepEqual(refreshed.stages.final_review.trigger, draft.stages.final_review.trigger);
+    assert.deepEqual(refreshed.reviewStatusField, patch.reviewStatusField);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("two trigger fields retain explicit reselection after another metadata refresh", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const { metadata, patch } = twoFieldStoreFixture();
+    await store.upsertBasePreview(metadata);
+    await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    metadata.tables[0].fields.find((field) => field.fieldId === "fld_review").options[0].name = "Renamed";
+    const cleared = (await store.upsertBasePreview(metadata, { refreshExistingOnly: true })).subjects[0];
+    metadata.tables[0].fields.push({ fieldId: "fld_added", fieldName: "Added", type: 1, uiType: "Text", options: [] });
+    const refreshed = (await store.upsertBasePreview(metadata, { refreshExistingOnly: true })).subjects[0];
+    assert.deepEqual(refreshed.stages.first_review.trigger, cleared.stages.first_review.trigger);
+    await assert.rejects(() => store.enableSubject(refreshed.subjectKey, refreshed.configVersion));
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("two trigger fields survive repair of incomplete stage settings", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const { metadata, patch } = twoFieldStoreFixture();
+    await store.upsertBasePreview(metadata);
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
+    const incomplete = structuredClone(draft);
+    delete incomplete.activeConfigVersion;
+    delete incomplete.stages.final_review.reviewSource;
+    database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify(incomplete), draft.subjectKey);
+    const refreshed = (await store.upsertBasePreview(metadata, { refreshExistingOnly: true })).subjects[0];
+    assert.deepEqual(refreshed.reviewStatusField, patch.reviewStatusField);
+    for (const stageId of STAGE_IDS) {
+      assert.deepEqual(refreshed.stages[stageId].trigger, draft.stages[stageId].trigger);
+      assert.deepEqual(refreshed.stages[stageId].audio, draft.stages[stageId].audio);
+    }
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("phased automatic upload enables using stage destinations without a common target", async () => {
   const { directory, database, store } = await fixture();
   try {

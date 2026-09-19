@@ -551,6 +551,7 @@ export interface FeishuSubjectConfig {
   /** Server-owned active version; a newer draft may coexist with it. */
   readonly activeConfigVersion?: number | null;
   statusField?: { fieldId: string; fieldName: string; type?: string; options?: FeishuFieldOption[] };
+  reviewStatusField?: { fieldId: string; fieldName: string; type?: string; options?: FeishuFieldOption[] };
   documentField?: { fieldId: string; fieldName: string; kind?: string };
   namingField?: { fieldId: string; fieldName: string; kind?: string };
   stages?: FeishuStageConfigMap;

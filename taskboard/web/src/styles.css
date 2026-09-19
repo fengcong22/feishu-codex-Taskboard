@@ -658,6 +658,26 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 
+.feishu-base-subscription {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feishu-base-subscription[data-state="ready"][data-subscribed="true"] {
+  color: var(--success);
+}
+
+.feishu-base-subscription[data-state="failed"] {
+  color: var(--danger);
+}
+
 .feishu-base-nav-chevron,
 .feishu-base-nav-icon {
   flex: 0 0 auto;

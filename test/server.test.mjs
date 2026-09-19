@@ -44,6 +44,9 @@ async function start(handler, getHealth, baseMetadataReader, workflowStore, opti
     baseMetadataReader,
     workflowStore,
     simulationEnabled: options.simulationEnabled ?? true,
+    ...(Object.hasOwn(options, "baseSubscriptionClient")
+      ? { baseSubscriptionClient: options.baseSubscriptionClient }
+      : {}),
     ...(Object.hasOwn(options, "bridgeSecret")
       ? { bridgeSecret: options.bridgeSecret }
       : {}),
@@ -54,6 +57,55 @@ async function start(handler, getHealth, baseMetadataReader, workflowStore, opti
     close: app.close,
   };
 }
+
+test("manages a Base subscription only through authenticated Taskboard requests", async (t) => {
+  const calls = [];
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    bridgeSecret: BRIDGE_SECRET,
+    baseSubscriptionClient: {
+      async get(baseToken) { calls.push(["get", baseToken]); return { subscribed: false }; },
+      async subscribe(baseToken) { calls.push(["subscribe", baseToken]); return { subscribed: true }; },
+      async unsubscribe(baseToken) { calls.push(["unsubscribe", baseToken]); return { subscribed: false }; },
+    },
+  });
+  t.after(app.close);
+  const route = `${app.url}/api/feishu/workflow/bases/bas_demo/subscription`;
+  const headers = { ...TASKBOARD_WRITE_HEADERS, "x-feishu-bridge-secret": BRIDGE_SECRET };
+
+  const read = await fetch(route, { headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": BRIDGE_SECRET } });
+  assert.equal(read.status, 200);
+  assert.deepEqual(await read.json(), { subscription: { subscribed: false } });
+
+  const subscribed = await fetch(route, { method: "POST", headers, body: "{}" });
+  assert.equal(subscribed.status, 200);
+  assert.deepEqual(await subscribed.json(), { subscription: { subscribed: true } });
+
+  const unsubscribed = await fetch(route, { method: "DELETE", headers, body: "{}" });
+  assert.equal(unsubscribed.status, 200);
+  assert.deepEqual(await unsubscribed.json(), { subscription: { subscribed: false } });
+  assert.deepEqual(calls, [["get", "bas_demo"], ["subscribe", "bas_demo"], ["unsubscribe", "bas_demo"]]);
+
+  const rejected = await fetch(route, { method: "POST", headers: TASKBOARD_WRITE_HEADERS, body: "{}" });
+  assert.equal(rejected.status, 403);
+  assert.equal((await rejected.json()).error.code, "BRIDGE_FAILURE");
+});
+
+test("rejects malformed percent encoding in a Base subscription token", async (t) => {
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    bridgeSecret: BRIDGE_SECRET,
+  });
+  t.after(app.close);
+
+  const response = await fetch(`${app.url}/api/feishu/workflow/bases/%ZZ/subscription`, {
+    headers: {
+      "x-feishu-bridge-client": "taskboard",
+      "x-feishu-bridge-secret": BRIDGE_SECRET,
+    },
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "INVALID_BASE_TOKEN");
+});
 
 test("previews a Feishu Base through the injected read-only metadata reader", async (t) => {
   let received;

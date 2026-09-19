@@ -918,6 +918,70 @@ describe("FeishuWorkflowPanel upload destinations", () => {
   });
 });
 
+describe("separate stage trigger fields", () => {
+  afterEach(() => cleanup());
+
+  const reviewField = {
+    fieldId: "fld_review_status", fieldName: "审核状态", type: 3, uiType: "SingleSelect",
+    options: [{ id: "opt_initial", name: "待初审修改" }, { id: "opt_review_final", name: "待终审修改" }],
+  };
+
+  function renderTriggers(configured = subject("split", "分字段学科")) {
+    configured.metadata = { fields: [...fields, reviewField] };
+    const onSaveDraft = vi.fn(async (_key: string, _patch: unknown) => configured);
+    render(<FeishuWorkflowPanel catalog={catalog(configured)} configurationBaseToken="bas_test"
+      selectedSubjectKey={configured.subjectKey} onSelectSubject={vi.fn()} onCatalogChange={vi.fn()}
+      onSubjectChange={vi.fn()} onSaveDraft={onSaveDraft} />);
+    selectSubjectSettingsTab("素材与阶段");
+    return { configured, onSaveDraft };
+  }
+
+  it("keeps both selectors on the legacy field and changes only review triggers", async () => {
+    const { configured, onSaveDraft } = renderTriggers();
+    expect((screen.getByRole("combobox", { name: "初稿触发字段" }) as HTMLSelectElement).value).toBe("fld_status");
+    const review = screen.getByRole("combobox", { name: "审核修改触发字段" });
+    expect((review as HTMLSelectElement).value).toBe("fld_status");
+    fireEvent.change(review, { target: { value: reviewField.fieldId } });
+    expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value).toBe("opt_initial");
+    for (const label of ["初审修改", "终审修改"]) {
+      const option = screen.getByRole("combobox", { name: `${label}触发选项` });
+      expect((option as HTMLSelectElement).value).toBe("");
+      expect(within(option).queryByRole("option", { name: "初稿" })).toBeNull();
+    }
+    fireEvent.click(screen.getByRole("checkbox", { name: "启用初审修改" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "启用终审修改" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "初审修改触发选项" }), { target: { value: "opt_initial" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "终审修改触发选项" }), { target: { value: "opt_review_final" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(onSaveDraft).toHaveBeenCalledTimes(1));
+    expect(onSaveDraft.mock.calls[0][1]).toMatchObject({
+      statusField: configured.statusField,
+      reviewStatusField: { fieldId: reviewField.fieldId, fieldName: reviewField.fieldName },
+      stages: {
+        initial: configured.stages!.initial,
+        first_review: { ...configured.stages!.first_review, enabled: true, trigger: {
+          fieldId: reviewField.fieldId, fieldName: reviewField.fieldName, optionId: "opt_initial", value: "待初审修改",
+        } },
+        final_review: { ...configured.stages!.final_review, enabled: true, trigger: {
+          fieldId: reviewField.fieldId, fieldName: reviewField.fieldName, optionId: "opt_review_final", value: "待终审修改",
+        } },
+      },
+    });
+  });
+
+  it("changing or clearing the initial field preserves review options and material sources", () => {
+    renderTriggers();
+    fireEvent.change(screen.getByRole("combobox", { name: "初稿触发字段" }), { target: { value: reviewField.fieldId } });
+    expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value).toBe("");
+    expect((screen.getByRole("combobox", { name: "初审修改触发选项" }) as HTMLSelectElement).value).toBe("opt_review");
+    expect((screen.getByRole("combobox", { name: "终审修改触发选项" }) as HTMLSelectElement).value).toBe("opt_final");
+    expect((screen.getByRole("textbox", { name: "初稿视频目录标题" }) as HTMLInputElement).value).toBe("录屏");
+    fireEvent.change(screen.getByRole("combobox", { name: "初稿触发字段" }), { target: { value: "" } });
+    expect((screen.getByRole("combobox", { name: "初稿触发字段" }) as HTMLSelectElement).value).toBe("");
+    expect((screen.getByRole("combobox", { name: "审核修改触发字段" }) as HTMLSelectElement).value).toBe("fld_status");
+  });
+});
+
 describe("FeishuWorkflowPanel audio drafts", () => {
   afterEach(() => cleanup());
 
@@ -933,13 +997,13 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     />);
 
     selectSubjectSettingsTab("素材与阶段");
-    expect(screen.getByRole("combobox", { name: "状态字段" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "初稿触发字段" })).toBeTruthy();
     expect(screen.getByRole("combobox", { name: "素材文档字段" })).toBeTruthy();
     expect(screen.getByRole("combobox", { name: "命名字段" })).toBeTruthy();
     expect(screen.getByRole("checkbox", { name: "启用初稿" })).toBeTruthy();
     expect(screen.getByRole("checkbox", { name: "启用初审修改" })).toBeTruthy();
     expect(screen.getByRole("checkbox", { name: "启用终审修改" })).toBeTruthy();
-    expect(within(screen.getByRole("combobox", { name: "状态字段" }))
+    expect(within(screen.getByRole("combobox", { name: "初稿触发字段" }))
       .getByRole("option", { name: "流程状态" })).toBeTruthy();
   });
 
@@ -986,7 +1050,7 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     />);
 
     selectSubjectSettingsTab("素材与阶段");
-    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value)
+    expect((screen.getByRole("combobox", { name: "初稿触发字段" }) as HTMLSelectElement).value)
       .toBe("fld_real_status");
     expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value)
       .toBe("opt_ready");
@@ -1057,7 +1121,7 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     />);
 
     selectSubjectSettingsTab("素材与阶段");
-    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value)
+    expect((screen.getByRole("combobox", { name: "初稿触发字段" }) as HTMLSelectElement).value)
       .toBe("fld_status");
     expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value)
       .toBe("");
@@ -1163,7 +1227,7 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     />);
 
     selectSubjectSettingsTab("素材与阶段");
-    const status = screen.getByRole("combobox", { name: "状态字段" });
+    const status = screen.getByRole("combobox", { name: "初稿触发字段" });
     expect(within(status).getByRole("option", { name: "流程状态" })).toBeTruthy();
     expect(within(status).queryByRole("option", { name: "伪状态类型" })).toBeNull();
     expect(within(status).queryByRole("option", { name: "伪状态界面" })).toBeNull();
@@ -1203,8 +1267,8 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     />);
 
     selectSubjectSettingsTab("素材与阶段");
-    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value).toBe("");
-    expect(within(screen.getByRole("combobox", { name: "状态字段" })).getByRole("option", { name: "新状态" })).toBeTruthy();
+    expect((screen.getByRole("combobox", { name: "初稿触发字段" }) as HTMLSelectElement).value).toBe("");
+    expect(within(screen.getByRole("combobox", { name: "初稿触发字段" })).getByRole("option", { name: "新状态" })).toBeTruthy();
     expect((screen.getByRole("combobox", { name: "素材文档字段" }) as HTMLSelectElement).value).toBe("");
     expect((screen.getByRole("combobox", { name: "命名字段" }) as HTMLSelectElement).value).toBe("");
     expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value).toBe("");
@@ -1256,8 +1320,8 @@ describe("FeishuWorkflowPanel audio drafts", () => {
         .toBe("用户未保存音频");
     });
     expect((screen.getByRole("textbox", { name: "初稿命名后缀" }) as HTMLInputElement).value).toBe("_用户未保存");
-    expect(within(screen.getByRole("combobox", { name: "状态字段" })).getByRole("option", { name: "刷新状态" })).toBeTruthy();
-    expect((screen.getByRole("combobox", { name: "状态字段" }) as HTMLSelectElement).value).toBe("");
+    expect(within(screen.getByRole("combobox", { name: "初稿触发字段" })).getByRole("option", { name: "刷新状态" })).toBeTruthy();
+    expect((screen.getByRole("combobox", { name: "初稿触发字段" }) as HTMLSelectElement).value).toBe("");
     expect((screen.getByRole("combobox", { name: "初稿触发选项" }) as HTMLSelectElement).value).toBe("");
     expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(true);
     expect(onSaveDraft).not.toHaveBeenCalled();

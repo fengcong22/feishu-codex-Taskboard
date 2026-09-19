@@ -552,7 +552,7 @@ export function createBridge({
       await archiveWaitingFeishuStageTasks(taskboard, {
         event: record.event,
         stageId: decision.stageId,
-        statusFieldId: subject.statusField?.fieldId ?? record.event.statusFieldId,
+        statusFieldId: record.event.statusFieldId ?? decision.stage?.trigger?.fieldId ?? subject.statusField?.fieldId,
       }, { ensureActive: () => heartbeat.ensureActive() });
       return completePhased(record, "ignored", {
         kind: "ignored",
@@ -629,7 +629,8 @@ export function createBridge({
       await archiveWaitingFeishuStageTasks(taskboard, {
         event: record.event,
         stageId: decision.previousStageId,
-        statusFieldId: subject.statusField?.fieldId ?? record.event.statusFieldId,
+        statusFieldId: record.event.statusFieldId
+          ?? subject.stages?.[decision.previousStageId]?.trigger?.fieldId ?? subject.statusField?.fieldId,
       }, { ensureActive: () => heartbeat.ensureActive() });
     }
 

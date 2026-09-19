@@ -97,8 +97,14 @@ function fieldRawMap(entries) {
   return result;
 }
 
-function fieldDisplayValue(raw, table, optionId) {
-  const configuredOptions = table?.statusField?.options;
+function statusFieldDefinition(table, fieldId) {
+  return [table.statusField, table.reviewStatusField].find((field) => (
+    field && (field.fieldId ?? field.field_id) === fieldId
+  ));
+}
+
+function fieldDisplayValue(raw, table, optionId, fieldId) {
+  const configuredOptions = statusFieldDefinition(table, fieldId)?.options;
   if (optionId && Array.isArray(configuredOptions)) {
     const option = configuredOptions.find((candidate) => (
       (candidate.optionId ?? candidate.option_id ?? candidate.id) === optionId
@@ -210,11 +216,12 @@ export function normalizeBitableRecordChanged(payload, table) {
     );
     const changedIds = changedFieldIds(before, after);
     const statusFieldId = table.statusField?.fieldId ?? table.statusField?.field_id ?? table.triggerFieldId ?? "";
+    const reviewStatusFieldId = table.reviewStatusField?.fieldId ?? table.reviewStatusField?.field_id;
     const finalDirectoryFieldId = table.delivery?.version === 1
       && table.delivery.finalDirectoryTrigger?.enabled === true
       ? table.delivery.finalDirectoryTrigger.fieldId
       : null;
-    const watchedFieldIds = [statusFieldId, finalDirectoryFieldId]
+    const watchedFieldIds = [statusFieldId, reviewStatusFieldId, finalDirectoryFieldId]
       .filter((fieldId, index, entries) => typeof fieldId === "string" && fieldId !== "" && entries.indexOf(fieldId) === index);
     const edgeFieldIds = watchedFieldIds.filter((fieldId) => changedIds.includes(fieldId));
     if (edgeFieldIds.length === 0) {
@@ -261,14 +268,14 @@ export function normalizeBitableRecordChanged(payload, table) {
       const beforeOptionId = optionIdValue(beforeRaw.get(edgeFieldId));
       const afterOptionId = optionIdValue(afterRaw.get(edgeFieldId));
       const beforeValue = before.has(edgeFieldId)
-        ? fieldDisplayValue(beforeRaw.get(edgeFieldId), table, beforeOptionId)
+        ? fieldDisplayValue(beforeRaw.get(edgeFieldId), table, beforeOptionId, edgeFieldId)
         : "";
       const afterValue = after.has(edgeFieldId)
-        ? fieldDisplayValue(afterRaw.get(edgeFieldId), table, afterOptionId)
+        ? fieldDisplayValue(afterRaw.get(edgeFieldId), table, afterOptionId, edgeFieldId)
         : "";
       const baseResult = {
         // Preserve the established stage-event key even when an additional
-        // watched field is enabled. Extra delivery fields receive their own
+        // watched field is enabled. Additional fields receive their own
         // key so each side effect remains independently idempotent.
         eventId: edgeFieldId === statusFieldId ? actionEventId : `${actionEventId}:${edgeFieldId}`,
         baseToken,
@@ -283,9 +290,9 @@ export function normalizeBitableRecordChanged(payload, table) {
         ).trim(),
         action: actionName,
         fieldId: edgeFieldId,
-        fieldName: edgeFieldId === table.triggerFieldId
+        fieldName: statusFieldDefinition(table, edgeFieldId)?.fieldName ?? (edgeFieldId === table.triggerFieldId
           ? table.triggerField
-          : String(actionObject.field_name ?? actionObject.fieldName ?? edgeFieldId).trim(),
+          : String(actionObject.field_name ?? actionObject.fieldName ?? edgeFieldId).trim()),
         beforeValue,
         afterValue,
         fields,

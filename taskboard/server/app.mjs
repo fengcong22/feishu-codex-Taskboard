@@ -107,6 +107,14 @@ const SAFE_FEISHU_PREVIEW_ERRORS = new Map([
   ["FEISHU_METADATA_INVALID_RESPONSE", { status: 502, message: "飞书返回了无法识别的多维表格信息" }],
   ["FEISHU_METADATA_READ_FAILED", { status: 502, message: "无法读取飞书多维表格，请检查应用权限" }],
 ]);
+const SAFE_FEISHU_SUBSCRIPTION_ERRORS = new Map([
+  ["INVALID_BASE_TOKEN", { status: 400, message: "飞书多维表格标识无效" }],
+  ["FEISHU_SUBSCRIPTION_UNAVAILABLE", { status: 503, message: "飞书事件订阅服务不可用" }],
+  ["FEISHU_SUBSCRIPTION_READ_FAILED", { status: 502, message: "无法读取飞书事件订阅状态，请检查应用权限" }],
+  ["FEISHU_SUBSCRIPTION_MUTATION_FAILED", { status: 502, message: "无法更新飞书事件订阅，请检查应用权限" }],
+  ["FEISHU_SUBSCRIPTION_VERIFY_FAILED", { status: 502, message: "飞书事件订阅状态未能确认，请刷新后重试" }],
+  ["FEISHU_SUBSCRIPTION_INVALID_RESPONSE", { status: 502, message: "飞书返回了无法识别的订阅状态" }],
+]);
 const BRIDGE_DIAGNOSTIC_PATH_PATTERN = /^bases\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
 const BRIDGE_DIAGNOSTIC_MESSAGES = new Map([
   ["BASE_NOT_FOUND", "The configured Base is not available in Feishu"],
@@ -164,7 +172,7 @@ function bridgeShareDiagnosticContext(configuration) {
         ".title.fieldId", ".title.fieldName", ".subjectCode.fieldId", ".subjectCode.fieldName",
         ".packageRoute", ".upload.artifactSourcePath", ".upload.targetPath",
       ]) paths.add(`${subjectPath}${suffix}`);
-      for (const fieldName of ["statusField", "documentField", "namingField"]) {
+      for (const fieldName of ["statusField", "reviewStatusField", "documentField", "namingField"]) {
         const field = subject[fieldName];
         if (!field || typeof field !== "object") continue;
         paths.add(`${subjectPath}.${fieldName}.fieldId`);
@@ -172,6 +180,9 @@ function bridgeShareDiagnosticContext(configuration) {
       }
       if (subject.statusField && typeof subject.statusField === "object") {
         paths.add(`${subjectPath}.statusField.options`);
+      }
+      if (subject.reviewStatusField && typeof subject.reviewStatusField === "object") {
+        paths.add(`${subjectPath}.reviewStatusField.options`);
       }
       if (subject.stages && typeof subject.stages === "object") {
         paths.add(`${subjectPath}.stages`);
@@ -212,7 +223,7 @@ function copyDefinedFields(value, keys) {
 
 function hasExplicitPhasedShape(subject) {
   if (!subject || typeof subject !== "object" || Array.isArray(subject)) return false;
-  return ["statusField", "documentField", "namingField", "stages"]
+  return ["statusField", "reviewStatusField", "documentField", "namingField", "stages"]
     .some((key) => subject[key] !== undefined && subject[key] !== null);
 }
 
@@ -278,7 +289,7 @@ function bridgeShareInspectionConfiguration(configuration, sourceConfiguration =
   const subjectKeys = [
     "subjectKey", "baseToken", "baseName", "tableId", "tableName", "displayEnabled",
     "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title",
-    "execution", "packageRoute", "upload", "statusField", "documentField",
+    "execution", "packageRoute", "upload", "statusField", "reviewStatusField", "documentField",
     "namingField", "stages",
   ];
   const sourceSubjects = bridgeShareSourceSubjects(sourceConfiguration);
@@ -291,7 +302,7 @@ function bridgeShareInspectionConfiguration(configuration, sourceConfiguration =
         const selected = source && !hasExplicitPhasedShape(source)
           ? {
             ...Object.fromEntries(Object.entries(subject ?? {}).filter(([key]) => (
-              !["statusField", "documentField", "namingField", "stages"].includes(key)
+              !["statusField", "reviewStatusField", "documentField", "namingField", "stages"].includes(key)
             ))),
             ...copyDefinedFields(source, ["trigger", "title", "execution", "packageRoute", "upload"]),
           }
@@ -351,6 +362,14 @@ function feishuPreviewError(payload) {
   return safe
     ? new ApiError(safe.status, code, safe.message)
     : new ApiError(502, "FEISHU_METADATA_READ_FAILED", "Feishu Base metadata preview failed");
+}
+
+function feishuSubscriptionError(payload) {
+  const code = payload?.error?.code;
+  const safe = typeof code === "string" ? SAFE_FEISHU_SUBSCRIPTION_ERRORS.get(code) : null;
+  return safe
+    ? new ApiError(safe.status, code, safe.message)
+    : new ApiError(502, "FEISHU_SUBSCRIPTION_READ_FAILED", "Feishu Base subscription request failed");
 }
 
 function isFeishuPreviewText(value) {
@@ -2954,8 +2973,11 @@ export function createTaskboardServer(options = {}) {
     if (!stage || stage.enabled !== true) {
       throw new ApiError(409, "STAGE_DISABLED", "The referenced Auto-Cut stage is disabled");
     }
+    const stageStatusField = binding.stageId === "initial"
+      ? subjectVersion.statusField
+      : subjectVersion.reviewStatusField ?? subjectVersion.statusField;
     if (
-      subjectVersion.statusField?.fieldId !== event.statusFieldId
+      stageStatusField?.fieldId !== event.statusFieldId
       || stage.trigger?.fieldId !== event.statusFieldId
       || stage.trigger?.optionId !== event.afterOptionId
       || event.beforeOptionId === event.afterOptionId
@@ -3019,7 +3041,7 @@ export function createTaskboardServer(options = {}) {
       ? "manual"
       : (subjectVersion.execution?.mode === "automatic" ? "automatic" : "manual");
     const uploadMode = subjectVersion.upload?.enqueueMode === "automatic" ? "automatic" : "manual";
-    const triggerField = subjectVersion.statusField?.fieldName ?? event.statusFieldId;
+    const triggerField = stageStatusField?.fieldName ?? event.statusFieldId;
     const origin = {
       version: 1,
       source: "feishu-base",
@@ -3286,6 +3308,7 @@ export function createTaskboardServer(options = {}) {
       lifecycle,
       configVersion: subject.configVersion,
       ...(subject.statusField ? { statusField: structuredClone(subject.statusField) } : {}),
+      ...(subject.reviewStatusField !== undefined ? { reviewStatusField: structuredClone(subject.reviewStatusField) } : {}),
       ...(subject.documentField ? { documentField: structuredClone(subject.documentField) } : {}),
       ...(subject.namingField ? { namingField: structuredClone(subject.namingField) } : {}),
       ...(courseNamingField ? { courseNamingField } : {}),
@@ -3373,6 +3396,42 @@ export function createTaskboardServer(options = {}) {
     }
     return { diagnostics: normalizeBridgeShareDiagnostics(payload.diagnostics, configuration) };
   }
+  async function manageFeishuBaseSubscription(baseToken, operation) {
+    let bridgeUrl;
+    try {
+      bridgeUrl = new URL(resolved.feishuBridgeUrl);
+    } catch {
+      throw new ApiError(503, "FEISHU_SUBSCRIPTION_UNAVAILABLE", "Feishu Base subscription is unavailable");
+    }
+    if (bridgeUrl.protocol !== "http:" || bridgeUrl.hostname !== "127.0.0.1"
+      || typeof resolved.feishuBridgeSecret !== "string" || !resolved.feishuBridgeSecret.trim()) {
+      throw new ApiError(503, "FEISHU_SUBSCRIPTION_UNAVAILABLE", "Feishu Base subscription is unavailable");
+    }
+    const method = operation === "get" ? "GET" : operation === "subscribe" ? "POST" : operation === "unsubscribe" ? "DELETE" : null;
+    if (!method) throw new ApiError(400, "INVALID_FIELD", "Invalid Feishu Base subscription operation");
+    let response;
+    try {
+      response = await fetch(new URL(`/api/feishu/workflow/bases/${encodeURIComponent(baseToken)}/subscription`, bridgeUrl), {
+        method,
+        redirect: "error",
+        headers: {
+          ...(method === "GET" ? {} : { "content-type": "application/json" }),
+          "x-feishu-bridge-client": "taskboard",
+          "x-feishu-bridge-secret": resolved.feishuBridgeSecret,
+        },
+        ...(method === "GET" ? {} : { body: "{}" }),
+      });
+    } catch {
+      throw new ApiError(503, "FEISHU_SUBSCRIPTION_UNAVAILABLE", "Feishu Base subscription is unavailable");
+    }
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!response.ok) throw feishuSubscriptionError(payload);
+    if (!payload?.subscription || typeof payload.subscription.subscribed !== "boolean") {
+      throw new ApiError(502, "FEISHU_SUBSCRIPTION_INVALID_RESPONSE", "Feishu Base subscription response is invalid");
+    }
+    return { subscribed: payload.subscription.subscribed };
+  }
   const feishuWorkflowStore = createFeishuWorkflowStore({
     database,
     packageAliases: async () => (typeof feishuPackages.list === "function"
@@ -3388,6 +3447,7 @@ export function createTaskboardServer(options = {}) {
     inspectShareImport: typeof options.feishuWorkflowShareImport === "function"
       ? options.feishuWorkflowShareImport
       : inspectFeishuShareImportWithBridge,
+    manageBaseSubscription: manageFeishuBaseSubscription,
     previewBase: async (url) => {
       let bridgeUrl;
       try {

@@ -21,6 +21,7 @@ import type {
   FeishuPackageWorkspaceInspection,
 } from "../types";
 import { LinearIcon } from "./LinearIcon";
+import { packageDisplayName } from "../feishuPackageDisplay";
 
 type Props = {
   refreshKey?: number;
@@ -125,10 +126,6 @@ function packageReferences(error: unknown): AutoCutPackageReference[] {
 function referenceLabel(reference: AutoCutPackageReference): string {
   if (reference.type === "subject") return `${reference.baseName} / ${reference.tableName}`;
   return `${reference.identifier} · ${reference.title}`;
-}
-
-function packageDisplayName(value: Pick<FeishuPackage, "name"> & { identity?: FeishuPackageWorkspaceInspection | null }): string {
-  return value.identity?.displayName || value.name;
 }
 
 function inspectionFailure(error: unknown): string {

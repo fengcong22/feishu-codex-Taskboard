@@ -114,36 +114,43 @@ function safeCourseName(value) {
   return result;
 }
 
-/**
- * Convert the explicitly configured course-name field into one directory-safe
- * display value. Text fields may be returned by Feishu as a direct string or
- * as exactly one structured text element; formula fields resolve to direct
- * text results.
- */
-export function normalizeCourseNameValue(value, field) {
-  const kind = courseNameFieldKind(field);
-  if (kind === "formula") {
-    if (typeof value !== "string") {
-      throw courseNameError("COURSE_NAME_NOT_TEXT", "Formula result is not text");
-    }
-    if (/^#(?:ERROR|REF|DIV\/0|VALUE|NAME\?|N\/A|NUM|NULL)!?$/iu.test(value.trim())) {
-      throw courseNameError("COURSE_NAME_NOT_TEXT", "Formula result is an error");
-    }
-    return safeCourseName(value);
-  }
-
-  if (typeof value === "string") return safeCourseName(value);
-
-  if (!Array.isArray(value) || value.length !== 1) {
-    throw courseNameError("COURSE_NAME_NOT_TEXT", "Text course name must contain one text element");
-  }
+function structuredTextValue(value) {
+  if (!Array.isArray(value) || value.length !== 1) return null;
   const [element] = value;
   if (!element || typeof element !== "object" || Array.isArray(element)
     || (element.type !== undefined && element.type !== "text")
     || typeof element.text !== "string") {
+    return null;
+  }
+  return element.text;
+}
+
+/**
+ * Convert the explicitly configured course-name field into one directory-safe
+ * display value. Text fields may be returned by Feishu as a direct string or
+ * as exactly one structured text element. Formula fields can also arrive in
+ * that SDK shape when text_field_as_array is requested.
+ */
+export function normalizeCourseNameValue(value, field) {
+  const kind = courseNameFieldKind(field);
+  if (kind === "formula") {
+    const formulaValue = typeof value === "string" ? value : structuredTextValue(value);
+    if (formulaValue === null) {
+      throw courseNameError("COURSE_NAME_NOT_TEXT", "Formula result is not text");
+    }
+    if (/^#(?:ERROR|REF|DIV\/0|VALUE|NAME\?|N\/A|NUM|NULL)!?$/iu.test(formulaValue.trim())) {
+      throw courseNameError("COURSE_NAME_NOT_TEXT", "Formula result is an error");
+    }
+    return safeCourseName(formulaValue);
+  }
+
+  if (typeof value === "string") return safeCourseName(value);
+
+  const textValue = structuredTextValue(value);
+  if (textValue === null) {
     throw courseNameError("COURSE_NAME_NOT_TEXT", "Text course name is invalid");
   }
-  return safeCourseName(element.text);
+  return safeCourseName(textValue);
 }
 
 function metadataFields(table) {

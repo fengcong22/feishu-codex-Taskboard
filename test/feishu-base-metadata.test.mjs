@@ -88,6 +88,49 @@ function phasedMetadata(fields = []) {
   };
 }
 
+function twoFieldMetadataFixture() {
+  const subject = phasedSubject({ reviewStatusField: { fieldId: "fld_review", fieldName: "Review" } });
+  subject.stages.first_review.trigger = { fieldId: "fld_review", fieldName: "Review", optionId: "opt_initial", value: "First" };
+  subject.stages.final_review.trigger = { fieldId: "fld_review", fieldName: "Review", optionId: "opt_final", value: "Final" };
+  return {
+    subject,
+    metadata: phasedMetadata([
+      { fieldId: "fld_status", fieldName: "制作进度", type: 3, uiType: "SingleSelect", options: [{ id: "opt_initial", name: "初稿" }] },
+      { fieldId: "fld_review", fieldName: "Review", type: 3, uiType: "SingleSelect", options: [{ id: "opt_initial", name: "First" }, { id: "opt_final", name: "Final" }] },
+      { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
+      { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
+    ]),
+  };
+}
+
+test("two trigger fields validate options independently when IDs overlap", () => {
+  const { subject, metadata } = twoFieldMetadataFixture();
+  assert.equal(assertPhasedSubjectMetadata(subject, metadata), true);
+  assert.deepEqual(comparePhasedSubjectMetadata(subject, metadata), []);
+  subject.stages.final_review.trigger = { ...subject.stages.first_review.trigger };
+  assert.throws(() => assertPhasedSubjectMetadata(subject, metadata), /unique/u);
+});
+
+test("two trigger fields reject renamed, missing and invalid review metadata", () => {
+  for (const mutation of [
+    (field) => { field.fieldName = "Renamed"; },
+    (field) => { field.fieldId = "fld_other"; },
+    (field) => { field.type = 1; field.uiType = "Text"; },
+    (field) => { field.options = null; },
+    (field) => { field.options.push({ ...field.options[0] }); },
+  ]) {
+    const { subject, metadata } = twoFieldMetadataFixture();
+    mutation(metadata.tables[0].fields[1]);
+    assert.throws(() => assertPhasedSubjectMetadata(subject, metadata));
+    assert.ok(comparePhasedSubjectMetadata(subject, metadata).some((issue) => issue.path.includes("reviewStatusField")));
+  }
+  const { subject, metadata } = twoFieldMetadataFixture();
+  metadata.tables[0].fields[1].options[0].name = "Renamed";
+  const issues = comparePhasedSubjectMetadata(subject, metadata);
+  assert.ok(issues.some((issue) => issue.path.endsWith("stages.first_review.trigger.optionId")));
+  assert.ok(issues.every((issue) => !issue.path.includes("stages.initial")));
+});
+
 test("parses direct Base and Wiki links with their optional table query", () => {
   assert.deepEqual(parseBaseLink("https://example.feishu.cn/base/bas_demo?table=tbl_chinese"), {
     baseToken: "bas_demo",

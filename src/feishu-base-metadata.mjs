@@ -808,13 +808,17 @@ function phasedSubjectErrors(subject, metadata, table) {
       return null;
     }
   };
-  const status = readField(subject?.statusField, "statusField");
-  if (status && !isSingleSelectField(status)) {
-    errors.push(phasedValidationError(
-      "statusField must be a single-select field",
-      "FIELD_TYPE_INVALID",
-      "statusField.fieldId",
-    ));
+  const statusFields = new Map();
+  for (const descriptorName of ["statusField", ...(subject?.reviewStatusField == null ? [] : ["reviewStatusField"])]) {
+    const field = readField(subject?.[descriptorName], descriptorName);
+    if (field && !isSingleSelectField(field)) {
+      errors.push(phasedValidationError(
+        `${descriptorName} must be a single-select field`,
+        "FIELD_TYPE_INVALID",
+        `${descriptorName}.fieldId`,
+      ));
+    }
+    statusFields.set(descriptorName, { field, options: [], optionsUsable: false });
   }
   readField(subject?.documentField, "documentField");
   const naming = readField(subject?.namingField, "namingField");
@@ -826,33 +830,34 @@ function phasedSubjectErrors(subject, metadata, table) {
     ));
   }
 
-  let options = [];
-  let optionsUsable = false;
-  if (status && Array.isArray(status.options)
-    && status.options.every((option) => (
-      metadataObject(option)
-      && typeof option.id === "string"
-      && option.id.trim() !== ""
-      && typeof option.name === "string"
-      && option.name.trim() !== ""
-    ))) {
-    options = status.options;
-    const optionIds = options.map((option) => option.id);
-    if (new Set(optionIds).size === optionIds.length) {
-      optionsUsable = true;
-    } else {
+  for (const [descriptorName, entry] of statusFields) {
+    const { field } = entry;
+    if (field && Array.isArray(field.options)
+      && field.options.every((option) => (
+        metadataObject(option)
+        && typeof option.id === "string"
+        && option.id.trim() !== ""
+        && typeof option.name === "string"
+        && option.name.trim() !== ""
+      ))) {
+      entry.options = field.options;
+      const optionIds = entry.options.map((option) => option.id);
+      if (new Set(optionIds).size === optionIds.length) {
+        entry.optionsUsable = true;
+      } else {
+        errors.push(phasedValidationError(
+          `Feishu returned ambiguous options for ${descriptorName}`,
+          "FEISHU_METADATA_INVALID_RESPONSE",
+          `${descriptorName}.options`,
+        ));
+      }
+    } else if (field) {
       errors.push(phasedValidationError(
-        "Feishu returned ambiguous status field options",
+        `Feishu returned unusable metadata for ${descriptorName}`,
         "FEISHU_METADATA_INVALID_RESPONSE",
-        "statusField.options",
+        `${descriptorName}.options`,
       ));
     }
-  } else if (status) {
-    errors.push(phasedValidationError(
-      "Feishu returned unusable metadata for the status field",
-      "FEISHU_METADATA_INVALID_RESPONSE",
-      "statusField.options",
-    ));
   }
 
   const enabled = Object.entries(subject?.stages ?? {}).filter(([, stage]) => stage?.enabled);
@@ -864,8 +869,10 @@ function phasedSubjectErrors(subject, metadata, table) {
   const seen = new Set();
   for (const [stageId, stage] of enabled) {
     const trigger = stage.trigger ?? {};
-    if (trigger.fieldId !== subject?.statusField?.fieldId) {
-      const error = configurationChanged(`${stageId}.trigger.fieldId must match statusField.fieldId`);
+    const descriptorName = stageId === "initial" || subject?.reviewStatusField == null ? "statusField" : "reviewStatusField";
+    const { field: status, options, optionsUsable } = statusFields.get(descriptorName);
+    if (trigger.fieldId !== subject?.[descriptorName]?.fieldId) {
+      const error = configurationChanged(`${stageId}.trigger.fieldId must match ${descriptorName}.fieldId`);
       error.path = `stages.${stageId}.trigger.fieldId`;
       errors.push(error);
     }
@@ -874,12 +881,13 @@ function phasedSubjectErrors(subject, metadata, table) {
       error.path = `stages.${stageId}.trigger.fieldName`;
       errors.push(error);
     }
-    if (seen.has(trigger.optionId)) {
+    const triggerKey = JSON.stringify([trigger.fieldId, trigger.optionId]);
+    if (seen.has(triggerKey)) {
       const error = configurationChanged("enabled stage trigger options must be unique");
       error.path = `stages.${stageId}.trigger.optionId`;
       errors.push(error);
     }
-    seen.add(trigger.optionId);
+    seen.add(triggerKey);
     if (optionsUsable) {
       const matches = options.filter((option) => (
         option.id === trigger.optionId && option.name === trigger.value

@@ -640,6 +640,7 @@ export function createWorkflowConfigStore({
       execution: input.execution ?? current.execution,
       packageRoute: input.packageRoute ?? current.packageRoute,
       statusField: input.statusField ?? current.statusField,
+      reviewStatusField: input.reviewStatusField === undefined ? current.reviewStatusField : input.reviewStatusField,
       documentField: input.documentField ?? current.documentField,
       namingField: input.namingField ?? current.namingField,
       stages: input.stages ?? current.stages,
@@ -653,7 +654,7 @@ export function createWorkflowConfigStore({
     if (input.delivery !== undefined || current.delivery !== undefined) {
       next.delivery = clone(input.delivery ?? current.delivery);
     }
-    for (const field of ["statusField", "documentField", "namingField", "stages"]) {
+    for (const field of ["statusField", "reviewStatusField", "documentField", "namingField", "stages"]) {
       if (next[field] === undefined) delete next[field];
     }
     delete next.activeSnapshot;

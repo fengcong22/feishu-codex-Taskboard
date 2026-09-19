@@ -773,6 +773,29 @@ export async function listFeishuWorkflowCatalog(signal?: AbortSignal): Promise<F
   return data.catalog;
 }
 
+export async function getFeishuBaseSubscription(baseToken: string): Promise<{ subscribed: boolean }> {
+  const data = await request<{ subscription: { subscribed: boolean } }>(
+    `/api/local/feishu/workflow/bases/${encodeURIComponent(baseToken)}/subscription`,
+  );
+  return data.subscription;
+}
+
+export async function subscribeFeishuBase(baseToken: string): Promise<{ subscribed: boolean }> {
+  const data = await request<{ subscription: { subscribed: boolean } }>(
+    `/api/local/feishu/workflow/bases/${encodeURIComponent(baseToken)}/subscription`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  return data.subscription;
+}
+
+export async function unsubscribeFeishuBase(baseToken: string): Promise<{ subscribed: boolean }> {
+  const data = await request<{ subscription: { subscribed: boolean } }>(
+    `/api/local/feishu/workflow/bases/${encodeURIComponent(baseToken)}/subscription`,
+    { method: "DELETE", body: JSON.stringify({}) },
+  );
+  return data.subscription;
+}
+
 export async function listFeishuPackages(signal?: AbortSignal): Promise<FeishuPackageSummary[]> {
   const data = await requestPackageBounded<{ packages: FeishuPackageSummary[] }>("/api/local/autocut/packages", { signal });
   return data.packages;

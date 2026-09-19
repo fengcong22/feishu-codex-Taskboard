@@ -87,6 +87,7 @@ function workflowTables(config) {
         triggerValue: trigger.startValue,
         triggerOptionId: trigger.optionId,
         statusField,
+        ...(subject.reviewStatusField ? { reviewStatusField: subject.reviewStatusField } : {}),
         titleField: subject.title?.fieldName ?? null,
         titleFieldId: subject.title?.fieldId ?? null,
         packageField: null,
@@ -129,7 +130,9 @@ function modernSubjects(config) {
 }
 
 function subjectTable(subject, stage = null) {
-  const statusField = subject.statusField ?? {};
+  const statusField = [subject.statusField, subject.reviewStatusField].find((field) => (
+    field && stage?.trigger?.fieldId === (field.fieldId ?? field.field_id)
+  )) ?? subject.statusField ?? {};
   return {
     ...subject,
     name: subject.tableName ?? subject.name ?? subject.tableId,
@@ -215,7 +218,10 @@ function modernDecision(subject, event) {
   if (finalDirectory) return finalDirectory;
   const statusField = subject.statusField ?? {};
   const statusFieldId = statusField.fieldId ?? statusField.field_id;
-  if (statusFieldId && event.fieldId && event.fieldId !== statusFieldId) {
+  const reviewStatusFieldId = subject.reviewStatusField?.fieldId
+    ?? subject.reviewStatusField?.field_id ?? statusFieldId;
+  const watchedFieldIds = [statusFieldId, reviewStatusFieldId].filter(Boolean);
+  if (watchedFieldIds.length && event.fieldId && !watchedFieldIds.includes(event.fieldId)) {
     return { kind: "ignored", reason: "unrelated_field" };
   }
   if (!event.beforePresent || !event.afterPresent
@@ -230,11 +236,15 @@ function modernDecision(subject, event) {
       event,
     };
   }
-  if (statusFieldId && event.statusFieldId !== statusFieldId) {
+  if (watchedFieldIds.length && (!watchedFieldIds.includes(event.statusFieldId)
+    || (event.fieldId && event.statusFieldId !== event.fieldId))) {
     return { kind: "ignored", reason: "unrelated_field" };
   }
   const stages = subject.stages ?? {};
-  const entries = Object.entries(stages).filter(([, stage]) => stage && typeof stage === "object");
+  const entries = Object.entries(stages).filter(([stageId, stage]) => (
+    stage && typeof stage === "object"
+    && (stage.trigger?.fieldId ?? (stageId === "initial" ? statusFieldId : reviewStatusFieldId)) === event.statusFieldId
+  ));
   const previous = entries.find(([, stage]) => stage.trigger?.optionId === event.beforeOptionId);
   const targetAny = entries.find(([, stage]) => stage.trigger?.optionId === event.afterOptionId);
   if (event.beforeOptionId === event.afterOptionId) {

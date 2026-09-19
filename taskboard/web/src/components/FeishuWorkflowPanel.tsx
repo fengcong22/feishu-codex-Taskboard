@@ -29,6 +29,7 @@ import {
   setFeishuSubjectEnabled,
 } from "../feishuWorkflow";
 import { listFeishuPackages, refreshFeishuBaseFields } from "../api";
+import { packageDisplayName } from "../feishuPackageDisplay";
 import { RefreshIcon } from "./SemanticIcons";
 import { useFeishuConfigurationLayout } from "./useFeishuConfigurationLayout";
 
@@ -163,10 +164,14 @@ function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata
   const statusField = uniqueMetadataField(fields, status?.fieldId)
     ?? (legacyTriggerField && isSingleSelectField(legacyTriggerField) ? legacyTriggerField : undefined)
     ?? fields.find(isSingleSelectField);
-  const options = statusField?.options ?? [];
+  const configuredReviewField = subject.reviewStatusField === undefined || subject.reviewStatusField === null
+    ? statusField
+    : uniqueMetadataField(fields, subject.reviewStatusField.fieldId);
   const existing = subject.stages;
   return Object.fromEntries(PHASE_IDS.map((stageId, index) => {
     const old = existing?.[stageId];
+    const triggerField = stageId === "initial" ? statusField : configuredReviewField;
+    const options = triggerField?.options ?? [];
     const projectsLegacyInitial = index === 0 && !old;
     const legacyInitialOption = projectsLegacyInitial
       ? subject.trigger?.optionId
@@ -177,8 +182,8 @@ function stageDefaults(subject: FeishuSubjectConfig, fields: FeishuFieldMetadata
     const fallback: FeishuStageConfig = {
       enabled: index === 0,
       trigger: {
-        fieldId: statusField?.fieldId ?? subject.trigger?.fieldId ?? null,
-        fieldName: statusField?.fieldName ?? subject.trigger?.fieldName ?? null,
+        fieldId: triggerField?.fieldId ?? (projectsLegacyInitial ? subject.trigger?.fieldId ?? null : null),
+        fieldName: triggerField?.fieldName ?? (projectsLegacyInitial ? subject.trigger?.fieldName ?? null : null),
         optionId: option?.id ?? (projectsLegacyInitial ? subject.trigger?.optionId ?? null : null),
         value: option?.name ?? (projectsLegacyInitial ? subject.trigger?.startValue ?? "" : ""),
       },
@@ -210,6 +215,8 @@ type SubjectForm = {
   uploadConcurrency: string;
   statusFieldId: string;
   statusFieldName: string;
+  reviewStatusFieldId: string;
+  reviewStatusFieldName: string;
   documentFieldId: string;
   documentFieldName: string;
   namingFieldId: string;
@@ -350,6 +357,7 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
     ? { fieldId: triggerField.fieldId, fieldName: triggerField.fieldName }
     : undefined;
   const statusField = subject.statusField ?? legacyStatusField;
+  const reviewStatusField = subject.reviewStatusField ?? statusField;
   const documentField = subject.documentField;
   const namingField = subject.namingField;
   return reconcileFormMetadata({
@@ -369,6 +377,8 @@ function formForSubject(subject: FeishuSubjectConfig): SubjectForm {
     uploadConcurrency: String(subject.upload?.uploadConcurrency ?? 1),
     statusFieldId: statusField?.fieldId ?? "",
     statusFieldName: statusField?.fieldName ?? "",
+    reviewStatusFieldId: reviewStatusField?.fieldId ?? "",
+    reviewStatusFieldName: reviewStatusField?.fieldName ?? "",
     documentFieldId: documentField?.fieldId ?? "",
     documentFieldName: documentField?.fieldName ?? "",
     namingFieldId: namingField?.fieldId ?? "",
@@ -388,6 +398,7 @@ function reconcileFormMetadata(
   const triggerField = uniqueMetadataField(fields, form.triggerFieldId);
   const triggerOption = uniqueMetadataOption(triggerField, form.optionId);
   const statusField = uniqueMetadataField(fields, form.statusFieldId);
+  const reviewStatusField = uniqueMetadataField(fields, form.reviewStatusFieldId);
   const documentField = uniqueMetadataField(fields, form.documentFieldId);
   const namingField = uniqueMetadataField(fields, form.namingFieldId);
   const stages = form.stages
@@ -484,6 +495,9 @@ function reconcileFormMetadata(
     statusFieldId: metadataFieldIsMissing(fields, form.statusFieldId)
       || metadataFieldRequiresReselection(fields, form.statusFieldId, form.statusFieldName, previousFields) ? "" : form.statusFieldId,
     statusFieldName: metadataFieldRequiresReselection(fields, form.statusFieldId, form.statusFieldName, previousFields) ? "" : statusField?.fieldName ?? form.statusFieldName,
+    reviewStatusFieldId: metadataFieldIsMissing(fields, form.reviewStatusFieldId)
+      || metadataFieldRequiresReselection(fields, form.reviewStatusFieldId, form.reviewStatusFieldName, previousFields) ? "" : form.reviewStatusFieldId,
+    reviewStatusFieldName: metadataFieldRequiresReselection(fields, form.reviewStatusFieldId, form.reviewStatusFieldName, previousFields) ? "" : reviewStatusField?.fieldName ?? form.reviewStatusFieldName,
     documentFieldId: metadataFieldIsMissing(fields, form.documentFieldId)
       || metadataFieldRequiresReselection(fields, form.documentFieldId, form.documentFieldName, previousFields) ? "" : form.documentFieldId,
     documentFieldName: metadataFieldRequiresReselection(fields, form.documentFieldId, form.documentFieldName, previousFields) ? "" : documentField?.fieldName ?? form.documentFieldName,
@@ -503,6 +517,7 @@ function editableSubjectSignature(subject: FeishuSubjectConfig): string {
     packageRoute: subject.packageRoute ?? null,
     upload: subject.upload ?? null,
     statusField: subject.statusField ?? null,
+    reviewStatusField: subject.reviewStatusField ?? null,
     documentField: subject.documentField ?? null,
     namingField: subject.namingField ?? null,
     stages: subject.stages ?? null,
@@ -526,7 +541,7 @@ function phasedFieldNamesNeedRefresh(subject: FeishuSubjectConfig): boolean {
     const current = uniqueMetadataField(fields, descriptor?.fieldId);
     return Boolean(current && descriptor?.fieldName !== current.fieldName);
   };
-  return [subject.statusField, subject.documentField, subject.namingField].some(descriptorIsStale)
+  return [subject.statusField, subject.reviewStatusField, subject.documentField, subject.namingField].some(descriptorIsStale)
     || Object.values(subject.stages ?? {}).some((stage) => {
       if (descriptorIsStale(stage.trigger)) return true;
       const field = uniqueMetadataField(fields, stage.trigger.fieldId);
@@ -617,10 +632,6 @@ export function FeishuWorkflowPanel({
   const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);
   const triggerFields = selected ? selected.metadata?.fields ?? [] : [];
   const phased = Boolean(subjectForm?.stages);
-  const selectedStatusField = subjectForm
-    ? uniqueMetadataField(triggerFields, subjectForm.statusFieldId)
-    : undefined;
-  const statusOptions = selectedStatusField?.options ?? [];
   const metadataFieldOptions = triggerFields;
   const courseNamingFields = metadataFieldOptions.filter(isCourseNamingField);
   const writableTextFields = metadataFieldOptions.filter(isWritableTextField);
@@ -641,13 +652,17 @@ export function FeishuWorkflowPanel({
     const enabledStages = PHASE_IDS.filter((stageId) => subjectForm.stages?.[stageId]?.enabled);
     if (enabledStages.length === 0) errors.push("至少启用一个阶段");
     const optionIds = enabledStages
-      .map((stageId) => subjectForm.stages?.[stageId]?.trigger.optionId)
-      .filter((value): value is string => Boolean(value));
+      .filter((stageId) => subjectForm.stages?.[stageId]?.trigger.optionId)
+      .map((stageId) => JSON.stringify([
+        subjectForm.stages?.[stageId]?.trigger.fieldId, subjectForm.stages?.[stageId]?.trigger.optionId,
+      ]));
     if (new Set(optionIds).size !== optionIds.length) errors.push("已启用阶段的触发选项不能重复");
     for (const stageId of PHASE_IDS) {
       const stage = subjectForm.stages[stageId];
       if (!stage) continue;
       const phaseLabel = PHASE_LABELS[stageId];
+      const expectedFieldId = stageId === "initial" ? subjectForm.statusFieldId : subjectForm.reviewStatusFieldId;
+      const statusOptions = uniqueMetadataField(triggerFields, expectedFieldId)?.options ?? [];
       if (stage.enabled && (!stage.trigger.optionId || !stage.trigger.value)) errors.push(`${phaseLabel}需要触发选项`);
       if (stage.enabled && stage.trigger.optionId) {
         const matches = statusOptions.filter((option) => option.id === stage.trigger.optionId);
@@ -655,7 +670,7 @@ export function FeishuWorkflowPanel({
         else if (matches.length > 1) errors.push(`${phaseLabel}的触发选项不唯一`);
       }
       if (stage.videoSource.kind === "docx_section" && !stage.videoSource.anchorText?.trim()) errors.push(`${phaseLabel}需要视频目录标题`);
-      if (stage.enabled && stage.trigger.fieldId !== subjectForm.statusFieldId) errors.push(`${phaseLabel}的触发字段与状态字段不一致`);
+      if (stage.enabled && stage.trigger.fieldId !== expectedFieldId) errors.push(`${phaseLabel}的触发字段与所选字段不一致`);
       if (stage.videoSource.kind === "base_attachment") {
         if (!stage.videoSource.fieldId) errors.push(`${phaseLabel}需要视频附件字段`);
         else {
@@ -690,8 +705,14 @@ export function FeishuWorkflowPanel({
         errors.push(`${phaseLabel}需要 ZIP 目标目录`);
       }
     }
-    if (!subjectForm.statusFieldId) errors.push("请选择状态字段");
-    else if (metadataFieldMatches(triggerFields, subjectForm.statusFieldId).length !== 1) errors.push("状态字段当前不可用或不唯一");
+    for (const [fieldId, label] of [
+      [subjectForm.statusFieldId, "初稿触发字段"],
+      [subjectForm.reviewStatusFieldId, "审核修改触发字段"],
+    ]) {
+      if (!fieldId) errors.push(`请选择${label}`);
+      else if (metadataFieldMatches(triggerFields, fieldId).length !== 1
+        || !isSingleSelectField(uniqueMetadataField(triggerFields, fieldId)!)) errors.push(`${label}当前不可用或不唯一`);
+    }
     if (!subjectForm.documentFieldId) errors.push("请选择素材文档字段");
     else if (metadataFieldMatches(triggerFields, subjectForm.documentFieldId).length === 0) errors.push("素材文档字段当前不可用");
     else if (metadataFieldMatches(triggerFields, subjectForm.documentFieldId).length > 1) errors.push("素材文档字段不唯一");
@@ -848,31 +869,35 @@ export function FeishuWorkflowPanel({
     });
   }
 
-  function selectPhasedField(kind: "status" | "document" | "naming", fieldId: string) {
+  function selectPhasedField(kind: "status" | "reviewStatus" | "document" | "naming", fieldId: string) {
     if (!subjectForm) return;
     const field = triggerFields.find((candidate) => candidate.fieldId === fieldId);
-    if (!field) return;
-    if (kind === "status") {
-      const option = field.options?.[0] ?? null;
+    if (kind === "status" || kind === "reviewStatus") {
+      if (fieldId && (!field || !isSingleSelectField(field))) return;
+      const currentFieldId = kind === "status" ? subjectForm.statusFieldId : subjectForm.reviewStatusFieldId;
+      if (fieldId === currentFieldId) return;
       const stages = subjectForm.stages
-        ? Object.fromEntries(PHASE_IDS.map((stageId, index) => {
+        ? Object.fromEntries(PHASE_IDS.map((stageId) => {
           const current = subjectForm.stages?.[stageId];
+          if ((stageId === "initial") !== (kind === "status")) return [stageId, current];
           return [stageId, current ? {
             ...current,
             trigger: {
               ...current.trigger,
-              fieldId: field.fieldId,
-              fieldName: field.fieldName,
-              ...(current.trigger.optionId && field.options?.some((candidate) => candidate.id === current.trigger.optionId)
-                ? {}
-                : { optionId: field.options?.[index]?.id ?? option?.id ?? null, value: field.options?.[index]?.name ?? option?.name ?? "" }),
+              fieldId: field?.fieldId ?? null,
+              fieldName: field?.fieldName ?? null,
+              optionId: null,
+              value: "",
             },
           } : current];
         })) as FeishuStageConfigMap
         : null;
-      setSubjectForm({ ...subjectForm, statusFieldId: field.fieldId, statusFieldName: field.fieldName, stages });
+      setSubjectForm({ ...subjectForm, stages, ...(kind === "status"
+        ? { statusFieldId: field?.fieldId ?? "", statusFieldName: field?.fieldName ?? "" }
+        : { reviewStatusFieldId: field?.fieldId ?? "", reviewStatusFieldName: field?.fieldName ?? "" }) });
       return;
     }
+    if (!field) return;
     setSubjectForm({
       ...subjectForm,
       ...(kind === "document"
@@ -1077,6 +1102,7 @@ export function FeishuWorkflowPanel({
         },
         ...(subjectForm.stages ? {
           statusField: { fieldId: subjectForm.statusFieldId || null, fieldName: subjectForm.statusFieldName || null },
+          reviewStatusField: { fieldId: subjectForm.reviewStatusFieldId || null, fieldName: subjectForm.reviewStatusFieldName || null },
           documentField: { fieldId: subjectForm.documentFieldId || null, fieldName: subjectForm.documentFieldName || null },
           namingField: { fieldId: subjectForm.namingFieldId || null, fieldName: subjectForm.namingFieldName || null },
           stages: subjectForm.stages,
@@ -1337,7 +1363,7 @@ export function FeishuWorkflowPanel({
               <label className="feishu-settings-wide">Auto-Cut 包<select value={subjectForm.packageAlias} onChange={(event) => setSubjectForm({ ...subjectForm, packageAlias: event.target.value })}>
                 {!selectedPackage && subjectForm.packageAlias && <option value={subjectForm.packageAlias}>{subjectForm.packageAlias}（不可用）</option>}
                 <option value="">未选择包</option>
-                {(packageOptions ?? []).filter((item) => item.state === "enabled").map((item) => <option key={item.alias} value={item.alias}>{item.name}（{item.alias}）</option>)}
+                {(packageOptions ?? []).filter((item) => item.state === "enabled").map((item) => <option key={item.alias} value={item.alias}>{packageDisplayName(item)}</option>)}
               </select></label>
             </div>
           </fieldset>
@@ -1358,7 +1384,8 @@ export function FeishuWorkflowPanel({
           <fieldset className="feishu-config-subsection" disabled={busy}>
             <legend>字段来源</legend>
             <div className="feishu-settings-grid">
-              <label><span>状态字段</span><select aria-label="状态字段" value={subjectForm.statusFieldId} onChange={(event) => selectPhasedField("status", event.target.value)}><option value="">选择单选状态字段</option>{triggerFields.filter(isSingleSelectField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
+              <label><span>初稿触发字段</span><select aria-label="初稿触发字段" value={subjectForm.statusFieldId} onChange={(event) => selectPhasedField("status", event.target.value)}><option value="">选择单选字段</option>{triggerFields.filter(isSingleSelectField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
+              <label><span>审核修改触发字段</span><select aria-label="审核修改触发字段" value={subjectForm.reviewStatusFieldId} onChange={(event) => selectPhasedField("reviewStatus", event.target.value)}><option value="">选择单选字段</option>{triggerFields.filter(isSingleSelectField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
               <label><span>素材文档字段</span><select aria-label="素材文档字段" value={subjectForm.documentFieldId} onChange={(event) => selectPhasedField("document", event.target.value)}><option value="">选择文档字段</option>{metadataFieldOptions.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
               <label><span>命名字段</span><select aria-label="命名字段" value={subjectForm.namingFieldId} onChange={(event) => selectPhasedField("naming", event.target.value)}><option value="">选择命名字段</option>{metadataFieldOptions.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
             </div>
@@ -1369,7 +1396,7 @@ export function FeishuWorkflowPanel({
               stageId={stageId}
               value={subjectForm.stages![stageId]}
               metadataFields={triggerFields}
-              statusOptions={statusOptions}
+              statusOptions={uniqueMetadataField(triggerFields, stageId === "initial" ? subjectForm.statusFieldId : subjectForm.reviewStatusFieldId)?.options ?? []}
               disabled={busy}
               audioDraft={audioDraftsBySubjectRef.current.get(selected.subjectKey)?.stages[stageId] ?? audioDraftFromStage(subjectForm.stages![stageId].audio)}
               onChange={(value) => updateStage(stageId, value)}

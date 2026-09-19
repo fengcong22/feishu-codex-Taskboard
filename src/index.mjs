@@ -10,6 +10,7 @@ import { JsonStateStore } from "./state-store.mjs";
 import { TaskboardClient } from "./taskboard-client.mjs";
 import { createFeishuWsListener } from "./feishu-ws.mjs";
 import { createFeishuBaseMetadataReader } from "./feishu-base-metadata.mjs";
+import { createFeishuBaseSubscriptionClient } from "./feishu-base-subscription.mjs";
 import {
   createFeishuControlledContextReader,
   createFeishuNamingSearch,
@@ -57,6 +58,9 @@ const controlledContextReader = apiClient
   : null;
 const recordWriter = apiClient
   ? createFeishuRecordWriter({ client: apiClient })
+  : null;
+const baseSubscriptionClient = apiClient
+  ? createFeishuBaseSubscriptionClient({ client: apiClient })
   : null;
 const workflowStore = createWorkflowConfigStore({
   filename: process.env.BRIDGE_WORKFLOW_CONFIG
@@ -163,6 +167,7 @@ const app = createBridgeServer({
     && (await taskboard.getAutomaticExecutionEnabled()) === false,
   workflowStore: workflowRuntime,
   baseMetadataReader: metadataReader,
+  baseSubscriptionClient,
   getHealth: async () => ({
     ok: true,
     feishuListener: feishuListener?.health ?? {

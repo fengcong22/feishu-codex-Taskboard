@@ -11,8 +11,9 @@ import {
   validateFeishuPackageOutputDirectory,
   saveFeishuPackageDraft,
 } from "../api";
-import type { FeishuPackageSummary, FeishuPackageWorkspaceInspection } from "../types";
+import type { FeishuPackageSummary, FeishuPackageWorkspaceInspection, FeishuSubjectConfig } from "../types";
 import { FeishuPackageManager } from "./FeishuPackageManager";
+import { FeishuWorkflowPanel } from "./FeishuWorkflowPanel";
 
 vi.mock("../api", async (importOriginal) => ({
   ApiError: (await importOriginal<typeof import("../api")>()).ApiError,
@@ -25,6 +26,7 @@ vi.mock("../api", async (importOriginal) => ({
   validateFeishuPackageOutputDirectory: vi.fn(async (directory: string) => directory),
   removeFeishuPackage: vi.fn(),
   saveFeishuPackageDraft: vi.fn(),
+  refreshFeishuBaseFields: vi.fn(),
 }));
 
 afterEach(() => {
@@ -68,6 +70,38 @@ const inspectionWithZipOutput: FeishuPackageWorkspaceInspection = {
     directory: "D:\\codex\\auto-cut-lite\\output",
   },
 };
+
+it("uses the current manifest name in subject routing without changing its saved alias", async () => {
+  const currentPackage = { ...historicalPackage, name: "Auto-cut-lite1.6.8", identity: inspection };
+  vi.mocked(listFeishuPackages).mockResolvedValue([currentPackage]);
+  const configured: FeishuSubjectConfig = {
+    subjectKey: "history", baseToken: "bas_test", baseName: "Test Base", tableId: "tbl_history",
+    tableName: "History", projectId: "subject-history", displayEnabled: true, lifecycle: "enabled",
+    configVersion: 1, createdAt: "2026-09-19T00:00:00.000Z", updatedAt: "2026-09-19T00:00:00.000Z",
+    packageRoute: { routeMode: "fixed", packageAlias: historicalPackage.alias, subjectCodeFieldId: null, branchMap: null },
+    metadata: { fields: [] },
+  };
+  const onSubjectChange = vi.fn();
+  render(<FeishuWorkflowPanel
+    catalog={[{
+      baseToken: configured.baseToken, baseName: configured.baseName, sourceUrlLabel: null,
+      metadataRefreshedAt: null, subjects: [configured], createdAt: configured.createdAt, updatedAt: configured.updatedAt,
+    }]}
+    configurationBaseToken={configured.baseToken}
+    selectedSubjectKey={configured.subjectKey}
+    onSelectSubject={vi.fn()}
+    onCatalogChange={vi.fn()}
+    onSubjectChange={onSubjectChange}
+  />);
+
+  const option = await screen.findByRole("option", { name: inspection.displayName }) as HTMLOptionElement;
+  expect(option.value).toBe(historicalPackage.alias);
+  expect(option.selected).toBe(true);
+  expect(screen.queryByRole("option", { name: /Auto-cut-lite1\.6\.8/ })).toBeNull();
+  expect(onSubjectChange).not.toHaveBeenCalled();
+  expect(currentPackage.name).toBe("Auto-cut-lite1.6.8");
+  expect(currentPackage.projectId).toBe(historicalPackage.projectId);
+});
 
 it("keeps an explicitly custom directory through workspace verification and validates before saving", async () => {
   const custom = { ...historicalPackage, zipOutputMode: "custom" as const, zipSourceDirectory: "E:\\剪辑输出" };

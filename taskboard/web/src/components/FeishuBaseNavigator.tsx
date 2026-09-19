@@ -1,8 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
+import {
+  getFeishuBaseSubscription,
+  subscribeFeishuBase,
+  unsubscribeFeishuBase,
+} from "../api";
 import { useTaskboardI18n } from "../i18n";
 import type { FeishuBaseCatalog, FeishuSubjectConfig } from "../types";
 import { LinearIcon } from "./LinearIcon";
+
+type SubscriptionState = {
+  status: "loading" | "ready" | "failed";
+  subscribed?: boolean;
+};
 
 export interface FeishuBaseNavigatorProps {
   catalog: FeishuBaseCatalog[];
@@ -43,6 +53,7 @@ export function FeishuBaseNavigator({
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
   const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const [busyActionKey, setBusyActionKey] = useState<string | null>(null);
+  const [subscriptions, setSubscriptions] = useState<Record<string, SubscriptionState>>({});
   const lifecycleLabel = (lifecycle: "draft" | "enabled" | "disabled") => {
     if (lifecycle === "enabled") return text("已启用", "Enabled");
     if (lifecycle === "disabled") return text("已停用", "Disabled");
@@ -76,6 +87,36 @@ export function FeishuBaseNavigator({
     });
   }, [catalog, selectedBaseToken]);
 
+  const refreshSubscription = useCallback(async (baseToken: string, reportError = false) => {
+    setSubscriptions((current) => ({
+      ...current,
+      [baseToken]: { status: "loading", subscribed: current[baseToken]?.subscribed },
+    }));
+    try {
+      const subscription = await getFeishuBaseSubscription(baseToken);
+      setSubscriptions((current) => ({
+        ...current,
+        [baseToken]: { status: "ready", subscribed: subscription.subscribed },
+      }));
+      return subscription;
+    } catch (error) {
+      setSubscriptions((current) => ({
+        ...current,
+        [baseToken]: { status: "failed", subscribed: current[baseToken]?.subscribed },
+      }));
+      if (reportError) {
+        onError?.(error instanceof Error ? error.message : text("无法读取事件订阅状态", "Unable to read event subscription status"));
+      }
+      return null;
+    }
+  }, [onError, text]);
+
+  useEffect(() => {
+    for (const baseToken of expandedBaseTokens) {
+      if (!subscriptions[baseToken]) void refreshSubscription(baseToken);
+    }
+  }, [expandedBaseTokens, refreshSubscription, subscriptions]);
+
   useEffect(() => {
     if (!openMenuKey) return;
     const closeMenu = (event: PointerEvent) => {
@@ -105,6 +146,13 @@ export function FeishuBaseNavigator({
       else next.add(baseToken);
       return next;
     });
+  }
+
+  function subscriptionLabel(state: SubscriptionState | undefined) {
+    if (!state) return text("未读取", "Not checked");
+    if (state?.status === "failed") return text("读取失败", "Unable to read");
+    if (state?.status === "loading") return text("读取中", "Loading");
+    return state.subscribed ? text("事件已订阅", "Subscribed") : text("事件未订阅", "Not subscribed");
   }
 
   function toggleMenu(key: string, trigger: HTMLButtonElement, itemCount: number) {
@@ -152,6 +200,46 @@ export function FeishuBaseNavigator({
     } finally {
       setBusyActionKey(null);
     }
+  }
+
+  async function runSubscriptionAction(
+    base: FeishuBaseCatalog,
+    action: "refresh" | "subscribe" | "unsubscribe",
+  ) {
+    const key = `base:${base.baseToken}`;
+    if (busyActionKey) return;
+    setBusyActionKey(key);
+    setOpenMenuKey(null);
+    try {
+      if (action === "refresh") {
+        await refreshSubscription(base.baseToken, true);
+        return;
+      }
+      const subscription = action === "subscribe"
+        ? await subscribeFeishuBase(base.baseToken)
+        : await unsubscribeFeishuBase(base.baseToken);
+      setSubscriptions((current) => ({
+        ...current,
+        [base.baseToken]: { status: "ready", subscribed: subscription.subscribed },
+      }));
+    } catch (error) {
+      setSubscriptions((current) => ({
+        ...current,
+        [base.baseToken]: { status: "failed", subscribed: current[base.baseToken]?.subscribed },
+      }));
+      onError?.(error instanceof Error ? error.message : text("无法更新事件订阅", "Unable to update event subscription"));
+    } finally {
+      setBusyActionKey(null);
+    }
+  }
+
+  function confirmUnsubscribe(base: FeishuBaseCatalog): boolean {
+    const enabledSubjects = base.subjects.filter((subject) => subject.lifecycle === "enabled");
+    const names = enabledSubjects.map((subject) => subject.tableName).join("、") || text("没有已启用学科", "no enabled subjects");
+    return window.confirm(text(
+      `取消“${base.baseName}”的事件订阅？这会停止其已启用学科（${names}）后续的记录变更通知，不会暂停、归档或删除已有 Taskboard 任务。`,
+      `Cancel event subscription for “${base.baseName}”? This stops future record-change notifications for its enabled subjects (${names}) and does not pause, archive, or delete existing Taskboard tasks.`,
+    ));
   }
 
   function confirmBaseRemoval(base: FeishuBaseCatalog): boolean {
@@ -225,6 +313,10 @@ export function FeishuBaseNavigator({
         {catalog.map((base) => {
           const expanded = expandedBaseTokens.has(base.baseToken);
           const visibleSubjects = base.subjects.filter((subject) => subject.displayEnabled);
+          const subscription = subscriptions[base.baseToken];
+          const subscriptionAction = subscription?.status === "ready" && subscription.subscribed
+            ? "unsubscribe"
+            : "subscribe";
           return (
             <div className="feishu-base-nav-group" key={base.baseToken}>
               <div className="feishu-base-nav-row-shell">
@@ -238,6 +330,12 @@ export function FeishuBaseNavigator({
                   <LinearIcon className="feishu-base-nav-chevron" name="chevronRight" />
                   <LinearIcon className="feishu-base-nav-icon" name="project" />
                   <span>{base.baseName}</span>
+                  <em
+                    className="feishu-base-subscription"
+                    data-state={subscription?.status ?? "idle"}
+                    data-subscribed={subscription?.subscribed}
+                    title={subscriptionLabel(subscription)}
+                  >{subscriptionLabel(subscription)}</em>
                   <small>{visibleSubjects.length}</small>
                 </button>
                 <div className="feishu-nav-actions">
@@ -249,7 +347,7 @@ export function FeishuBaseNavigator({
                     aria-haspopup="menu"
                     aria-expanded={openMenuKey === `base:${base.baseToken}`}
                     disabled={busyActionKey === `base:${base.baseToken}`}
-                    onClick={(event) => toggleMenu(`base:${base.baseToken}`, event.currentTarget, 2)}
+                    onClick={(event) => toggleMenu(`base:${base.baseToken}`, event.currentTarget, 4)}
                   >
                     <LinearIcon name="more" />
                   </button>
@@ -264,6 +362,24 @@ export function FeishuBaseNavigator({
                       }}>
                         <LinearIcon name="displayOptions" />
                         <span>{text("配置", "Configure")}</span>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => {
+                        void runSubscriptionAction(base, "refresh");
+                      }}>
+                        <LinearIcon name="link" />
+                        <span>{text("刷新订阅状态", "Refresh subscription status")}</span>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => {
+                        if (subscriptionAction === "unsubscribe" && !confirmUnsubscribe(base)) {
+                          setOpenMenuKey(null);
+                          return;
+                        }
+                        void runSubscriptionAction(base, subscriptionAction);
+                      }}>
+                        <LinearIcon name={subscriptionAction === "unsubscribe" ? "linkOff" : "link"} />
+                        <span>{subscriptionAction === "unsubscribe"
+                          ? text("取消订阅", "Cancel subscription")
+                          : text("订阅事件", "Subscribe events")}</span>
                       </button>
                       <button type="button" role="menuitem" className="danger" onClick={() => {
                         if (!confirmBaseRemoval(base)) return;

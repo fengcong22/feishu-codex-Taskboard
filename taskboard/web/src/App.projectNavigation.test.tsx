@@ -26,6 +26,9 @@ vi.mock("./api", async (importOriginal) => ({
   listTaskArtifactSummaries: vi.fn(),
   getWorkflowWorkspace: vi.fn(),
   listFeishuWorkflowCatalog: vi.fn(),
+  getFeishuBaseSubscription: vi.fn(),
+  subscribeFeishuBase: vi.fn(),
+  unsubscribeFeishuBase: vi.fn(),
   getUnifiedWorkflowViews: vi.fn(),
   getUnifiedWorkflowStageDisplays: vi.fn(),
   listDevelopmentContexts: vi.fn(),
@@ -233,6 +236,9 @@ describe("App project navigation", () => {
       projectId, workspace: null, version: 1, updatedAt: NOW,
     }));
     vi.mocked(api.listFeishuWorkflowCatalog).mockResolvedValue(CATALOG);
+    vi.mocked(api.getFeishuBaseSubscription).mockResolvedValue({ subscribed: false });
+    vi.mocked(api.subscribeFeishuBase).mockResolvedValue({ subscribed: true });
+    vi.mocked(api.unsubscribeFeishuBase).mockResolvedValue({ subscribed: false });
     vi.mocked(api.getUnifiedWorkflowViews).mockImplementation(async (subjectKey) => ({
       schemaVersion: 1, subjectKey, revision: 1, defaultViewId: "all", activeViewId: "all",
       views: [{

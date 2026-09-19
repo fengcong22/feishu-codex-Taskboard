@@ -329,6 +329,7 @@ export function createBridgeServer({
   bridgeSecret = process.env.CODEX_FEISHU_BRIDGE_SECRET,
   metadataReader = null,
   baseMetadataReader,
+  baseSubscriptionClient = null,
   previewBase,
   workflowStore,
   getSubjectVersion = null,
@@ -348,6 +349,56 @@ export function createBridgeServer({
       }
       if (request.method === "GET" && url.pathname === "/api/config-summary") {
         return sendJson(response, 200, configSummary);
+      }
+      const subscriptionMatch = url.pathname.match(/^\/api\/feishu\/workflow\/bases\/([^/]+)\/subscription$/);
+      if (subscriptionMatch) {
+        if (!["GET", "POST", "DELETE"].includes(request.method)) {
+          return sendJson(response, 405, {
+            error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed" },
+          });
+        }
+        if (request.method !== "GET" && !requireLocalJsonWrite(request, response, "taskboard")) return;
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+          let token;
+          try {
+            token = decodeURIComponent(subscriptionMatch[1]);
+          } catch {
+            const error = new Error("Base token is invalid");
+            error.code = "INVALID_BASE_TOKEN";
+            error.status = 400;
+            throw error;
+          }
+          if (!baseSubscriptionClient || typeof baseSubscriptionClient.get !== "function") {
+            const error = new Error("Feishu subscription client is unavailable");
+            error.code = "FEISHU_SUBSCRIPTION_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          const method = request.method === "GET"
+            ? baseSubscriptionClient.get
+            : request.method === "POST"
+              ? baseSubscriptionClient.subscribe
+              : baseSubscriptionClient.unsubscribe;
+          if (typeof method !== "function") {
+            const error = new Error("Feishu subscription client is unavailable");
+            error.code = "FEISHU_SUBSCRIPTION_UNAVAILABLE";
+            error.status = 503;
+            throw error;
+          }
+          const subscription = await method.call(baseSubscriptionClient, token);
+          if (!subscription || typeof subscription.subscribed !== "boolean") {
+            const error = new Error("Feishu subscription response is invalid");
+            error.code = "FEISHU_SUBSCRIPTION_INVALID_RESPONSE";
+            error.status = 502;
+            throw error;
+          }
+          return sendJson(response, 200, { subscription: { subscribed: subscription.subscribed } });
+        } catch (error) {
+          return sendJson(response, controlledErrorStatus(error, 502), {
+            error: publicFailure(error),
+          });
+        }
       }
       if (request.method === "POST" && url.pathname === "/api/feishu/base-preview") {
         const authenticatedReader = typeof metadataReader?.preview === "function"

@@ -102,6 +102,45 @@ test("records activity when a normalized event is accepted", async () => {
   assert.equal(listener.health.state, "sdk_managed");
 });
 
+test("emits a value-free callback routing diagnostic", async () => {
+  const logs = [];
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [table],
+    sdk: fakeSdk(),
+    logger: { info: (...args) => logs.push(args) },
+    handleEvent: async () => {},
+  });
+
+  await listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT](payload());
+  await listener.drain();
+
+  assert.deepEqual(logs, [["Feishu record callback: tables=1 table_ids=1 matching=1 normalized=1"]]);
+  assert.equal(JSON.stringify(logs).includes("bas_demo"), false);
+  assert.equal(JSON.stringify(logs).includes("待剪辑"), false);
+});
+
+test("emits a value-free callback diagnostic when no active tables are available", async () => {
+  const logs = [];
+  const listener = createFeishuWsListener({
+    appId: "cli_test",
+    appSecret: "secret_test",
+    tables: [],
+    getTables: () => [],
+    sdk: fakeSdk(),
+    logger: { info: (...args) => logs.push(args) },
+    handleEvent: async () => assert.fail("an unmatched callback must not reach the handler"),
+  });
+
+  await listener.eventDispatcher.handlers[BITABLE_RECORD_CHANGED_EVENT](payload());
+  await listener.drain();
+
+  assert.deepEqual(logs, [["Feishu record callback: tables=0 table_ids=1 matching=0 normalized=0"]]);
+  assert.equal(JSON.stringify(logs).includes("bas_demo"), false);
+  assert.equal(JSON.stringify(logs).includes("待剪辑"), false);
+});
+
 test("records a safe callback failure summary without exposing the raw error", async () => {
   const expected = Object.assign(new Error("secret token should not be logged"), {
     code: "TASKBOARD_UNAVAILABLE",

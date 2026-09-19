@@ -82,7 +82,7 @@ async function request(baseUrl, pathname, body, headers = {}) {
   return { response, body: text ? JSON.parse(text) : undefined };
 }
 
-async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery = undefined } = {}) {
+async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery = undefined, splitFields = false } = {}) {
   const catalog = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog", {
     baseToken: "bas_stage",
     baseName: "阶段 Base",
@@ -104,6 +104,17 @@ async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery
         },
         { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text" },
         { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text" },
+        {
+          fieldId: "fld_review",
+          fieldName: "审核进度",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_other", name: "其他" },
+            { id: "opt_review", name: "初审修改" },
+            { id: "opt_final", name: "终审修改" },
+          ],
+        },
         {
           fieldId: "fld_final_directory",
           fieldName: "成片状态",
@@ -133,12 +144,19 @@ async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery
     },
     body: JSON.stringify({
       statusField: { fieldId: "fld_status", fieldName: "流程" },
+      ...(splitFields ? { reviewStatusField: { fieldId: "fld_review", fieldName: "审核进度" } } : {}),
       documentField: { fieldId: "fld_document", fieldName: "素材文档" },
       namingField: { fieldId: "fld_name", fieldName: "命名" },
       stages: {
         initial: stage("initial", "opt_initial", "初稿"),
-        first_review: stage("first_review", "opt_review", "初审修改"),
-        final_review: stage("final_review", "opt_final", "终审修改"),
+        first_review: {
+          ...stage("first_review", "opt_review", "初审修改"),
+          ...(splitFields ? { trigger: { fieldId: "fld_review", fieldName: "审核进度", optionId: "opt_review", value: "初审修改" } } : {}),
+        },
+        final_review: {
+          ...stage("final_review", "opt_final", "终审修改"),
+          ...(splitFields ? { trigger: { fieldId: "fld_review", fieldName: "审核进度", optionId: "opt_final", value: "终审修改" } } : {}),
+        },
       },
       trigger: { fieldId: "fld_status", fieldName: "流程", startValue: "初稿", optionId: "opt_initial" },
       title: { fieldId: null, fieldName: null },
@@ -156,8 +174,8 @@ async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery
       ...(delivery === undefined ? {} : { delivery }),
     }),
   });
-  assert.equal(patchResponse.status, 200);
   const patched = await patchResponse.json();
+  assert.equal(patchResponse.status, 200, JSON.stringify(patched));
   const enable = await fetch(`${fixtureData.baseUrl}${route}/enable`, {
     method: "POST",
     headers: {
@@ -931,7 +949,7 @@ test("a legacy failed upload for a simulated stage task cannot be retried", asyn
   }
 });
 
-test("workflow synchronization carries the selected course-name field descriptor", async () => {
+test("workflow synchronization carries course-name and separate review field descriptors", async () => {
   let synchronized = null;
   const bridge = createServer(async (incoming, response) => {
     let body = "";
@@ -951,6 +969,7 @@ test("workflow synchronization carries the selected course-name field descriptor
   });
   try {
     await enableSubject(fixtureData, {
+      splitFields: true,
       delivery: {
         version: 1,
         rootPath: "D:\\课程交付",
@@ -966,10 +985,53 @@ test("workflow synchronization carries the selected course-name field descriptor
       type: 1,
       uiType: "Text",
     });
+    assert.equal(synchronized?.subject.reviewStatusField?.fieldId, "fld_review");
+    assert.equal(synchronized?.subject.reviewStatusField?.fieldName, "审核进度");
   } finally {
     await fixtureData.app.close();
     await new Promise((resolve) => bridge.close(resolve));
     await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("separate review registration uses its own field and rejects cross-field bindings", async () => {
+  const f = await fixture();
+  try {
+    const subject = await enableSubject(f, { splitFields: true });
+    for (const [stageId, optionId] of [["first_review", "opt_review"], ["final_review", "opt_final"]]) {
+      const event = { eventId: `evt-split-${stageId}`, statusFieldId: "fld_review", afterOptionId: optionId };
+      const payload = registration(subject, { event, binding: { stageId } });
+      const result = await request(f.baseUrl, "/api/local/feishu/tasks", payload);
+      assert.equal(result.response.status, 201, JSON.stringify(result.body));
+      assert.equal(result.body.task.feishuOrigin.statusFieldId, "fld_review");
+      assert.equal(result.body.task.feishuOrigin.triggerField, "审核进度");
+      assert.equal(result.body.task.feishuOrigin.stageId, stageId);
+      const replay = await request(f.baseUrl, "/api/local/feishu/tasks", payload);
+      assert.equal(replay.body.task.id, result.body.task.id);
+
+      const wrongField = registration(subject, {
+        event: { ...event, eventId: `${event.eventId}-wrong`, statusFieldId: "fld_status" },
+        binding: { stageId },
+      });
+      const rejected = await request(f.baseUrl, "/api/local/feishu/tasks", wrongField);
+      assert.equal(rejected.response.status, 409);
+      assert.equal(rejected.body.error.code, "FEISHU_STAGE_BINDING_MISMATCH");
+    }
+    const initial = await request(f.baseUrl, "/api/local/feishu/tasks", registration(subject));
+    assert.equal(initial.response.status, 201);
+    const wrongInitial = await request(f.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-wrong-initial", statusFieldId: "fld_review" },
+    }));
+    assert.equal(wrongInitial.body.error.code, "FEISHU_STAGE_BINDING_MISMATCH");
+    const simulated = await request(f.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      event: { eventId: "evt-split-simulation", statusFieldId: "fld_review", afterOptionId: "opt_review", deliverySource: "simulation" },
+      binding: { stageId: "first_review" },
+    }));
+    assert.equal(simulated.response.status, 201);
+    assert.equal(simulated.body.task.feishuOrigin.executionMode, "manual");
+  } finally {
+    await f.app.close();
+    await rm(f.directory, { recursive: true, force: true });
   }
 });
 
