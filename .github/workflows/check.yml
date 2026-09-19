@@ -25,4 +25,4 @@ jobs:
       - name: Install Taskboard dependencies
         run: npm ci --prefix taskboard
       - name: Run complete verification gate
-        run: npm test
+        run: npm run test:ci

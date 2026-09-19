@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test && npm --prefix taskboard run typecheck && npm --prefix taskboard run build:web && npm --prefix taskboard run test:components"
+    "test": "node --test && npm --prefix taskboard run typecheck && npm --prefix taskboard run build:web && npm --prefix taskboard run test:components",
+    "test:ci": "node --test --test-concurrency=1 && npm --prefix taskboard run typecheck && npm --prefix taskboard run build:web && npm --prefix taskboard run test:components"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.36.0"
