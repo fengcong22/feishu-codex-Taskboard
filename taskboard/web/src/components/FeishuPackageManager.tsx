@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   discoverFeishuPackageModels,
@@ -263,7 +263,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
     // refreshKey is incremented by local realtime package events.
   }, [refreshKey]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!loadError || loading || busy) return;
     const retry = () => { void refresh(); };
     window.addEventListener("focus", retry);
