@@ -76,7 +76,7 @@ async function fixture(scriptBody) {
   };
 }
 
-test("launches the installed Auto-Cut runtime with only the bound run paths", async () => {
+test("launches the installed Auto-Cut runtime with only the bound run paths and exact composite event ID", async () => {
   const capturePath = path.join(os.tmpdir(), `taskboard-runner-capture-${process.pid}-${Date.now()}.json`);
   const current = await fixture(`
 const { writeFileSync } = require("node:fs");
@@ -92,7 +92,9 @@ writeFileSync(process.env.RUNNER_CAPTURE_PATH, JSON.stringify({
 }));
 process.stdout.write("fixture complete");
 `);
+  current.run.stageId = "first_review";
   try {
+    current.run.eventId = "event-fixed:tbl_math:rec_1:abc123:0:fld_review";
     const result = await runLocalAutoCut({
       run: current.run,
       packageConfig: current.packageConfig,
@@ -101,6 +103,7 @@ process.stdout.write("fixture complete");
         LOCALAPPDATA: current.localAppData,
         RUNNER_CAPTURE_PATH: capturePath,
         CODEX_AUTOCUT_UNTRUSTED: "must-not-reach-the-runtime",
+        CODEX_AUTOCUT_EVENT_ID: "untrusted-inherited-event",
         FEISHU_APP_ID: "must-not-reach-the-runtime",
         FEISHU_APP_SECRET: "must-not-reach-the-runtime",
       },

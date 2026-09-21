@@ -5,6 +5,7 @@ import path from "node:path";
 export const SOURCE_MANIFEST_SCHEMA_VERSION = 1;
 const STAGE_IDS = new Set(["initial", "first_review", "final_review"]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*(?::[A-Za-z0-9][A-Za-z0-9_-]*)*$/u;
 
 function error(message, code = "INVALID_SOURCE_MANIFEST") {
   const result = new Error(`SOURCE_MANIFEST_INVALID: ${message}`);
@@ -27,6 +28,13 @@ function text(value, name, { max = 4096 } = {}) {
 function id(value, name) {
   const result = text(value, name, { max: 256 });
   if (!ID.test(result)) throw error(`${name} is invalid`);
+  return result;
+}
+
+function eventId(value) {
+  const result = text(value, "binding.event_id", { max: 256 });
+  // Bridge suffixes watched fields and batch identities; preserve their separators.
+  if (!EVENT_ID.test(result)) throw error("binding.event_id is invalid");
   return result;
 }
 
@@ -90,7 +98,7 @@ function normalizeBinding(value) {
     subject_key: subjectKey,
     config_version: configVersion,
     stage_id: stageId,
-    event_id: id(binding.event_id, "binding.event_id"),
+    event_id: eventId(binding.event_id),
   };
 }
 

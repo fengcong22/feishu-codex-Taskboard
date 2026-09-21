@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { prepareFeishuRunInputs } from "../server/feishu-run-inputs.mjs";
 import { sourceManifestSha256 } from "../server/feishu-source-manifest.mjs";
+import { normalizeBitableRecordChanged } from "../../src/feishu-event.mjs";
 
 async function fixture() {
   const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "taskboard-run-inputs-"));
@@ -65,6 +66,51 @@ test("writes one immutable manifest and naming input under the run root", async 
     assert.equal(path.extname(result.packageZipPath), ".zip");
     assert.match(result.packageZipPath, /\.taskboard-autocut[\\/]task-1[\\/]run-1[\\/]课程001_初稿\.zip$/u);
     assert.match(result.draftsRoot, /autocut-runs[\\/]task-1[\\/]run-1[\\/]drafts$/u);
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("prepares every stage from actual Bridge composite event IDs without rewriting identity", async () => {
+  const fixtureData = await fixture();
+  try {
+    for (const envelope of ["single", "batched", "headerless"]) {
+      for (const [stageId, fieldId] of [
+        ["initial", "fld_initial"], ["first_review", "fld_review"], ["final_review", "fld_review"],
+      ]) {
+        const table = {
+          baseToken: "bas_demo", tableId: "tbl_math",
+          statusField: { fieldId: "fld_initial" }, reviewStatusField: { fieldId: "fld_review" },
+        };
+        const action = {
+          action: "record_edited", record_id: "rec_1",
+          before_value: [{ field_id: fieldId, field_value: '"opt_other"' }],
+          after_value: [{ field_id: fieldId, field_value: '"opt_ready"' }],
+        };
+        const payload = {
+          ...(envelope === "headerless" ? {} : { header: { event_id: "evt-provider" } }),
+          event: {
+            file_token: table.baseToken, table_id: table.tableId,
+            action_list: envelope === "batched" ? [action, { ...action, record_id: "rec_2" }] : [action],
+          },
+        };
+        const [event] = normalizeBitableRecordChanged(payload, table);
+        assert.ok(event);
+        if (envelope !== "single" || stageId !== "initial") assert.ok(event.eventId.includes(":"));
+        const request = input(fixtureData);
+        request.task.id = `task-${envelope}-${stageId}`;
+        request.run.runId = `run-${envelope}-${stageId}`;
+        request.origin = { ...request.origin, stageId, eventId: event.eventId, recordId: event.recordId };
+        request.subjectVersion.stages = { [stageId]: request.subjectVersion.stages.initial };
+        const result = await prepareFeishuRunInputs(request);
+        const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+        assert.equal(manifest.binding.event_id, event.eventId);
+        assert.equal(manifest.binding.stage_id, stageId);
+        assert.equal(sourceManifestSha256(manifest), result.manifestSha256);
+        assert.equal(path.basename(path.dirname(result.manifestPath)), request.run.runId);
+      }
+    }
   } finally {
     await rm(fixtureData.dataDirectory, { recursive: true, force: true });
     await rm(fixtureData.packageRoot, { recursive: true, force: true });

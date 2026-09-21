@@ -254,7 +254,9 @@ Taskboard 要求 `deployment_status` 为 `installed`、`workspace_root` 与已�
 
 - 顶层只允许 `schema_version`、`binding`、`record`、`document`、`sources`；未知字段拒绝。
 - `schema_version` 固定为 `1`。
-- `binding` 只允许 `task_id`、`run_id`、`subject_key`、`config_version`、`stage_id`、`event_id`。除 `subject_key` 外的 ID 为非空、最长 256 字符的安全标识；`subject_key` 去首尾空格后必须非空、最长 513 字符且包含 `:`；`config_version` 为正安全整数；`stage_id` 必须是三个固定阶段之一。
+- `binding` 只允许 `task_id`、`run_id`、`subject_key`、`config_version`、`stage_id`、`event_id`。`task_id`、`run_id` 为非空、最长 256 字符且匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$` 的安全标识；`subject_key` 去首尾空格后必须非空、最长 513 字符且包含 `:`；`config_version` 为正安全整数；`stage_id` 必须是三个固定阶段之一。
+- `binding.event_id` 的原始输入最长 256 字符，去首尾空格后必须非空，使用专用规则 `^[A-Za-z0-9][A-Za-z0-9_-]*(?::[A-Za-z0-9][A-Za-z0-9_-]*)*$`。兼容原始事件编号，以及 Bridge 为独立触发字段、批量记录或缺少上游编号的事件生成的冒号分段编号，例如 `evt-provider:fld_review`、`evt-provider:tbl_math:rec_1:abc123:0:fld_review`、`feishu:bas_demo:tbl_math:rec_1:abc123:0`。空分段、路径分隔符、内部空白和控制字符拒绝；其他字段的 ID 规则不随之放宽。
+- 事件编号是 opaque identity，不是文件路径。manifest、`CODEX_AUTOCUT_EVENT_ID`、result 和 package receipt 必须保留同一原编号；禁止用替换冒号、截断或另行散列的编号代替它。Taskboard 校验 result/receipt 时仍要求整个 binding 精确相等。
 - `record` 只允许 `base_token`、`table_id`、`record_id`，并与 `binding.subject_key` 和服务器任务身份一致。
 - `document` 只允许 `field_id` 和 `url`。URL 必须是无用户名/密码/查询/片段的官方 HTTPS 飞书 `/docx/{token}` 或 `/wiki/{token}` URL；必须恰好解析到一个可读文档链接。
 - `sources.video` 支持 `docx_section` 或 `base_attachment`；`sources.review` 只支持 `docx_section`；`sources.audio` 支持 `video_original`，或带 `docx_section`/`base_attachment` 的 `replace_original`。
@@ -265,6 +267,8 @@ Taskboard 要求 `deployment_status` 为 `installed`、`workspace_root` 与已�
 ### 6.3 canonical JSON 和 SHA-256
 
 `CURRENT`：Taskboard 将规范化 manifest 的对象键按 JavaScript `Object.keys(...).sort()` 顺序递归排序，数组保持顺序，使用无空白 JSON 序列化后计算 SHA-256。文件可以漂亮打印，但 `CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256` 必须等于该 canonical JSON 的小写 64 位 digest。Auto-Cut Lite 必须读取文件、重新规范化并拒绝 digest 不一致、schema 不一致或 binding 不一致；不得改写用户原始 `anchor_text`。
+
+消费端兼容验收必须包含带冒号的真实 Bridge 编号格式，并验证规范化后编号和 SHA-256 不变。仅使用 `evt-1` 之类的单段 fixture 不足以覆盖初审/终审独立字段；如果已部署 Auto-Cut Lite 的 event ID 校验仍拒绝冒号，必须先升级兼容包，再重试任务。
 
 ## 7. execution_input.json schema v1
 

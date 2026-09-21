@@ -47,6 +47,51 @@ test("creates a stable manifest and digest independent of object insertion order
   assert.equal(first.manifest.binding.stage_id, "initial");
 });
 
+test("preserves composite Bridge event IDs and their distinct canonical digests", () => {
+  const digests = new Set();
+  for (const eventId of [
+    "event-1",
+    "event-1:fld_review",
+    "event-1:tbl_subject:rec_1:abc123:0:fld_review",
+    "feishu:bas_demo:tbl_subject:rec_1:abc123:0:fld_review",
+    "event-1_fld_review",
+    `e:${"a".repeat(254)}`,
+  ]) {
+    const value = input();
+    value.binding.event_id = eventId;
+    const created = createSourceManifest(value);
+    assert.equal(created.manifest.binding.event_id, eventId);
+    assert.equal(createSourceManifest(created.manifest).sha256, created.sha256);
+    assert.ok(!digests.has(created.sha256), "distinct event IDs must retain distinct identities");
+    digests.add(created.sha256);
+  }
+});
+
+test("rejects malformed composite event IDs without weakening other ID fields", () => {
+  for (const eventId of [
+    "", ":event", "event:", "event::field", "event:../field", "event:field/name",
+    "event:field\\name", "event:field name", "event:field\nname", "event:field\0name",
+    "event:field;command", "event:%3Afield", `e:${"a".repeat(255)}`,
+  ]) {
+    const value = input();
+    value.binding.event_id = eventId;
+    assert.throws(() => createSourceManifest(value), /binding\.event_id is invalid/u);
+  }
+  for (const field of ["task_id", "run_id"]) {
+    const value = input();
+    value.binding[field] = "id:segment";
+    assert.throws(() => createSourceManifest(value), new RegExp(`binding\\.${field} is invalid`, "u"));
+  }
+  const value = input();
+  value.document.field_id = "fld:document";
+  assert.throws(() => createSourceManifest(value), /document\.field_id is invalid/u);
+  for (const field of ["base_token", "table_id", "record_id"]) {
+    const value = input();
+    value.record = { base_token: "bas_demo", table_id: "tbl_subject", record_id: "rec_1", [field]: "id:segment" };
+    assert.throws(() => createSourceManifest(value), new RegExp(`record\\.${field} is invalid`, "u"));
+  }
+});
+
 test("accepts canonical official HTTPS Feishu Docx and Wiki document URLs", () => {
   for (const url of [
     "https://guanghe.feishu.cn/docx/Docx_123-token",
@@ -214,7 +259,9 @@ test("writes and reads the exact canonical manifest", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-source-manifest-"));
   try {
     const target = path.join(directory, "source-manifest.json");
-    const created = await writeSourceManifest(target, input());
+    const value = input();
+    value.binding.event_id = "evt-roundtrip:fld_review";
+    const created = await writeSourceManifest(target, value);
     const loaded = await readSourceManifest(target);
     assert.equal(loaded.sha256, created.sha256);
     assert.deepEqual(loaded.manifest, created.manifest);

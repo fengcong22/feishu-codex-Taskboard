@@ -218,6 +218,7 @@ async function registerSubject(fixture, {
   targetPath = path.join(fixture.directory, "upload"),
   targetId = "target",
   delivery = undefined,
+  reviewStages = false,
 } = {}) {
   const catalog = await jsonRequest(fixture.baseUrl, "/api/local/feishu/workflow/catalog", {
     baseToken: "bas_lifecycle",
@@ -239,6 +240,17 @@ async function registerSubject(fixture, {
         },
         { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text" },
         { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text" },
+        ...(reviewStages ? [{
+          fieldId: "fld_review",
+          fieldName: "Review",
+          type: 3,
+          uiType: "SingleSelect",
+          options: [
+            { id: "opt_review_other", name: "Other" },
+            { id: "opt_first_review", name: "First review" },
+            { id: "opt_final_review", name: "Final review" },
+          ],
+        }] : []),
       ],
     }],
   });
@@ -256,9 +268,23 @@ async function registerSubject(fixture, {
   };
   const patch = await jsonRequest(fixture.baseUrl, route, {
     statusField: { fieldId: "fld_status", fieldName: "流程" },
+    ...(reviewStages ? { reviewStatusField: { fieldId: "fld_review", fieldName: "Review" } } : {}),
     documentField: { fieldId: "fld_document", fieldName: "素材文档" },
     namingField: { fieldId: "fld_name", fieldName: "命名" },
-    stages: { initial: stage, first_review: { ...stage, enabled: false }, final_review: { ...stage, enabled: false } },
+    stages: {
+      initial: stage,
+      ...Object.fromEntries(["first_review", "final_review"].map((stageId) => [stageId, {
+        ...stage,
+        enabled: reviewStages,
+        ...(reviewStages ? {
+          trigger: {
+            fieldId: "fld_review", fieldName: "Review", optionId: `opt_${stageId}`,
+            value: stageId === "first_review" ? "First review" : "Final review",
+          },
+          nameSuffix: `_${stageId}`,
+        } : {}),
+      }])),
+    },
     trigger: { fieldId: "fld_status", fieldName: "流程", startValue: "初稿", optionId: "opt_initial" },
     title: { fieldId: null, fieldName: null },
     execution: { mode: executionMode, concurrencyGroup: "autocut", maxConcurrent: 1, resourceGroups: [] },
@@ -281,18 +307,18 @@ async function registerSubject(fixture, {
   return enabled.body.subject;
 }
 
-function registration(subject, controlledContext) {
+function registration(subject, controlledContext, { stageId = "initial", eventId = "evt-lifecycle-1" } = {}) {
   return {
     event: {
-      eventId: "evt-lifecycle-1",
+      eventId,
       baseToken: "bas_lifecycle",
       tableId: "tbl_math",
       recordId: "rec_1",
-      statusFieldId: "fld_status",
-      beforeOptionId: "opt_other",
-      afterOptionId: "opt_initial",
+      statusFieldId: subject.stages[stageId].trigger.fieldId,
+      beforeOptionId: stageId === "initial" ? "opt_other" : "opt_review_other",
+      afterOptionId: subject.stages[stageId].trigger.optionId,
     },
-    binding: { subjectKey: SUBJECT_KEY, configVersion: subject.configVersion, stageId: "initial" },
+    binding: { subjectKey: SUBJECT_KEY, configVersion: subject.configVersion, stageId },
     controlledContext,
   };
 }
@@ -376,6 +402,106 @@ async function reportRunArtifact(fixture, run, overrides = {}) {
     },
   );
 }
+
+for (const stageId of ["initial", "first_review", "final_review"]) {
+  test(`a composite event ID stays exact through ${stageId} run inputs and artifact verification`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/composite-event-fixture"],
+      namingDisplayValue: "Composite event course",
+      namingValueUnique: true,
+    };
+    const fixture = await createFixture({ controlledContext, turnDelayMs: 5_000 });
+    const eventId = `evt-provider:${stageId === "initial" ? "fld_status" : "fld_review"}`;
+    try {
+      const subject = await registerSubject(fixture, { reviewStages: true });
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks",
+        registration(subject, controlledContext, { stageId, eventId }));
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      const started = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+      assert.equal(started.response.status, 202, JSON.stringify(started.body));
+      const run = await waitForRun(fixture.app, created.body.task.id);
+      assert.equal(run.eventId, eventId);
+      assert.equal(run.stageId, stageId);
+      const manifest = JSON.parse(await readFile(run.manifestPath, "utf8"));
+      assert.deepEqual(manifest.binding, runBinding(run));
+      const env = await waitForJsonFile(fixture.capturePath);
+      assert.equal(env.CODEX_AUTOCUT_EVENT_ID, eventId);
+      assert.equal(env.CODEX_AUTOCUT_STAGE_ID, stageId);
+
+      const mutatedBinding = { ...runBinding(run), event_id: eventId.replace(":", "_") };
+      for (const source of ["resultOverrides", "receiptOverrides"]) {
+        const sha256 = await writePassingRunResult(run, { [source]: { binding: mutatedBinding } });
+        const rejected = await reportRunArtifact(fixture, run, { sha256 });
+        assert.equal(rejected.response.status, 409, `${source}: ${JSON.stringify(rejected.body)}`);
+        assert.equal(rejected.body.error.code, "AUTOCUT_RUN_BINDING_MISMATCH", source);
+        assert.deepEqual(fixture.app.database.listTaskArtifacts(run.taskId), [], source);
+      }
+
+      const sha256 = await writePassingRunResult(run);
+      const accepted = await reportRunArtifact(fixture, run, { sha256 });
+      assert.equal(accepted.response.status, 201, JSON.stringify(accepted.body));
+      assert.equal(fixture.app.database.getTaskArtifactForRun(run.taskId, run.runId).validationStatus, "verified");
+      for (const filename of [run.resultPath, `${run.packageZipPath}.receipt.json`]) {
+        assert.equal(JSON.parse(await readFile(filename, "utf8")).binding.event_id, eventId);
+      }
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a blocked task retry preserves its composite event ID through a verified local run", async () => {
+  const eventId = "evt-provider:fld_review";
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/composite-event-retry"],
+    namingDisplayValue: "Composite event retry",
+    namingValueUnique: true,
+  };
+  const invocations = [];
+  const fixture = await createFixture({
+    controlledContext: "document_link_missing",
+    bridgeStatus: 409,
+    autoCutRunner: async ({ run }) => {
+      invocations.push(run);
+      await writePassingRunResult(run);
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, { reviewStages: true });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks",
+      registration(subject, controlledContext, { stageId: "first_review", eventId }));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const initial = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    assert.equal(initial.response.status, 409, JSON.stringify(initial.body));
+    const blocked = fixture.app.database.getTask(created.body.task.id);
+    const [firstRun] = fixture.app.database.listFeishuAutoCutRuns(blocked.id);
+    assert.equal(blocked.status, "blocked");
+    assert.equal(firstRun.eventId, eventId);
+    fixture.bridge.setResponse(controlledContext);
+    const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+      version: blocked.version,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+    });
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    await waitForTaskStatus(fixture.app, blocked.id, "in_review");
+    const runs = fixture.app.database.listFeishuAutoCutRuns(blocked.id);
+    assert.deepEqual(runs.map((run) => run.eventId), [eventId, eventId]);
+    assert.deepEqual(runs.map((run) => run.attempt), [1, 2]);
+    assert.equal(runs[0].runId, firstRun.runId);
+    assert.equal(runs[0].state, "blocked");
+    assert.notEqual(runs[1].runId, firstRun.runId);
+    assert.deepEqual(invocations.map((run) => run.eventId), [eventId]);
+    assert.equal(JSON.parse(await readFile(runs[1].manifestPath, "utf8")).binding.event_id, eventId);
+    assert.equal(fixture.app.database.getTaskArtifactForRun(blocked.id, runs[1].runId).validationStatus, "verified");
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test("an initial automatic phased run completes locally without Codex or taskctl on PATH", async () => {
   const controlledContext = {
