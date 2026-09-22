@@ -370,23 +370,42 @@ test("partial ephemeral restart stops the surviving identity match and clears it
       "Invoke-Expression $definition.Extent.Text",
       "$global:node = 'node.exe'",
       "$global:identityMatches = $true",
+      "$global:scriptMatches = $true",
+      "$global:currentIdentityAvailable = $true",
+      "$global:removeSnapshotSucceeds = $true",
       "$global:stopped = @()",
       "$global:removed = @()",
+      "$global:snapshotRemovals = 0",
       `function global:Read-PersistedProcessId { param([string]$Path) if ($Path -eq ${powershellLiteral(taskboardPidFile)}) { return 4241 }; return 4242 }`,
       "function global:Read-PersistedProcessIdentity { param([string]$Path) $markerPid = if ($Path -like '*taskboard*') { 4241 } else { 4242 }; [pscustomobject]@{ Version = 1; Pid = $markerPid; CreationTicks = $markerPid } }",
       "function global:Get-ProcessMarkerFileSnapshot { param([string]$Path) [pscustomobject]@{ Exists = $true; Bytes = $Path } }",
       "function global:Get-ProcessQueryResult { param([int]$ProcessId) $process = if ($ProcessId -eq 4241) { [pscustomobject]@{ ProcessId = $ProcessId } } else { $null }; [pscustomobject]@{ Succeeded = $true; Process = $process; Error = $null } }",
+      "function global:Get-CimInstance { return @() }",
       "function global:Test-PersistedProcessIdentity { param([object]$Process, [object]$Identity) return $global:identityMatches }",
-      "function global:Test-NodeScriptProcess { return $true }",
+      "function global:New-PersistedProcessIdentity { param([object]$Process) if (-not $global:currentIdentityAvailable) { return $null }; return [pscustomobject]@{ Version = 1; Pid = $Process.ProcessId; CreationTicks = 9999 } }",
+      "function global:Test-NodeScriptProcess { return $global:scriptMatches }",
       "function global:Stop-ValidatedNode { param([object]$Process) $global:stopped += [int]$Process.ProcessId }",
+      "function global:Remove-ProcessMarkerFilesIfUnchanged { $global:snapshotRemovals += 1; return $global:removeSnapshotSucceeds }",
       "function global:Remove-PersistedProcessMarkersIfMatch { param([string]$PidFile, [string]$IdentityFile, [object]$ExpectedIdentity, [string[]]$AdditionalFiles, [object[]]$AdditionalFileSnapshots) $global:removed += [int]$ExpectedIdentity.Pid; return $true }",
       `Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823`,
       `Stop-ExistingLocalNodeForEphemeralSecret 'Feishu Bridge' ${powershellLiteral(bridgePidFile)} ${powershellLiteral(bridgeIdentityFile)} 'C:\\bridge\\src\\index.mjs' ${powershellLiteral(bridgeModeFile)} 47824`,
       "if (($global:stopped -join ',') -ne '4241' -or ($global:removed -join ',') -ne '4241,4242') { throw 'the surviving service or stale peer was not reset' }",
       "$global:identityMatches = $false",
       "$before = $global:stopped.Count",
+      `Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823`,
+      "if ($global:stopped.Count -ne $before -or $global:snapshotRemovals -ne 1) { throw 'reused PID was stopped or its stale markers were not cleared' }",
+      "$global:currentIdentityAvailable = $false",
       `$rejected = $false; try { Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823 } catch { $rejected = $true }`,
-      "if (-not $rejected -or $global:stopped.Count -ne $before) { throw 'identity mismatch was allowed to stop a process' }",
+      "if (-not $rejected -or $global:snapshotRemovals -ne 1) { throw 'unreadable current identity cleared stale markers' }",
+      "$global:currentIdentityAvailable = $true",
+      "$global:removeSnapshotSucceeds = $false",
+      `$rejected = $false; try { Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823 } catch { $rejected = $true }`,
+      "if (-not $rejected -or $global:snapshotRemovals -ne 2) { throw 'rewritten markers were accepted during stale cleanup' }",
+      "$global:removeSnapshotSucceeds = $true",
+      "$global:identityMatches = $true",
+      "$global:scriptMatches = $false",
+      `$rejected = $false; try { Stop-ExistingLocalNodeForEphemeralSecret 'Taskboard' ${powershellLiteral(taskboardPidFile)} ${powershellLiteral(taskboardIdentityFile)} 'C:\\taskboard\\server\\index.mjs' $null 47823 } catch { $rejected = $true }`,
+      "if (-not $rejected -or $global:stopped.Count -ne $before) { throw 'unexpected script mismatch was allowed to stop a process' }",
     ].join(";");
     const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
       encoding: "utf8",
@@ -1134,6 +1153,58 @@ test("stop leaves a legacy PID-only process running in an isolated execution", a
     assert.equal(result.status, 1, result.stderr || result.stdout);
     assert.match(`${result.stdout}\n${result.stderr}`, /legacy PID-only marker/i);
     await assert.rejects(access(pidFile));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stop clears stale markers without terminating a process that reused the PID", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-stop-reused-pid-"));
+  const repository = join(directory, "repo");
+  const scripts = join(repository, "scripts");
+  const runtime = join(repository, ".runtime");
+  const taskboard = join(directory, "taskboard");
+  const pidFile = join(runtime, "taskboard.pid");
+  const identityFile = join(runtime, "taskboard.process.json");
+  const stopScript = join(scripts, "stop-local.ps1");
+  const helperScript = join(scripts, "process-identity.ps1");
+  const fakePid = 2147482989;
+
+  try {
+    const helperSource = await readFile(files.processIdentity, "utf8");
+    await Promise.all([
+      mkdir(scripts, { recursive: true }),
+      mkdir(runtime, { recursive: true }),
+      mkdir(join(taskboard, "server"), { recursive: true }),
+    ]);
+    await Promise.all([
+      copyFile(fileURLToPath(files.stop), stopScript),
+      writeFile(
+        helperScript,
+        `${helperSource}\nfunction Stop-IdentityVerifiedNodeProcess { throw 'termination helper must not run for a reused PID' }\n`,
+        "utf8",
+      ),
+      writeFile(pidFile, String(fakePid), "utf8"),
+    ]);
+
+    const command = [
+      `$env:CODEX_TASKBOARD_ROOT = ${powershellLiteral(taskboard)}`,
+      `. ${powershellLiteral(helperScript)}`,
+      "$oldCreated = [DateTime]::SpecifyKind([DateTime]'2026-08-20T00:00:00', [DateTimeKind]::Utc)",
+      `$oldProcess = [pscustomobject]@{ ProcessId = ${fakePid}; CreationDate = $oldCreated }`,
+      `Write-PersistedProcessIdentity ${powershellLiteral(identityFile)} $oldProcess`,
+      `$global:reusedProcess = [pscustomobject]@{ ProcessId = ${fakePid}; CreationDate = $oldCreated.AddSeconds(1) }`,
+      "function global:Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName, [string]$Filter) $global:reusedProcess }",
+      `& ${powershellLiteral(stopScript)}`,
+    ].join(";");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(`${result.stdout}\n${result.stderr}`, /PID .* reused/i);
+    await assert.rejects(access(pidFile));
+    await assert.rejects(access(identityFile));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

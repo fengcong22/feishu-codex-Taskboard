@@ -301,19 +301,37 @@ function Stop-ExistingLocalNodeForEphemeralSecret(
         throw "Cannot safely query $Name PID $persistedPid before the paired restart. ($($query.Error))"
       }
       if ($query.Process) {
-        if (-not (Test-PersistedProcessIdentity $query.Process $persistedIdentity) -or
-          -not (Test-NodeScriptProcess $query.Process $Script $node)) {
-          throw "Cannot safely restart $Name because its persisted process identity does not match."
-        }
-        Stop-ValidatedNode $query.Process $Script $persistedIdentity $node
-      }
+        if (-not (Test-PersistedProcessIdentity $query.Process $persistedIdentity)) {
+          $currentIdentity = New-PersistedProcessIdentity $query.Process
+          if (-not $currentIdentity -or
+            [int]$currentIdentity.Pid -ne [int]$persistedIdentity.Pid -or
+            [long]$currentIdentity.CreationTicks -eq [long]$persistedIdentity.CreationTicks) {
+            throw "Cannot safely restart $Name because its current process identity could not be read."
+          }
+          if (-not (Remove-ProcessMarkerFilesIfUnchanged $PidFile $IdentityFile $ModeFile $pidSnapshot $identitySnapshot $modeSnapshot)) {
+            throw "Could not clear stale $Name process markers after detecting a reused PID."
+          }
+        } else {
+          if (-not (Test-NodeScriptProcess $query.Process $Script $node)) {
+            throw "Cannot safely restart $Name because its persisted process does not match the expected script."
+          }
+          Stop-ValidatedNode $query.Process $Script $persistedIdentity $node
 
-      $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
-      $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeSnapshot) }
-      if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
-        throw "Could not clear $Name process markers after the paired restart check."
+          $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
+          $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeSnapshot) }
+          if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
+            throw "Could not clear $Name process markers after the paired restart check."
+          }
+          return
+        }
+      } else {
+        $additionalFiles = if ([string]::IsNullOrWhiteSpace($ModeFile)) { @() } else { @($ModeFile) }
+        $additionalSnapshots = if ($additionalFiles.Count -eq 0) { @() } else { @($modeSnapshot) }
+        if (-not (Remove-PersistedProcessMarkersIfMatch $PidFile $IdentityFile $persistedIdentity $additionalFiles $additionalSnapshots)) {
+          throw "Could not clear $Name process markers after the paired restart check."
+        }
+        return
       }
-      return
     }
   }
 

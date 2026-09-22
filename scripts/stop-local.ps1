@@ -103,9 +103,18 @@ function Remove-TargetMarkersIfUnchanged(
   [object]$ExpectedIdentity = $null,
   [object]$ExpectedIdentitySnapshot = $null,
   [object]$ExpectedModeSnapshot = $null,
+  [object]$ExpectedPidSnapshot = $null,
   [switch]$AllowInvalidIdentity
 ) {
+  if ($null -ne $ExpectedPidSnapshot -and
+    -not (Test-ProcessMarkerFileSnapshot $Target.File $ExpectedPidSnapshot)) {
+    return $false
+  }
   if ($ExpectedIdentity) {
+    if ($null -ne $ExpectedIdentitySnapshot -and
+      -not (Test-ProcessMarkerFileSnapshot $Target.IdentityFile $ExpectedIdentitySnapshot)) {
+      return $false
+    }
     if (-not [string]::IsNullOrWhiteSpace($Target.ModeFile) -and
       -not (Test-ProcessMarkerFileSnapshot $Target.ModeFile $ExpectedModeSnapshot)) {
       return $false
@@ -165,6 +174,7 @@ try {
 
   foreach ($target in $targets) {
     try {
+      $pidSnapshot = Get-ProcessMarkerFileSnapshot $target.File
       $identitySnapshot = Get-ProcessMarkerFileSnapshot $target.IdentityFile
       $pidPathPresent = Test-Path -LiteralPath $target.File
       $pidMarkerPresent = Test-Path -LiteralPath $target.File -PathType Leaf
@@ -215,12 +225,12 @@ try {
       if (-not $process) {
         Write-Host "Already stopped $($target.Name) (stale PID $processId)"
         if ($markerState -eq 'valid' -and $identity) {
-          if (-not (Remove-TargetMarkersIfUnchanged $target $processId $identity $null $modeSnapshot)) {
+          if (-not (Remove-TargetMarkersIfUnchanged $target $processId $identity $identitySnapshot $modeSnapshot $pidSnapshot)) {
             Write-Warning "Could not remove stale $($target.Name) markers because they changed."
             $refusedTargets += $target.Name
           }
         } elseif ($markerState -eq 'valid') {
-          if (-not (Remove-TargetMarkersIfUnchanged $target $processId -ExpectedIdentitySnapshot $identitySnapshot -ExpectedModeSnapshot $modeSnapshot -AllowInvalidIdentity)) {
+          if (-not (Remove-TargetMarkersIfUnchanged $target $processId -ExpectedIdentitySnapshot $identitySnapshot -ExpectedModeSnapshot $modeSnapshot -ExpectedPidSnapshot $pidSnapshot -AllowInvalidIdentity)) {
             Write-Warning "Could not remove stale $($target.Name) markers because they changed."
             $refusedTargets += $target.Name
           }
@@ -235,16 +245,32 @@ try {
         if ($markerState -eq 'valid' -and -not $identity) {
           Write-Warning "Skipped $($target.Name): legacy PID-only marker cannot authorize termination; leaving it running. Run the start launcher once to migrate it safely, then stop again."
           $refusedTargets += $target.Name
-          Remove-TargetMarkersIfUnchanged $target $processId -ExpectedIdentitySnapshot $identitySnapshot -ExpectedModeSnapshot $modeSnapshot -AllowInvalidIdentity | Out-Null
+          Remove-TargetMarkersIfUnchanged $target $processId -ExpectedIdentitySnapshot $identitySnapshot -ExpectedModeSnapshot $modeSnapshot -ExpectedPidSnapshot $pidSnapshot -AllowInvalidIdentity | Out-Null
         } else {
           Write-Warning "Skipped $($target.Name): $markerState marker cannot authorize termination; leaving it running. Run the start launcher once to migrate it safely, then stop again."
           $refusedTargets += $target.Name
         }
         continue
       }
-      if (-not (Test-PersistedProcessIdentity $process $identity) -or
-        -not (Test-NodeScriptProcess $process $target.Match $target.Node)) {
-        Write-Warning "Skipped $($target.Name): persisted process identity did not match; leaving it running."
+      if (-not (Test-PersistedProcessIdentity $process $identity)) {
+        $currentIdentity = New-PersistedProcessIdentity $process
+        if (-not $currentIdentity -or
+          [int]$currentIdentity.Pid -ne [int]$identity.Pid -or
+          [long]$currentIdentity.CreationTicks -eq [long]$identity.CreationTicks) {
+          Write-Warning "Skipped $($target.Name): current process identity could not be verified; leaving it running."
+          $refusedTargets += $target.Name
+          continue
+        }
+        if (-not (Remove-TargetMarkersIfUnchanged $target $processId $identity $identitySnapshot $modeSnapshot $pidSnapshot)) {
+          Write-Warning "Could not remove stale $($target.Name) markers after detecting a reused PID."
+          $refusedTargets += $target.Name
+          continue
+        }
+        Write-Host "Already stopped $($target.Name) (PID $processId was reused)"
+        continue
+      }
+      if (-not (Test-NodeScriptProcess $process $target.Match $target.Node)) {
+        Write-Warning "Skipped $($target.Name): persisted process did not match the expected script; leaving it running."
         $refusedTargets += $target.Name
         continue
       }
@@ -271,7 +297,7 @@ try {
       }
 
       try {
-        if (-not (Remove-TargetMarkersIfUnchanged $target $processId $identity $null $modeSnapshot)) {
+        if (-not (Remove-TargetMarkersIfUnchanged $target $processId $identity $identitySnapshot $modeSnapshot $pidSnapshot)) {
           Write-Warning "Stopped $($target.Name), but its markers changed before cleanup; leaving them in place."
           $refusedTargets += $target.Name
           continue
