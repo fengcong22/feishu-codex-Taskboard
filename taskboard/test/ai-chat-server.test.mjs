@@ -622,6 +622,42 @@ test("AI SSE is live-only and thread snapshots remain the durable source", async
   }
 });
 
+test("AI updates reach the shared event stream as content-free thread hints", async () => {
+  const fixture = await createServerFixture();
+  const controller = new AbortController();
+  try {
+    const created = await request(fixture.baseUrl, "/api/local/ai/threads", {
+      method: "POST",
+      body: { projectId: "local" },
+    });
+    const threadId = created.body.thread.id;
+    const response = await fetch(`${fixture.baseUrl}/api/events`, { signal: controller.signal });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    let streamed = "";
+    const turn = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
+      method: "POST",
+      body: { message: "private user content" },
+    });
+    assert.equal(turn.response.status, 202);
+    while (!streamed.includes("event: ai.thread.updated")) {
+      const { done, value } = await reader.read();
+      assert.equal(done, false);
+      streamed += new TextDecoder().decode(value);
+    }
+    const frame = streamed.match(/event: ai\.thread\.updated\ndata: ([^\n]+)\n\n/u);
+    assert.ok(frame);
+    const payload = JSON.parse(frame[1]);
+    assert.equal(payload.threadId, threadId);
+    assert.ok(["ai.event", "ai.run"].includes(payload.hintType));
+    assert.deepEqual(Object.keys(payload).sort(), ["at", "hintType", "threadId", "type"]);
+    assert.equal(streamed.includes("private user content"), false);
+  } finally {
+    controller.abort();
+    await fixture.close();
+  }
+});
+
 test("server close stops accepting requests before AI shutdown completes", async () => {
   const fixture = await createServerFixture();
   let appClosed = false;

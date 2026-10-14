@@ -64,6 +64,68 @@ const DEFAULT_USER_ACTOR: ActorIdentity = {
 let currentUserActor = DEFAULT_USER_ACTOR;
 let apiText = (_chinese: string, english: string) => english;
 
+type LocalEventSubscription = {
+  eventNames: Set<string>;
+  onEvent: (event: MessageEvent<string>) => void;
+  onOpen?: () => void;
+  onError?: () => void;
+};
+
+let localEventSource: EventSource | null = null;
+const localEventSubscriptions = new Set<LocalEventSubscription>();
+const localEventDispatchers = new Map<string, EventListener>();
+
+function openLocalEventSource() {
+  if (localEventSource) return localEventSource;
+  const source = new EventSource(resolveTaskboardUrl("/api/events"));
+  localEventSource = source;
+  source.addEventListener("open", () => {
+    for (const subscription of localEventSubscriptions) subscription.onOpen?.();
+  });
+  source.addEventListener("error", () => {
+    for (const subscription of localEventSubscriptions) subscription.onError?.();
+  });
+  return source;
+}
+
+export function subscribeLocalEvents(
+  eventNames: readonly string[],
+  callbacks: Omit<LocalEventSubscription, "eventNames">,
+): () => void {
+  if (eventNames.length === 0) return () => {};
+  const source = openLocalEventSource();
+  const subscription: LocalEventSubscription = {
+    ...callbacks,
+    eventNames: new Set(eventNames),
+  };
+  localEventSubscriptions.add(subscription);
+  for (const name of subscription.eventNames) {
+    if (localEventDispatchers.has(name)) continue;
+    const dispatcher: EventListener = (event) => {
+      for (const subscriber of localEventSubscriptions) {
+        if (subscriber.eventNames.has(name)) subscriber.onEvent(event as MessageEvent<string>);
+      }
+    };
+    localEventDispatchers.set(name, dispatcher);
+    source.addEventListener(name, dispatcher);
+  }
+
+  return () => {
+    if (!localEventSubscriptions.delete(subscription)) return;
+    for (const name of subscription.eventNames) {
+      if ([...localEventSubscriptions].some((subscriber) => subscriber.eventNames.has(name))) continue;
+      const dispatcher = localEventDispatchers.get(name);
+      if (dispatcher) source.removeEventListener(name, dispatcher);
+      localEventDispatchers.delete(name);
+    }
+    if (localEventSubscriptions.size === 0 && localEventSource === source) {
+      source.close();
+      localEventSource = null;
+      localEventDispatchers.clear();
+    }
+  };
+}
+
 export function setCurrentUserActor(actor?: ActorIdentity) {
   currentUserActor = actor?.type === "user" ? actor : DEFAULT_USER_ACTOR;
 }
@@ -553,13 +615,19 @@ export function subscribeAiChatThread(
   onHint: (type: "ai.event" | "ai.run") => void,
   onError?: () => void,
 ): () => void {
-  const source = new EventSource(
-    resolveTaskboardUrl(`/api/local/ai/threads/${encodeURIComponent(threadId)}/events`),
-  );
-  source.addEventListener("ai.event", () => onHint("ai.event"));
-  source.addEventListener("ai.run", () => onHint("ai.run"));
-  if (onError) source.addEventListener("error", onError);
-  return () => source.close();
+  return subscribeLocalEvents(["ai.thread.updated"], {
+    onEvent: (event) => {
+      let payload: { threadId?: string; hintType?: string };
+      try {
+        payload = JSON.parse(event.data) as { threadId?: string; hintType?: string };
+      } catch {
+        return;
+      }
+      if (payload.threadId !== threadId) return;
+      if (payload.hintType === "ai.event" || payload.hintType === "ai.run") onHint(payload.hintType);
+    },
+    ...(onError ? { onError } : {}),
+  });
 }
 
 export async function listDeviceWorkspaces(signal?: AbortSignal): Promise<Record<string, string>> {

@@ -3963,6 +3963,11 @@ export function createTaskboardServer(options = {}) {
     resolveContext: resolveAiChatContext,
     remoteAppServerFactory: options.remoteAppServerFactory,
   });
+  const unsubscribeAiChatHints = aiChat.subscribeHints(({ threadId, type }) => {
+    if (type === "ai.event" || type === "ai.run") {
+      events.emit("ai.thread.updated", { threadId, hintType: type });
+    }
+  });
   function executionModeForMetadata(metadata) {
     return metadata?.executionMode === "automatic" || metadata?.mode === "automatic"
       ? "automatic"
@@ -8087,6 +8092,7 @@ export function createTaskboardServer(options = {}) {
       cloudRealtimeSockets.clear();
       cloudRealtimeServer.close();
       events.close();
+      unsubscribeAiChatHints();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await executionCoordinator.close();
