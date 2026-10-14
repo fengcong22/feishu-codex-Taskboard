@@ -154,6 +154,7 @@ interface TaskDetailProps {
   ) => Promise<RelationMutationResult>;
   onOpenThread: (binding: CodexThreadBinding) => void;
   onOpenLegacyLocalThread: (threadId: string) => void;
+  onOpenAutoCutLog?: (threadId: string) => void;
   onOpenInThread: (task: Task) => void;
   onStartCodex: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
@@ -437,6 +438,7 @@ export function TaskDetail({
   onRemoveRelation,
   onOpenThread,
   onOpenLegacyLocalThread,
+  onOpenAutoCutLog,
   onOpenInThread,
   onStartCodex,
   onCopy,
@@ -694,7 +696,7 @@ export function TaskDetail({
       },
     );
     return () => controller.abort();
-  }, [attachmentsRevision, isPhasedAutoCutTask, task.id]);
+  }, [attachmentsRevision, isPhasedAutoCutTask, task.id, currentTask.version, currentTask.status]);
 
   useEffect(() => {
     if (!isFeishuAutoCutTask) {
@@ -1670,6 +1672,8 @@ export function TaskDetail({
                       attempts={autoCutRuns}
                       retrying={retryingAutoCut}
                       onRetry={() => void retryAutoCut()}
+                      onOpenLog={onOpenAutoCutLog}
+                      onCopy={onCopy}
                     />
                 )}
                 {autoCutRunsError && (

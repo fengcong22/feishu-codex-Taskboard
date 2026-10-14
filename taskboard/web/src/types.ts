@@ -524,6 +524,10 @@ export interface FeishuDeliveryConfig {
 
 export interface FeishuAutoCutRun {
   runId: string;
+  threadId?: string | null;
+  executionKind?: "local" | "codex" | null;
+  failedPhase?: string | null;
+  lastPhase?: string | null;
   taskId: string;
   attempt: number;
   subjectKey: string;

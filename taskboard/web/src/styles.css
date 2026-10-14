@@ -13589,6 +13589,15 @@ kbd {
 .autocut-run-row-meta code { color: var(--text-secondary); }
 .autocut-run-error { display: flex; min-width: 0; flex-wrap: wrap; gap: 6px; margin-top: 7px; color: var(--danger); font-size: 9px; }
 .autocut-run-error span { overflow-wrap: anywhere; }
+.autocut-run-error { font-size: 12px; line-height: 1.5; }
+.autocut-diagnostic { margin-top: 8px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.autocut-diagnostic summary { cursor: pointer; color: var(--text-primary); font-weight: 600; }
+.autocut-diagnostic p { margin: 8px 0; }
+.autocut-diagnostic-context { color: var(--text-tertiary); }
+.autocut-diagnostic h3 { margin: 8px 0 4px; font-size: 12px; }
+.autocut-diagnostic ul { margin: 0; padding-left: 20px; }
+.autocut-diagnostic-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.autocut-diagnostic-actions .button { min-height: 28px; font-size: 11px; }
 
 @media (max-width: 1000px) {
   .feishu-workflow-panel {

@@ -4009,13 +4009,14 @@ export function App() {
     window.location.assign(`codex://threads/${encodeURIComponent(threadId.trim())}`);
   }
 
+  function openLocalAiThread(threadId: string) {
+    aiOpenThreadRequestSequenceRef.current += 1;
+    setAiOpenThreadRequest({ threadId, requestId: aiOpenThreadRequestSequenceRef.current });
+  }
+
   function openTaskConversation(conversation: TaskConversationItem) {
     if (conversation.kind === "local-ai" && conversation.aiThreadId) {
-      aiOpenThreadRequestSequenceRef.current += 1;
-      setAiOpenThreadRequest({
-        threadId: conversation.aiThreadId!,
-        requestId: aiOpenThreadRequestSequenceRef.current,
-      });
+      openLocalAiThread(conversation.aiThreadId);
       return;
     }
     if (conversation.threadBinding) {
@@ -5105,6 +5106,7 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenLegacyLocalThread={openLegacyLocalThread}
+            onOpenAutoCutLog={openLocalAiThread}
             onOpenInThread={openTaskInThread}
             onStartCodex={startCodexForTask}
             onCopy={(text, message) => void copyText(text, message)}

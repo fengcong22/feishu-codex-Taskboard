@@ -541,6 +541,45 @@ test("an initial automatic phased run completes locally without Codex or taskctl
   }
 });
 
+for (const recoveryStatus of ["complete", "resumed"]) {
+  test(`Auto-Cut diagnostics ignore a ${recoveryStatus} failure before the next unrecovered phase`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/recovered-failure"],
+      namingDisplayValue: "恢复后失败",
+      namingValueUnique: true,
+    };
+    const fixture = await createFixture({
+      controlledContext,
+      allowAutomaticExecution: true,
+      autoCutRunner: async ({ onProgress }) => {
+        onProgress({ phase: "document_fetch", status: "failed" });
+        onProgress({ phase: "document_fetch", status: recoveryStatus });
+        onProgress({ phase: "asset_download", status: "failed" });
+        onProgress({ phase: "package_publish", status: "skipped" });
+        onProgress({ phase: "package_publish", status: "failed" });
+        const error = new Error("Fixture material download failed");
+        error.code = "fixture_asset_download_failed";
+        throw error;
+      },
+    });
+    try {
+      const subject = await registerSubject(fixture, { executionMode: "automatic" });
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      const task = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 8_000);
+      const attempts = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${task.id}/autocut-runs`,
+        undefined, { method: "GET" });
+      assert.equal(attempts.response.status, 200);
+      assert.equal(attempts.body.runs[0].failedPhase, "asset_download");
+      assert.equal(attempts.body.runs[0].lastPhase, "package_publish");
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
 test("an automatic phased run with no package ZIP directory uses its frozen subject source through artifact verification", async () => {
   const controlledContext = {
     documentLinks: ["https://guanghe.feishu.cn/docx/frozen-zip-source"],
@@ -1622,6 +1661,10 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
     assert.deepEqual(attempts.body.runs, [{
       runId: blockedRun.runId,
       taskId: blockedRun.taskId,
+      threadId: started.body.thread.id,
+      executionKind: "codex",
+      failedPhase: null,
+      lastPhase: null,
       attempt: blockedRun.attempt,
       subjectKey: blockedRun.subjectKey,
       configVersion: blockedRun.configVersion,
@@ -1634,6 +1677,13 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
       errorMessage: blockedRun.errorMessage,
       createdAt: blockedRun.createdAt,
       updatedAt: blockedRun.updatedAt,
+    }]);
+    fixture.app.database.deleteAiChatRun(blockedRun.runId);
+    const withoutAiRun = await jsonRequest(fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(run.taskId)}/autocut-runs`, undefined, { method: "GET" });
+    assert.equal(withoutAiRun.response.status, 200);
+    assert.deepEqual(withoutAiRun.body.runs, [{
+      ...attempts.body.runs[0], threadId: null, executionKind: null, failedPhase: null, lastPhase: null,
     }]);
   } finally {
     await fixture.app.close();

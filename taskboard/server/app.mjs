@@ -1,3 +1,4 @@
+import { normalizeAutoCutProgress } from "./autocut-progress.mjs";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
@@ -4107,9 +4108,27 @@ export function createTaskboardServer(options = {}) {
   }
 
   function publicAutoCutRun(run) {
+    const aiRun = database.getAiChatRun(run.runId);
+    const threadId = aiRun?.threadId ?? null;
+    const thread = threadId ? database.getAiChatThread(threadId) : null;
+    let lastPhase = null;
+    const phaseStates = new Map();
+    for (const event of thread ? database.listAiChatEvents(threadId) : []) {
+      if (event.runId !== run.runId || event.type !== "autocut_progress") continue;
+      const progress = normalizeAutoCutProgress(event.data);
+      if (!progress) continue;
+      phaseStates.set(progress.phase, progress.status);
+      lastPhase = progress.phase;
+    }
+    // A later wrapper failure must not hide the first phase that never recovered.
+    const failedPhase = [...phaseStates].find(([, status]) => status === "failed")?.[0] ?? null;
     return {
       runId: run.runId,
       taskId: run.taskId,
+      threadId,
+      executionKind: thread ? (thread.model === "local-autocut" ? "local" : "codex") : null,
+      failedPhase,
+      lastPhase,
       attempt: run.attempt,
       subjectKey: run.subjectKey,
       configVersion: run.configVersion,
