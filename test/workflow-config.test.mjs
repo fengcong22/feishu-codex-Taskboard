@@ -8,6 +8,8 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import {
   WORKFLOW_SCHEMA_VERSION,
+  activeTables,
+  portableSubject,
   subjectKey,
   validateSubjectConfig,
   validateWorkflowConfig,
@@ -98,6 +100,85 @@ function twoFieldSubject() {
     },
   });
 }
+
+function vmSubject(overrides = {}) {
+  const writeback = () => ({
+    processing: { fieldId: null, optionId: null },
+    completed: { fieldId: null, optionId: null },
+  });
+  return {
+    baseToken: "bas_demo_123", baseName: "课程库", tableId: "tbl_math_123", tableName: "数学",
+    lifecycle: "enabled", configVersion: 2,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    statusField: { fieldId: "fld_progress", fieldName: "制作进度", type: "single_select",
+      options: [{ optionId: "opt_wait", value: "待制作" }, { optionId: "opt_ready", value: "待剪辑" }] },
+    execution: { mode: "automatic", concurrencyGroup: "vm", maxConcurrent: 1, resourceGroups: [] },
+    packageRoute: { routeMode: "fixed", packageAlias: "auto-cut-slicing", subjectCodeFieldId: null, branchMap: null },
+    vmWorkflow: {
+      fields: { vmidFieldId: "fld_vmid", outputAttachmentFieldId: "fld_output", namingFieldId: "fld_name" },
+      approval: { department: "动画组", reason: "切片剪辑" },
+      stages: {
+        initial: { enabled: true, statusFieldId: "fld_progress", triggerOptionId: "opt_ready",
+          instructionFieldId: "fld_instructions", writeback: writeback() },
+        review: { enabled: false, statusFieldId: null, triggerOptionId: null,
+          instructionFieldId: null, instructionAttachmentsFieldId: null, writeback: writeback() },
+      },
+      finalArchive: { enabled: false, statusFieldId: null, triggerOptionId: null,
+        pathSource: "manual", directoryPath: null, pathFieldId: null },
+    },
+    ...overrides,
+  };
+}
+
+test("VM initial subject validates and survives portable active catalog without ZIP fields", () => {
+  const normalized = validateSubjectConfig(vmSubject());
+  assert.equal(normalized.trigger.optionId, "opt_ready");
+  assert.equal(normalized.statusField.type, "single_select");
+  assert.equal(normalized.documentField, undefined);
+  assert.equal(normalized.stages, undefined);
+  assert.deepEqual(normalized.vmWorkflow.stages.initial, vmSubject().vmWorkflow.stages.initial);
+  const portable = portableSubject(normalized);
+  assert.deepEqual(validateSubjectConfig(portable), portable);
+  const catalog = validateWorkflowConfig(validConfig({
+    bases: [{ ...validConfig().bases[0], subjects: [portable] }],
+  }));
+  assert.deepEqual(activeTables(catalog), [portable]);
+});
+
+test("VM active snapshot under a draft remains the active table", () => {
+  const active = portableSubject(vmSubject());
+  const draft = validSubject({ lifecycle: "draft", configVersion: 3, activeSnapshot: active });
+  const catalog = validConfig({ bases: [{ ...validConfig().bases[0], subjects: [draft] }] });
+  assert.deepEqual(activeTables(catalog), [active]);
+});
+
+test("VM schema rejects incomplete, multi-select, review, archive, and unknown declarations", () => {
+  const cases = [
+    vmSubject({ workflowTemplate: { id: "vm_pmo_review_video", version: 2 } }),
+    vmSubject({ workflowTemplate: { id: "unknown", version: 1 } }),
+    vmSubject({ workflowTemplate: undefined }),
+    vmSubject({ vmWorkflow: undefined }),
+    vmSubject({ statusField: { ...vmSubject().statusField, type: "multi_select" } }),
+    vmSubject({ statusField: { ...vmSubject().statusField, uiType: 42 } }),
+    vmSubject({ statusField: { ...vmSubject().statusField, options: [] } }),
+    vmSubject({ vmWorkflow: { ...vmSubject().vmWorkflow, stages: { ...vmSubject().vmWorkflow.stages,
+      review: { ...vmSubject().vmWorkflow.stages.review, enabled: true } } } }),
+    vmSubject({ vmWorkflow: { ...vmSubject().vmWorkflow, finalArchive: {
+      ...vmSubject().vmWorkflow.finalArchive, enabled: true } } }),
+    vmSubject({ vmWorkflow: { ...vmSubject().vmWorkflow, stages: { ...vmSubject().vmWorkflow.stages,
+      initial: { ...vmSubject().vmWorkflow.stages.initial, triggerOptionId: "opt_unknown" } } } }),
+    vmSubject({ packageRoute: { routeMode: "fixed", packageAlias: null } }),
+  ];
+  for (const candidate of cases) assert.throws(() => validateSubjectConfig(candidate));
+  assert.throws(() => validateWorkflowConfig(validConfig({
+    bases: [{ ...validConfig().bases[0], subjects: [vmSubject({ workflowTemplate: { id: "unknown", version: 1 } })] }],
+  })));
+});
+
+test("ZIP subjects cannot acquire a VM workflow by attaching undeclared config", () => {
+  assert.throws(() => validateSubjectConfig(validSubject({ vmWorkflow: vmSubject().vmWorkflow })));
+  assert.equal(validateWorkflowConfig(validConfig()).bases[0].subjects[0].workflowTemplate, undefined);
+});
 
 test("two trigger fields accept option IDs reused in separate fields and reject same-field duplicates", () => {
   const subject = twoFieldSubject();
@@ -558,6 +639,85 @@ test("syncSubject persists enabled and disabled lifecycle through the real store
 
   const temporaryFiles = (await readdir(directory)).filter((name) => name.endsWith(".tmp"));
   assert.deepEqual(temporaryFiles, []);
+});
+
+test("syncSubject preserves VM initial workflow without ZIP fields across enable, replay and disable", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-sync-vm-"));
+  const store = createWorkflowConfigStore({ filename: path.join(directory, "workflow.json"),
+    initial: { schemaVersion: WORKFLOW_SCHEMA_VERSION, configVersion: 1, bases: [] },
+    now: () => 1_700_000_000_000, packageAliases: ["auto-cut-slicing"] });
+  const input = vmSubject({ title: { fieldId: "fld_name", fieldName: "视频名称" } });
+  const enabled = await store.syncSubject(input, { lifecycle: "enabled", expectedVersion: 1 });
+  assert.deepEqual(enabled.workflowTemplate, { id: "vm_pmo_review_video", version: 1 });
+  assert.deepEqual(enabled.vmWorkflow, input.vmWorkflow);
+  assert.deepEqual(enabled.title, input.title);
+  assert.equal(enabled.upload, undefined);
+  assert.equal(enabled.stages, undefined);
+  assert.equal(enabled.createdAt, 1_700_000_000_000);
+  assert.equal(enabled.updatedAt, 1_700_000_000_000);
+  assert.deepEqual(await store.syncSubject(structuredClone(input), { lifecycle: "enabled", expectedVersion: 1 }), enabled);
+  const disabled = await store.syncSubject({ ...input, configVersion: 3 }, { lifecycle: "disabled", expectedVersion: 2 });
+  assert.equal(disabled.lifecycle, "disabled");
+  assert.deepEqual(disabled.vmWorkflow, input.vmWorkflow);
+  assert.equal(disabled.upload, undefined);
+  assert.equal((await store.activeTables()).length, 0);
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("syncSubject never stores VM local archive directory in the Bridge catalog", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-sync-vm-path-"));
+  const filename = path.join(directory, "workflow.json");
+  const store = createWorkflowConfigStore({ filename,
+    initial: { schemaVersion: WORKFLOW_SCHEMA_VERSION, configVersion: 1, bases: [] },
+    packageAliases: ["auto-cut-slicing"] });
+  const input = vmSubject({ title: { fieldId: "fld_name", fieldName: "视频名称" },
+    vmWorkflow: { ...vmSubject().vmWorkflow,
+      finalArchive: { ...vmSubject().vmWorkflow.finalArchive, directoryPath: "C:\\vm-pmo\\private" } } });
+  const enabled = await store.syncSubject(input, { lifecycle: "enabled", expectedVersion: 1 });
+  assert.equal(enabled.vmWorkflow.finalArchive.directoryPath, null);
+  assert.equal(JSON.parse(await readFile(filename, "utf8")).bases[0].subjects[0].vmWorkflow.finalArchive.directoryPath, null);
+  assert.equal(input.vmWorkflow.finalArchive.directoryPath, "C:\\vm-pmo\\private");
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("VM share export removes local archive path and import preserves local active version", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-share-vm-"));
+  const archivePath = "C:\\vm-pmo\\archive";
+  const vm = vmSubject({ title: { fieldId: "fld_name", fieldName: "视频名称" },
+    vmWorkflow: { ...vmSubject().vmWorkflow,
+      finalArchive: { ...vmSubject().vmWorkflow.finalArchive, directoryPath: archivePath } } });
+  const store = createWorkflowConfigStore({ filename: path.join(directory, "workflow.json"),
+    initial: validConfig({ bases: [{ ...validConfig().bases[0], subjects: [vm] }] }),
+    packageAliases: ["auto-cut-slicing"] });
+  const share = await store.exportShareable();
+  assert.equal(share.bases[0].subjects[0].vmWorkflow.finalArchive.directoryPath, null);
+  assert.equal(share.bases[0].subjects[0].upload, undefined);
+  const imported = await store.importShareable(share);
+  assert.equal(imported.configuration.bases[0].subjects[0].vmWorkflow.finalArchive.directoryPath, null);
+  assert.equal(imported.diagnosticsOk, false);
+  assert.ok(imported.diagnostics.some((item) => item.code === "VM_METADATA_RECHECK_REQUIRED"));
+  const draft = (await store.read()).bases[0].subjects[0];
+  assert.equal(draft.lifecycle, "draft");
+  assert.equal(draft.vmWorkflow.finalArchive.directoryPath, archivePath);
+  assert.equal(draft.activeSnapshot.vmWorkflow.finalArchive.directoryPath, archivePath);
+  assert.equal(draft.upload, undefined);
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("syncSubject can switch from VM back to a ZIP package without retaining VM fields", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workflow-vm-to-zip-"));
+  const store = createWorkflowConfigStore({ filename: path.join(directory, "workflow.json"),
+    initial: { schemaVersion: WORKFLOW_SCHEMA_VERSION, configVersion: 1, bases: [] },
+    packageAliases: ["auto-cut-slicing", "Auto-cut-copyA"] });
+  const vm = vmSubject({ title: { fieldId: "fld_name", fieldName: "视频名称" } });
+  await store.syncSubject(vm, { lifecycle: "enabled", expectedVersion: 1 });
+  const zip = validSubject({ baseToken: vm.baseToken, tableId: vm.tableId, configVersion: 3 });
+  const enabled = await store.syncSubject(zip, { lifecycle: "enabled", expectedVersion: 2 });
+  assert.equal(enabled.workflowTemplate, undefined);
+  assert.equal(enabled.vmWorkflow, undefined);
+  assert.equal(enabled.upload.enqueueMode, "manual");
+  assert.equal(enabled.trigger.optionId, "opt_ready");
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("refreshes dynamic package aliases before each lifecycle sync", async () => {

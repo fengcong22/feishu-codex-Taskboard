@@ -1,9 +1,13 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AutoCutRunSummary } from "./AutoCutRunSummary";
+import { retryTaskAutoCut } from "../api";
 
 describe("AutoCutRunSummary", () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
   it("shows the blocking reason and sends an explicit retry for a blocked task", async () => {
     const onRetry = vi.fn();
@@ -21,8 +25,51 @@ describe("AutoCutRunSummary", () => {
 
     expect(screen.getByText("docx_anchor_missing")).toBeTruthy();
     expect(screen.getByText("run-1")).toBeTruthy();
+    const retryButton = screen.getByRole("button", { name: "重试 Auto-Cut" });
+    expect(retryButton.getAttribute("aria-describedby")).toBeTruthy();
+    expect(document.getElementById(retryButton.getAttribute("aria-describedby")!)?.textContent)
+      .toMatch(/本次.*视频原音.*语音识别.*已配置的本机输出目录/);
+    fireEvent.click(retryButton);
+    expect(onRetry).toHaveBeenCalledWith("task-1", 4, {
+      allowVideoAudioAsr: true,
+      allowConfiguredLocalOutput: true,
+    });
+  });
+
+  it("sends the displayed single-run consent to the local retry endpoint only after a click", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ task: { id: "task-1" } }), {
+      status: 202, headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<AutoCutRunSummary
+      task={{ id: "task-1", version: 4, status: "blocked" }}
+      attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked" }]}
+      retrying={false}
+      onRetry={async (taskId, version, runConsent) => { await retryTaskAutoCut(taskId, version, runConsent); }}
+    />);
+
+    expect(fetchMock).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "重试 Auto-Cut" }));
-    expect(onRetry).toHaveBeenCalledWith("task-1", 4);
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/local/tasks/task-1/autocut-retry"),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({
+        version: 4,
+        runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+      }) }));
+  });
+
+  it.each([
+    { status: "in_progress", retrying: false },
+    { status: "blocked", retrying: true },
+  ])("does not allow another retry for $status with retrying=$retrying", ({ status, retrying }) => {
+    const onRetry = vi.fn();
+    render(<AutoCutRunSummary
+      task={{ id: "task-1", version: 4, status }}
+      attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked" }]}
+      retrying={retrying}
+      onRetry={onRetry}
+    />);
+    expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull();
+    expect(onRetry).not.toHaveBeenCalled();
   });
 
   it("does not expose private source paths or report credentials", () => {
@@ -36,6 +83,7 @@ describe("AutoCutRunSummary", () => {
     );
     expect(document.body.textContent).not.toMatch(/C:\\|tmp|token|secret|feishu\.cn/i);
   });
+
   it("explains the recorded failure and opens the matching attempt log", () => {
     const onOpenLog = vi.fn();
     const onCopy = vi.fn();

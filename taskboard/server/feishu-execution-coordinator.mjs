@@ -1,4 +1,5 @@
 import { ApiError } from "./database.mjs";
+import { assertPackageWorkflowExecutable, workflowTemplatesEqual } from "../shared/feishu-package-workflow.mjs";
 
 const MAX_LAUNCH_RETRIES = 3;
 const MAX_PUMP_RETRIES = 3;
@@ -18,6 +19,7 @@ export function createFeishuExecutionCoordinator({
   scheduler,
   startClaimedTask,
   resolveCurrentMetadata,
+  validatePackageWorkflow = null,
   onTaskUpdated = null,
   allowAutomaticExecution = true,
   now = () => Date.now(),
@@ -88,6 +90,24 @@ export function createFeishuExecutionCoordinator({
       return catalog?.[alias] ?? null;
     }
     return null;
+  }
+
+  async function assertWorkflow(taskId, record) {
+    const snapshot = typeof database.getFeishuTaskPackageSnapshot === "function"
+      ? database.getFeishuTaskPackageSnapshot(taskId) : null;
+    assertPackageWorkflowExecutable(record?.workflowTemplate);
+    if (snapshot) {
+      assertPackageWorkflowExecutable(snapshot.workflowTemplate);
+      if (!workflowTemplatesEqual(snapshot.workflowTemplate, record?.workflowTemplate)) {
+        throw new ApiError(409, "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "The task cannot change its package workflow");
+      }
+    }
+    if (typeof validatePackageWorkflow === "function") await validatePackageWorkflow(record, snapshot);
+  }
+
+  function isWorkflowFailure(error) {
+    return ["PACKAGE_WORKFLOW_NOT_READY", "PACKAGE_WORKFLOW_UNSUPPORTED", "PACKAGE_WORKFLOW_MISMATCH",
+      "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "INVALID_PACKAGE_SNAPSHOT"].includes(error?.code);
   }
 
   function executionResult(taskId) {
@@ -163,6 +183,10 @@ export function createFeishuExecutionCoordinator({
 
   function schedulePumpRetry(entry, error) {
     if (closed || entries.get(entry.task.id) !== entry || entry.timer !== null) return false;
+    if (isWorkflowFailure(error)) {
+      revokeReservation(entry);
+      return false;
+    }
     if (entry.trigger === "automatic" && (
       error?.code === "AUTOMATIC_EXECUTION_DISABLED" || !automaticExecutionAllowed()
     )) {
@@ -236,9 +260,17 @@ export function createFeishuExecutionCoordinator({
         armPumpTimer(entry, 1_000);
         return executionResult(entry.task.id);
       }
-      const latestTask = database.getTask(entry.task.id) ?? currentTask;
+      await assertWorkflow(entry.task.id, packageConfig);
+      if (!reservationIsCurrent(entry)) {
+        scheduler.release(lease);
+        return executionResult(entry.task.id);
+      }
+      const latestTask = database.getTask(entry.task.id);
+      if (!latestTask || latestTask.archivedAt !== null || !["todo", "queued"].includes(latestTask.status)) {
+        return revokeReservation(entry, lease);
+      }
       currentMetadata = eligibleMetadata(entry, latestTask);
-      if (!currentMetadata) return revokeReservation(entry, lease);
+      if (!currentMetadata || packageAliasFor(currentMetadata) !== alias) return revokeReservation(entry, lease);
       entry.task = latestTask;
       entry.metadata = currentMetadata;
       const result = await startClaimedTask(
@@ -273,7 +305,7 @@ export function createFeishuExecutionCoordinator({
         scheduler.release(lease);
         throw error;
       }
-      if (error?.code === "TASK_NOT_STARTABLE" || (entry.trigger === "automatic" && (
+      if (isWorkflowFailure(error) || error?.code === "TASK_NOT_STARTABLE" || (entry.trigger === "automatic" && (
         error?.code === "AUTOMATIC_EXECUTION_DISABLED" || !automaticExecutionAllowed()
       ))) {
         revokeReservation(entry, lease);
@@ -369,6 +401,27 @@ export function createFeishuExecutionCoordinator({
       entry.pumping = false;
       return executionResult(entry.task.id);
     }
+    try {
+      await assertWorkflow(entry.task.id, packageConfig);
+    } catch (error) {
+      entry.pumping = false;
+      throw error;
+    }
+    if (!reservationIsCurrent(entry)) {
+      entry.pumping = false;
+      return executionResult(entry.task.id);
+    }
+    // Workflow verification can read disk; recheck eligibility before asking
+    // for an editing slot in case the task was archived during that read.
+    const verifiedTask = database.getTask(entry.task.id);
+    const verifiedMetadata = verifiedTask ? eligibleMetadata(entry, verifiedTask) : null;
+    if (!verifiedTask || verifiedTask.archivedAt !== null || !["todo", "queued"].includes(verifiedTask.status)
+      || !verifiedMetadata || packageAliasFor(verifiedMetadata) !== alias) {
+      entry.pumping = false;
+      return revokeReservation(entry);
+    }
+    entry.task = verifiedTask;
+    entry.metadata = verifiedMetadata;
     const packageSnapshot = typeof database.getFeishuTaskPackageSnapshot === "function"
       ? database.getFeishuTaskPackageSnapshot(entry.task.id)
       : null;

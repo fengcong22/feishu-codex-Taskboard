@@ -16,6 +16,29 @@ const SIMULATION_WRITE_HEADERS = {
 };
 const BRIDGE_SECRET = "server-test-bridge-secret";
 
+// Windows may assign port: 0 a port that the Fetch standard blocks before HTTP.
+// Isolate connections so a closed fixture's socket cannot reach a later listener.
+async function localRequest(url, { method = "GET", headers, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const requestHeaders = { ...headers };
+    if (body !== undefined) requestHeaders["content-length"] = Buffer.byteLength(body);
+    const request = httpRequest(url, { method, headers: requestHeaders, agent: false }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.once("error", reject);
+      response.once("end", () => {
+        const content = Buffer.concat(chunks);
+        resolve(new Response(content.length ? content : null, {
+          status: response.statusCode,
+          headers: response.headers,
+        }));
+      });
+    });
+    request.once("error", reject);
+    request.end(body);
+  });
+}
+
 async function postWithRawHeaders(url, headers, body) {
   const target = new URL(url);
   return new Promise((resolve, reject) => {
@@ -25,6 +48,7 @@ async function postWithRawHeaders(url, headers, body) {
       path: `${target.pathname}${target.search}`,
       method: "POST",
       headers,
+      agent: false,
     }, (response) => {
       response.resume();
       response.once("end", () => resolve({ status: response.statusCode }));
@@ -72,20 +96,20 @@ test("manages a Base subscription only through authenticated Taskboard requests"
   const route = `${app.url}/api/feishu/workflow/bases/bas_demo/subscription`;
   const headers = { ...TASKBOARD_WRITE_HEADERS, "x-feishu-bridge-secret": BRIDGE_SECRET };
 
-  const read = await fetch(route, { headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": BRIDGE_SECRET } });
+  const read = await localRequest(route, { headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": BRIDGE_SECRET } });
   assert.equal(read.status, 200);
   assert.deepEqual(await read.json(), { subscription: { subscribed: false } });
 
-  const subscribed = await fetch(route, { method: "POST", headers, body: "{}" });
+  const subscribed = await localRequest(route, { method: "POST", headers, body: "{}" });
   assert.equal(subscribed.status, 200);
   assert.deepEqual(await subscribed.json(), { subscription: { subscribed: true } });
 
-  const unsubscribed = await fetch(route, { method: "DELETE", headers, body: "{}" });
+  const unsubscribed = await localRequest(route, { method: "DELETE", headers, body: "{}" });
   assert.equal(unsubscribed.status, 200);
   assert.deepEqual(await unsubscribed.json(), { subscription: { subscribed: false } });
   assert.deepEqual(calls, [["get", "bas_demo"], ["subscribe", "bas_demo"], ["unsubscribe", "bas_demo"]]);
 
-  const rejected = await fetch(route, { method: "POST", headers: TASKBOARD_WRITE_HEADERS, body: "{}" });
+  const rejected = await localRequest(route, { method: "POST", headers: TASKBOARD_WRITE_HEADERS, body: "{}" });
   assert.equal(rejected.status, 403);
   assert.equal((await rejected.json()).error.code, "BRIDGE_FAILURE");
 });
@@ -96,7 +120,7 @@ test("rejects malformed percent encoding in a Base subscription token", async (t
   });
   t.after(app.close);
 
-  const response = await fetch(`${app.url}/api/feishu/workflow/bases/%ZZ/subscription`, {
+  const response = await localRequest(`${app.url}/api/feishu/workflow/bases/%ZZ/subscription`, {
     headers: {
       "x-feishu-bridge-client": "taskboard",
       "x-feishu-bridge-secret": BRIDGE_SECRET,
@@ -120,7 +144,7 @@ test("previews a Feishu Base through the injected read-only metadata reader", as
     },
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+  const response = await localRequest(`${app.url}/api/feishu/base-preview`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ url: "https://example.feishu.cn/base/bas_demo" }),
@@ -143,7 +167,7 @@ test("passes a Wiki Base link to the injected read-only metadata reader", async 
     },
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+  const response = await localRequest(`${app.url}/api/feishu/base-preview`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -158,7 +182,7 @@ test("passes a Wiki Base link to the injected read-only metadata reader", async 
 test("rejects an invalid Base preview request without echoing the URL", async (t) => {
   const app = await start(assert.fail, undefined, { preview: assert.fail });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+  const response = await localRequest(`${app.url}/api/feishu/base-preview`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ url: "https://example.feishu.cn/docx/docx_secret" }),
@@ -180,7 +204,7 @@ test("returns a controlled client error when a Wiki node is not a Base", async (
     preview: async () => { throw error; },
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+  const response = await localRequest(`${app.url}/api/feishu/base-preview`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ url: "https://example.feishu.cn/wiki/wik_doc" }),
@@ -201,7 +225,7 @@ test("sanitizes Base metadata SDK failures", async (t) => {
     preview: async () => { throw error; },
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+  const response = await localRequest(`${app.url}/api/feishu/base-preview`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ url: "https://example.feishu.cn/base/bas_demo" }),
@@ -222,7 +246,7 @@ test("preserves the safe code for a missing selected Base table", async (t) => {
     preview: async () => { throw error; },
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/base-preview`, {
+  const response = await localRequest(`${app.url}/api/feishu/base-preview`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ url: "https://example.feishu.cn/base/bas_demo?table=tbl_missing" }),
@@ -242,7 +266,7 @@ test("syncs an enabled workflow subject through the loopback Bridge store", asyn
     },
   }, { bridgeSecret: BRIDGE_SECRET });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+  const response = await localRequest(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
     headers: {
       ...TASKBOARD_WRITE_HEADERS,
@@ -280,7 +304,7 @@ test("rejects non-loopback Host and Origin values before workflow sync", async (
     { ...TASKBOARD_WRITE_HEADERS, host: "attacker.example" },
     body,
   );
-  const crossSiteOrigin = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+  const crossSiteOrigin = await localRequest(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
     headers: {
       ...TASKBOARD_WRITE_HEADERS,
@@ -309,17 +333,17 @@ test("requires JSON and the Taskboard client header for workflow sync", async (t
     subject: { subjectKey: "bas_sync:tbl_sync", tableId: "tbl_sync" },
   });
 
-  const nonJson = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+  const nonJson = await localRequest(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
     headers: { "x-feishu-bridge-client": "taskboard" },
     body,
   });
-  const missingClient = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+  const missingClient = await localRequest(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
   });
-  const wrongClient = await fetch(`${app.url}/api/feishu/workflow/sync`, {
+  const wrongClient = await localRequest(`${app.url}/api/feishu/workflow/sync`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body,
@@ -360,7 +384,7 @@ test("applies a resolved frozen writeback intent without accepting Feishu coordi
     "x-feishu-bridge-secret": BRIDGE_SECRET,
   };
 
-  const accepted = await fetch(endpoint, {
+  const accepted = await localRequest(endpoint, {
     method: "POST",
     headers,
     body: JSON.stringify({ operationId: "writeback-001", claimToken: "claim-001", version: 3 }),
@@ -370,7 +394,7 @@ test("applies a resolved frozen writeback intent without accepting Feishu coordi
   assert.deepEqual(requests, [{ operationId: "writeback-001", claimToken: "claim-001", version: 3 }]);
   assert.equal(applied.length, 1);
 
-  const rejected = await fetch(endpoint, {
+  const rejected = await localRequest(endpoint, {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -388,8 +412,8 @@ test("applies a resolved frozen writeback intent without accepting Feishu coordi
 test("serves health and configuration summary", async (t) => {
   const app = await start(assert.fail);
   t.after(app.close);
-  const health = await (await fetch(`${app.url}/health`)).json();
-  const summary = await (await fetch(`${app.url}/api/config-summary`)).json();
+  const health = await (await localRequest(`${app.url}/health`)).json();
+  const summary = await (await localRequest(`${app.url}/api/config-summary`)).json();
   assert.deepEqual(health, { ok: true });
   assert.deepEqual(summary, { tables: 1, packages: 1 });
 });
@@ -442,14 +466,14 @@ test("serves real Feishu Base metadata only to the authenticated Taskboard", asy
     url: "https://example.feishu.cn/base/bas_demo?table=tbl_math",
   });
 
-  const denied = await fetch(url, {
+  const denied = await localRequest(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
   });
   assert.equal(denied.status, 403);
 
-  const allowed = await fetch(url, {
+  const allowed = await localRequest(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -484,7 +508,7 @@ test("includes listener and queue health objects unchanged", async (t) => {
   };
   const app = await start(assert.fail, () => expected);
   t.after(app.close);
-  const health = await (await fetch(`${app.url}/health`)).json();
+  const health = await (await localRequest(`${app.url}/health`)).json();
   assert.deepEqual(health, expected);
 });
 
@@ -495,7 +519,7 @@ test("validates and handles a simulated event", async (t) => {
     return { kind: "ready", taskIdentifier: "AUTO-1" };
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: { ...SIMULATION_WRITE_HEADERS, origin: "http://localhost:47823" },
     body: JSON.stringify({
@@ -527,7 +551,7 @@ test("disables simulation whenever the real listener or automatic execution is e
     return { kind: "ignored" };
   }, undefined, undefined, undefined, { simulationEnabled: false });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
@@ -566,7 +590,7 @@ test("simulation reevaluates the live Taskboard switch for each request and pres
       && (await taskboard.getAutomaticExecutionEnabled()) === false,
   });
   t.after(app.close);
-  const post = () => fetch(`${app.url}/api/simulate/record-changed`, {
+  const post = () => localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST", headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({ eventId: "evt_dynamic", baseToken: "bas_demo", tableId: "tbl_a",
       recordId: "rec_1", fieldName: "进度", fields: {}, deliverySource: "feishu" }),
@@ -598,7 +622,7 @@ test("simulation fails closed with a safe error when the live policy cannot be r
   });
   t.after(app.close);
   for (failRequest of [true, false]) {
-    const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+    const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
       method: "POST", headers: SIMULATION_WRITE_HEADERS, body: "{}",
     });
     assert.equal(response.status, 503);
@@ -631,7 +655,7 @@ test("rejects non-loopback Host and Origin values before simulation", async (t) 
     { ...SIMULATION_WRITE_HEADERS, host: "attacker.example" },
     body,
   );
-  const crossSiteOrigin = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const crossSiteOrigin = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: {
       ...SIMULATION_WRITE_HEADERS,
@@ -664,17 +688,17 @@ test("requires JSON and the local operator header for simulation", async (t) => 
     fields: {},
   });
 
-  const nonJson = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const nonJson = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: { "x-feishu-bridge-client": "local-operator" },
     body,
   });
-  const missingClient = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const missingClient = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
   });
-  const wrongClient = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const wrongClient = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: TASKBOARD_WRITE_HEADERS,
     body,
@@ -689,7 +713,7 @@ test("requires JSON and the local operator header for simulation", async (t) => 
 test("rejects incomplete simulated events", async (t) => {
   const app = await start(assert.fail);
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({ eventId: "evt_1" }),
@@ -701,7 +725,7 @@ test("rejects incomplete simulated events", async (t) => {
 test("does not echo malformed JSON content in validation errors", async (t) => {
   const app = await start(assert.fail);
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: '{"value":secret-token-not-for-client}',
@@ -722,7 +746,7 @@ test("returns 202 when a simulated event is durably pending retry", async (t) =>
     retryAt: 100,
   }));
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
@@ -748,7 +772,7 @@ test("returns 202 when a simulated event is durably dead-lettered", async (t) =>
     errorCode: "TASKBOARD_UNAVAILABLE",
   }));
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
@@ -775,7 +799,7 @@ test("returns 202 when a persisted dead letter is replayed", async (t) => {
     duplicate: true,
   }));
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({
@@ -799,7 +823,7 @@ test("sanitizes unexpected simulation failures", async (t) => {
     });
   });
   t.after(app.close);
-  const response = await fetch(`${app.url}/api/simulate/record-changed`, {
+  const response = await localRequest(`${app.url}/api/simulate/record-changed`, {
     method: "POST",
     headers: SIMULATION_WRITE_HEADERS,
     body: JSON.stringify({

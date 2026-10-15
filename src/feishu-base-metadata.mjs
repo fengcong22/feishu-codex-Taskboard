@@ -342,7 +342,9 @@ export function createFeishuBaseMetadataReader({ client } = {}) {
     const baseToken = identifier(subject?.baseToken, "Base token");
     const tableId = identifier(subject?.tableId, "table id");
     const metadata = await preview({ baseToken, tableId });
-    if (subject?.statusField && subject?.stages) {
+    if (subject?.workflowTemplate !== undefined || subject?.vmWorkflow !== undefined) {
+      assertVmSubjectMetadata(subject, metadata);
+    } else if (subject?.statusField && subject?.stages) {
       assertPhasedSubjectMetadata(subject, metadata);
     } else {
       assertSubjectMetadata(subject, metadata);
@@ -709,6 +711,102 @@ function phasedSubjectPaths(subject) {
 
 function metadataObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function vmField(table, fieldId, pathName, type) {
+  if (typeof fieldId !== "string" || !BASE_ID_PATTERN.test(fieldId)) {
+    throw phasedValidationError(`${pathName} is missing or invalid`, "INVALID_FIELD", pathName);
+  }
+  const matches = table.fields.filter((field) => field.fieldId === fieldId);
+  if (matches.length !== 1) {
+    throw phasedValidationError(`${pathName} is not present in Feishu metadata`, "INVALID_FIELD", pathName);
+  }
+  const field = matches[0];
+  const validType = type === "text"
+    ? strictMetadataFieldType(field, 1, new Set(["text"]))
+    : type === "naming"
+      ? isCourseNamingField(field)
+      : type === "attachment"
+        ? isAttachmentField(field)
+        : isSingleSelectField(field);
+  if (!validType) {
+    throw phasedValidationError(`${pathName} has an incompatible field type`, "FIELD_TYPE_INVALID", pathName);
+  }
+  return field;
+}
+
+function vmOption(field, optionId, pathName) {
+  if (typeof optionId !== "string" || !BASE_ID_PATTERN.test(optionId)) {
+    throw phasedValidationError(`${pathName} is missing or invalid`, "INVALID_FIELD", pathName);
+  }
+  if (!Array.isArray(field.options) || !field.options.every((option) => (
+    metadataObject(option) && typeof option.id === "string" && BASE_ID_PATTERN.test(option.id)
+    && typeof option.name === "string" && option.name.trim() !== ""
+  ))) {
+    throw phasedValidationError(`${pathName} has unusable option metadata`, "FEISHU_METADATA_INVALID_RESPONSE", pathName);
+  }
+  const optionIds = field.options.map((option) => option.id);
+  if (new Set(optionIds).size !== optionIds.length) {
+    throw phasedValidationError(`${pathName} has ambiguous option metadata`, "FEISHU_METADATA_INVALID_RESPONSE", pathName);
+  }
+  const matches = field.options.filter((option) => option.id === optionId);
+  if (matches.length !== 1) {
+    throw phasedValidationError(`${pathName} is not present in Feishu metadata`, "INVALID_FIELD", pathName);
+  }
+  return matches[0];
+}
+
+function assertVmSubjectMetadata(subject, metadata) {
+  const table = phasedMetadataTable(subject, metadata);
+  const template = subject?.workflowTemplate;
+  const config = subject?.vmWorkflow;
+  if (!metadataObject(template) || template.id !== "vm_pmo_review_video" || template.version !== 1
+    || !metadataObject(config) || config.stages?.initial?.enabled !== true
+    || config.stages?.review?.enabled !== false || config.finalArchive?.enabled !== false) {
+    throw phasedValidationError("VM workflow declaration is unsupported", "INVALID_FIELD", "workflowTemplate");
+  }
+  if (metadata.baseName !== subject.baseName || table.tableName !== subject.tableName) {
+    throw phasedValidationError("Configured Base or table name no longer matches Feishu metadata", "INVALID_FIELD", "tableName");
+  }
+  const fieldIds = table.fields.map((field) => field.fieldId);
+  if (new Set(fieldIds).size !== fieldIds.length) {
+    throw phasedValidationError("Feishu returned ambiguous field metadata", "FEISHU_METADATA_INVALID_RESPONSE", "fields");
+  }
+  const fields = config.fields;
+  const initial = config.stages.initial;
+  vmField(table, fields?.vmidFieldId, "vmWorkflow.fields.vmidFieldId", "text");
+  const naming = vmField(table, fields?.namingFieldId, "vmWorkflow.fields.namingFieldId", "naming");
+  vmField(table, fields?.outputAttachmentFieldId, "vmWorkflow.fields.outputAttachmentFieldId", "attachment");
+  vmField(table, initial.instructionFieldId, "vmWorkflow.stages.initial.instructionFieldId", "text");
+  if (subject?.title?.fieldId !== naming.fieldId || subject.title.fieldName !== naming.fieldName) {
+    throw phasedValidationError("VM naming field no longer matches Feishu metadata", "INVALID_FIELD", "title");
+  }
+  if (initial.statusFieldId !== subject?.statusField?.fieldId) {
+    throw phasedValidationError("VM initial status field does not match its binding", "INVALID_FIELD", "vmWorkflow.stages.initial.statusFieldId");
+  }
+  const status = vmField(table, initial.statusFieldId, "vmWorkflow.stages.initial.statusFieldId", "select");
+  if (subject.statusField.fieldName !== status.fieldName) {
+    throw phasedValidationError("VM status field name no longer matches Feishu metadata", "INVALID_FIELD", "statusField.fieldName");
+  }
+  const savedOptions = subject.statusField.options;
+  if (!Array.isArray(savedOptions) || savedOptions.length < 2
+    || savedOptions.some((option) => !metadataObject(option) || typeof option.optionId !== "string"
+      || typeof option.value !== "string")
+    || new Set(savedOptions.map((option) => option.optionId)).size !== savedOptions.length) {
+    throw phasedValidationError("VM status options are invalid", "INVALID_FIELD", "statusField.options");
+  }
+  const trigger = vmOption(status, initial.triggerOptionId, "vmWorkflow.stages.initial.triggerOptionId");
+  const savedTrigger = savedOptions.filter((option) => option.optionId === trigger.id && option.value === trigger.name);
+  if (savedTrigger.length !== 1 || !savedOptions.some((option) => option.optionId !== trigger.id)) {
+    throw phasedValidationError("VM trigger option no longer matches Feishu metadata", "INVALID_FIELD", "vmWorkflow.stages.initial.triggerOptionId");
+  }
+  for (const moment of ["processing", "completed"]) {
+    const binding = initial.writeback?.[moment];
+    const pathName = `vmWorkflow.stages.initial.writeback.${moment}`;
+    const writebackField = vmField(table, binding?.fieldId, `${pathName}.fieldId`, "select");
+    vmOption(writebackField, binding?.optionId, `${pathName}.optionId`);
+  }
+  return true;
 }
 
 function phasedDiagnosticCode(errorCode) {

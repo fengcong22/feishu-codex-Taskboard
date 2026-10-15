@@ -183,6 +183,50 @@ export function canonicalizePhasedSubjectPatch(value) {
   return result;
 }
 
+/** Preserve intentionally unselected draft bindings using the existing editor sentinels. */
+export function normalizePhasedDraftBindings(value, { projectLegacyTrigger = false } = {}) {
+  const result = canonicalizePhasedSubjectPatch(structuredClone(value));
+  const empty = (entry) => entry === null || entry === undefined || (typeof entry === "string" && entry.trim() === "");
+  for (const [key, pendingId] of Object.entries({
+    statusField: "pending_status_field", reviewStatusField: "pending_review_status_field",
+    documentField: "pending_document_field", namingField: "pending_naming_field",
+  })) {
+    const descriptor = result[key];
+    if (descriptor && typeof descriptor === "object" && !Array.isArray(descriptor)
+      && (empty(descriptor.fieldId) || descriptor.fieldId === pendingId)) {
+      result[key] = { ...descriptor, fieldId: pendingId, fieldName: "待配置" };
+    }
+  }
+  for (const stageId of STAGE_IDS) {
+    const stage = result.stages?.[stageId];
+    if (!stage || typeof stage !== "object" || Array.isArray(stage)) continue;
+    const descriptor = stageId === "initial" ? result.statusField : result.reviewStatusField ?? result.statusField;
+    if (stage.trigger && typeof stage.trigger === "object" && !Array.isArray(stage.trigger)) {
+      if (stage.enabled && empty(stage.trigger.fieldId)) {
+        stage.trigger.fieldId = descriptor?.fieldId;
+        stage.trigger.fieldName = descriptor?.fieldName;
+      }
+      if (stage.enabled && (empty(stage.trigger.optionId) || stage.trigger.optionId === `pending_${stageId}_option`)) {
+        stage.trigger.optionId = `pending_${stageId}_option`;
+        stage.trigger.value = "待配置";
+      }
+    }
+    for (const source of [stage.videoSource, stage.audio?.source]) {
+      if (source?.kind === "base_attachment" && empty(source.fieldId)) source.fieldId = "pending_attachment_field";
+    }
+  }
+  if (projectLegacyTrigger) {
+    const stage = STAGE_IDS.map((stageId) => result.stages?.[stageId]).find((entry) => entry?.enabled);
+    if (stage?.trigger && result.trigger && typeof result.trigger === "object" && !Array.isArray(result.trigger)) {
+      for (const [key, value] of Object.entries({ fieldId: stage.trigger.fieldId, fieldName: stage.trigger.fieldName,
+        optionId: stage.trigger.optionId, startValue: stage.trigger.value })) {
+        if (empty(result.trigger[key])) result.trigger[key] = value;
+      }
+    }
+  }
+  return result;
+}
+
 function fieldId(field) {
   return field?.fieldId ?? field?.id ?? null;
 }
@@ -332,11 +376,13 @@ export function normalizeStage(stage, metadata = null, stageId = "stage") {
   };
 }
 
-function validateMetadataField(metadata, descriptor, name, predicate = null, { required = true } = {}) {
+function validateMetadataField(metadata, descriptor, name, predicate = null, { required = true, allowIncompleteBindings = false } = {}) {
   descriptor = canonicalizeFieldDescriptor(descriptor, name);
   const id = identifier(descriptor?.fieldId ?? descriptor?.field_id, `${name}.fieldId`, { optional: !required });
   const configuredName = text(descriptor?.fieldName ?? descriptor?.field_name, `${name}.fieldName`, { optional: !required });
   if (id === null) return { fieldId: null, fieldName: null };
+  const pendingId = { statusField: "pending_status_field", reviewStatusField: "pending_review_status_field", documentField: "pending_document_field", namingField: "pending_naming_field" }[name];
+  if (allowIncompleteBindings && id === pendingId) return { fieldId: id, fieldName: configuredName };
   const field = metadataField(metadata, id);
   const matches = metadataFieldMatches(metadata, id);
   if (matches.length > 1) throw fail(`${name}.fieldId is not unique in metadata`, "FIELD_NOT_UNIQUE");
@@ -358,7 +404,7 @@ function validateMetadataField(metadata, descriptor, name, predicate = null, { r
  * default `requireMetadata: false` to defer validation. An explicit empty
  * fields array is considered known metadata and therefore rejects bindings.
  */
-export function assertPhasedAttachmentBindings(value, metadata = value?.metadata, { requireMetadata = false } = {}) {
+export function assertPhasedAttachmentBindings(value, metadata = value?.metadata, { requireMetadata = false, allowIncompleteBindings = false } = {}) {
   const fields = Array.isArray(metadata)
     ? metadata
     : (metadata && Array.isArray(metadata.fields) ? metadata.fields : null);
@@ -368,6 +414,7 @@ export function assertPhasedAttachmentBindings(value, metadata = value?.metadata
   }
   const resolve = (source, path) => {
     if (!source || source.kind !== "base_attachment") return;
+    if (allowIncompleteBindings && source.fieldId === "pending_attachment_field") return;
     const matches = fields.filter((candidate) => fieldId(candidate) === source.fieldId);
     if (matches.length === 0) {
       const error = fail(`${path} is not present in metadata`, "FIELD_NOT_FOUND");
@@ -404,16 +451,16 @@ export function assertPhasedAttachmentBindings(value, metadata = value?.metadata
  * The caller decides whether the subject is a legacy single-trigger subject;
  * this function is only required when staged fields are present.
  */
-export function validatePhasedSubjectConfig(value) {
+export function validatePhasedSubjectConfig(value, { allowIncompleteBindings = false } = {}) {
   plainObject(value, "Subject configuration");
   const metadata = value.metadata ?? null;
-  const statusField = validateMetadataField(metadata, value.statusField, "statusField", isSingleSelectMetadataField);
+  const statusField = validateMetadataField(metadata, value.statusField, "statusField", isSingleSelectMetadataField, { allowIncompleteBindings });
   if (!statusField.fieldId) throw fail("statusField is required");
   const reviewStatusField = value.reviewStatusField == null ? statusField
-    : validateMetadataField(metadata, value.reviewStatusField, "reviewStatusField", isSingleSelectMetadataField);
-  const documentField = validateMetadataField(metadata, value.documentField, "documentField", null);
+    : validateMetadataField(metadata, value.reviewStatusField, "reviewStatusField", isSingleSelectMetadataField, { allowIncompleteBindings });
+  const documentField = validateMetadataField(metadata, value.documentField, "documentField", null, { allowIncompleteBindings });
   if (!documentField.fieldId) throw fail("documentField is required");
-  const namingField = validateMetadataField(metadata, value.namingField, "namingField", null);
+  const namingField = validateMetadataField(metadata, value.namingField, "namingField", null, { allowIncompleteBindings });
   if (!namingField.fieldId) throw fail("namingField is required");
   const stagesValue = plainObject(value.stages, "stages");
   const unknownStage = Object.keys(stagesValue).find((key) => !STAGE_IDS.includes(key));
@@ -440,6 +487,7 @@ export function validatePhasedSubjectConfig(value) {
       throw fail("status field options are unavailable in metadata", "TRIGGER_OPTION_NOT_FOUND");
     }
     if (field && Array.isArray(field.options)) {
+      if (allowIncompleteBindings && stages[stageId].trigger.optionId === `pending_${stageId}_option`) continue;
       const matches = field.options.filter((candidate) => candidate?.id === stages[stageId].trigger.optionId);
       if (matches.length === 0) throw fail(`stages.${stageId}.trigger.optionId is not present in metadata`, "TRIGGER_OPTION_NOT_FOUND");
       if (matches.length > 1) throw fail(`stages.${stageId}.trigger.optionId is not unique in metadata`, "TRIGGER_OPTION_NOT_UNIQUE");

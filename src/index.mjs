@@ -31,7 +31,7 @@ const configFile = process.env.BRIDGE_CONFIG ?? path.join(root, "config", "bridg
 const config = await loadConfig(configFile);
 const packageRegistryFile = process.env.CODEX_FEISHU_PACKAGES_PATH
   ?? path.join(root, "config", "taskboard-feishu-packages.json");
-const packageCatalog = await loadPackageRegistry(packageRegistryFile);
+const packageCatalog = await loadPackageRegistry(packageRegistryFile, { allowVmInitial: true });
 function envEnabled(name) {
   return ["1", "true", "yes", "on"].includes(
     String(process.env[name] ?? "").trim().toLowerCase(),
@@ -66,7 +66,7 @@ const workflowStore = createWorkflowConfigStore({
   filename: process.env.BRIDGE_WORKFLOW_CONFIG
     ?? path.join(root, ".runtime", "bridge", "workflow.json"),
   initial: { schemaVersion: 1, configVersion: 1, bases: [] },
-  packageAliases: () => loadPackageRegistry(packageRegistryFile),
+  packageAliases: () => loadPackageRegistry(packageRegistryFile, { allowVmInitial: true }),
   metadataReader,
 });
 const workflowRuntime = createWorkflowRuntime({
@@ -81,7 +81,7 @@ const taskboard = new TaskboardClient(config.taskboardUrl, {
 const bridge = createBridge({
   config,
   packageCatalog,
-  getPackageCatalog: () => loadPackageRegistry(packageRegistryFile),
+  getPackageCatalog: () => loadPackageRegistry(packageRegistryFile, { allowVmInitial: true }),
   getConfig: workflowRuntime.getConfig,
   workflowStore,
   workflowRuntime,

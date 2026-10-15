@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 
 import { ApiError } from "./database.mjs";
+import { normalizeVmPackageWorkflowConfig } from "./feishu-package-workflow-drafts.mjs";
+import { validateSubjectConfig as validateBridgeSubject } from "../../src/workflow-config.mjs";
 import {
   normalizeDeliveryConfig,
   validateDeliveryConfig,
@@ -13,6 +15,7 @@ import {
   isPhasedSubject,
   isSingleSelectMetadataField,
   normalizeStage,
+  normalizePhasedDraftBindings,
   portablePhasedSubject,
   validatePhasedSubjectConfig,
 } from "./feishu-workflow-stages.mjs";
@@ -51,6 +54,21 @@ const PENDING_STAGE_OPTION_IDS = Object.freeze({
 });
 
 const DEFAULT_STAGE_SUFFIXES = Object.freeze(["_初稿", "_初审修改", "_终审修改"]);
+const VM_WORKFLOW_TEMPLATE = Object.freeze({ id: "vm_pmo_review_video", version: 1 });
+
+function isVmSubject(subject) {
+  return subject?.workflowTemplate?.id === VM_WORKFLOW_TEMPLATE.id || subject?.vmWorkflow !== undefined;
+}
+
+function validateVmSubject(value) {
+  const { metadata, projectId, ...bridge } = value;
+  if (projectId !== subjectProjectId(value.subjectKey)) throw new ApiError(400, "INVALID_FIELD", "Subject project identity is invalid");
+  for (const key of ["createdAt", "updatedAt", "enabledAt", "closedAt"]) {
+    if (typeof bridge[key] === "string") bridge[key] = Date.parse(bridge[key]);
+  }
+  try { return { ...validateBridgeSubject(bridge), projectId, metadata }; }
+  catch (error) { throw new ApiError(400, error.code ?? "INVALID_FIELD", "VM subject configuration is invalid"); }
+}
 
 function metadataFieldId(field) {
   return field?.fieldId ?? field?.id ?? null;
@@ -58,6 +76,15 @@ function metadataFieldId(field) {
 
 function metadataFieldName(field) {
   return field?.fieldName ?? field?.name ?? null;
+}
+
+function isCourseNamingMetadataField(field) {
+  const type = typeof field?.type === "string" ? Number(field.type) : field?.type;
+  const uiType = typeof field?.uiType === "string"
+    ? field.uiType.replace(/[\s_-]/gu, "").toLowerCase()
+    : null;
+  return (type === 1 && (uiType === null || uiType === "text"))
+    || (type === 20 && (uiType === null || uiType === "formula"));
 }
 
 function validIdentifier(value) {
@@ -345,7 +372,10 @@ function phasedDefaultsForSubject({
   // Reusing the status column would make strict enable validation accept a
   // binding the operator never selected.
   const documentCandidate = remainingFields[0];
-  const namingCandidate = remainingFields[1] ?? documentCandidate;
+  const positionalNamingCandidate = remainingFields[1] ?? documentCandidate;
+  const namingCandidate = isCourseNamingMetadataField(positionalNamingCandidate)
+    ? positionalNamingCandidate
+    : null;
   const defaultStatusField = metadataDescriptor(
     statusCandidate ?? (migratingLegacySubject && !legacyTriggerFieldRenamed ? existingTrigger : null),
     "pending_status_field",
@@ -523,7 +553,7 @@ function phasedDefaultsForSubject({
   );
   const packageRoute = clone(existing?.packageRoute ?? {
     routeMode: "fixed",
-    packageAlias: "Auto-cut-A",
+    packageAlias: null,
     subjectCodeFieldId: null,
     branchMap: null,
   });
@@ -665,14 +695,19 @@ function rowSubject(row) {
 
 function subjectResponse(database, row) {
   const active = database.prepare(`
-    SELECT version FROM feishu_subject_versions
+    SELECT version, snapshot_json FROM feishu_subject_versions
     WHERE subject_key = ? AND lifecycle = 'enabled' AND closed_at IS NULL
     ORDER BY version DESC LIMIT 1
+  `).get(row.subject_key);
+  const editingPreference = database.prepare(`
+    SELECT package_alias FROM feishu_subject_editing_preferences WHERE subject_key = ?
   `).get(row.subject_key);
   return {
     ...rowSubject(row),
     // Response-only state: editing a draft does not replace the active version.
     activeConfigVersion: active?.version ?? null,
+    activePackageAlias: active ? json(active.snapshot_json)?.packageRoute?.packageAlias ?? null : null,
+    preferredPackageAlias: editingPreference?.package_alias ?? null,
   };
 }
 
@@ -1152,7 +1187,7 @@ function validateShareDocument(value) {
       // filling only fields that are safe defaults for a portable document.
       normalized.title ??= { fieldId: null, fieldName: null };
       normalized.execution ??= { mode: "manual", concurrencyGroup: "default", maxConcurrent: 1, resourceGroups: [] };
-      normalized.packageRoute ??= { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null };
+      normalized.packageRoute ??= { routeMode: "fixed", packageAlias: null, subjectCodeFieldId: null, branchMap: null };
       if (normalized.upload !== undefined && normalized.upload !== null
         && (typeof normalized.upload !== "object" || Array.isArray(normalized.upload))) {
         throw new ApiError(
@@ -1226,9 +1261,22 @@ const SUBJECT_PATCH_KEYS = new Set([
   "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery", "expectedVersion",
 ]);
 
-export function validateSubjectConfig(value, { projectLegacyTrigger = false } = {}) {
+const PACKAGE_PROFILE_KEYS = new Set([...SUBJECT_PATCH_KEYS].filter((key) => !["displayEnabled", "expectedVersion"].includes(key)));
+const ZIP_WORKFLOW_TEMPLATE = Object.freeze({ id: "document_draft_zip", version: 1 });
+
+function packageProfileConfig(subject) {
+  return Object.fromEntries([...PACKAGE_PROFILE_KEYS].filter((key) => Object.hasOwn(subject, key))
+    .map((key) => [key, clone(subject[key])]));
+}
+
+export function validateSubjectConfig(value, { projectLegacyTrigger = false, allowIncompleteBindings = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiError(400, "INVALID_BODY", "Subject configuration must be an object");
+  }
+  if (isVmSubject(value)) return validateVmSubject(value);
+  if (allowIncompleteBindings && isPhasedSubject(value)) {
+    try { value = normalizePhasedDraftBindings(value, { projectLegacyTrigger }); }
+    catch (error) { throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message); }
   }
   const allowedTopLevel = new Set([
     "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId",
@@ -1269,8 +1317,12 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
   if (new Set(groups).size !== groups.length) throw new ApiError(400, "INVALID_FIELD", "execution.resourceGroups must be unique");
   assertKeys(value.packageRoute, new Set(["routeMode", "packageAlias", "subjectCodeFieldId", "branchMap"]), "packageRoute");
   if ((value.packageRoute.routeMode ?? "fixed") !== "fixed") throw new ApiError(400, "INVALID_FIELD", "packageRoute.routeMode is invalid");
-  const alias = requireText(value.packageRoute.packageAlias, "packageRoute.packageAlias");
-  if (/^[./\\]/u.test(alias) || /[\s\u0000-\u001f\u007f"'`:$<>|]/u.test(alias)) {
+  const aliasValue = value.packageRoute.packageAlias;
+  const alias = aliasValue === null || aliasValue === undefined || (typeof aliasValue === "string" && aliasValue.trim() === "")
+    ? null : requireText(aliasValue, "packageRoute.packageAlias");
+  if (alias === null && value.lifecycle === "enabled") throw new ApiError(409, "PACKAGE_ALIAS_REQUIRED", "请选择剪辑包后再启用学科流程");
+  value.packageRoute.packageAlias = alias;
+  if (alias !== null && (/^[./\\]/u.test(alias) || /[\s\u0000-\u001f\u007f"'`:$<>|]/u.test(alias))) {
     throw new ApiError(400, "INVALID_FIELD", "packageRoute.packageAlias is invalid");
   }
   optionalIdentifier(value.packageRoute.subjectCodeFieldId, "packageRoute.subjectCodeFieldId");
@@ -1301,7 +1353,7 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
   }
   if (isPhasedSubject(value)) {
     try {
-      const normalized = validatePhasedSubjectConfig(value);
+      const normalized = validatePhasedSubjectConfig(value, { allowIncompleteBindings });
       if (value.lifecycle === "enabled" && value.upload.enqueueMode === "automatic" && value.delivery?.version !== 1) {
         const missingDestination = STAGE_IDS.find((stageId) => (
           normalized.stages[stageId].enabled
@@ -1346,9 +1398,33 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false } = 
   return value;
 }
 
-export function createFeishuWorkflowStore({ database, validateConfig = null, packageAliases = null, syncSubject = null } = {}) {
+export function createFeishuWorkflowStore({ database, validateConfig = null, packageAliases = null, validatePackageWorkflow = null,
+  validateVmWorkflowActivation = null, syncSubject = null } = {}) {
   if (!database?.database) throw new TypeError("database is required");
   const db = database.database;
+  db.exec(`CREATE TABLE IF NOT EXISTS feishu_package_workflow_drafts (
+    subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+    package_alias TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    template_version INTEGER NOT NULL CHECK (template_version > 0),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    config_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (subject_key, package_alias, template_id, template_version)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS feishu_subject_editing_preferences (
+    subject_key TEXT PRIMARY KEY REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
+    package_alias TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+  db.exec(`INSERT OR IGNORE INTO feishu_subject_editing_preferences (subject_key, package_alias, updated_at)
+    SELECT draft.subject_key, draft.package_alias, draft.updated_at
+    FROM feishu_package_workflow_drafts AS draft
+    WHERE draft.rowid = (
+      SELECT recent.rowid FROM feishu_package_workflow_drafts AS recent
+      WHERE recent.subject_key = draft.subject_key
+      ORDER BY recent.updated_at DESC, recent.revision DESC, recent.rowid DESC LIMIT 1
+    )`);
   const validate = (value, options = {}) => {
     const normalized = typeof validateConfig === "function" ? validateConfig(value) : value;
     return validateSubjectConfig(normalized, options);
@@ -1372,10 +1448,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     return normalized;
   };
 
-  function assertStrictPhasedAttachments(subject) {
+  function assertStrictPhasedAttachments(subject, { allowIncompleteBindings = false } = {}) {
     if (!isPhasedSubject(subject)) return;
     try {
-      assertPhasedAttachmentBindings(subject, subject.metadata);
+      assertPhasedAttachmentBindings(subject, subject.metadata, { allowIncompleteBindings });
     } catch (error) {
       const code = error?.code === "FIELD_TYPE_INVALID"
         ? "FIELD_TYPE_INVALID"
@@ -1393,6 +1469,20 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         error?.path ? { path: error.path } : undefined,
       );
     }
+  }
+
+  function assertPhasedNamingField(subject) {
+    if (!isPhasedSubject(subject)) return;
+    const fields = Array.isArray(subject?.metadata?.fields) ? subject.metadata.fields : [];
+    const field = fields.find((candidate) => metadataFieldId(candidate) === subject.namingField?.fieldId);
+    if (!field) return;
+    if (isCourseNamingMetadataField(field)) return;
+    throw new ApiError(
+      409,
+      "FIELD_TYPE_INVALID",
+      "namingField.fieldId must identify a text or formula field",
+      { path: "namingField.fieldId" },
+    );
   }
 
   function assertDeliveryConfiguration(subject, mode) {
@@ -1467,6 +1557,35 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     return new Set(Array.isArray(aliases) ? aliases : []);
   }
 
+  function hasActiveShareImportVersion(row) {
+    if (!row) return false;
+    if (row.removed_at !== null) return false;
+    if (row.lifecycle === "enabled") return true;
+    return Boolean(db.prepare(`
+      SELECT 1 FROM feishu_subject_versions
+      WHERE subject_key = ? AND lifecycle = 'enabled' AND closed_at IS NULL
+      LIMIT 1
+    `).get(row.subject_key));
+  }
+
+  function enabledSubjectSkipDiagnostic(subject) {
+    return {
+      code: "ENABLED_SUBJECT_SKIPPED",
+      severity: "warning",
+      path: `bases.${subject.baseToken}.subjects.${subject.tableId}`,
+      message: `Subject ${subject.tableName} has an active workflow and will remain unchanged during import`,
+    };
+  }
+
+  function removedShareSkipDiagnostic(base, subject = null) {
+    return {
+      code: subject ? "REMOVED_SUBJECT_SKIPPED" : "REMOVED_BASE_SKIPPED",
+      severity: "warning",
+      path: `bases.${base.baseToken}${subject ? `.subjects.${subject.tableId}` : ""}`,
+      message: "Removed catalog entries remain removed during configuration import",
+    };
+  }
+
   async function shareDiagnostics(configuration) {
     const diagnostics = [];
     const packageSet = await configuredPackageAliases();
@@ -1474,6 +1593,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const currentSubjects = new Map(db.prepare("SELECT * FROM feishu_subjects").all().map((row) => [row.subject_key, row]));
     for (const base of configuration.bases) {
       const currentBase = currentBases.get(base.baseToken);
+      if (currentBase?.removed_at) {
+        diagnostics.push(removedShareSkipDiagnostic(base));
+        continue;
+      }
       if (!currentBase) {
         diagnostics.push({
           code: "BASE_NOT_FOUND",
@@ -1484,6 +1607,14 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       }
       for (const subject of base.subjects) {
         const current = currentSubjects.get(subject.subjectKey);
+        if (current?.removed_at) {
+          diagnostics.push(removedShareSkipDiagnostic(base, subject));
+          continue;
+        }
+        if (hasActiveShareImportVersion(current)) {
+          diagnostics.push(enabledSubjectSkipDiagnostic(subject));
+          continue;
+        }
         if (!current) {
           diagnostics.push({
             code: "SUBJECT_NOT_FOUND",
@@ -1513,6 +1644,47 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           }
         }
         const fieldById = new Map(fields.map((field) => [field?.fieldId ?? field?.id, field]));
+        if (isPhasedSubject(subject)) {
+          for (const [name, descriptor, predicate] of [
+            ["statusField", subject.statusField, isSingleSelectMetadataField],
+            ["reviewStatusField", subject.reviewStatusField, isSingleSelectMetadataField],
+            ["documentField", subject.documentField, null],
+            ["namingField", subject.namingField, isCourseNamingMetadataField],
+          ]) {
+            const fieldId = descriptor?.fieldId;
+            if (!fieldId) continue;
+            const matches = fields.filter((field) => metadataFieldId(field) === fieldId);
+            const code = matches.length === 0 ? "FIELD_NOT_FOUND"
+              : matches.length > 1 ? "FIELD_NOT_UNIQUE"
+                : predicate && !predicate(matches[0]) ? "FIELD_TYPE_INVALID" : null;
+            if (!code) continue;
+            diagnostics.push({
+              code,
+              severity: "warning",
+              path: `bases.${base.baseToken}.subjects.${subject.tableId}.${name}.fieldId`,
+              message: `Configured ${name} field must be reselected from current metadata`,
+            });
+          }
+        }
+        if (subject.delivery) {
+          const namingField = fieldById.get(subject.namingField?.fieldId) ?? null;
+          const deliveryIssues = validateDeliveryConfig(subject.delivery, {
+            mode: "activation",
+            fields,
+            stages: subject.stages,
+            uploadEnabled: subject.upload?.enabled !== false,
+            namingField,
+          }).issues;
+          for (const issue of deliveryIssues) {
+            if (!issue.path.endsWith(".fieldId") && !issue.path.endsWith(".optionId")) continue;
+            diagnostics.push({
+              code: issue.code,
+              severity: "warning",
+              path: `bases.${base.baseToken}.subjects.${subject.tableId}.${issue.path}`,
+              message: issue.message,
+            });
+          }
+        }
         const stageSources = [];
         for (const stageId of STAGE_IDS) {
           const stage = subject.stages?.[stageId];
@@ -1553,6 +1725,11 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           subject.packageRoute?.packageAlias,
           ...Object.values(subject.packageRoute?.branchMap ?? {}),
         ].filter(Boolean);
+        if (!subject.packageRoute?.packageAlias) diagnostics.push({
+          code: "PACKAGE_ALIAS_REQUIRED", severity: "warning",
+          path: `bases.${base.baseToken}.subjects.${subject.tableId}.packageRoute.packageAlias`,
+          message: "此学科尚未选择剪辑包，请选择后再启用。",
+        });
         if (packageSet) {
           for (const alias of aliases) {
             if (!packageSet.has(alias)) {
@@ -1613,6 +1790,115 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     if (!row) throw new ApiError(404, "SUBJECT_NOT_FOUND", `Subject '${subjectKey}' does not exist`);
     return row;
   }
+  const selectProfile = db.prepare(`SELECT * FROM feishu_package_workflow_drafts
+    WHERE subject_key = ? AND package_alias = ? AND template_id = 'document_draft_zip' AND template_version = 1`);
+
+  function profileSubject(subject, config, packageAlias, { checkMetadata = false } = {}) {
+    assertKeys(config, PACKAGE_PROFILE_KEYS, "config");
+    for (const key of ["trigger", "title", "execution", "packageRoute", "upload"]) {
+      if (!Object.hasOwn(config, key)) throw new ApiError(400, "INVALID_FIELD", `config.${key} is required`);
+    }
+    if (config.packageRoute?.packageAlias !== packageAlias) {
+      throw new ApiError(409, "PACKAGE_WORKFLOW_MISMATCH", "Package route does not match the profile identity");
+    }
+    const identity = Object.fromEntries(Object.entries(subject).filter(([key]) => !PACKAGE_PROFILE_KEYS.has(key)));
+    delete identity.workflowTemplate;
+    delete identity.vmWorkflow;
+    delete identity.enabledAt;
+    delete identity.closedAt;
+    const candidate = { ...identity, ...clone(config), lifecycle: "draft", metadata: checkMetadata ? subject.metadata : null };
+    const normalized = checkMetadata
+      ? validate(candidate, { projectLegacyTrigger: true, allowIncompleteBindings: true })
+      : validateSubjectConfig(candidate, { projectLegacyTrigger: true });
+    normalized.metadata = subject.metadata;
+    return normalized;
+  }
+
+  function profileResponse(subject, packageAlias, row, defaultConfig = null) {
+    let config = defaultConfig;
+    if (row) {
+      try { config = packageProfileConfig(profileSubject(subject, JSON.parse(row.config_json), packageAlias)); }
+      catch { throw new ApiError(500, "PACKAGE_WORKFLOW_DRAFT_INVALID", "Saved package workflow draft is invalid"); }
+    }
+    return {
+      subjectKey: subject.subjectKey, packageAlias, workflowTemplate: { ...ZIP_WORKFLOW_TEMPLATE },
+      revision: row?.revision ?? 0, config, updatedAt: row?.updated_at ?? null,
+    };
+  }
+
+  function writeProfile(subject, packageAlias, config, timestamp = now()) {
+    const current = selectProfile.get(subject.subjectKey, packageAlias);
+    if (current) profileResponse(subject, packageAlias, current);
+    db.prepare(`INSERT INTO feishu_package_workflow_drafts
+      (subject_key, package_alias, template_id, template_version, revision, config_json, updated_at)
+      VALUES (?, ?, 'document_draft_zip', 1, ?, ?, ?)
+      ON CONFLICT(subject_key, package_alias, template_id, template_version) DO UPDATE SET
+        revision = excluded.revision, config_json = excluded.config_json, updated_at = excluded.updated_at`)
+      .run(subject.subjectKey, packageAlias, (current?.revision ?? 0) + 1, JSON.stringify(config), timestamp);
+    return profileResponse(subject, packageAlias, selectProfile.get(subject.subjectKey, packageAlias));
+  }
+
+  function preferEditingPackage(subjectKey, packageAlias, timestamp = now()) {
+    db.prepare(`INSERT INTO feishu_subject_editing_preferences (subject_key, package_alias, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(subject_key) DO UPDATE SET package_alias = excluded.package_alias, updated_at = excluded.updated_at`)
+      .run(subjectKey, packageAlias, timestamp);
+  }
+
+  function readProfile(subject, packageAlias) {
+    const current = selectProfile.get(subject.subjectKey, packageAlias);
+    if (current) return profileResponse(subject, packageAlias, current);
+    // Recover the last snapshot for this alias, never the configuration of the
+    // package currently selected on the subject. History remains immutable.
+    const history = db.prepare("SELECT snapshot_json, created_at FROM feishu_subject_versions WHERE subject_key = ? ORDER BY version DESC").all(subject.subjectKey);
+    for (const version of history) {
+      let snapshot;
+      try { snapshot = JSON.parse(version.snapshot_json); } catch {
+        throw new ApiError(500, "PACKAGE_WORKFLOW_DRAFT_INVALID", "Saved package workflow history is invalid");
+      }
+      if (snapshot?.packageRoute?.packageAlias !== packageAlias || isVmSubject(snapshot)) continue;
+      const config = packageProfileConfig(profileSubject(subject, packageProfileConfig(snapshot), packageAlias));
+      return writeProfile(subject, packageAlias, config, version.created_at);
+    }
+    const { workflowTemplate: _template, vmWorkflow: _vmWorkflow, enabledAt: _enabledAt, closedAt: _closedAt, ...baseline } = subject;
+    const fresh = phasedDefaultsForSubject({
+      ...baseline, existing: null, lifecycle: "draft", validate: validateSubjectConfig,
+    });
+    fresh.packageRoute.packageAlias = packageAlias;
+    fresh.execution.mode = "manual";
+    return profileResponse(subject, packageAlias, null, packageProfileConfig(fresh));
+  }
+
+  function checkProfileRevision(profile, expectedRevision, { requireSaved = false } = {}) {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+      throw new ApiError(400, "INVALID_FIELD", "expectedRevision must be a non-negative integer");
+    }
+    if (expectedRevision !== profile.revision) {
+      throw new ApiError(409, "VERSION_CONFLICT", "Package workflow draft was changed by another client", {
+        expectedRevision, actualRevision: profile.revision,
+      });
+    }
+    if (requireSaved && profile.revision === 0) throw new ApiError(409, "PACKAGE_WORKFLOW_DRAFT_UNSAVED", "Save the package workflow draft before enabling it");
+  }
+
+  function syncLegacyProfile(subject, timestamp, previousMetadata) {
+    if (isVmSubject(subject)) return;
+    const alias = subject.packageRoute?.packageAlias;
+    if (!alias) return;
+    let config = packageProfileConfig(subject);
+    if (previousMetadata !== undefined) {
+      const row = selectProfile.get(subject.subjectKey, alias);
+      if (row) {
+        const saved = profileResponse(subject, alias, row);
+        const refreshed = clearDeletedMetadataBindings(
+          profileSubject(subject, saved.config, alias), subject.metadata, previousMetadata,
+        );
+        config = packageProfileConfig(validateMetadataRefreshDraft(refreshed));
+      }
+    }
+    writeProfile(subject, alias, config, timestamp);
+  }
+
   function getBase(baseToken) {
     const row = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ? AND removed_at IS NULL")
       .get(identifier(baseToken, "baseToken"));
@@ -1647,6 +1933,31 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         subject_key, version, snapshot_json, lifecycle, enabled_at, closed_at, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(row.subject_key, version, JSON.stringify(snapshot), lifecycle, enabledAt, closedAt, timestamp);
+  }
+
+  function snapshotForBridgeLifecycle(subject, currentRow) {
+    if (subject.packageRoute?.packageAlias) return subject;
+    // Unconfigured local drafts have never registered a Bridge route. A draft
+    // may also deliberately clear its package while an older version remains
+    // active; use that immutable routing identity only for disabling Bridge.
+    if (subject.lifecycle !== "disabled") return null;
+    const active = db.prepare(`SELECT snapshot_json FROM feishu_subject_versions
+      WHERE subject_key=? AND lifecycle='enabled' AND closed_at IS NULL ORDER BY version DESC LIMIT 1`).get(subject.subjectKey);
+    let previous = null;
+    if (active) {
+      try { previous = JSON.parse(active.snapshot_json); } catch {}
+      if (!previous || previous.subjectKey !== subject.subjectKey || previous.lifecycle !== "enabled"
+        || typeof previous.packageRoute?.packageAlias !== "string" || !previous.packageRoute.packageAlias.trim()) {
+        throw new ApiError(409, "WORKFLOW_HISTORY_INVALID", "无法确认此前启用的流程身份，请先检查历史配置。");
+      }
+    }
+    if (!previous) {
+      if (!currentRow || requiresBridgeDisableBeforeRemoval(currentRow)) {
+        throw new ApiError(409, "WORKFLOW_HISTORY_INVALID", "无法确认该学科是否已停用，请先检查历史配置。");
+      }
+      return null;
+    }
+    return { ...previous, lifecycle: "disabled", configVersion: subject.configVersion };
   }
 
   function requiresBridgeDisableBeforeRemoval(subject) {
@@ -1696,6 +2007,24 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         throw new ApiError(400, "INVALID_FIELD", "dryRun must be boolean");
       }
       const configuration = validateShareDocument(value);
+      const validatedAliases = new Set();
+      if (typeof validatePackageWorkflow === "function") {
+        for (const base of configuration.bases) {
+          if (db.prepare("SELECT removed_at FROM feishu_bases WHERE base_token = ?").get(base.baseToken)?.removed_at) continue;
+          for (const subject of base.subjects) {
+            const existing = db.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(subject.subjectKey);
+            if (existing?.removed_at || hasActiveShareImportVersion(existing)) continue;
+            for (const alias of [
+              subject.packageRoute?.packageAlias,
+              ...Object.values(subject.packageRoute?.branchMap ?? {}),
+            ]) {
+              if (!alias || validatedAliases.has(alias)) continue;
+              await validatePackageWorkflow(alias);
+              validatedAliases.add(alias);
+            }
+          }
+        }
+      }
       const diagnostics = await shareDiagnostics(configuration);
       const diagnosticsOk = diagnostics.every((entry) => entry.severity !== "error");
       const draftConfiguration = shareableConfiguration(
@@ -1709,10 +2038,16 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         return { ...draftConfiguration, configuration: draftConfiguration, diagnostics, diagnosticsOk, dryRun: true };
       }
       const timestamp = now();
+      const skippedEnabled = [];
+      const skippedRemoved = [];
       db.exec("BEGIN IMMEDIATE");
       try {
         for (const base of configuration.bases) {
           const existingBase = db.prepare("SELECT * FROM feishu_bases WHERE base_token = ?").get(base.baseToken);
+          if (existingBase?.removed_at) {
+            skippedRemoved.push(removedShareSkipDiagnostic(base));
+            continue;
+          }
           const localMetadataRefreshedAt = existingBase?.metadata_refreshed_at ?? null;
           db.prepare(`INSERT INTO feishu_bases
               (base_token, base_name, source_url_label, metadata_refreshed_at, created_at, updated_at)
@@ -1726,7 +2061,28 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               existingBase?.created_at ?? timestamp, timestamp);
           for (const imported of base.subjects) {
             const existing = db.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(imported.subjectKey);
+            if (existing?.removed_at) {
+              skippedRemoved.push(removedShareSkipDiagnostic(base, imported));
+              continue;
+            }
+            if (hasActiveShareImportVersion(existing)) {
+              skippedEnabled.push(enabledSubjectSkipDiagnostic(imported));
+              continue;
+            }
+            if (typeof validatePackageWorkflow === "function" && [
+              imported.packageRoute?.packageAlias,
+              ...Object.values(imported.packageRoute?.branchMap ?? {}),
+            ].some((alias) => alias && !validatedAliases.has(alias))) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Subject changed during import; retry");
+            }
             const local = existing ? rowSubject(existing) : null;
+            const importedAlias = imported.packageRoute.packageAlias;
+            const localProfile = local && importedAlias ? selectProfile.get(local.subjectKey, importedAlias) : null;
+            const localBindings = localProfile
+              ? profileResponse(local, importedAlias, localProfile).config
+              : local?.packageRoute?.packageAlias === importedAlias
+                ? local
+                : local && importedAlias ? readProfile(local, importedAlias).config : null;
             const importedSubject = {
               ...imported,
               baseName: base.baseName,
@@ -1735,22 +2091,22 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
               configVersion: (existing?.config_version ?? 0) + 1,
               createdAt: existing?.created_at ?? timestamp,
               updatedAt: timestamp,
-              // Keep bindings already established on this machine.  Imported
-              // files themselves always carry null paths.
+              // Shared files carry null paths. Preserve this alias's own local
+              // bindings, including edits saved only in its independent profile.
               upload: {
                 ...imported.upload,
-                artifactSourcePath: local?.upload?.artifactSourcePath ?? null,
-                targetPath: local?.upload?.targetPath ?? null,
+                artifactSourcePath: localBindings?.upload?.artifactSourcePath ?? null,
+                targetPath: localBindings?.upload?.targetPath ?? null,
               },
               ...(imported.delivery === undefined ? {} : {
                 delivery: {
                   ...imported.delivery,
-                  rootPath: local?.delivery?.rootPath ?? null,
+                  rootPath: localBindings?.delivery?.rootPath ?? null,
                 },
               }),
               ...(imported.stages ? {
                 stages: Object.fromEntries(STAGE_IDS.map((stageId) => {
-                  const localStage = local?.stages?.[stageId];
+                  const localStage = localBindings?.stages?.[stageId];
                   return [stageId, {
                     ...imported.stages[stageId],
                     artifactTargetPath: localStage?.artifactTargetPath
@@ -1798,6 +2154,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             database.syncSourceProjectArchived(next.projectId, false, "feishu", db);
             database.restoreSourceWorkflowState(next.subjectKey, db);
             saveVersion({ subject_key: next.subjectKey }, next, next.configVersion, timestamp);
+            syncLegacyProfile(next, timestamp);
           }
         }
         db.exec("COMMIT");
@@ -1807,10 +2164,50 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       }
       const catalog = db.prepare("SELECT * FROM feishu_bases WHERE removed_at IS NULL ORDER BY base_name, base_token").all().map((row) => rowBase(db, row));
       const resultConfiguration = configurationFromCatalog(catalog);
-      return { ...resultConfiguration, configuration: resultConfiguration, catalog, diagnostics, diagnosticsOk, dryRun: false };
+      const committedDiagnostics = [
+        ...diagnostics.filter((entry) => !["ENABLED_SUBJECT_SKIPPED", "REMOVED_SUBJECT_SKIPPED", "REMOVED_BASE_SKIPPED"].includes(entry.code)),
+        ...skippedEnabled,
+        ...skippedRemoved,
+      ];
+      return {
+        ...resultConfiguration,
+        configuration: resultConfiguration,
+        catalog,
+        diagnostics: committedDiagnostics,
+        diagnosticsOk: committedDiagnostics.every((entry) => entry.severity !== "error"),
+        dryRun: false,
+      };
     },
     async getSubject(subjectKey) {
       return subjectResponse(db, getSubject(parseSubjectKey(subjectKey).subjectKey));
+    },
+    async getPackageWorkflowProfile(subjectKey, packageAlias) {
+      return readProfile(rowSubject(getSubject(parseSubjectKey(subjectKey).subjectKey)), packageAlias);
+    },
+    async savePackageWorkflowProfile(subjectKey, packageAlias, { expectedRevision, config }) {
+      const key = parseSubjectKey(subjectKey).subjectKey;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const subject = rowSubject(getSubject(key));
+        const profile = readProfile(subject, packageAlias);
+        checkProfileRevision(profile, expectedRevision);
+        const next = profileSubject(subject, config, packageAlias, { checkMetadata: true });
+        assertStrictPhasedAttachments(next, { allowIncompleteBindings: true });
+        assertDeliveryConfiguration(next, "draft");
+        const saved = writeProfile(subject, packageAlias, packageProfileConfig(next));
+        preferEditingPackage(key, packageAlias);
+        db.exec("COMMIT");
+        return saved;
+      } catch (error) { db.exec("ROLLBACK"); throw error; }
+    },
+    async enablePackageWorkflowProfile(subjectKey, packageAlias, { expectedRevision, expectedVersion }) {
+      return transition(subjectKey, expectedVersion, "enabled", { packageAlias, expectedRevision });
+    },
+    async enableVmPackageWorkflowProfile(subjectKey, packageAlias, request) {
+      return activateVmProfile(subjectKey, packageAlias, request);
+    },
+    vmWorkflowActivationAvailable() {
+      return typeof validateVmWorkflowActivation === "function" && typeof syncSubject === "function";
     },
     async getBase(baseToken) {
       return rowBase(db, getBase(baseToken));
@@ -1852,13 +2249,13 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             const existingConfig = rowSubject(existing);
             const namesChanged = existingConfig.baseName !== baseName || existingConfig.tableName !== tableName;
             const metadataChanged = JSON.stringify(existingConfig.metadata ?? {}) !== JSON.stringify(metadata);
-            const phasedDefaultsNeeded = !hasCompletePhasedConfig(existingConfig)
-              || (isPendingPhasedDefaults(existingConfig) && (namesChanged || metadataChanged));
+            const phasedDefaultsNeeded = !isVmSubject(existingConfig) && (!hasCompletePhasedConfig(existingConfig)
+              || (isPendingPhasedDefaults(existingConfig) && (namesChanged || metadataChanged)));
             if (namesChanged || metadataChanged || phasedDefaultsNeeded) {
               // A metadata refresh changes the configuration snapshot.  Keep
               // the Bridge's last enabled snapshot active until the operator
               // explicitly validates and re-enables the refreshed draft.
-              const refreshedDraft = clearDeletedMetadataBindings({
+              const refreshedInput = {
                 ...existingConfig,
                 baseName,
                 tableName,
@@ -1866,7 +2263,9 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 lifecycle: existingConfig.lifecycle === "enabled" ? "draft" : existingConfig.lifecycle,
                 configVersion: existing.config_version + 1,
                 updatedAt: timestamp,
-              }, metadata, existingConfig.metadata);
+              };
+              const refreshedDraft = isVmSubject(existingConfig) ? refreshedInput
+                : clearDeletedMetadataBindings(refreshedInput, metadata, existingConfig.metadata);
               let next = phasedDefaultsNeeded
                 ? phasedDefaultsForSubject({
                   ...existingConfig,
@@ -1899,6 +2298,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
                 WHERE subject_key = ?`)
                 .run(tableName, JSON.stringify(metadata), next.lifecycle, next.configVersion, JSON.stringify(next), timestamp, key);
               saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
+              syncLegacyProfile(next, timestamp, existingConfig.metadata);
             } else if (existing.removed_at !== null) {
               db.prepare("UPDATE feishu_subjects SET removed_at = NULL, updated_at = ? WHERE subject_key = ?")
                 .run(timestamp, key);
@@ -1948,6 +2348,13 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       for (const field of Object.keys(patch)) {
         if (!SUBJECT_PATCH_KEYS.has(field)) throw new ApiError(400, "UNKNOWN_FIELD", `Unknown subject field '${field}'`);
       }
+      // This store owns the document/ZIP contract. Other package templates
+      // keep their drafts separately and cannot replace this subject version.
+      if (typeof validatePackageWorkflow === "function") {
+        const alias = patch.packageRoute && Object.hasOwn(patch.packageRoute, "packageAlias")
+          ? patch.packageRoute.packageAlias : rowSubject(getSubject(key)).packageRoute?.packageAlias;
+        if (typeof alias === "string" && alias.trim()) await validatePackageWorkflow(alias);
+      }
       const timestamp = now();
       db.exec("BEGIN IMMEDIATE");
       try {
@@ -1967,8 +2374,20 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
         }
         const currentConfig = rowSubject(current);
+        const targetAlias = changes.packageRoute && Object.hasOwn(changes.packageRoute, "packageAlias")
+          ? changes.packageRoute.packageAlias : currentConfig.packageRoute?.packageAlias;
+        const savedProfile = targetAlias ? selectProfile.get(key, targetAlias) : null;
+        const targetProfile = savedProfile
+          ? profileResponse(currentConfig, targetAlias, savedProfile)
+          : !targetAlias || targetAlias === currentConfig.packageRoute?.packageAlias ? null : readProfile(currentConfig, targetAlias);
+        // Legacy PATCH still inherits untouched current-subject values when
+        // routing to an alias never configured before. Existing profiles (or
+        // recovered history) take precedence over that compatibility baseline.
+        const editableBaseline = targetProfile?.revision > 0
+          ? profileSubject(currentConfig, targetProfile.config, targetAlias)
+          : currentConfig;
         const merged = {
-          ...mergeObjects(currentConfig, changes),
+          ...mergeObjects(editableBaseline, changes),
           subjectKey: key,
           baseToken: current.base_token,
           tableId: current.table_id,
@@ -1989,29 +2408,13 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           // path usable by both manual and automatic phased uploads.
           merged.stages = projectLegacyUploadTarget(merged.stages, merged.upload);
         }
-        let next;
-        if (isPendingPhasedDefaults(currentConfig) && !phasedPatch) {
-          // A newly imported table with no usable metadata still exposes the
-          // phased editor through its metadata fallback, but legacy callers
-          // may save non-binding fields before selecting phased bindings.
-          const phasedDefaults = {
-            statusField: clone(merged.statusField),
-            ...(merged.reviewStatusField === undefined ? {} : { reviewStatusField: clone(merged.reviewStatusField) }),
-            documentField: clone(merged.documentField),
-            namingField: clone(merged.namingField),
-            stages: clone(merged.stages),
-          };
-          for (const field of Object.keys(phasedDefaults)) delete merged[field];
-          next = validate(merged, { projectLegacyTrigger: false });
-          Object.assign(next, phasedDefaults);
-        } else {
-          next = validate(merged, { projectLegacyTrigger: Object.hasOwn(rawChanges, "stages") });
-        }
-        assertStrictPhasedAttachments(next);
+        const next = validate(merged, { projectLegacyTrigger: Object.hasOwn(rawChanges, "stages"), allowIncompleteBindings: true });
+        assertStrictPhasedAttachments(next, { allowIncompleteBindings: true });
         assertDeliveryConfiguration(next, "draft");
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
           .run(next.configVersion, JSON.stringify(next), next.displayEnabled === false ? 0 : 1, timestamp, key);
         saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
+        syncLegacyProfile(next, timestamp);
         db.exec("COMMIT");
       } catch (error) { db.exec("ROLLBACK"); throw error; }
       return subjectResponse(db, getSubject(key));
@@ -2095,7 +2498,8 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
             configVersion: expectedVersion + 1,
           });
           if (requiresBridgeDisableBeforeRemoval(locked) && typeof syncSubject === "function") {
-            await syncSubject(disabled, { lifecycle: "disabled", expectedVersion });
+            const bridgeSnapshot = snapshotForBridgeLifecycle(disabled, locked);
+            if (bridgeSnapshot) await syncSubject(bridgeSnapshot, { lifecycle: "disabled", expectedVersion });
           }
           const transitioned = db.prepare(`UPDATE feishu_subjects
             SET lifecycle='disabled', config_version=?, config_json=?, updated_at=?
@@ -2131,15 +2535,28 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     }
   }
 
-  async function transition(subjectKey, expectedVersion, lifecycle) {
+  async function transition(subjectKey, expectedVersion, lifecycle, profileRequest = null) {
     const key = parseSubjectKey(subjectKey).subjectKey;
     const current = getSubject(key);
     if (!Number.isInteger(expectedVersion) || expectedVersion !== current.config_version) {
       throw new ApiError(409, "VERSION_CONFLICT", "Subject was changed by another client", { expectedVersion, actualVersion: current.config_version });
     }
-    const currentConfig = rowSubject(current);
+    const currentSubject = rowSubject(current);
+    if (isVmSubject(currentSubject) && !profileRequest && lifecycle === "enabled") {
+      throw new ApiError(409, "PACKAGE_WORKFLOW_DRAFT_REQUIRED", "Enable a saved VM package workflow profile");
+    }
+    const profile = profileRequest ? readProfile(currentSubject, profileRequest.packageAlias) : null;
+    if (profile) checkProfileRevision(profile, profileRequest.expectedRevision, { requireSaved: true });
+    const currentConfig = profile ? profileSubject(currentSubject, profile.config, profileRequest.packageAlias) : currentSubject;
     if (lifecycle === "enabled") {
+      if (typeof currentConfig.packageRoute?.packageAlias !== "string" || !currentConfig.packageRoute.packageAlias.trim()) {
+        throw new ApiError(409, "PACKAGE_ALIAS_REQUIRED", "请选择剪辑包后再启用学科流程");
+      }
+      if (typeof validatePackageWorkflow === "function") {
+        await validatePackageWorkflow(currentConfig.packageRoute.packageAlias);
+      }
       assertStrictPhasedAttachments(currentConfig);
+      assertPhasedNamingField(currentConfig);
       assertTriggerMetadata(currentConfig);
       await assertPackageAlias(currentConfig.packageRoute.packageAlias);
       if (
@@ -2174,8 +2591,11 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           actualVersion: locked.config_version,
         });
       }
+      const lockedSubject = rowSubject(locked);
+      const lockedProfile = profileRequest ? readProfile(lockedSubject, profileRequest.packageAlias) : null;
+      if (lockedProfile) checkProfileRevision(lockedProfile, profileRequest.expectedRevision, { requireSaved: true });
       const lifecycleCandidate = {
-        ...rowSubject(locked),
+        ...(lockedProfile ? profileSubject(lockedSubject, lockedProfile.config, profileRequest.packageAlias) : lockedSubject),
         subjectKey: key,
         baseToken: locked.base_token,
         tableId: locked.table_id,
@@ -2195,14 +2615,86 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         // validated snapshot.  A failed loopback sync rolls back the local
         // lifecycle transition and leaves the subject as a draft/previous
         // state.
-        await syncSubject(next, {
-          lifecycle,
-          expectedVersion,
-        });
+        const bridgeSnapshot = snapshotForBridgeLifecycle(next, locked);
+        if (bridgeSnapshot) await syncSubject(bridgeSnapshot, { lifecycle, expectedVersion });
       }
       db.prepare("UPDATE feishu_subjects SET lifecycle=?, config_version=?, config_json=?, updated_at=? WHERE subject_key=? AND config_version=?")
         .run(lifecycle, next.configVersion, JSON.stringify(next), timestamp, key, expectedVersion);
       saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
+      if (lifecycle === "enabled") preferEditingPackage(key, next.packageRoute.packageAlias, timestamp);
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return subjectResponse(db, getSubject(key));
+  }
+
+  function vmProfileCandidate(row, packageAlias, expectedRevision) {
+    const saved = db.prepare(`SELECT * FROM feishu_package_workflow_drafts
+      WHERE subject_key = ? AND package_alias = ? AND template_id = 'vm_pmo_review_video' AND template_version = 1`)
+      .get(row.subject_key, packageAlias);
+    checkProfileRevision({ revision: saved?.revision ?? 0 }, expectedRevision, { requireSaved: true });
+    const subject = rowSubject(row);
+    let config;
+    try { config = normalizeVmPackageWorkflowConfig(JSON.parse(saved.config_json), subject.metadata).config; }
+    catch (error) { throw new ApiError(409, error.code ?? "VM_WORKFLOW_NOT_READY", "VM workflow fields must be repaired before activation"); }
+    const stage = config.stages.initial;
+    if (stage.enabled !== true || config.stages.review.enabled !== false || config.finalArchive.enabled !== false
+      || [config.fields.vmidFieldId, config.fields.namingFieldId, config.fields.outputAttachmentFieldId,
+        stage.statusFieldId, stage.triggerOptionId, stage.instructionFieldId].some((value) => !value)
+      || !config.approval.department || !config.approval.reason) {
+      throw new ApiError(409, "VM_WORKFLOW_NOT_READY", "Only a fully configured initial VM workflow is available");
+    }
+    const status = subject.metadata.fields.find((field) => field.fieldId === stage.statusFieldId);
+    if (!isSingleSelectMetadataField(status)) throw new ApiError(409, "VM_WORKFLOW_NOT_READY", "Initial VM workflow requires a single-select trigger");
+    const naming = subject.metadata.fields.find((field) => field.fieldId === config.fields.namingFieldId);
+    return validateVmSubject({
+      subjectKey: subject.subjectKey, baseToken: subject.baseToken, baseName: subject.baseName,
+      tableId: subject.tableId, tableName: subject.tableName, projectId: subject.projectId,
+      displayEnabled: subject.displayEnabled, lifecycle: "enabled", configVersion: subject.configVersion + 1,
+      createdAt: subject.createdAt, updatedAt: now(), workflowTemplate: { ...VM_WORKFLOW_TEMPLATE },
+      title: { fieldId: naming.fieldId, fieldName: naming.fieldName },
+      execution: { mode: "automatic", concurrencyGroup: packageAlias, maxConcurrent: 1, resourceGroups: [] },
+      packageRoute: { routeMode: "fixed", packageAlias, subjectCodeFieldId: null, branchMap: null },
+      statusField: { fieldId: status.fieldId, fieldName: status.fieldName, type: "single_select",
+        options: status.options.map((option) => ({ optionId: option.id, value: option.name })) },
+      vmWorkflow: config, metadata: clone(subject.metadata),
+    });
+  }
+
+  async function activateVmProfile(subjectKey, packageAlias, { expectedRevision, expectedVersion } = {}) {
+    if (typeof validateVmWorkflowActivation !== "function" || typeof syncSubject !== "function") {
+      throw new ApiError(409, "PACKAGE_WORKFLOW_NOT_READY", "VM runtime and Bridge validation must be available before activation");
+    }
+    const key = parseSubjectKey(subjectKey).subjectKey;
+    const current = getSubject(key);
+    const assertVersion = (row) => {
+      if (!Number.isSafeInteger(expectedVersion) || expectedVersion !== row.config_version) {
+        throw new ApiError(409, "VERSION_CONFLICT", "Subject was changed by another client", {
+          expectedVersion, actualVersion: row.config_version,
+        });
+      }
+    };
+    assertVersion(current);
+    const candidate = vmProfileCandidate(current, packageAlias, expectedRevision);
+    await assertPackageAlias(packageAlias);
+    if (await validateVmWorkflowActivation({ subject: clone(candidate), packageAlias, config: clone(candidate.vmWorkflow) }) !== true) {
+      throw new ApiError(409, "PACKAGE_WORKFLOW_NOT_READY", "VM runtime is not ready for activation");
+    }
+    const timestamp = now();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const locked = getSubject(key);
+      assertVersion(locked);
+      const next = vmProfileCandidate(locked, packageAlias, expectedRevision);
+      next.updatedAt = Date.parse(timestamp);
+      // The Bridge revalidates these exact field/option IDs against live Feishu
+      // metadata before the local transaction can publish the active version.
+      await syncSubject(next, { lifecycle: "enabled", expectedVersion });
+      const changed = db.prepare(`UPDATE feishu_subjects SET lifecycle='enabled', config_version=?, config_json=?, updated_at=?
+        WHERE subject_key=? AND config_version=? AND removed_at IS NULL`)
+        .run(next.configVersion, JSON.stringify(next), timestamp, key, expectedVersion);
+      if (changed.changes !== 1) throw new ApiError(409, "VERSION_CONFLICT", "Subject changed during VM activation");
+      saveVersion({ subject_key: key }, next, next.configVersion, timestamp);
+      preferEditingPackage(key, packageAlias, timestamp);
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
     return subjectResponse(db, getSubject(key));

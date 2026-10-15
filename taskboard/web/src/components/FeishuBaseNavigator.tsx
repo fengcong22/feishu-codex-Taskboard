@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   getFeishuBaseSubscription,
@@ -54,9 +54,11 @@ export function FeishuBaseNavigator({
   const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const [busyActionKey, setBusyActionKey] = useState<string | null>(null);
   const [subscriptions, setSubscriptions] = useState<Record<string, SubscriptionState>>({});
-  const lifecycleLabel = (lifecycle: "draft" | "enabled" | "disabled") => {
-    if (lifecycle === "enabled") return text("已启用", "Enabled");
-    if (lifecycle === "disabled") return text("已停用", "Disabled");
+  const subscriptionRequestVersions = useRef(new Map<string, number>());
+  const lifecycleLabel = (subject: FeishuSubjectConfig) => {
+    if (subject.lifecycle === "enabled") return text("已启用", "Enabled");
+    if (subject.lifecycle === "disabled") return text("已停用", "Disabled");
+    if (subject.activeConfigVersion != null) return text("已启用旧版 · 有草稿", "Older version enabled · Draft pending");
     return text("草稿", "Draft");
   };
 
@@ -88,18 +90,22 @@ export function FeishuBaseNavigator({
   }, [catalog, selectedBaseToken]);
 
   const refreshSubscription = useCallback(async (baseToken: string, reportError = false) => {
+    const requestVersion = (subscriptionRequestVersions.current.get(baseToken) ?? 0) + 1;
+    subscriptionRequestVersions.current.set(baseToken, requestVersion);
     setSubscriptions((current) => ({
       ...current,
       [baseToken]: { status: "loading", subscribed: current[baseToken]?.subscribed },
     }));
     try {
       const subscription = await getFeishuBaseSubscription(baseToken);
+      if (subscriptionRequestVersions.current.get(baseToken) !== requestVersion) return subscription;
       setSubscriptions((current) => ({
         ...current,
         [baseToken]: { status: "ready", subscribed: subscription.subscribed },
       }));
       return subscription;
     } catch (error) {
+      if (subscriptionRequestVersions.current.get(baseToken) !== requestVersion) return null;
       setSubscriptions((current) => ({
         ...current,
         [baseToken]: { status: "failed", subscribed: current[baseToken]?.subscribed },
@@ -112,10 +118,12 @@ export function FeishuBaseNavigator({
   }, [onError, text]);
 
   useEffect(() => {
-    for (const baseToken of expandedBaseTokens) {
+    // Subscription badges stay visible while a Base is collapsed, so read
+    // server state for every catalog entry rather than only expanded groups.
+    for (const { baseToken } of catalog) {
       if (!subscriptions[baseToken]) void refreshSubscription(baseToken);
     }
-  }, [expandedBaseTokens, refreshSubscription, subscriptions]);
+  }, [catalog, refreshSubscription, subscriptions]);
 
   useEffect(() => {
     if (!openMenuKey) return;
@@ -208,6 +216,9 @@ export function FeishuBaseNavigator({
   ) {
     const key = `base:${base.baseToken}`;
     if (busyActionKey) return;
+    // A newer action supersedes an automatic read that is still in flight.
+    const requestVersion = (subscriptionRequestVersions.current.get(base.baseToken) ?? 0) + 1;
+    subscriptionRequestVersions.current.set(base.baseToken, requestVersion);
     setBusyActionKey(key);
     setOpenMenuKey(null);
     try {
@@ -218,11 +229,13 @@ export function FeishuBaseNavigator({
       const subscription = action === "subscribe"
         ? await subscribeFeishuBase(base.baseToken)
         : await unsubscribeFeishuBase(base.baseToken);
+      if (subscriptionRequestVersions.current.get(base.baseToken) !== requestVersion) return;
       setSubscriptions((current) => ({
         ...current,
         [base.baseToken]: { status: "ready", subscribed: subscription.subscribed },
       }));
     } catch (error) {
+      if (subscriptionRequestVersions.current.get(base.baseToken) !== requestVersion) return;
       setSubscriptions((current) => ({
         ...current,
         [base.baseToken]: { status: "failed", subscribed: current[base.baseToken]?.subscribed },
@@ -234,7 +247,9 @@ export function FeishuBaseNavigator({
   }
 
   function confirmUnsubscribe(base: FeishuBaseCatalog): boolean {
-    const enabledSubjects = base.subjects.filter((subject) => subject.lifecycle === "enabled");
+    const enabledSubjects = base.subjects.filter((subject) => (
+      subject.lifecycle === "enabled" || (subject.lifecycle === "draft" && subject.activeConfigVersion != null)
+    ));
     const names = enabledSubjects.map((subject) => subject.tableName).join("、") || text("没有已启用学科", "no enabled subjects");
     return window.confirm(text(
       `取消“${base.baseName}”的事件订阅？这会停止其已启用学科（${names}）后续的记录变更通知，不会暂停、归档或删除已有 Taskboard 任务。`,
@@ -401,13 +416,14 @@ export function FeishuBaseNavigator({
                         type="button"
                         className={`feishu-subject-nav-item${subject.subjectKey === selectedSubjectKey ? " active" : ""}`}
                         aria-current={subject.subjectKey === selectedSubjectKey ? "page" : undefined}
-                        title={`${subject.tableName} · ${lifecycleLabel(subject.lifecycle)}`}
+                        title={`${subject.tableName} · ${lifecycleLabel(subject)}`}
                         onClick={() => onSelectSubject(subject.subjectKey)}
                       >
                         <span className="feishu-subject-nav-branch" aria-hidden="true" />
                         <span>{subject.tableName}</span>
-                        <i data-lifecycle={subject.lifecycle} aria-hidden="true" />
-                        <span className="sr-only">{lifecycleLabel(subject.lifecycle)}</span>
+                        <i data-lifecycle={subject.lifecycle === "draft" && subject.activeConfigVersion != null
+                          ? "enabled" : subject.lifecycle} aria-hidden="true" />
+                        <span className="sr-only">{lifecycleLabel(subject)}</span>
                       </button>
                       <div className="feishu-nav-actions">
                         <button

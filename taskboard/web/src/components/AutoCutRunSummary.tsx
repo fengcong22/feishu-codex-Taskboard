@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import type { AutoCutRunConsent } from "../types";
 import { autoCutDiagnostic } from "../autocutDiagnostics";
 import { LinearIcon } from "./LinearIcon";
 
@@ -22,7 +23,7 @@ export interface AutoCutRunSummaryProps {
   task: { id: string; version: number; status: string };
   attempts: AutoCutAttemptSummary[];
   retrying: boolean;
-  onRetry: (taskId: string, version: number) => void | Promise<void>;
+  onRetry: (taskId: string, version: number, runConsent: AutoCutRunConsent) => void | Promise<void>;
   onOpenLog?: (threadId: string) => void;
   onCopy?: (value: string, announcement: string) => void;
 }
@@ -63,13 +64,20 @@ export function AutoCutRunSummary({ task, attempts, retrying, onRetry, onOpenLog
       {canRetry && <button
         type="button"
         className="button secondary"
-        onClick={() => void onRetry(task.id, task.version)}
+        aria-describedby="autocut-retry-consent"
+        onClick={() => void onRetry(task.id, task.version, {
+          allowVideoAudioAsr: true,
+          allowConfiguredLocalOutput: true,
+        })}
       >
         <LinearIcon name="recurrence" />
         重试 Auto-Cut
       </button>}
       {retrying && <span className="autocut-run-retrying" role="status">重试中…</span>}
     </header>
+    {canRetry && <p id="autocut-retry-consent" className="autocut-retry-consent">
+      点击重试，即允许本次 Auto-Cut 将视频原音发送至火山语音服务进行语音识别，并写入已配置的本机输出目录。
+    </p>}
     <ol className="autocut-run-list">
       {ordered.map((attempt) => {
         const diagnostic = autoCutDiagnostic(attempt);

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, getAutomaticExecutionSettings, updateAutomaticExecutionSettings } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import type { AutomaticExecutionSettings } from "../types";
+import { VmDownloadsPanel } from "./VmDownloadsPanel";
 
 interface LocalSettingsDialogProps {
   revision: number;
@@ -16,6 +17,7 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [activePanel, setActivePanel] = useState<"automatic" | "downloads">("automatic");
   const dialogRef = useRef<HTMLElement>(null);
   const requestRef = useRef(0);
   const savingRef = useRef(false);
@@ -117,7 +119,7 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
     }}>
       <section
         ref={dialogRef}
-        className="delete-dialog local-settings-dialog"
+        className={`delete-dialog local-settings-dialog${activePanel === "downloads" ? " vm-downloads-open" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="local-settings-title"
@@ -128,7 +130,7 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
             if (!saving) onClose();
           }
           if (event.key === "Tab") {
-            const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"));
+            const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href]"));
             const first = controls[0];
             const last = controls.at(-1);
             if (event.shiftKey && (document.activeElement === first || document.activeElement === event.currentTarget)) {
@@ -142,6 +144,11 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
         }}
       >
         <h2 id="local-settings-title">{text("本机设置", "Local settings")}</h2>
+        <nav className="local-settings-panels" aria-label={text("本机设置分类", "Local settings sections")}>
+          <button type="button" className="button secondary" aria-pressed={activePanel === "automatic"} onClick={() => setActivePanel("automatic")}>{text("自动剪辑", "Automatic editing")}</button>
+          <button type="button" className="button secondary" aria-pressed={activePanel === "downloads"} onClick={() => setActivePanel("downloads")}>{text("VM 下载", "VM downloads")}</button>
+        </nav>
+        {activePanel === "downloads" ? <VmDownloadsPanel /> : <>
         <label className="local-settings-switch-row">
           <span>{text("允许本机自动剪辑", "Allow automatic editing on this device")}</span>
           <input
@@ -167,8 +174,9 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
                   : text("状态未知", "Status unknown")}
         </p>
         {error && <p role="alert" className="project-dialog-error">{error}</p>}
+        </>}
         <div>
-          {!settings && !loading && <button className="button secondary" type="button" onClick={() => void loadSettings()}>{text("重试", "Retry")}</button>}
+          {activePanel === "automatic" && !settings && !loading && <button className="button secondary" type="button" onClick={() => void loadSettings()}>{text("重试", "Retry")}</button>}
           <button className="button secondary" type="button" disabled={saving} onClick={onClose}>{text("关闭", "Close")}</button>
         </div>
       </section>

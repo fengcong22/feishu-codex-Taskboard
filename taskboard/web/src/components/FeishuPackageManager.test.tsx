@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, expect, it, vi } from "vitest";
 
 import {
+  ApiError,
   discoverFeishuPackageModels,
   disableFeishuPackage,
   enableFeishuPackage,
@@ -22,6 +23,11 @@ vi.mock("../api", async (importOriginal) => ({
   enableFeishuPackage: vi.fn(),
   inspectFeishuPackageWorkspace: vi.fn(),
   listFeishuPackages: vi.fn(async () => []),
+  getFeishuPackageWorkflowDraft: vi.fn(async (subjectKey: string, packageAlias: string) => ({
+    subjectKey, packageAlias, workflowTemplate: { id: "document_draft_zip", version: 1 },
+    revision: 0, updatedAt: null,
+    config: { packageRoute: { routeMode: "fixed", packageAlias, subjectCodeFieldId: null, branchMap: null } },
+  })),
   prepareFeishuPackageOutputDirectory: vi.fn(),
   validateFeishuPackageOutputDirectory: vi.fn(async (directory: string) => directory),
   removeFeishuPackage: vi.fn(),
@@ -101,6 +107,54 @@ it("uses the current manifest name in subject routing without changing its saved
   expect(onSubjectChange).not.toHaveBeenCalled();
   expect(currentPackage.name).toBe("Auto-cut-lite1.6.8");
   expect(currentPackage.projectId).toBe(historicalPackage.projectId);
+});
+
+it("saves a VM workflow package without ZIP or model setup and keeps execution unavailable", async () => {
+  const workflowTemplate = { id: "vm_pmo_review_video", version: 1 } as const;
+  const vmInspection = { ...inspection, workflowTemplate };
+  const vmPackage: FeishuPackageSummary = { ...historicalPackage, alias: inspection.alias, projectId: inspection.projectId,
+    name: inspection.displayName, state: "draft", model: null, reasoningEffort: null, zipSourceDirectory: null, workflowTemplate, identity: vmInspection };
+  vi.mocked(listFeishuPackages).mockResolvedValue([]);
+  vi.mocked(inspectFeishuPackageWorkspace).mockResolvedValue(vmInspection);
+  vi.mocked(saveFeishuPackageDraft).mockResolvedValue(vmPackage);
+  render(<FeishuPackageManager />);
+  const path = await screen.findByRole("textbox", { name: "Codex 工作区路径" });
+  fireEvent.change(path, { target: { value: "E:\\vm-workflow" } });
+  fireEvent.click(screen.getByRole("button", { name: "验证并读取" }));
+  await screen.findByText(/工作流程：VM 视频剪辑与 PMO 审核/);
+  expect(screen.queryByRole("textbox", { name: "ZIP 生成目录" })).toBeNull();
+  expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(false);
+  vi.mocked(listFeishuPackages).mockResolvedValue([vmPackage]);
+  fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+  await waitFor(() => expect(saveFeishuPackageDraft).toHaveBeenCalledWith(null, expect.objectContaining({ workflowTemplate, model: null, zipSourceDirectory: null })));
+  const enable = await screen.findByRole("button", { name: "启用" });
+  expect((enable as HTMLButtonElement).disabled).toBe(true);
+  expect(prepareFeishuPackageOutputDirectory).not.toHaveBeenCalled();
+  expect(validateFeishuPackageOutputDirectory).not.toHaveBeenCalled();
+  expect(enableFeishuPackage).not.toHaveBeenCalled();
+});
+
+it("enables a VM package only after the configured initial runtime capability becomes available", async () => {
+  const workflowTemplate = { id: "vm_pmo_review_video", version: 1 } as const;
+  const vmPackage: FeishuPackageSummary = { ...historicalPackage, state: "draft", model: null,
+    reasoningEffort: null, zipSourceDirectory: null, workflowTemplate,
+    identity: { ...inspection, workflowTemplate } };
+  vi.mocked(listFeishuPackages).mockResolvedValue([vmPackage]);
+  vi.mocked(enableFeishuPackage).mockImplementation(async () => {
+    const enabled = { ...vmPackage, state: "enabled" as const, revision: 19 };
+    vi.mocked(listFeishuPackages).mockResolvedValue([enabled]);
+    return enabled;
+  });
+  const view = render(<FeishuPackageManager vmPmoInitialReady={false} />);
+  await screen.findByDisplayValue("historical prompt");
+  expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
+  view.rerender(<FeishuPackageManager vmPmoInitialReady />);
+  expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "启用" }));
+  await screen.findByRole("button", { name: "停用" });
+  expect(enableFeishuPackage).toHaveBeenCalledWith(vmPackage.alias, vmPackage.revision);
+  expect(prepareFeishuPackageOutputDirectory).not.toHaveBeenCalled();
+  expect(validateFeishuPackageOutputDirectory).not.toHaveBeenCalled();
 });
 
 it("keeps an explicitly custom directory through workspace verification and validates before saving", async () => {
@@ -569,6 +623,31 @@ it("clears previous success and shows a retryable inspection failure then releas
   expect(screen.queryByText(/验证并读取成功/)).toBeNull();
   expect((screen.getByRole("button", { name: "验证并读取" }) as HTMLButtonElement).disabled).toBe(false);
   expect((screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("explains missing Taskboard declarations while preventing a new package from being saved", async () => {
+  vi.mocked(inspectFeishuPackageWorkspace).mockRejectedValueOnce(new ApiError(409, {
+    error: { code: "PACKAGE_MANIFEST_UNAVAILABLE", message: "Auto-Cut package manifests are unavailable" },
+  }));
+  render(<FeishuPackageManager />);
+  await screen.findByText("暂无包配置");
+  fireEvent.change(screen.getByRole("textbox", { name: "Codex 工作区路径" }), {
+    target: { value: "E:\\codex\\Auto-cut-slicing-src" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "验证并读取" }));
+
+  const feedback = (await screen.findByRole("alert")).textContent;
+  expect(feedback).toContain(".codex-plugin/plugin.json");
+  expect(feedback).toContain("PACKAGE-MANIFEST.json");
+  expect(feedback).toContain("适配 Taskboard 接口");
+  expect(feedback).not.toMatch(/超时|完整的 Auto-Cut 包/u);
+  expect(screen.queryByText(/验证并读取成功/u)).toBeNull();
+  const save = screen.getByRole("button", { name: "保存草稿" }) as HTMLButtonElement;
+  expect(save.disabled).toBe(true);
+  fireEvent.click(save);
+  expect(saveFeishuPackageDraft).not.toHaveBeenCalled();
+  expect(prepareFeishuPackageOutputDirectory).not.toHaveBeenCalled();
+  expect((screen.getByRole("button", { name: "验证并读取" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 it("cancels stale inspection when the workspace changes and ignores its late result", async () => {

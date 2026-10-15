@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { decideRecordChange } from "./decide-event.mjs";
+import { decideRecordChange, zipPackageWorkflowErrorCode } from "./decide-event.mjs";
+import { decideVmInitialRecordChange } from "./vm-workflow-decision.mjs";
 import {
   calculateNextAttemptAt,
   classifyDeliveryError,
@@ -117,7 +118,7 @@ function buildDecisionSnapshot(decision) {
     kind: decision.kind,
     table,
   };
-  for (const field of ["reason", "effect"]) {
+  for (const field of ["reason", "reasonCode", "effect"]) {
     const value = optionalSnapshotString(decision[field]);
     if (value !== undefined) snapshot[field] = value;
   }
@@ -152,6 +153,7 @@ function decisionFromSnapshot(record, snapshot, runtimeConfig) {
     table,
     event: record.event,
     ...(snapshot.reason ? { reason: snapshot.reason } : {}),
+    ...(snapshot.reasonCode ? { reasonCode: snapshot.reasonCode } : {}),
     ...(snapshot.effect ? { effect: snapshot.effect } : {}),
     ...(snapshot.subjectKey ? { subjectKey: snapshot.subjectKey } : {}),
     ...(snapshot.table.subjectKey ? { subjectKey: snapshot.table.subjectKey } : {}),
@@ -174,7 +176,8 @@ function decisionFromSnapshot(record, snapshot, runtimeConfig) {
       && Object.hasOwn(packages, snapshot.packageAlias)
       ? packages[snapshot.packageAlias]
       : undefined;
-    if (!packageConfig || packageConfig.projectId !== snapshot.packageProjectId
+    if (!packageConfig || zipPackageWorkflowErrorCode(packageConfig)
+      || packageConfig.projectId !== snapshot.packageProjectId
       || (snapshot.packageConfigFingerprint !== undefined
         && packageConfigFingerprint(packageConfig) !== snapshot.packageConfigFingerprint)) {
       throw snapshotPackageUnavailable();
@@ -186,7 +189,7 @@ function decisionFromSnapshot(record, snapshot, runtimeConfig) {
 
 function isPhasedSubject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
-    && value.statusField && value.stages);
+    && value.statusField && (value.stages || value.vmWorkflow));
 }
 
 function isPhasedEvent(event) {
@@ -244,6 +247,7 @@ function portablePhasedSubject(value) {
     subject.upload.artifactSourcePath = null;
     subject.upload.targetPath = null;
   }
+  if (subject.vmWorkflow?.finalArchive) subject.vmWorkflow.finalArchive.directoryPath = null;
   return subject;
 }
 
@@ -279,7 +283,7 @@ function decisionFromPhasedSnapshot(record, snapshot) {
     previousStageId: snapshot.previousStageId ?? null,
     reason: snapshot.reason ?? undefined,
     reasonCode: snapshot.reasonCode ?? undefined,
-    stage: snapshot.stageId ? subject.stages?.[snapshot.stageId] : undefined,
+    stage: snapshot.stageId ? (subject.vmWorkflow?.stages ?? subject.stages)?.[snapshot.stageId] : undefined,
     operationKind: snapshot.kind === "directory_operation" ? "ensure_final_directory" : undefined,
     controlledContext: snapshot.controlledContext ?? null,
     packageAlias: subject.packageRoute?.packageAlias ?? subject.defaultPackageAlias ?? null,
@@ -323,7 +327,7 @@ export function createBridge({
     }
     return {
       ...(runtimeConfig ?? {}),
-      packages: packages ?? Object.create(null),
+      ...(packages === undefined || packages === null ? {} : { packages }),
     };
   }
   // The production configuration is normalized by config.mjs and never
@@ -538,14 +542,25 @@ export function createBridge({
     return outcome;
   }
 
-  async function deliverPhasedRecord(record, subject, heartbeat, persistedSnapshot = null) {
-    const decision = persistedSnapshot
+  async function deliverPhasedRecord(record, subject, heartbeat, persistedSnapshot = null, runtimeConfig = null) {
+    if (subject.vmWorkflow) return deliverVmRecord(record, subject, heartbeat, persistedSnapshot);
+    let decision = persistedSnapshot
       ? decisionFromPhasedSnapshot(record, persistedSnapshot)
-      : decideRecordChange(subject, record.event);
+      : decideRecordChange({ subject, ...(runtimeConfig?.packages ? { packages: runtimeConfig.packages } : {}) }, record.event);
     if (!decision) {
       const error = new Error("phased decision snapshot is invalid");
       error.code = "DECISION_SNAPSHOT_INVALID";
       throw error;
+    }
+    if (["register", "archive_waiting", "directory_operation"].includes(decision.kind)) {
+      const packages = runtimeConfig?.packages ?? subject.packages ?? subject.packageCatalog;
+      const alias = subject.packageRoute?.packageAlias ?? subject.defaultPackageAlias;
+      const packageConfig = packages && Object.hasOwn(packages, alias)
+        ? packages[alias] : subject.packageConfig;
+      const reasonCode = zipPackageWorkflowErrorCode(packageConfig);
+      if (reasonCode) decision = {
+        ...decision, kind: "blocked", reason: "incompatible_package_workflow", reasonCode,
+      };
     }
 
     if (decision.kind === "archive_waiting") {
@@ -668,6 +683,69 @@ export function createBridge({
     }, heartbeat);
   }
 
+  async function deliverVmRecord(record, subject, heartbeat, persistedSnapshot = null) {
+    // Durable provenance takes priority over any historic decision snapshot.
+    if (deliverySourceOf(record) === "simulation") {
+      return completePhased(record, "ignored", { kind: "ignored", reason: "simulation_forbidden" },
+        heartbeat, { requireTaskIdentifier: false });
+    }
+    const decision = persistedSnapshot
+      ? decisionFromPhasedSnapshot(record, persistedSnapshot)
+      : decideVmInitialRecordChange(subject, record.event);
+    if (!decision || !["register", "archive_waiting", "ignored", "blocked"].includes(decision.kind)) {
+      throw Object.assign(new Error("VM decision snapshot is invalid"), { code: "DECISION_SNAPSHOT_INVALID" });
+    }
+    if (decision.kind === "ignored") {
+      return completePhased(record, "ignored", { kind: "ignored", reason: decision.reason },
+        heartbeat, { requireTaskIdentifier: false });
+    }
+    if (!persistedSnapshot) await persistPhasedSnapshot(record, decision, null, heartbeat);
+    if (decision.kind === "blocked") {
+      return completePhased(record, "blocked", {
+        kind: "blocked", reason: decision.reason, reasonCode: decision.reasonCode,
+      }, heartbeat, { requireTaskIdentifier: false });
+    }
+    if (decision.kind === "archive_waiting") {
+      await archiveWaitingFeishuStageTasks(taskboard, {
+        event: record.event,
+        stageId: decision.stageId,
+        statusFieldId: subject.vmWorkflow.stages.initial.statusFieldId,
+        packageAlias: decision.packageAlias,
+      }, { ensureActive: () => heartbeat.ensureActive() });
+      return completePhased(record, "ignored", { kind: "ignored", reason: "left_trigger" },
+        heartbeat, { requireTaskIdentifier: false });
+    }
+    const register = taskboard?.registerFeishuVmTask;
+    if (typeof register !== "function") {
+      throw Object.assign(new Error("Taskboard VM registration route is unavailable"), {
+        code: "TASKBOARD_PROVENANCE_ROUTE_UNAVAILABLE", status: 503,
+      });
+    }
+    const event = record.event;
+    await heartbeat.ensureActive();
+    let task;
+    try {
+      task = await register.call(taskboard, {
+        event: {
+          eventId: event.eventId, baseToken: event.baseToken, tableId: event.tableId,
+          recordId: event.recordId, statusFieldId: event.statusFieldId,
+          beforeOptionId: event.beforeOptionId, afterOptionId: event.afterOptionId,
+          ...(event.eventOccurredAtPresent ? { occurredAt: event.eventOccurredAt } : {}),
+        },
+        binding: { subjectKey: decision.subjectKey, configVersion: decision.configVersion, stageId: "initial" },
+      }, { bridgeSecret });
+    } catch (error) {
+      if (!isPermanentlyDeletedRegistration(error)) throw error;
+      return completePhased(record, "ignored", { kind: "ignored", reason: "task_permanently_deleted" },
+        heartbeat, { requireTaskIdentifier: false });
+    }
+    return completePhased(record, "register", {
+      kind: "register", taskId: task?.id, taskIdentifier: task?.identifier,
+      stageId: "initial", subjectKey: decision.subjectKey, configVersion: decision.configVersion,
+      packageAlias: decision.packageAlias,
+    }, heartbeat);
+  }
+
   async function resultAfterLeaseLoss(record) {
     if (typeof store.get !== "function") return publicPending(record);
     const current = await store.get(record.eventId);
@@ -769,7 +847,7 @@ export function createBridge({
         return outcome;
       }
       if (isPhasedSubject(phasedSubject)) {
-        return await deliverPhasedRecord(record, phasedSubject, heartbeat, persistedPhased);
+        return await deliverPhasedRecord(record, phasedSubject, heartbeat, persistedPhased, runtimeConfig);
       }
       let decision;
       if (persistedSnapshot) {
@@ -818,6 +896,11 @@ export function createBridge({
         return outcome;
       }
 
+      if (decision.kind === "blocked" && ["PACKAGE_WORKFLOW_MISMATCH", "PACKAGE_WORKFLOW_UNSUPPORTED"].includes(decision.reasonCode)) {
+        return completePhased(record, "blocked", {
+          kind: "blocked", reason: decision.reason, reasonCode: decision.reasonCode,
+        }, heartbeat, { requireTaskIdentifier: false });
+      }
       let taskDecision = decision;
       if (typeof resolveRecordTitle === "function" && !decision.event.recordTitle) {
         try {

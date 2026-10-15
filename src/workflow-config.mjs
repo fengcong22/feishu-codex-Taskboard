@@ -70,6 +70,8 @@ const SUBJECT_KEYS = new Set([
   "enabledAt",
   "closedAt",
   "activeSnapshot",
+  "workflowTemplate",
+  "vmWorkflow",
 ]);
 const TRIGGER_KEYS = new Set(["fieldId", "fieldName", "startValue", "optionId"]);
 const TITLE_KEYS = new Set(["fieldId", "fieldName"]);
@@ -241,6 +243,159 @@ function normalizeStatusField(value, name = "statusField") {
     type: "single_select",
     ...(options.length ? { options } : {}),
   };
+}
+
+function exactKeys(value, names, name) {
+  const input = plainObject(value, name);
+  assertKnownKeys(input, new Set(names), name);
+  for (const key of names) {
+    if (!Object.hasOwn(input, key)) fail(`${name}.${key} is required`);
+  }
+  return input;
+}
+
+function normalizeVmWriteback(value, name) {
+  const input = exactKeys(value, ["processing", "completed"], name);
+  return Object.fromEntries(["processing", "completed"].map((state) => {
+    const binding = exactKeys(input[state], ["fieldId", "optionId"], `${name}.${state}`);
+    const fieldId = nullableId(binding.fieldId, `${name}.${state}.fieldId`);
+    const option = nullableId(binding.optionId, `${name}.${state}.optionId`);
+    if (Boolean(fieldId) !== Boolean(option)) fail(`${name}.${state} requires a complete field and option pair`);
+    return [state, { fieldId, optionId: option }];
+  }));
+}
+
+function normalizeVmStage(value, stageId) {
+  const name = `vmWorkflow.stages.${stageId}`;
+  const keys = ["enabled", "statusFieldId", "triggerOptionId", "instructionFieldId", "writeback",
+    ...(stageId === "review" ? ["instructionAttachmentsFieldId"] : [])];
+  const input = exactKeys(value, keys, name);
+  const stage = {
+    enabled: booleanValue(input.enabled, `${name}.enabled`),
+    statusFieldId: nullableId(input.statusFieldId, `${name}.statusFieldId`),
+    triggerOptionId: nullableId(input.triggerOptionId, `${name}.triggerOptionId`),
+    instructionFieldId: nullableId(input.instructionFieldId, `${name}.instructionFieldId`),
+    writeback: normalizeVmWriteback(input.writeback, `${name}.writeback`),
+  };
+  if (stageId === "review") stage.instructionAttachmentsFieldId = nullableId(
+    input.instructionAttachmentsFieldId, `${name}.instructionAttachmentsFieldId`);
+  if (Boolean(stage.statusFieldId) !== Boolean(stage.triggerOptionId)) {
+    fail(`${name} requires a complete trigger binding`);
+  }
+  return stage;
+}
+
+function normalizeVmWorkflow(value, statusField) {
+  const input = exactKeys(value, ["fields", "approval", "stages", "finalArchive"], "vmWorkflow");
+  const rawFields = exactKeys(input.fields,
+    ["vmidFieldId", "outputAttachmentFieldId", "namingFieldId"], "vmWorkflow.fields");
+  const fields = Object.fromEntries(Object.keys(rawFields).map((key) => [key,
+    idString(rawFields[key], `vmWorkflow.fields.${key}`)]));
+  const rawApproval = exactKeys(input.approval, ["department", "reason"], "vmWorkflow.approval");
+  const approval = {
+    department: nonEmptyString(rawApproval.department, "vmWorkflow.approval.department"),
+    reason: nonEmptyString(rawApproval.reason, "vmWorkflow.approval.reason"),
+  };
+  const rawStages = exactKeys(input.stages, ["initial", "review"], "vmWorkflow.stages");
+  const stages = {
+    initial: normalizeVmStage(rawStages.initial, "initial"),
+    review: normalizeVmStage(rawStages.review, "review"),
+  };
+  if (stages.initial.enabled !== true || stages.review.enabled !== false
+    || stages.initial.statusFieldId !== statusField.fieldId || !stages.initial.instructionFieldId) {
+    fail("vmWorkflow only supports a fully bound initial stage");
+  }
+  const matchingOptions = statusField.options.filter((option) => option.optionId === stages.initial.triggerOptionId);
+  if (matchingOptions.length !== 1) fail("vmWorkflow.stages.initial.triggerOptionId is not in statusField options");
+  const rawArchive = exactKeys(input.finalArchive,
+    ["enabled", "statusFieldId", "triggerOptionId", "pathSource", "directoryPath", "pathFieldId"],
+    "vmWorkflow.finalArchive");
+  if (rawArchive.enabled !== false || !["manual", "pmo_field"].includes(rawArchive.pathSource)) {
+    fail("vmWorkflow.finalArchive is not supported when enabled");
+  }
+  const finalArchive = {
+    enabled: false,
+    statusFieldId: nullableId(rawArchive.statusFieldId, "vmWorkflow.finalArchive.statusFieldId"),
+    triggerOptionId: nullableId(rawArchive.triggerOptionId, "vmWorkflow.finalArchive.triggerOptionId"),
+    pathSource: rawArchive.pathSource,
+    directoryPath: localPath(rawArchive.directoryPath, "vmWorkflow.finalArchive.directoryPath"),
+    pathFieldId: nullableId(rawArchive.pathFieldId, "vmWorkflow.finalArchive.pathFieldId"),
+  };
+  return { fields, approval, stages, finalArchive };
+}
+
+function normalizeVmSubject(input) {
+  assertKnownKeys(input, SUBJECT_KEYS, "VM subject", { allowInternal: true });
+  if (input.workflowTemplate?.id !== "vm_pmo_review_video" || input.workflowTemplate?.version !== 1
+    || Object.keys(input.workflowTemplate).length !== 2 || input.vmWorkflow === undefined
+    || ["stages", "documentField", "namingField", "reviewStatusField", "upload", "delivery",
+      "courseNamingField"].some((key) => input[key] !== undefined)) {
+    fail("VM subject declaration is unsupported");
+  }
+  const baseToken = idString(input.baseToken, "subject.baseToken");
+  const tableId = idString(input.tableId, "subject.tableId");
+  const computedKey = subjectKey(baseToken, tableId);
+  if (input.subjectKey !== undefined && input.subjectKey !== computedKey) {
+    fail("subject.subjectKey does not match baseToken/tableId");
+  }
+  const rawStatus = plainObject(input.statusField, "statusField");
+  if (rawStatus.type === undefined && rawStatus.uiType === undefined) {
+    fail("VM statusField must declare its single-select type");
+  }
+  if (rawStatus.uiType !== undefined
+    && (typeof rawStatus.uiType !== "string"
+      || rawStatus.uiType.trim().toLowerCase().replace(/[\s_-]/gu, "") !== "singleselect")) {
+    fail("VM statusField must be single-select");
+  }
+  const statusField = normalizeStatusField(rawStatus);
+  if (!Array.isArray(statusField.options) || statusField.options.length < 2
+    || new Set(statusField.options.map((option) => option.optionId)).size !== statusField.options.length) {
+    fail("VM statusField requires unique options and a non-trigger source option");
+  }
+  const vmWorkflow = normalizeVmWorkflow(input.vmWorkflow, statusField);
+  const option = statusField.options.find((entry) => entry.optionId === vmWorkflow.stages.initial.triggerOptionId);
+  const trigger = {
+    fieldId: statusField.fieldId,
+    fieldName: statusField.fieldName,
+    startValue: option.value,
+    optionId: option.optionId,
+  };
+  if (input.trigger !== undefined && JSON.stringify(normalizeTrigger(input.trigger)) !== JSON.stringify(trigger)) {
+    fail("VM trigger does not match the initial stage");
+  }
+  const packageRoute = normalizePackageRoute(input.packageRoute);
+  if (packageRoute.subjectCodeFieldId !== null || packageRoute.branchMap !== null) {
+    fail("VM packageRoute must use a fixed alias");
+  }
+  const lifecycle = input.lifecycle ?? "draft";
+  if (!LIFECYCLES.has(lifecycle)) fail("subject.lifecycle is not supported");
+  const normalized = {
+    subjectKey: computedKey,
+    baseToken,
+    baseName: nonEmptyString(input.baseName ?? baseToken, "subject.baseName"),
+    tableId,
+    tableName: nonEmptyString(input.tableName ?? tableId, "subject.tableName"),
+    displayEnabled: booleanValue(input.displayEnabled, "subject.displayEnabled", true),
+    lifecycle,
+    configVersion: positiveInteger(input.configVersion, "subject.configVersion", 1),
+    createdAt: timestamp(input.createdAt, "subject.createdAt"),
+    updatedAt: timestamp(input.updatedAt, "subject.updatedAt"),
+    ...(input.enabledAt !== undefined ? { enabledAt: timestamp(input.enabledAt, "subject.enabledAt") } : {}),
+    ...(input.closedAt !== undefined ? { closedAt: timestamp(input.closedAt, "subject.closedAt") } : {}),
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    trigger,
+    title: normalizeTitle(input.title),
+    execution: normalizeExecution(input.execution),
+    packageRoute,
+    statusField,
+    vmWorkflow,
+  };
+  if (input.activeSnapshot !== undefined && input.activeSnapshot !== null) {
+    normalized.activeSnapshot = validateSubjectConfig({
+      ...input.activeSnapshot, lifecycle: "enabled", baseToken, tableId,
+    });
+  }
+  return normalized;
 }
 
 function normalizeConfiguredField(value, name, kind = null) {
@@ -486,6 +641,9 @@ function isPhasedSubject(value) {
  */
 export function validateSubjectConfig(value) {
   const input = plainObject(value, "subject");
+  if (input.workflowTemplate !== undefined || input.vmWorkflow !== undefined) {
+    return normalizeVmSubject(input);
+  }
   if (!isPhasedSubject(input)) {
     const base = {
       baseToken: idString(input.baseToken, "subject.baseToken"),
@@ -568,6 +726,7 @@ export function validateSubjectConfig(value) {
 /** Return a synchronized subject without machine-local artifact destinations. */
 export function portableSubject(value) {
   const result = validateSubjectConfig(value);
+  if (result.vmWorkflow) result.vmWorkflow.finalArchive.directoryPath = null;
   if (result.stages) {
     for (const stageId of STAGE_IDS) {
       if (result.stages[stageId]) delete result.stages[stageId].artifactTargetPath;
@@ -587,6 +746,14 @@ export const stageSuffix = (stageId) => DEFAULT_STAGE_SUFFIXES[stageId] ?? "";
 function normalizeSubject(value, base, index, { allowActiveSnapshot = true } = {}) {
   const input = plainObject(value, `bases[${index}].subjects[${index}]`);
   assertKnownKeys(input, SUBJECT_KEYS, `subject[${index}]`, { allowInternal: allowActiveSnapshot });
+  if (input.workflowTemplate !== undefined || input.vmWorkflow !== undefined) {
+    const vm = normalizeVmSubject({
+      ...input, baseToken: input.baseToken ?? base.baseToken,
+      baseName: input.baseName ?? base.baseName,
+    });
+    if (vm.baseToken !== base.baseToken) fail(`subject[${index}].baseToken does not match its Base`);
+    return vm;
+  }
   if (isPhasedSubject(input)) {
     const phased = validateSubjectConfig({
       ...input,

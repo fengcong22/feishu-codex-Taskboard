@@ -61,6 +61,14 @@ test("routes a transition into 待剪辑 through the package whitelist", () => {
   assert.equal(result.packageConfig.workspacePath, "D:\\trusted\\Auto-cut-copyA");
 });
 
+test("legacy triggers cannot route to a VM package", () => {
+  const packages = { "Auto-cut-copyA": { ...config.packages["Auto-cut-copyA"],
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 } } };
+  const result = decideRecordChange({ ...config, packages }, event());
+  assert.equal(result.kind, "blocked");
+  assert.equal(result.reasonCode, "PACKAGE_WORKFLOW_MISMATCH");
+});
+
 test("uses the table-level default package when the package field is not configured", () => {
   const defaultConfig = {
     ...config,

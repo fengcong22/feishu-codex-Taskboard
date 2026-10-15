@@ -14,6 +14,7 @@ import {
 import { createBridgeServer } from "../src/server.mjs";
 import { createBridge } from "../src/bridge.mjs";
 import { JsonStateStore } from "../src/state-store.mjs";
+import { isFetchSafePort } from "./fetch-safe-listen.mjs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -107,6 +108,73 @@ test("registers only a non-target to enabled stage target edge", () => {
   assert.equal(result.stageId, "initial");
   assert.equal(result.archiveWaiting, false);
   assert.equal(decideRecordChange(subject, edge("opt_initial", "opt_initial")).kind, "ignored");
+});
+
+test("phased ZIP decisions use the external catalog and reject VM packages", () => {
+  const packages = { "Auto-cut-lite": { workflowTemplate: { id: "vm_pmo_review_video", version: 1 } } };
+  for (const status of [["opt_other", "opt_initial"], ["opt_initial", "opt_other"]]) {
+    const result = decideRecordChange({ subject, packages }, edge(...status));
+    assert.equal(result.kind, "blocked");
+    assert.equal(result.reasonCode, "PACKAGE_WORKFLOW_MISMATCH");
+  }
+});
+
+test("phased ZIP delivery blocks a live VM package before context, archive and registration", async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-vm-boundary-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const calls = [];
+  const bridge = createBridge({
+    config: { tables: [subject] },
+    getPackageCatalog: async () => ({ "Auto-cut-lite": {
+      workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    } }),
+    store: new JsonStateStore(path.join(directory, "state.json")),
+    workflowStore: { resolveSubjectVersionAt: async () => subject },
+    readControlledContext: async () => { calls.push("context"); return {
+      documentLinks: ["https://guanghe.feishu.cn/docx/one"], namingDisplayValue: "课程001", namingValueUnique: true,
+    }; },
+    taskboard: {
+      listFeishuTasks: async () => { calls.push("archive"); return []; },
+      registerFeishuStageTask: async () => { calls.push("register"); return { id: "task", identifier: "FEI-1" }; },
+    },
+  });
+  const result = await bridge.handle(edge("opt_initial", "opt_first", { eventId: "evt-vm-wrong-route" }));
+  assert.equal(result.kind, "blocked");
+  assert.equal(result.reasonCode, "PACKAGE_WORKFLOW_MISMATCH");
+  assert.deepEqual(calls, []);
+});
+
+test("persisted phased ZIP retries recheck the live package workflow before side effects", async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-phased-vm-retry-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new JsonStateStore(path.join(directory, "state.json"));
+  let clock = 1000;
+  let packages = { "Auto-cut-lite": { projectId: "p", workspacePath: "D:\\trusted", prompt: "fixed" } };
+  let registerCalls = 0;
+  let contextCalls = 0;
+  const settings = {
+    config: { tables: [subject], delivery: { maxAttempts: 3, initialDelayMs: 5, maxDelayMs: 5, leaseMs: 1000, pollIntervalMs: 100 } },
+    getPackageCatalog: async () => packages,
+    workflowStore: { resolveSubjectVersionAt: async () => subject },
+    readControlledContext: async () => { contextCalls += 1; return {
+      documentLinks: ["https://guanghe.feishu.cn/docx/one"], namingDisplayValue: "课程001", namingValueUnique: true,
+    }; },
+    taskboard: { registerFeishuStageTask: async () => {
+      registerCalls += 1;
+      throw Object.assign(new Error("offline"), { code: "TASKBOARD_UNAVAILABLE" });
+    } },
+    now: () => clock,
+    random: () => 0.5,
+  };
+  assert.equal((await createBridge({ ...settings, store }).handle(edge("opt_other", "opt_initial"))).kind, "pending");
+  packages = { "Auto-cut-lite": { ...packages["Auto-cut-lite"], workflowTemplate: { id: "vm_pmo_review_video", version: 1 } } };
+  clock = 2000;
+  const restarted = createBridge({ ...settings, store: new JsonStateStore(path.join(directory, "state.json")) });
+  const result = await restarted.processDue();
+  assert.equal(result.kind, "blocked");
+  assert.equal(result.reasonCode, "PACKAGE_WORKFLOW_MISMATCH");
+  assert.equal(registerCalls, 1);
+  assert.equal(contextCalls, 1);
 });
 
 test("archives the old stage before registering a stage-to-stage move", () => {
@@ -515,7 +583,13 @@ test("controlled context endpoint requires Taskboard identity and shared secret"
       workspacePath: "D:\\untrusted",
     }),
   });
-  const address = await app.listen();
+  let address;
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    address = await app.listen();
+    if (isFetchSafePort(address.port)) break;
+    await app.close();
+  }
+  assert.ok(isFetchSafePort(address?.port));
   t.after(app.close);
   const body = {
     subjectKey: subject.subjectKey,
@@ -550,7 +624,13 @@ test("workflow sync returns a portable subject and never echoes local destinatio
     bridgeSecret: "bridge-secret",
     syncSubject: async (value) => value,
   });
-  const address = await app.listen();
+  let address;
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    address = await app.listen();
+    if (isFetchSafePort(address.port)) break;
+    await app.close();
+  }
+  assert.ok(isFetchSafePort(address?.port));
   t.after(app.close);
   const response = await fetch(`http://127.0.0.1:${address.port}/api/feishu/workflow/sync`, {
     method: "POST",

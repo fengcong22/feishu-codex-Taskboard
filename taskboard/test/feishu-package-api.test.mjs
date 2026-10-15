@@ -44,6 +44,7 @@ test("workspace inspection reads fixed manifests and derives collision-safe pack
       runtimeVersion: "1.7.0",
       defaultPrompt: "处理审阅文档\n生成交付包",
       zipOutput: null,
+      workflowTemplate: { id: "document_draft_zip", version: 1 },
       alias: "auto-cut-lite-3",
       projectId: "auto-cut-lite-3",
     });
@@ -307,6 +308,7 @@ test("package listing exposes read-only manifest identity without changing store
       runtimeVersion: "1.7.0",
       defaultPrompt: null,
       zipOutput: null,
+      workflowTemplate: { id: "document_draft_zip", version: 1 },
       alias: stored.alias,
       projectId: stored.projectId,
     });

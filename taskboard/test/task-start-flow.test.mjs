@@ -3064,6 +3064,7 @@ test("task execution uses the captured package workspace and prompt after live e
     assert.deepEqual(fixture.app.database.getFeishuTaskPackageSnapshot(created.body.task.id), {
       packageAlias: "Auto-cut-copyA",
       packageRevision: 1,
+      workflowTemplate: { id: "document_draft_zip", version: 1 },
       name: "Auto-cut-copyA",
       projectId: "auto-cut-copy-a",
       workspacePath: fixture.workspace,

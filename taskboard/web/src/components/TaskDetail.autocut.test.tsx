@@ -1,12 +1,12 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 import { TaskboardLanguageProvider } from "../i18n";
 import type { ActorIdentity, FeishuAutoCutRun, Task } from "../types";
 import { TaskDetail } from "./TaskDetail";
 
-// Keep the task detail, run diagnostics and HTTP reads real;
-// editor internals are unrelated to execution-state refreshes.
+// Editor internals are unrelated to execution state. Keep TaskDetail, the
+// Auto-Cut summary and all HTTP request serialization real.
 vi.mock("./InlineMediaComposer", async (importOriginal) => ({
   ...await importOriginal<typeof import("./InlineMediaComposer")>(),
   InlineMediaComposer: () => null,
@@ -66,16 +66,22 @@ function json(value: unknown, status = 200) {
 describe("TaskDetail Auto-Cut execution", () => {
   let runs: FeishuAutoCutRun[];
   let runReads: number;
+  let retryTask: Task;
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     runs = [attempt()];
     runReads = 0;
+    retryTask = { ...TASK, version: 3 };
     fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const pathname = new URL(String(input), "http://localhost/").pathname;
       if (pathname === `/api/local/tasks/${TASK.id}/autocut-runs`) {
         runReads += 1;
         return json({ runs });
+      }
+      if (pathname === `/api/local/tasks/${TASK.id}/autocut-retry`) {
+        runs = [attempt({ state: "blocked" }), attempt({ runId: "run-2", attempt: 2 })];
+        return json({ task: retryTask }, 202);
       }
       if (pathname === `/api/tasks/${TASK.id}/comments`) return json({ comments: [] });
       if (pathname === `/api/tasks/${TASK.id}/activities`) return json({ activities: [] });
@@ -111,4 +117,26 @@ describe("TaskDetail Auto-Cut execution", () => {
     expect(screen.getByRole("button", { name: "重试 Auto-Cut" })).toBeTruthy();
   });
 
+  it("passes the displayed single-run consent through the real detail retry handler and API", async () => {
+    const blockedTask = { ...TASK, status: "blocked" as const, version: 2 };
+    runs = [attempt({ state: "blocked", errorCode: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE" })];
+    render(view(props(blockedTask)));
+    const retryButton = await screen.findByRole("button", { name: "重试 Auto-Cut" });
+    const retryRequests = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/autocut-retry"));
+    expect(retryRequests()).toHaveLength(0);
+    expect(document.getElementById(retryButton.getAttribute("aria-describedby")!)?.textContent)
+      .toMatch(/本次.*视频原音.*语音识别.*已配置的本机输出目录/);
+
+    fireEvent.click(retryButton);
+
+    await waitFor(() => expect(retryRequests()).toHaveLength(1));
+    const [, request] = retryRequests()[0];
+    expect(request.method).toBe("POST");
+    expect(JSON.parse(request.body)).toEqual({
+      version: 2,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+    });
+    expect(await screen.findByText("run-2")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull());
+  });
 });

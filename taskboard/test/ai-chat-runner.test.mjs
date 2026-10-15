@@ -805,9 +805,9 @@ if (args[0] === "app-server") {
     if (prompt.includes("ITEM_ERROR")) {
       emit({type:"item.completed",item:{id:"item-error-1",type:"error",message:"Recoverable item error"}});
     }
-    if (prompt.includes("WAIT")) {
-      const timer = setTimeout(() => { emit({type:"turn.completed",usage:{input_tokens:1,output_tokens:2}}); }, 800);
-      process.on("SIGTERM", () => { clearTimeout(timer); process.exit(143); });
+    if (prompt.includes("WAIT_UNTIL_INTERRUPT")) {
+      const timer = setInterval(() => {}, 1_000);
+      process.on("SIGTERM", () => { clearInterval(timer); process.exit(143); });
       return;
     }
     if (prompt.includes("FAIL")) process.exit(7);
@@ -1043,13 +1043,14 @@ test("same-thread turns are locked, different threads run concurrently, failures
   try {
     const firstThread = await fixture.service.createThread({ projectId: "project" });
     const secondThread = await fixture.service.createThread({ projectId: "other" });
-    const waiting = await fixture.service.startTurn(firstThread.id, { message: "WAIT" });
+    const waiting = await fixture.service.startTurn(firstThread.id, { message: "WAIT_UNTIL_INTERRUPT" });
     await assert.rejects(
       fixture.service.startTurn(firstThread.id, { message: "must reject" }),
       (error) => error.code === "THREAD_BUSY",
     );
     const parallel = await fixture.service.startTurn(secondThread.id, { message: "normal" });
     await waitFor(() => fixture.service.getRun(parallel.id)?.status === "completed");
+    assert.equal(fixture.service.getRun(waiting.id)?.status, "running");
     const interrupted = await fixture.service.interrupt(waiting.id);
     assert.equal(interrupted.id, waiting.id);
     await waitFor(() => fixture.service.getRun(waiting.id)?.status === "interrupted", 10_000);

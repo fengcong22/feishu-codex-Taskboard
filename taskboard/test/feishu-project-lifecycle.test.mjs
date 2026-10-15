@@ -146,7 +146,10 @@ test("removing a draft with malformed history still requires Bridge lifecycle sy
     },
   });
   const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a"]));
-  const subject = catalog.subjects[0];
+  const subject = await fixture.store.saveSubjectDraft(
+    catalog.subjects[0].subjectKey,
+    configuredSubjectPatch("table-a"),
+  );
   fixture.database.database.prepare(`UPDATE feishu_subject_versions
     SET snapshot_json = ? WHERE subject_key = ? AND version = 1`)
     .run("{}", subject.subjectKey);
@@ -155,6 +158,31 @@ test("removing a draft with malformed history still requires Bridge lifecycle sy
 
   assert.equal(syncCalls, 1);
   assert.equal(fixture.database.getProject(subject.projectId).archivedAt, null);
+});
+
+test("removing an unconfigured draft with malformed history fails closed before Bridge sync", async () => {
+  let syncCalls = 0;
+  const fixture = await createFeishuFixture({
+    syncSubject: async () => {
+      syncCalls += 1;
+      return { ok: true };
+    },
+  });
+  const catalog = await fixture.store.upsertBasePreview(baseWithSubjects(["table-a"]));
+  const subject = catalog.subjects[0];
+  assert.equal(subject.packageRoute.packageAlias, null);
+  fixture.database.database.prepare(`UPDATE feishu_subject_versions
+    SET snapshot_json = ? WHERE subject_key = ? AND version = 1`)
+    .run("{}", subject.subjectKey);
+
+  await assert.rejects(() => fixture.store.removeBase(catalog.baseToken), (error) => error.code === "WORKFLOW_HISTORY_INVALID");
+
+  assert.equal(syncCalls, 0);
+  assert.equal(fixture.database.getProject(subject.projectId).archivedAt, null);
+  const remaining = await fixture.store.listCatalog();
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].subjects[0].lifecycle, "draft");
+  assert.equal(remaining[0].subjects[0].configVersion, subject.configVersion);
 });
 
 test("removing a previously enabled draft still requires Bridge lifecycle sync", async () => {

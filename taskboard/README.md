@@ -22,6 +22,8 @@ npm start
 
 Open <http://127.0.0.1:47823>. The SQLite database is stored at `.data/taskboard.sqlite`.
 
+Feishu Bridge packages using `vm_pmo_review_video` have an independent initial-draft workflow: a trusted status transition registers a task, normal VM download approval supplies the source, and `plan/render` produces one MP4. The stage completes after the MP4 is uploaded and read back from the configured PMO attachment field. Activation requires local Python, an enabled package, the local automatic-execution setting, and a complete initial-only subject profile. Review revisions and NAS archival are not yet available; saving or enabling does not replay existing records. See the [VM integration guide](../docs/vm-pmo-offline-integration.md).
+
 For development with live frontend reload:
 
 ```bash
@@ -223,9 +225,11 @@ Local artifact registration has a five-minute response deadline, including readi
 
 Before editing, a bounded subprocess checks the installed deployment report's absolute CLI path, existing strict user identity via `whoami`, readiness file access and temporary-file creation in the readiness/job/drafts/ZIP parent directories. On Windows, the supported deployment layout is an npm shim (`.cmd`, `.ps1`, or `.bat`) alongside `lark-cli.cmd` and `node_modules/@larksuite/cli/scripts/run.js`. If an adjacent `node.exe` exists, it must resolve to Taskboard's Node executable. Other Windows layouts fail closed because the installed Python adapter's PATH discovery could select a different CLI. The service account must retain access to its own CLI authentication directories and credential store; credentials are not copied or printed. Set `AUTOCUT_LITE_READINESS_PATH` to an absolute readiness file path when overriding the `%LOCALAPPDATA%/Auto-Cut/auto-cut-lite/runtime-readiness.json` default. The probe preserves existing readiness content. Failures return `AUTOCUT_LARK_CLI_UNAVAILABLE`, `AUTOCUT_LARK_IDENTITY_UNAVAILABLE`, `AUTOCUT_READINESS_UNAVAILABLE`, or `AUTOCUT_OUTPUT_UNAVAILABLE`; stalled probes/preflight/runs return the corresponding `AUTOCUT_*_TIMEOUT`. Preflight completion is read from Auto-cut-lite's stderr JSON progress stream.
 
+The task detail's **重试 Auto-Cut** button displays the scope of video-audio speech recognition and writes to configured local output directories. Clicking it submits consent for that one retry, keeps the local Auto-Cut runner and structured phase progress, and retains earlier attempts. Merely viewing the task does not submit consent or start a run.
+
 Blocked attempts show Chinese diagnostics with the recorded failure phase, a code-based explanation, checks, and retry guidance. The latest blocked attempt expands by default; earlier attempts remain available. **查看本次日志** opens that attempt's own Taskboard conversation, and **复制排查信息** copies only identifiers and fixed diagnostic text. Unknown errors are explicitly inconclusive; raw runtime error messages are not reproduced in the diagnostic card. The runs API adds `threadId`, `executionKind`, `failedPhase`, and `lastPhase`, derived from that run's closed-vocabulary progress events. The first phase still failed after subsequent progress is preferred over downstream failure notifications; recovered phases are excluded. A last recorded phase alone is not reported as a confirmed failure location. Diagnostics refresh when the task version changes, including failures without attachments.
 
-When a blocked phased Feishu Auto-Cut run needs the two external-operation approvals, send `POST /api/local/tasks/:id/autocut-retry` with the current optimistic version (replace the example `16`) and the closed consent object:
+API callers can send `POST /api/local/tasks/:id/autocut-retry` with the current optimistic version (replace the example `16`) and the closed consent object:
 
 ```json
 {

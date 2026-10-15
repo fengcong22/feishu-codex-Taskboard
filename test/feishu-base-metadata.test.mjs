@@ -8,6 +8,52 @@ import {
   parseBaseLink,
 } from "../src/feishu-base-metadata.mjs";
 
+function vmMetadataFixture() {
+  const options = [
+    { id: "opt_idle", name: "未开始" },
+    { id: "opt_initial", name: "初稿" },
+    { id: "opt_processing", name: "处理中" },
+    { id: "opt_completed", name: "初稿完成" },
+  ];
+  const subject = {
+    subjectKey: "bas_demo:tbl_math", baseToken: "bas_demo", baseName: "课程库",
+    tableId: "tbl_math", tableName: "小学数学", lifecycle: "enabled", configVersion: 2,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    title: { fieldId: "fld_name", fieldName: "视频名称" },
+    statusField: { fieldId: "fld_status", fieldName: "制作进度", type: "single_select",
+      options: options.map(({ id, name }) => ({ optionId: id, value: name })) },
+    packageRoute: { routeMode: "fixed", packageAlias: "slicing", subjectCodeFieldId: null, branchMap: null },
+    execution: { mode: "automatic", concurrencyGroup: "slicing", maxConcurrent: 1, resourceGroups: [] },
+    vmWorkflow: {
+      fields: { vmidFieldId: "fld_vmid", namingFieldId: "fld_name", outputAttachmentFieldId: "fld_output" },
+      approval: { department: "课程制作", reason: "初稿剪辑" },
+      stages: {
+        initial: { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_initial", instructionFieldId: "fld_instruction",
+          writeback: { processing: { fieldId: "fld_status", optionId: "opt_processing" }, completed: { fieldId: "fld_status", optionId: "opt_completed" } } },
+        review: { enabled: false, statusFieldId: null, triggerOptionId: null, instructionFieldId: null, instructionAttachmentsFieldId: null,
+          writeback: { processing: { fieldId: null, optionId: null }, completed: { fieldId: null, optionId: null } } },
+      },
+      finalArchive: { enabled: false, statusFieldId: null, triggerOptionId: null, pathSource: "manual", directoryPath: null, pathFieldId: null },
+    },
+  };
+  const fields = [
+    { field_id: "fld_status", field_name: "制作进度", type: 3, ui_type: "SingleSelect", property: { options } },
+    { field_id: "fld_vmid", field_name: "VMID", type: 1, ui_type: "Text" },
+    { field_id: "fld_name", field_name: "视频名称", type: 20, ui_type: "Formula" },
+    { field_id: "fld_instruction", field_name: "剪辑意见", type: 1, ui_type: "Text" },
+    { field_id: "fld_output", field_name: "成片附件", type: 17, ui_type: "Attachment" },
+  ];
+  return { subject, fields };
+}
+
+function vmMetadataReader(fields, overrides = {}) {
+  return createFeishuBaseMetadataReader({ client: fakeClient({
+    tables: { code: 0, data: { items: [{ table_id: "tbl_math", name: "小学数学" }] } },
+    fields: { tbl_math: { code: 0, data: { items: fields } } },
+    ...overrides,
+  }) });
+}
+
 function fakeClient({ app, tables, fields, wikiNode, calls = [] } = {}) {
   return {
     bitable: {
@@ -102,6 +148,165 @@ function twoFieldMetadataFixture() {
     ]),
   };
 }
+
+test("VM metadata validates the actual initial profile without a legacy trigger", async (t) => {
+  for (const [name, type, uiType] of [["formula", 20, "Formula"], ["text", 1, "Text"], ["numeric string without uiType", "20", undefined]]) {
+    await t.test(name, async () => {
+      const { subject, fields } = vmMetadataFixture();
+      fields[2].type = type;
+      fields[2].ui_type = uiType;
+      assert.equal(Object.hasOwn(subject, "trigger"), false);
+      await vmMetadataReader(fields).validateSubject(subject);
+    });
+  }
+});
+
+test("VM metadata validates processing and completed options in their own fields", async () => {
+  const { subject, fields } = vmMetadataFixture();
+  subject.vmWorkflow.stages.initial.writeback.completed = { fieldId: "fld_delivery", optionId: "opt_delivered" };
+  fields.push({ field_id: "fld_delivery", field_name: "交付状态", type: 3, ui_type: "SingleSelect",
+    property: { options: [{ id: "opt_delivered", name: "已交付" }] } });
+  await vmMetadataReader(fields).validateSubject(subject);
+});
+
+test("VM metadata checks every active field type instead of accepting a valid legacy trigger", async (t) => {
+  const scenarios = [
+    ["VMID formula", 1, 20, "Formula"],
+    ["VMID number", 1, 2, "Number"],
+    ["instruction formula", 3, 20, "Formula"],
+    ["naming number", 2, 2, "Number"],
+    ["output text", 4, 1, "Text"],
+    ["multi-select trigger", 0, 4, "MultiSelect"],
+    ["text trigger", 0, 1, "Text"],
+    ["VMID conflicting uiType", 1, 1, "Formula"],
+    ["instruction conflicting uiType", 3, 1, "Attachment"],
+    ["naming conflicting uiType", 2, 20, "Text"],
+    ["output conflicting uiType", 4, 17, "Text"],
+    ["malformed output type", 4, [17], "Attachment"],
+    ["missing VMID type", 1, undefined, "Text"],
+  ];
+  for (const [name, index, type, uiType] of scenarios) {
+    await t.test(name, async () => {
+      const { subject, fields } = vmMetadataFixture();
+      subject.trigger = { fieldId: "fld_status", fieldName: "制作进度", optionId: "opt_initial", startValue: "初稿" };
+      fields[index].type = type;
+      fields[index].ui_type = uiType;
+      await assert.rejects(vmMetadataReader(fields).validateSubject(subject), { code: "FIELD_TYPE_INVALID", status: 409 });
+    });
+  }
+});
+
+test("VM metadata refuses missing or mismatched initial and writeback bindings", async (t) => {
+  const mutations = [
+    ["VMID field removed", ({ fields }) => { fields.splice(1, 1); }],
+    ["instruction field removed", ({ fields }) => { fields.splice(3, 1); }],
+    ["naming field removed", ({ fields }) => { fields.splice(2, 1); }],
+    ["attachment field removed", ({ fields }) => { fields.splice(4, 1); }],
+    ["trigger option removed", ({ fields }) => { fields[0].property.options.splice(1, 1); }],
+    ["processing option removed", ({ fields }) => { fields[0].property.options.splice(2, 1); }],
+    ["completed option removed", ({ fields }) => { fields[0].property.options.splice(3, 1); }],
+    ["trigger option renamed", ({ fields }) => { fields[0].property.options[1].name = "已改名"; }],
+    ["trigger belongs to another field", ({ subject }) => { subject.vmWorkflow.stages.initial.statusFieldId = "fld_output"; }],
+    ["title differs from naming binding", ({ subject }) => { subject.vmWorkflow.fields.namingFieldId = "fld_vmid"; }],
+    ["processing field missing", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.processing.fieldId = "fld_missing"; }],
+    ["completed field missing", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.completed.fieldId = "fld_missing"; }],
+    ["processing option missing", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.processing.optionId = "opt_missing"; }],
+    ["completed option missing", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.completed.optionId = "opt_missing"; }],
+    ["processing unbound", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.processing = { fieldId: null, optionId: null }; }],
+    ["completed unbound", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.completed = { fieldId: null, optionId: null }; }],
+    ["processing incomplete", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.processing.optionId = null; }],
+    ["completed incomplete", ({ subject }) => { subject.vmWorkflow.stages.initial.writeback.completed.fieldId = null; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      const fixture = vmMetadataFixture();
+      fixture.subject.trigger = { fieldId: "fld_status", fieldName: "制作进度", optionId: "opt_initial", startValue: "初稿" };
+      mutate(fixture);
+      await assert.rejects(vmMetadataReader(fixture.fields).validateSubject(fixture.subject), { code: "INVALID_FIELD", status: 409 });
+    });
+  }
+});
+
+test("VM metadata rejects writeback fields with an incompatible live type", async (t) => {
+  for (const moment of ["processing", "completed"]) {
+    await t.test(moment, async () => {
+      const { subject, fields } = vmMetadataFixture();
+      subject.trigger = { fieldId: "fld_status", fieldName: "制作进度", optionId: "opt_initial", startValue: "初稿" };
+      subject.vmWorkflow.stages.initial.writeback[moment] = { fieldId: "fld_delivery", optionId: "opt_delivered" };
+      fields.push({ field_id: "fld_delivery", field_name: "交付状态", type: 4, ui_type: "MultiSelect",
+        property: { options: [{ id: "opt_delivered", name: "已交付" }] } });
+      await assert.rejects(vmMetadataReader(fields).validateSubject(subject), { code: "FIELD_TYPE_INVALID", status: 409 });
+    });
+  }
+});
+
+test("VM metadata fails closed on duplicate live fields, tables and options", async (t) => {
+  const mutations = [
+    ["duplicate VMID field", ({ fields }) => { fields.push(structuredClone(fields[1])); }],
+    ["duplicate unrelated field", ({ fields }) => { fields.push({ field_id: "fld_other", field_name: "其他", type: 1 }, { field_id: "fld_other", field_name: "另一其他", type: 1 }); }],
+    ["duplicate initial option", ({ fields }) => { fields[0].property.options.push({ id: "opt_initial", name: "另一个初稿" }); }],
+    ["duplicate processing option", ({ fields }) => { fields[0].property.options.push({ id: "opt_processing", name: "另一个处理中" }); }],
+    ["duplicate completed option", ({ fields }) => { fields[0].property.options.push({ id: "opt_completed", name: "另一个完成" }); }],
+    ["malformed option list", ({ fields }) => { fields[0].property.options = {}; }],
+    ["malformed option", ({ fields }) => { fields[0].property.options.push({ id: "opt_bad", name: 1 }); }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      const fixture = vmMetadataFixture();
+      fixture.subject.trigger = { fieldId: "fld_status", fieldName: "制作进度", optionId: "opt_initial", startValue: "初稿" };
+      mutate(fixture);
+      await assert.rejects(vmMetadataReader(fixture.fields).validateSubject(fixture.subject), { code: "FEISHU_METADATA_INVALID_RESPONSE" });
+    });
+  }
+  await t.test("duplicate table", async () => {
+    const { subject, fields } = vmMetadataFixture();
+    const reader = vmMetadataReader(fields, { tables: { code: 0, data: { items: [
+      { table_id: "tbl_math", name: "小学数学" }, { table_id: "tbl_math", name: "小学数学副本" },
+    ] } } });
+    await assert.rejects(reader.validateSubject(subject), { code: "FEISHU_METADATA_INVALID_RESPONSE" });
+  });
+});
+
+test("VM metadata cannot fall back to legacy validation for incomplete or unsupported VM declarations", async (t) => {
+  const mutations = [
+    ["missing template", (subject) => { delete subject.workflowTemplate; }],
+    ["unknown template", (subject) => { subject.workflowTemplate.id = "other"; }],
+    ["unsupported version", (subject) => { subject.workflowTemplate.version = 2; }],
+    ["missing VM workflow", (subject) => { delete subject.vmWorkflow; }],
+    ["initial disabled", (subject) => { subject.vmWorkflow.stages.initial.enabled = false; }],
+    ["review enabled", (subject) => { subject.vmWorkflow.stages.review.enabled = true; }],
+    ["archive enabled", (subject) => { subject.vmWorkflow.finalArchive.enabled = true; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      const { subject, fields } = vmMetadataFixture();
+      subject.trigger = { fieldId: "fld_status", fieldName: "制作进度", optionId: "opt_initial", startValue: "初稿" };
+      mutate(subject);
+      await assert.rejects(vmMetadataReader(fields).validateSubject(subject), { code: "INVALID_FIELD", status: 409 });
+    });
+  }
+});
+
+test("Bridge ZIP phased and legacy subjects keep their existing metadata validation paths", async () => {
+  const phased = phasedSubject({ stages: {
+    initial: phasedSubject().stages.initial,
+    first_review: { ...phasedSubject().stages.first_review, enabled: false },
+    final_review: { ...phasedSubject().stages.final_review, enabled: false },
+  } });
+  const reader = vmMetadataReader([
+    { field_id: "fld_status", field_name: "制作进度", type: 3, ui_type: "SingleSelect",
+      property: { options: [{ id: "opt_initial", name: "初稿" }] } },
+    { field_id: "fld_document", field_name: "素材文档", type: 1, ui_type: "Text" },
+    { field_id: "fld_name", field_name: "命名", type: 1, ui_type: "Text" },
+  ]);
+  assert.equal(Object.hasOwn(phased, "workflowTemplate"), false);
+  await reader.validateSubject(phased);
+  await reader.validateSubject({
+    baseToken: "bas_demo", baseName: "课程库", tableId: "tbl_math", tableName: "小学数学",
+    trigger: { fieldId: "fld_status", fieldName: "制作进度", optionId: "opt_initial", startValue: "初稿" },
+    title: { fieldId: "fld_name", fieldName: "命名" },
+  });
+});
 
 test("two trigger fields validate options independently when IDs overlap", () => {
   const { subject, metadata } = twoFieldMetadataFixture();

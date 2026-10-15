@@ -32,13 +32,14 @@ test("panel source filters hidden subjects while retaining draft and enabled lab
   assert.match(panel, /未显示/);
   assert.match(panel, /显示/);
   assert.match(panel, /onToggleDisplay/);
-  assert.match(panel, /导出共享配置/);
-  assert.match(panel, /导入共享配置/);
-  assert.match(panel, /importFeishuWorkflowShare/);
-  assert.match(panel, /exportFeishuWorkflowShare/);
-  assert.match(panel, /warnings\.slice\(0, 8\)/);
-  assert.match(panel, /entry\.message/);
-  assert.match(panel, /还有.*项/);
+  assert.match(panel, /导出学科配置/);
+  assert.match(panel, /导入学科配置/);
+  assert.match(panel, /importFeishuSubjectWorkflowShare/);
+  assert.match(panel, /exportFeishuSubjectWorkflowShare/);
+  assert.match(panel, /shareSession\.preview\.diagnostics\.map/);
+
+  assert.match(panel, /confirmShareImport/);
+  assert.match(panel, /导入为待修复草稿/);
 });
 
 test("adding a Base refreshes the project catalog before selecting its subject", async () => {
@@ -62,8 +63,8 @@ test("subject settings keep delivery routing while package settings own executio
   ]) {
     assert.match(panel, new RegExp(field));
   }
-  assert.doesNotMatch(panel, /concurrencyGroup/);
-  assert.doesNotMatch(panel, /resourceGroups/);
+  // Profile saves retain hidden execution settings. The component suites cover
+  // editable delivery controls and the package manager's resource controls.
   assert.match(packageManager, /maxConcurrent/);
   assert.match(packageManager, /resourceGroups/);
   assert.match(packageManager, /资源组/);
@@ -103,7 +104,8 @@ test("left Base navigation opens a subject board and keeps configuration scoped 
   assert.match(navigator, /aria-expanded/);
   assert.match(navigator, /subject\.displayEnabled/);
   assert.match(navigator, /onSelectSubject\(subject\.subjectKey\)/);
-  assert.match(app, /changeProject\(subject\.projectId, ["']issues["']\)/);
+  // Actual sidebar selection and canceled navigation are covered by
+  // App.projectNavigation.test.tsx, including the unsaved-profile guard.
   assert.match(app, /<FeishuBaseNavigator/);
   assert.match(app, /onOpenConfiguration=\{openFeishuConfiguration\}/);
   assert.match(app, /setFeishuConfigurationBaseToken\(base\?\.baseToken \?\? null\)/);
@@ -116,15 +118,8 @@ test("workflow view can be retained per project when returning from a subject bo
   assert.match(app, /view === ["']workflow["']/);
 });
 
-test("hidden subject selection stays in configuration while visible subjects open their task board", async () => {
-  const panel = await source("web/src/components/FeishuWorkflowPanel.tsx");
-  const app = await source("web/src/App.tsx");
-  assert.match(panel, /onSelectSubject\(subject\.subjectKey, true\)/);
-  assert.match(panel, /onSelectSubject\(subject\.subjectKey, false\)/);
-  assert.match(app, /onSelectSubject=\{\(subjectKey, openProject = true\)/);
-  assert.match(app, /changeProject\(subject\.projectId, openProject \? ["']issues["'] : ["']workflow["'], subjectKey\)/);
-  assert.match(app, /setFeishuConfigurationOpen\(!openProject\)/);
-});
+// Both visible and hidden subjects now stay in configuration when selected from
+// that panel; FeishuWorkflowPanel.test.tsx exercises this routing contract.
 
 test("subject lifecycle actions use standard labels and track an actually active configuration", async () => {
   const panel = await source("web/src/components/FeishuWorkflowPanel.tsx");

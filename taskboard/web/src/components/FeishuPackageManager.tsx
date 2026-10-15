@@ -25,6 +25,7 @@ import { packageDisplayName } from "../feishuPackageDisplay";
 
 type Props = {
   refreshKey?: number;
+  vmPmoInitialReady?: boolean;
   onPackageChange?: (packages: FeishuPackageSummary[]) => void;
   onError?: (message: string) => void;
 };
@@ -59,6 +60,7 @@ const DRAFT_FIELDS: Array<keyof AutoCutPackageDraft> = [
   "zipOutputMode",
   "maxConcurrent",
   "resourceGroups",
+  "workflowTemplate",
 ];
 
 const STATE_LABELS: Record<FeishuPackageState, string> = {
@@ -80,6 +82,7 @@ function asForm(value: FeishuPackage): PackageForm {
     zipOutputMode: value.zipOutputMode,
     maxConcurrent: value.maxConcurrent,
     resourceGroups: value.resourceGroups ?? [],
+    ...(value.workflowTemplate ? { workflowTemplate: { ...value.workflowTemplate } } : {}),
     state: value.state,
     revision: value.revision,
     updatedAt: value.updatedAt,
@@ -99,6 +102,7 @@ function asDraft(value: PackageForm): AutoCutPackageDraft {
     ...(value.zipOutputMode ? { zipOutputMode: value.zipOutputMode } : {}),
     maxConcurrent: value.maxConcurrent,
     resourceGroups: value.resourceGroups,
+    ...(value.workflowTemplate ? { workflowTemplate: { ...value.workflowTemplate } } : {}),
   };
 }
 
@@ -107,8 +111,8 @@ function resourceGroupsFrom(value: string): string[] {
 }
 
 function draftChanged(form: PackageForm, saved: AutoCutPackageDraft): boolean {
-  return DRAFT_FIELDS.some((field) => field === "resourceGroups"
-    ? JSON.stringify(form.resourceGroups) !== JSON.stringify(saved.resourceGroups ?? [])
+  return DRAFT_FIELDS.some((field) => field === "resourceGroups" || field === "workflowTemplate"
+    ? JSON.stringify(form[field] ?? (field === "resourceGroups" ? [] : null)) !== JSON.stringify(saved[field] ?? (field === "resourceGroups" ? [] : null))
     : form[field] !== saved[field]);
 }
 
@@ -132,7 +136,7 @@ function inspectionFailure(error: unknown): string {
   if (error instanceof ApiError) {
     const messages: Record<string, string> = {
       PACKAGE_WORKSPACE_UNAVAILABLE: "工作区不存在或不可访问，请检查路径后重试。",
-      PACKAGE_MANIFEST_UNAVAILABLE: "无法读取包清单，请确认所选目录是完整的 Auto-Cut 包。",
+      PACKAGE_MANIFEST_UNAVAILABLE: "未发现或无法读取 Taskboard 接入声明（.codex-plugin/plugin.json、PACKAGE-MANIFEST.json）。请先为该剪辑包适配 Taskboard 接口。",
       PACKAGE_MANIFEST_INVALID: "包清单格式或版本信息无效，请检查 Auto-Cut 包。",
       INVALID_FIELD: "请填写完整的工作区绝对路径。",
     };
@@ -141,7 +145,7 @@ function inspectionFailure(error: unknown): string {
   return error instanceof Error ? error.message : "工作区验证失败，请重试。";
 }
 
-export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError }: Props) {
+export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false, onPackageChange, onError }: Props) {
   const [packages, setPackages] = useState<FeishuPackageSummary[]>([]);
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
   const [form, setForm] = useState<PackageForm>({ ...EMPTY_FORM });
@@ -199,17 +203,18 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
     ?? (availableZipOutput && form.zipSourceDirectory === availableZipOutput.directory ? "package_default" : "custom");
   const declaredZipOutput = zipMode === "package_default" ? availableZipOutput : null;
   const usePackageDefault = zipMode === "package_default";
+  const identityPreview = validationMatchesWorkspace ? workspaceValidation!.inspection
+    : form.workspacePath === selected?.workspacePath ? selected?.identity ?? null : null;
+  const vmWorkflow = (identityPreview?.workflowTemplate ?? form.workflowTemplate)?.id === "vm_pmo_review_video";
   const requiresWorkspaceValidation = !selected || form.workspacePath !== selected.workspacePath;
   const canSave = Boolean(
     form.alias
     && form.name
     && form.projectId
-    && (form.zipOutputMode !== "custom" || Boolean(form.zipSourceDirectory?.trim()))
-    && (!usePackageDefault || Boolean(declaredZipOutput))
+    && (vmWorkflow || form.zipOutputMode !== "custom" || Boolean(form.zipSourceDirectory?.trim()))
+    && (vmWorkflow || !usePackageDefault || Boolean(declaredZipOutput))
     && (!requiresWorkspaceValidation || validationMatchesWorkspace),
   );
-  const identityPreview = validationMatchesWorkspace ? workspaceValidation!.inspection
-    : form.workspacePath === selected?.workspacePath ? selected?.identity ?? null : null;
   const operationBusy = busy || inspecting;
 
   async function refresh(preferredAlias?: string | null, resetEditor = false) {
@@ -296,6 +301,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
   }
 
   async function prepareDeclaredZipOutput() {
+    if (vmWorkflow) return;
     const custom = zipMode === "custom";
     if (!custom && (!declaredZipOutput || !normalizedWorkspacePath)) return;
     const version = editorVersion.current;
@@ -330,6 +336,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
       PACKAGE_CUSTOM_ZIP_OUTPUT_INVALID: "请填写存在且可写的 ZIP 生成目录绝对路径。",
       PACKAGE_ZIP_OUTPUT_INVALID: "请填写 ZIP 生成目录的完整绝对路径。",
       PACKAGE_ZIP_OUTPUT_UNAVAILABLE: "ZIP 生成目录不存在或不可写，请检查目录和访问权限。",
+      PACKAGE_WORKFLOW_NOT_READY: "本机初稿运行能力尚未就绪，可先保存配置草稿。",
     };
     const message = error instanceof ApiError && messages[error.code]
       ? messages[error.code] : error instanceof Error ? error.message : fallback;
@@ -352,6 +359,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
 
   async function runEditorAction(kind: "enable" | "disable" | "delete") {
     if (!selectedAlias || !selected) return;
+    if (kind === "enable" && vmWorkflow && !vmPmoInitialReady) return;
     if (kind === "delete" && selected.referenceCount > 0) {
       setReferenceDrawer(selected.references);
       return;
@@ -442,14 +450,18 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
       if (!isCurrent()) return;
       editorVersion.current += 1;
       setWorkspaceValidation({ workspacePath, inspection });
-      if (inspection.zipOutput && editor.current.form.zipOutputMode !== "custom") {
+      setForm((current) => ({ ...current,
+        workflowTemplate: inspection.workflowTemplate ? { ...inspection.workflowTemplate } : undefined,
+        ...(inspection.workflowTemplate?.id === "vm_pmo_review_video" ? { zipSourceDirectory: null, zipOutputMode: undefined } : {}),
+      }));
+      if (inspection.workflowTemplate?.id !== "vm_pmo_review_video" && inspection.zipOutput && editor.current.form.zipOutputMode !== "custom") {
         if (!declaredZipOutput) zipDirectoryBeforeAutofill.current = editor.current.form.zipSourceDirectory;
         setForm((current) => ({
           ...current,
           ...(wasNewPackage ? { zipOutputMode: "package_default" } : {}),
           zipSourceDirectory: inspection.zipOutput!.directory,
         }));
-      } else if (declaredZipOutput) {
+      } else if (inspection.workflowTemplate?.id !== "vm_pmo_review_video" && declaredZipOutput) {
         const fallback = selected?.zipSourceDirectory === declaredZipOutput.directory
           ? selected.zipSourceDirectory : zipDirectoryBeforeAutofill.current;
         setForm((current) => ({ ...current, zipSourceDirectory: fallback, zipOutputMode: undefined }));
@@ -552,7 +564,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
         </div>
         <div className="feishu-package-actions">
           <button type="button" disabled={operationBusy || !canSave} onClick={() => void save()}>保存草稿</button>
-          {selected && selected.state !== "enabled" && <button type="button" disabled={operationBusy || !canSave} onClick={() => void runEditorAction("enable")}>启用</button>}
+          {selected && selected.state !== "enabled" && <button type="button" disabled={operationBusy || !canSave || (vmWorkflow && !vmPmoInitialReady)} title={vmWorkflow && !vmPmoInitialReady ? "本机初稿运行能力尚未就绪" : undefined} onClick={() => void runEditorAction("enable")}>启用</button>}
           {selected && selected.state === "enabled" && <button type="button" disabled={operationBusy || !canSave} onClick={() => void runEditorAction("disable")}>停用</button>}
           {selected && <button type="button" className="danger" disabled={operationBusy || selected.referenceCount > 0} title={selected.referenceCount > 0 ? "存在引用，不能删除" : "删除"} onClick={() => void runEditorAction("delete")}>删除</button>}
         </div>
@@ -565,6 +577,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
         </li>)}</ul>
       </aside>}
       {actionError && <p className="feishu-package-load-error" role="alert">{actionError}</p>}
+      {vmWorkflow && <p role="status">{vmPmoInitialReady ? "初稿：审批下载 → 按明确时间范围剪辑 → PMO 视频附件。审核修改与成片归档暂未开放。" : "VM 素材 → PMO 审核 → 视频附件。当前可保存草稿，本机初稿运行能力尚未就绪。"}</p>}
 
       <div className="feishu-package-form">
         <label className="wide">Codex 工作区路径<input value={form.workspacePath ?? ""} onChange={(event) => changeWorkspace(event.target.value)} placeholder="绝对路径" /></label>
@@ -576,13 +589,14 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
           {!inspecting && !inspectionError && identityPreview && <span className={`feishu-package-identity${validationMatchesWorkspace ? " is-success" : ""}`} aria-label="已读取的包版本" role={validationMatchesWorkspace ? "status" : undefined}>
             {validationMatchesWorkspace && <span>验证并读取成功</span>}
             <strong>{identityPreview.displayName}</strong>
+            {identityPreview.workflowTemplate && <small>工作流程：{identityPreview.workflowTemplate.id === "vm_pmo_review_video" ? "VM 视频剪辑与 PMO 审核" : "文档剪辑与 ZIP 交付"}</small>}
             {identityPreview.runtimeVersion && <small>运行核心 {identityPreview.runtimeVersion}</small>}
             {validationMatchesWorkspace && <small>{selected
               ? declaredZipOutput && form.zipSourceDirectory !== selected.zipSourceDirectory ? "ZIP 生成目录已带入，保存后生效" : "现有配置已保留"
               : "已自动带入，尚未保存"}</small>}
           </span>}
         </div>
-        <label>ZIP 目录来源<select aria-label="ZIP 目录来源" value={zipMode} onChange={(event) => changeZipOutputMode(event.target.value as "package_default" | "custom")}>
+        {!vmWorkflow && <><label>ZIP 目录来源<select aria-label="ZIP 目录来源" value={zipMode} onChange={(event) => changeZipOutputMode(event.target.value as "package_default" | "custom")}>
           <option value="package_default" disabled={!availableZipOutput}>Auto-Cut-Lite 默认目录</option>
           <option value="custom">自定义目录</option>
         </select></label>
@@ -592,7 +606,7 @@ export function FeishuPackageManager({ refreshKey = 0, onPackageChange, onError 
         }} placeholder="绝对路径（可选）" />
           {declaredZipOutput && <small className="feishu-package-zip-output"><strong>来自 Auto-Cut-Lite</strong><span>{declaredZipOutput.relativeDirectory} → {declaredZipOutput.directory}</span><span>保存或启用时自动创建缺失目录。</span></small>}
           {validationMatchesWorkspace && !declaredZipOutput && <small>该包未声明默认目录，可手动填写 ZIP 生成目录。</small>}
-        </label>
+        </label></>}
         <label>GPT 模型<select value={form.model ?? ""} onChange={(event) => changeModel(event.target.value)}>
           <option value="">请选择模型</option>
           {modelOptions.map((model) => <option key={model.slug} value={model.slug}>{model.displayName || model.slug}</option>)}

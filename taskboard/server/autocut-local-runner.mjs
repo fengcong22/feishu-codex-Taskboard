@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { signalProcessTree } from "../shared/process-tree.mjs";
+import { assertExecutablePackageWorkflow } from "./feishu-package-identity.mjs";
 
 const PROBE_PATH = fileURLToPath(new URL("./autocut-environment-probe.mjs", import.meta.url));
 const PROGRESS_PHASES = new Set([
@@ -217,6 +218,7 @@ export async function runLocalAutoCut({
   preflightTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_PREFLIGHT_TIMEOUT_MS,
   runTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_RUN_TIMEOUT_MS,
 } = {}) {
+  await assertExecutablePackageWorkflow(packageConfig);
   environmentTimeoutMs = timeoutSetting(environmentTimeoutMs, 30_000);
   preflightTimeoutMs = timeoutSetting(preflightTimeoutMs, 120_000);
   runTimeoutMs = timeoutSetting(runTimeoutMs, 2 * 60 * 60 * 1_000);

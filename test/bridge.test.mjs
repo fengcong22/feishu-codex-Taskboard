@@ -60,6 +60,24 @@ const event = {
 
 const retryEvent = { ...event, eventId: "evt_retry" };
 
+test("legacy events reject a VM package without creating any Taskboard task", async () => {
+  const calls = [];
+  const bridge = createBridge({
+    config: { ...config, packages: { "Auto-cut-copyA": {
+      ...config.packages["Auto-cut-copyA"], workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    } } },
+    store: memoryStore(),
+    taskboard: {
+      ensureProject: async () => calls.push("project"),
+      createTask: async () => { calls.push("task"); return { id: "task", identifier: "LEG-1" }; },
+    },
+  });
+  const result = await bridge.handle(event);
+  assert.equal(result.kind, "blocked");
+  assert.equal(result.reasonCode, "PACKAGE_WORKFLOW_MISMATCH");
+  assert.deepEqual(calls, []);
+});
+
 test("permanently deleted legacy registrations remain ignored after replay and restart", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-deleted-legacy-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -1034,6 +1052,10 @@ for (const [label, mutatePackage] of [
   ["prompt", (packageConfig) => ({
     ...packageConfig,
     prompt: "执行被替换的流程。",
+  })],
+  ["workflow", (packageConfig) => ({
+    ...packageConfig,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
   })],
 ]) {
   test(`dead-letters a retry when the aliased package ${label} changes`, async () => {

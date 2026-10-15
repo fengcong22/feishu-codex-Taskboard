@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -70,17 +70,8 @@ async function request(baseUrl, body) {
   return { response, body: await response.json() };
 }
 
-test("subject editor uses configured package aliases instead of free text", async () => {
-  const source = await import("node:fs/promises").then(({ readFile }) => readFile(
-    new URL("../web/src/components/FeishuWorkflowPanel.tsx", import.meta.url),
-    "utf8",
-  ));
-  assert.match(source, /listFeishuPackages/);
-  assert.match(source, /<select[^>]*value=\{subjectForm\.packageAlias\}/s);
-  assert.doesNotMatch(source, /包别名<input value=\{subjectForm\.packageAlias\}/);
-  assert.match(source, /selectedPackage\.state !== "enabled"/);
-  assert.match(source, /packageAlias: subject\.packageRoute\?\.packageAlias \?\? ""/);
-});
+// Package selection and activation are exercised by FeishuWorkflowPanel.test.tsx;
+// this file tests the server-owned snapshots, independent of React state names.
 
 test("Bridge registration stores a server-owned package snapshot outside the task description", async () => {
   const fixtureData = await fixture();
@@ -104,6 +95,7 @@ test("Bridge registration stores a server-owned package snapshot outside the tas
     assert.equal(snapshot.packageRevision, 1);
     assert.equal(snapshot.model, "fixture-model");
     assert.equal(snapshot.reasoningEffort, "low");
+    assert.deepEqual(snapshot.workflowTemplate, { id: "document_draft_zip", version: 1 });
     assert.equal(snapshot.prompt, "run fixture workflow");
     assert.equal(snapshot.workspacePath, path.join(fixtureData.directory, "workspace"));
     assert.equal(snapshot.zipSourceDirectory, path.join(fixtureData.directory, "zips"));
@@ -111,6 +103,47 @@ test("Bridge registration stores a server-owned package snapshot outside the tas
     await fixtureData.app.close();
     await rm(fixtureData.directory, { recursive: true, force: true });
   }
+});
+
+test("a manifest changed to VM blocks both existing task start and new registration", async (t) => {
+  const data = await fixture();
+  t.after(async () => { await data.app.close(); await rm(data.directory, { recursive: true, force: true }); });
+  const projectId = subjectProjectId("bas_snapshot:tbl_subject");
+  data.app.database.createProject({ id: projectId, name: "Fixture", workspacePath: data.directory });
+  const input = { projectId, title: "Frozen legacy task", description: description(), status: "todo", priority: "high", labels: ["feishu"] };
+  const created = await request(data.baseUrl, input);
+  assert.equal(created.response.status, 201);
+  const vm = { id: "vm_pmo_review_video", version: 1 };
+  await writeFile(path.join(data.directory, "workspace", "PACKAGE-MANIFEST.json"), JSON.stringify({ interface: { workflowTemplate: vm } }));
+  const start = await fetch(`${data.baseUrl}/api/tasks/${created.body.task.id}/start-ai`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+  assert.equal(start.status, 409);
+  assert.equal((await start.json()).error.code, "PACKAGE_WORKFLOW_NOT_READY");
+  assert.equal(data.app.database.getTask(created.body.task.id).status, "todo");
+  assert.equal(data.app.database.getFeishuExecution(created.body.task.id), null);
+  assert.equal(data.app.database.listAiChatThreads().length, 0);
+  const next = await request(data.baseUrl, { ...input, description: description({ eventId: "evt-vm-block", recordId: "rec-vm" }) });
+  assert.equal(next.response.status, 409);
+  assert.equal(next.body.error.code, "PACKAGE_WORKFLOW_NOT_READY");
+  const snapshot = data.app.database.getFeishuTaskPackageSnapshot(created.body.task.id);
+  assert.throws(() => data.app.database.refreshFeishuTaskPackageSnapshot(created.body.task.id, created.body.task.version,
+    { ...snapshot, workflowTemplate: vm }), { code: "TASK_PACKAGE_WORKFLOW_IMMUTABLE" });
+  assert.deepEqual(data.app.database.getFeishuTaskPackageSnapshot(created.body.task.id), snapshot);
+});
+
+test("corrupt saved workflow identity never falls back to a live legacy package", async (t) => {
+  const data = await fixture();
+  t.after(async () => { await data.app.close(); await rm(data.directory, { recursive: true, force: true }); });
+  const projectId = subjectProjectId("bas_snapshot:tbl_subject");
+  data.app.database.createProject({ id: projectId, name: "Fixture", workspacePath: data.directory });
+  const created = await request(data.baseUrl, { projectId, title: "Corrupt snapshot", description: description(), status: "todo", priority: "high", labels: ["feishu"] });
+  const snapshot = data.app.database.getFeishuTaskPackageSnapshot(created.body.task.id);
+  snapshot.workflowTemplate = { id: "unregistered", version: 1 };
+  data.app.database.database.prepare("UPDATE feishu_task_package_snapshots SET snapshot_json = ? WHERE task_id = ?")
+    .run(JSON.stringify(snapshot), created.body.task.id);
+  assert.throws(() => data.app.database.getFeishuTaskPackageSnapshot(created.body.task.id), { code: "INVALID_PACKAGE_SNAPSHOT" });
+  assert.equal(data.app.database.listAiChatThreads().length, 0);
 });
 
 test("legacy registration cannot gain automatic execution eligibility without an active subject snapshot", async () => {

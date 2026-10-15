@@ -198,6 +198,7 @@ export class AiChatService {
     });
     this.active = new Map();
     this.listeners = new Map();
+    this.hintListeners = new Set();
     this.completions = new Map();
     this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
       this.#handleAppServerNotification(this.appServer, notification);
@@ -287,6 +288,11 @@ export class AiChatService {
       listeners.delete(listener);
       if (listeners.size === 0) this.listeners.delete(threadId);
     };
+  }
+
+  subscribeHints(listener) {
+    this.hintListeners.add(listener);
+    return () => this.hintListeners.delete(listener);
   }
 
   // In-process lifecycle bridge for Taskboard-owned runs; no HTTP write API.
@@ -895,6 +901,7 @@ export class AiChatService {
     }
     this.remoteRuntimes.clear();
     this.listeners.clear();
+    this.hintListeners.clear();
   }
 
   #resolveModel(catalog, requestedModel) {
@@ -1388,6 +1395,12 @@ export class AiChatService {
     for (const listener of this.listeners.get(threadId) ?? []) {
       try {
         listener(event);
+      } catch {}
+    }
+    const hint = { threadId, type: event?.type };
+    for (const listener of this.hintListeners) {
+      try {
+        listener(hint);
       } catch {}
     }
   }

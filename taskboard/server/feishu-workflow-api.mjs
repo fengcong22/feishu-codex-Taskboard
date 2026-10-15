@@ -20,6 +20,15 @@ function mergeDiagnostics(...groups) {
   return diagnostics;
 }
 
+function bridgeDiagnosticsForImportedSubjects(bridgeDiagnostics, localDiagnostics) {
+  const skippedPaths = (localDiagnostics ?? [])
+    .filter((entry) => ["ENABLED_SUBJECT_SKIPPED", "REMOVED_SUBJECT_SKIPPED", "REMOVED_BASE_SKIPPED"].includes(entry.code) && typeof entry.path === "string")
+    .map((entry) => entry.path);
+  return bridgeDiagnostics.filter((entry) => !skippedPaths.some((path) => (
+    entry.path === path || entry.path?.startsWith(`${path}.`)
+  )));
+}
+
 function requireObjectBody(body, label) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new ApiError(400, "INVALID_BODY", `${label} body must be an object`);
@@ -204,12 +213,15 @@ export function createFeishuWorkflowApi({
           throw new ApiError(400, "INVALID_FIELD", "dryRun must be boolean");
         }
         const localPreview = await store.importShareable(body.configuration, { dryRun: true });
-        const bridgePreview = typeof inspectShareImport === "function"
+        const bridgeConfiguration = { ...localPreview.configuration, bases: localPreview.configuration.bases.map((base) => ({
+          ...base, subjects: base.subjects.filter((subject) => Boolean(subject.packageRoute?.packageAlias)),
+        })).filter((base) => base.subjects.length > 0) };
+        const bridgePreview = typeof inspectShareImport === "function" && bridgeConfiguration.bases.length > 0
           // Keep the local result authoritative for the editor, but let the
           // Bridge know which subjects were legacy in the operator's import.
           // The app-side inspector uses that hint to preserve legacy
           // field/option diagnostics after local phased-default expansion.
-          ? await inspectShareImport(localPreview.configuration, {
+          ? await inspectShareImport(bridgeConfiguration, {
             sourceConfiguration: body.configuration,
           })
           : null;
@@ -219,7 +231,10 @@ export function createFeishuWorkflowApi({
           ))
           : [];
         if (body.dryRun === true) {
-          const diagnostics = mergeDiagnostics(bridgeDiagnostics, localPreview.diagnostics);
+          const diagnostics = mergeDiagnostics(
+            bridgeDiagnosticsForImportedSubjects(bridgeDiagnostics, localPreview.diagnostics),
+            localPreview.diagnostics,
+          );
           const diagnosticsOk = diagnostics.every((entry) => entry.severity !== "error");
           return {
             status: 200,
@@ -227,7 +242,10 @@ export function createFeishuWorkflowApi({
           };
         }
         const result = await store.importShareable(localPreview.configuration, { dryRun: false });
-        const diagnostics = mergeDiagnostics(bridgeDiagnostics, result.diagnostics);
+        const diagnostics = mergeDiagnostics(
+          bridgeDiagnosticsForImportedSubjects(bridgeDiagnostics, result.diagnostics),
+          result.diagnostics,
+        );
         const diagnosticsOk = diagnostics.every((entry) => entry.severity !== "error");
         return {
           status: 200,

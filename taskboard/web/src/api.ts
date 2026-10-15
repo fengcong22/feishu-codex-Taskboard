@@ -41,12 +41,19 @@ import type {
   FeishuSubjectConfig,
   FeishuWorkflowShareConfiguration,
   FeishuWorkflowShareResult,
+  FeishuSubjectWorkflowShareConfiguration,
+  FeishuSubjectWorkflowShareInput,
+  FeishuSubjectWorkflowShareResult,
   AutoCutPackageDraft,
   FeishuPackage,
   FeishuPackageSummary,
   FeishuPackageZipOutput,
   FeishuPackageWorkspaceInspection,
+  FeishuPackageWorkflowDraft,
+  FeishuVmPmoWorkflowConfig,
+  FeishuZipWorkflowConfig,
   FeishuAutoCutRun,
+  AutoCutRunConsent,
   CreateUnifiedWorkflowViewInput,
   StageDisplayOverride,
   UnifiedWorkflowStage,
@@ -304,6 +311,13 @@ export async function getAutomaticExecutionSettings(signal?: AbortSignal): Promi
     "/api/local/settings/automatic-execution", { signal },
   );
   return data.setting;
+}
+
+/** Local VM requests share actor headers, base-path handling and bounded cancellation. */
+export function requestVmDownloads<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return requestPackageBounded<T>(`/api/local/vm-downloads${path}`, init, () => new ApiError(0, {
+    error: { code: "VM_DOWNLOAD_REQUEST_TIMEOUT" },
+  }));
 }
 
 export async function updateAutomaticExecutionSettings(input: {
@@ -879,6 +893,23 @@ export async function getFeishuPackage(alias: string): Promise<FeishuPackage> {
   return data.package;
 }
 
+export function getFeishuPackageWorkflowDraft<Config = FeishuVmPmoWorkflowConfig>(subjectKey: string, alias: string, signal?: AbortSignal): Promise<FeishuPackageWorkflowDraft<Config>> {
+  return request<FeishuPackageWorkflowDraft<Config>>(`/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/${encodeURIComponent(alias)}`, { signal });
+}
+
+export function saveFeishuPackageWorkflowDraft<Config extends FeishuVmPmoWorkflowConfig | FeishuZipWorkflowConfig>(subjectKey: string, alias: string, expectedRevision: number, config: Config): Promise<FeishuPackageWorkflowDraft<Config>> {
+  return request<FeishuPackageWorkflowDraft<Config>>(`/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/${encodeURIComponent(alias)}`, {
+    method: "PUT", body: JSON.stringify({ expectedRevision, config }),
+  });
+}
+
+export async function enableFeishuPackageWorkflowDraft(subjectKey: string, alias: string, expectedRevision: number, expectedVersion: number): Promise<FeishuSubjectConfig> {
+  const result = await request<{ subject: FeishuSubjectConfig }>(`/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/${encodeURIComponent(alias)}/enable`, {
+    method: "POST", body: JSON.stringify({ expectedRevision, expectedVersion }),
+  });
+  return result.subject;
+}
+
 export async function saveFeishuPackageDraft(
   alias: string | null,
   patch: AutoCutPackageDraft & { expectedRevision?: number },
@@ -1032,6 +1063,20 @@ export async function importFeishuWorkflowShare(
   return request<FeishuWorkflowShareResult>("/api/local/feishu/workflow/share/import", {
     method: "POST",
     body: JSON.stringify({ configuration, dryRun }),
+  });
+}
+
+export async function exportFeishuSubjectWorkflowShare(subjectKey: string, packageAlias: string): Promise<FeishuSubjectWorkflowShareConfiguration> {
+  const query = new URLSearchParams({ subjectKey, packageAlias });
+  const data = await request<{ configuration: FeishuSubjectWorkflowShareConfiguration }>(
+    `/api/local/feishu/workflow/subject-share/export?${query}`,
+  );
+  return data.configuration;
+}
+
+export function importFeishuSubjectWorkflowShare(input: FeishuSubjectWorkflowShareInput): Promise<FeishuSubjectWorkflowShareResult> {
+  return request<FeishuSubjectWorkflowShareResult>("/api/local/feishu/workflow/subject-share/import", {
+    method: "POST", body: JSON.stringify(input),
   });
 }
 
@@ -1435,12 +1480,13 @@ export async function getTaskAutoCutRuns(
 export async function retryTaskAutoCut(
   taskId: string,
   version: number,
+  runConsent: AutoCutRunConsent,
 ): Promise<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }> {
   return request<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }>(
     `/api/local/tasks/${encodeURIComponent(taskId)}/autocut-retry`,
     {
       method: "POST",
-      body: JSON.stringify({ version }),
+      body: JSON.stringify({ version, runConsent }),
     },
   );
 }

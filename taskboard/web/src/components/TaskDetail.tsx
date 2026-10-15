@@ -59,6 +59,7 @@ import type {
   Task,
   TaskArtifact,
   FeishuAutoCutRun,
+  AutoCutRunConsent,
   TaskChangeActivity,
   TaskDraft,
   TaskPriority,
@@ -1239,12 +1240,12 @@ export function TaskDetail({
     }
   }
 
-  async function retryAutoCut() {
-    if (!isPhasedAutoCutTask || retryingAutoCut) return;
+  async function retryAutoCut(taskId: string, version: number, runConsent: AutoCutRunConsent) {
+    if (!isPhasedAutoCutTask || retryingAutoCut || taskId !== currentTask.id) return;
     setRetryingAutoCut(true);
     setAutoCutRunsError(null);
     try {
-      const result = await retryTaskAutoCut(currentTask.id, currentTask.version);
+      const result = await retryTaskAutoCut(taskId, version, runConsent);
       setCurrentTask(result.task);
       const runs = await getTaskAutoCutRuns(currentTask.id);
       setAutoCutRuns(runs);
@@ -1671,7 +1672,7 @@ export function TaskDetail({
                       task={currentTask}
                       attempts={autoCutRuns}
                       retrying={retryingAutoCut}
-                      onRetry={() => void retryAutoCut()}
+                      onRetry={retryAutoCut}
                       onOpenLog={onOpenAutoCutLog}
                       onCopy={onCopy}
                     />

@@ -147,6 +147,20 @@ function validFinalDirectoryOperation(value) {
     && validVersion(value.configVersion);
 }
 
+function validVmRegistration(value) {
+  if (!objectPayload(value) || Object.keys(value).length !== 2
+    || !objectPayload(value.event) || !objectPayload(value.binding)) return false;
+  const { event, binding } = value;
+  const eventKeys = ["eventId", "baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionId", "afterOptionId"];
+  return Object.keys(event).every((key) => eventKeys.includes(key) || key === "occurredAt")
+    && eventKeys.every((key) => validWritebackIdentifier(event[key]))
+    && event.beforeOptionId !== event.afterOptionId
+    && (!Object.hasOwn(event, "occurredAt") || Number.isSafeInteger(event.occurredAt) && event.occurredAt >= 0)
+    && Object.keys(binding).length === 3
+    && binding.subjectKey === `${event.baseToken}:${event.tableId}`
+    && validVersion(binding.configVersion) && binding.stageId === "initial";
+}
+
 export class TaskboardError extends Error {
   constructor(message, { code = "TASKBOARD_REQUEST_FAILED", status = 0 } = {}) {
     super(message);
@@ -280,6 +294,30 @@ export class TaskboardClient {
     });
     if (!validTask(response?.task)) throw invalidResponse(pathname);
     return response.task;
+  }
+
+  async registerFeishuVmTask(payload, { bridgeSecret = this.bridgeSecret } = {}) {
+    const pathname = "/api/local/feishu/vm/tasks";
+    if (!validVmRegistration(payload)) throw invalidResponse(pathname);
+    const secret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : "";
+    if (!secret) {
+      throw new TaskboardError("Feishu Bridge secret is not configured", {
+        code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED", status: 503,
+      });
+    }
+    const response = await this.#request(pathname, {
+      body: payload,
+      headers: { "x-taskboard-client": "feishu-bridge", "x-feishu-bridge-secret": secret },
+    });
+    const task = response?.task;
+    const origin = task?.feishuOrigin;
+    if (!validFeishuTask(task)
+      || !["eventId", "baseToken", "tableId", "recordId"].every((key) => origin[key] === payload.event[key])
+      || (origin.statusFieldId ?? origin.triggerFieldId) !== payload.event.statusFieldId
+      || !["subjectKey", "configVersion", "stageId"].every((key) => origin[key] === payload.binding[key])) {
+      throw invalidResponse(pathname);
+    }
+    return task;
   }
 
   async ensureFinalDirectory(payload, { bridgeSecret = this.bridgeSecret } = {}) {
