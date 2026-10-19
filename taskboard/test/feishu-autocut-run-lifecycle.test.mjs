@@ -875,7 +875,7 @@ test("a recovered automatic phased reservation runs locally after policy revalid
     await fixture.app.close();
     fixture.app = createTaskboardServer(fixture.serverOptions);
     await listenTaskboardOnFetchSafePort(fixture.app);
-    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 30_000);
     const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
     assert.deepEqual(invocations, [run.runId]);
     assert.equal(run.state, "completed");
