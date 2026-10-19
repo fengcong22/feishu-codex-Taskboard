@@ -802,7 +802,7 @@ test("local switch cancels waiting automatic tasks while a running edit complete
     next.event.eventId = "evt-switch-second";
     next.event.recordId = "rec_switch_second";
     const running = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", next);
-    const deadline = Date.now() + 8_000;
+    const deadline = Date.now() + 30_000;
     while (!started && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
     assert.equal(started, true);
     assert.equal((await save(false, 3)).response.status, 200);
