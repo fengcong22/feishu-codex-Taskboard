@@ -86,6 +86,23 @@ test("package choices retain saved historical identity rather than relabeling a 
   assert.equal(choices[1].historical, true);
 });
 
+test("package choices prefer live identity names and fall back to registry names", () => {
+  const choices = packageBoardChoices([
+    {
+      alias: "slicing",
+      name: "Auto-cut-slicing0.2.0",
+      identity: { displayName: "Auto-cut-slicing0.3.0", pluginVersion: "0.3.0" },
+      workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    },
+    { alias: "lite", name: "Auto-cut-lite1.6.10" },
+  ], [], "slicing");
+
+  assert.deepEqual(choices.map(({ alias, name }) => [alias, name]), [
+    ["slicing", "Auto-cut-slicing0.3.0"],
+    ["lite", "Auto-cut-lite1.6.10"],
+  ]);
+});
+
 test("VM lifecycle uses run evidence and never requires a local acceptance click", () => {
   const cases = [
     ["waiting_materials", "materials"],

@@ -27,6 +27,7 @@ export function packageBoardChoices(packages, tasks, activeAlias) {
   for (const item of packages ?? [])
     choices.set(item.alias, {
       ...item,
+      name: item.identity?.displayName || item.name,
       historical: false,
       workflowTemplate: item.workflowTemplate ?? {
         id: "document_draft_zip",
