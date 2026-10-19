@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
+import { isSameFilesystemPath } from "./filesystem-path-boundary.mjs";
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -43,7 +44,7 @@ function rowValue(row) {
 async function verifiedFile(file, expectedSha, expectedBytes) {
   try {
     if (typeof file !== "string" || !path.isAbsolute(file) || path.normalize(file) !== file
-      || await realpath(file) !== file) throw new Error("noncanonical path");
+      || !isSameFilesystemPath(await realpath(file), file)) throw new Error("noncanonical path");
     const before = await lstat(file, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
       || before.size !== BigInt(expectedBytes)) throw new Error("not a stable file");

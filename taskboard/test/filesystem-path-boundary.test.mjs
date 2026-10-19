@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isStrictDescendantPath } from "../server/filesystem-path-boundary.mjs";
+import { isSameFilesystemPath, isStrictDescendantPath } from "../server/filesystem-path-boundary.mjs";
+
+test("Windows canonical path comparison accepts ordinary and extended forms of the same file", () => {
+  const ordinary = "D:\\a\\_temp\\vm-output\\source.mp4";
+  const extended = "\\\\?\\D:\\a\\_temp\\vm-output\\source.mp4";
+
+  assert.equal(isSameFilesystemPath(extended, ordinary, "win32"), true);
+  assert.equal(isSameFilesystemPath(ordinary, extended, "win32"), true);
+  assert.equal(isSameFilesystemPath(extended, "\\\\?\\E:\\a\\_temp\\vm-output\\source.mp4", "win32"), false);
+});
 
 test("Windows descendant checks accept mixed extended and ordinary absolute path forms", () => {
   const ordinaryRoot = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\materials";
