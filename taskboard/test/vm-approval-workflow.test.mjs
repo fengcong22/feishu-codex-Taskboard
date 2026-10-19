@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdtemp, readFile, rm, unlink, writeFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,7 @@ import { createVmApprovalStore } from "../server/vm-approval-store.mjs";
 import * as vmApprovalWorkflow from "../server/vm-approval-workflow.mjs";
 import { prepareVmSource } from "../server/vm-source-adapter.mjs";
 import { VmSourceError } from "../server/vm-source-transfer.mjs";
+import { isStrictDescendantPath } from "../server/filesystem-path-boundary.mjs";
 import { enqueueVmApproval, extendVmApprovalWait, processVmApproval, resumeVmApproval, summarizeVmApproval,
   validateVmApprovalRequest, verifyVmAcquisitionReceipt } from "../server/vm-approval-workflow.mjs";
 
@@ -464,6 +466,11 @@ test("operator-confirmed repeatable download recovery reuses the approved applic
   assert.throws(() => vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, job.id, {
     confirmRepeatableResource: false, privateEndpoints: policy, now: f.now,
   }), { code: "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED" });
+
+  const canonicalOutputRoot = realpathSync(f.request.output_root);
+  const canonicalJobRoot = realpathSync(path.dirname(failed.receipt_path));
+  assert.ok(isStrictDescendantPath(canonicalOutputRoot, canonicalJobRoot),
+    JSON.stringify({ canonicalOutputRoot, canonicalJobRoot, receiptPath: failed.receipt_path }));
 
   const recovered = vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, job.id, {
     confirmRepeatableResource: true, privateEndpoints: policy, now: f.now,
