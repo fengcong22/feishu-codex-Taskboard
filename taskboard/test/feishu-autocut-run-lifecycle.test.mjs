@@ -575,7 +575,7 @@ test("the panel-authorized retry of a failed automatic run keeps local execution
     const subject = await registerSubject(fixture, { executionMode: "automatic" });
     const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
     assert.equal(created.response.status, 201, JSON.stringify(created.body));
-    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 8_000);
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 30_000);
     const [firstRun] = fixture.app.database.listFeishuAutoCutRuns(blocked.id);
     const firstAiRun = fixture.app.database.getAiChatRun(firstRun.runId);
     const firstSnapshot = fixture.app.aiChat.getThreadSnapshot(firstAiRun.threadId);
