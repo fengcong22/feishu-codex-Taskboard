@@ -72,7 +72,7 @@ function message(error: unknown): string {
     if (error.code === "PACKAGE_WORKFLOW_DRAFT_UNSUPPORTED") return "此包暂不支持该流程，请重新选择包。";
     if (error.code === "PACKAGE_WORKFLOW_NOT_READY") return "本机初稿运行能力尚未就绪，请检查运行配置后重试。";
     if (error.code === "PACKAGE_DISABLED") return "请先在剪辑包管理中启用当前包。";
-    if (error.code === "VM_WORKFLOW_NOT_READY") return "当前仅支持完整配置的初稿流程，请关闭审核修改和成片归档并检查必填字段。";
+    if (error.code === "VM_WORKFLOW_NOT_READY") return "VM 流程未满足启用条件，请检查已启用阶段的字段、选项和归档路径。";
   }
   return "流程草稿读取或保存失败，请重试。";
 }
@@ -231,18 +231,48 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
       || current.enabling || current.conflict || isDirty(current)) return "请先保存当前流程草稿并处理配置冲突。";
     const draft = current.config;
     const stage = draft.stages.initial;
-    if (!stage.enabled || draft.stages.review.enabled || draft.finalArchive?.enabled) return "当前仅支持初稿，请关闭审核修改和成片归档。";
-    const status = uniqueFields.find((field) => field.fieldId === stage.statusFieldId && isSingleSelectField(field));
-    if (!status || status.options.filter((option) => option.id === stage.triggerOptionId).length !== 1
+    if (!stage.enabled) return "请启用并配置初稿阶段。";
+    const hasTrigger = (fieldId: string | null, optionId: string | null) => {
+      const field = uniqueFields.find((candidate) => candidate.fieldId === fieldId && isSingleSelectField(candidate));
+      return Boolean(field && field.options.filter((option) => option.id === optionId).length === 1);
+    };
+    if (!hasTrigger(stage.statusFieldId, stage.triggerOptionId)
       || !uniqueFields.some((field) => field.fieldId === draft.fields.vmidFieldId && textField(field))
       || !namingFields.some((field) => field.fieldId === draft.fields.namingFieldId)
       || !uniqueFields.some((field) => field.fieldId === draft.fields.outputAttachmentFieldId && isAttachmentField(field))
       || !uniqueFields.some((field) => field.fieldId === stage.instructionFieldId && textField(field))
       || !draft.approval.department.trim() || !draft.approval.reason.trim()) return "请补齐来源、命名、附件、初稿意见和单选触发配置。";
-    for (const target of Object.values(stage.writeback ?? {})) {
-      if (!target.fieldId && !target.optionId) continue;
-      const field = uniqueFields.find((candidate) => candidate.fieldId === target.fieldId && isSingleSelectField(candidate));
-      if (!field || field.options.filter((option) => option.id === target.optionId).length !== 1) return "请检查阶段状态回写字段和选项。";
+
+    const enabledStages = Object.entries(draft.stages).filter(([, value]) => value.enabled);
+    for (const [stageId, configuredStage] of enabledStages) {
+      if (stageId !== "initial" && (!hasTrigger(configuredStage.statusFieldId, configuredStage.triggerOptionId)
+        || !uniqueFields.some((field) => field.fieldId === configuredStage.instructionFieldId && textField(field)))) {
+        return "请补齐审核修改的进度字段、触发状态和审核意见字段。";
+      }
+      if (stageId === "review") {
+        const review = draft.stages.review;
+        if (review.instructionAttachmentsFieldId
+          && !uniqueFields.some((field) => field.fieldId === review.instructionAttachmentsFieldId && isAttachmentField(field))) {
+          return "请检查审核意见附件字段。";
+        }
+      }
+      for (const target of Object.values(configuredStage.writeback ?? {})) {
+        if (!target.fieldId && !target.optionId) continue;
+        const field = uniqueFields.find((candidate) => candidate.fieldId === target.fieldId && isSingleSelectField(candidate));
+        if (!field || field.options.filter((option) => option.id === target.optionId).length !== 1) return "请检查阶段状态回写字段和选项。";
+      }
+    }
+    const archive = draft.finalArchive;
+    if (archive?.enabled) {
+      if (!hasTrigger(archive.statusFieldId, archive.triggerOptionId)) return "请补齐成片归档的进度字段和触发状态。";
+      if (archive.pathSource === "manual" ? !archive.directoryPath?.trim()
+        : !namingFields.some((field) => field.fieldId === archive.pathFieldId)) {
+        return "请配置有效的成片归档目录或 PMO 路径字段。";
+      }
+      if (enabledStages.some(([, configuredStage]) => configuredStage.statusFieldId === archive.statusFieldId
+        && configuredStage.triggerOptionId === archive.triggerOptionId)) {
+        return "成片归档触发状态必须与初稿、审核修改触发状态不同。";
+      }
     }
     return "";
   }
@@ -415,9 +445,9 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
     </section>
     <div className="feishu-subject-actions feishu-vm-pmo-actions">
       {saved && <span role="status">流程草稿已保存。</span>}
-      {entry.enabled && <span role="status">初稿流程已启用。</span>}
+      {entry.enabled && <span role="status">VM 流程已启用。</span>}
       <button type="button" className="button secondary" disabled={!config || !profile || saving || enabling || loading || entry.conflict} onClick={() => void save()}>{saving ? "正在保存…" : "保存流程草稿"}</button>
-      <button type="button" className="button primary" disabled={Boolean(enableBlockedReason)} title={enableBlockedReason || "启用已保存的初稿流程"} onClick={() => void enable()}>{enabling ? "正在启用…" : "启用流程"}</button>
+      <button type="button" className="button primary" disabled={Boolean(enableBlockedReason)} title={enableBlockedReason || "启用已保存的 VM 流程"} onClick={() => void enable()}>{enabling ? "正在启用…" : "启用流程"}</button>
     </div>
   </section>;
 }

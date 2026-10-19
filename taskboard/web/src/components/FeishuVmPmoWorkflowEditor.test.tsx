@@ -64,10 +64,44 @@ describe("VM package draft editing boundaries", () => {
     await screen.findByRole("group", { name: "视频来源" });
     expect((screen.getByRole("button", { name: "启用流程" }) as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "启用流程" }));
-    await screen.findByText("初稿流程已启用。");
+    await screen.findByText("VM 流程已启用。");
     expect(enableFeishuPackageWorkflowDraft).toHaveBeenCalledWith("subject-a", "vm-a", 1, 4);
     expect(onEnabled).toHaveBeenCalledWith(enabled);
     expect(saveFeishuPackageWorkflowDraft).not.toHaveBeenCalled();
+  });
+
+  it("enables a complete initial, review and archive workflow", async () => {
+    const next = readyProfile();
+    const statusOptions = [
+      { id: "ready", name: "待剪辑" }, { id: "review", name: "审核修改" }, { id: "archive", name: "出片" },
+    ];
+    const fields: FeishuFieldMetadata[] = [
+      ...readyFields.filter((field) => field.fieldId !== "status"),
+      { fieldId: "status", fieldName: "状态", type: 3, uiType: "SingleSelect", options: statusOptions },
+      { fieldId: "review-instruction", fieldName: "审核意见", type: 1, uiType: "Text", options: [] },
+      { fieldId: "review-images", fieldName: "审核截图", type: 17, uiType: "Attachment", options: [] },
+    ];
+    next.config.stages.review = {
+      enabled: true, statusFieldId: "status", triggerOptionId: "review", instructionFieldId: "review-instruction",
+      instructionAttachmentsFieldId: "review-images",
+    };
+    next.config.finalArchive = {
+      enabled: true, statusFieldId: "status", triggerOptionId: "archive",
+      pathSource: "manual", directoryPath: "\\\\nas\\deliveries", pathFieldId: null,
+    };
+    vi.mocked(getFeishuPackageWorkflowDraft).mockResolvedValue(next);
+    const enabled = { subjectKey: "subject-a", configVersion: 5, activeConfigVersion: 5,
+      activePackageAlias: "vm-a", workflowTemplate: template };
+    vi.mocked(enableFeishuPackageWorkflowDraft).mockResolvedValue(enabled as never);
+    const onEnabled = vi.fn();
+    render(editor(new Map(), "vm-a", { ...readyProps, fields, onEnabled }));
+    await screen.findByRole("group", { name: "视频来源" });
+    const button = screen.getByRole("button", { name: "启用流程" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    fireEvent.click(button);
+    await screen.findByText("VM 流程已启用。");
+    expect(enableFeishuPackageWorkflowDraft).toHaveBeenCalledWith("subject-a", "vm-a", 1, 4);
+    expect(onEnabled).toHaveBeenCalledWith(enabled);
   });
 
   it.each([
@@ -81,7 +115,7 @@ describe("VM package draft editing boundaries", () => {
     expect(enableFeishuPackageWorkflowDraft).not.toHaveBeenCalled();
   });
 
-  it.each(["review", "archive", "multiselect", "missing-name", "unsaved-profile"])("keeps unsupported or incomplete %s workflows blocked", async (kind) => {
+  it.each(["review", "archive", "multiselect", "missing-name", "unsaved-profile"])("keeps incomplete %s workflows blocked", async (kind) => {
     const next = readyProfile();
     let fields = readyFields;
     if (kind === "review") next.config.stages.review.enabled = true;
@@ -108,7 +142,7 @@ describe("VM package draft editing boundaries", () => {
     await screen.findByText("流程草稿已保存。");
     expect((screen.getByRole("button", { name: "启用流程" }) as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "启用流程" }));
-    await screen.findByText("初稿流程已启用。");
+    await screen.findByText("VM 流程已启用。");
     expect(enableFeishuPackageWorkflowDraft).toHaveBeenCalledWith("subject-a", "vm-a", 2, 4);
   });
 
