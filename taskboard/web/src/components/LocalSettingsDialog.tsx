@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, getAutomaticExecutionSettings, updateAutomaticExecutionSettings } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import type { AutomaticExecutionSettings } from "../types";
-import { VmDownloadsPanel } from "./VmDownloadsPanel";
 
 interface LocalSettingsDialogProps {
   revision: number;
@@ -17,7 +16,6 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const [activePanel, setActivePanel] = useState<"automatic" | "downloads">("automatic");
   const dialogRef = useRef<HTMLElement>(null);
   const requestRef = useRef(0);
   const savingRef = useRef(false);
@@ -119,7 +117,7 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
     }}>
       <section
         ref={dialogRef}
-        className={`delete-dialog local-settings-dialog${activePanel === "downloads" ? " vm-downloads-open" : ""}`}
+        className="delete-dialog local-settings-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby="local-settings-title"
@@ -144,39 +142,25 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
         }}
       >
         <h2 id="local-settings-title">{text("本机设置", "Local settings")}</h2>
-        <nav className="local-settings-panels" aria-label={text("本机设置分类", "Local settings sections")}>
-          <button type="button" className="button secondary" aria-pressed={activePanel === "automatic"} onClick={() => setActivePanel("automatic")}>{text("自动剪辑", "Automatic editing")}</button>
-          <button type="button" className="button secondary" aria-pressed={activePanel === "downloads"} onClick={() => setActivePanel("downloads")}>{text("VM 下载", "VM downloads")}</button>
-        </nav>
-        {activePanel === "downloads" ? <VmDownloadsPanel /> : <>
         <label className="local-settings-switch-row">
-          <span>{text("允许本机自动剪辑", "Allow automatic editing on this device")}</span>
+          <span>{text("自动执行", "Automatic execution")}</span>
           <input
             className="local-settings-switch"
             type="checkbox"
             role="switch"
             checked={settings?.enabled ?? false}
             disabled={!settings || loading || saving}
-            aria-describedby="local-settings-help"
             onChange={(event) => void saveSettings(event.target.checked)}
           />
         </label>
-        <section id="local-settings-help" className="local-settings-help">
-          <p>{text("适用于本机所有学科。设置立即生效，重启后保留。", "Applies to all subjects on this device. Changes take effect immediately and persist after restart.")}</p>
-          <p>{text("关闭后，尚未开始的自动任务退回待处理；正在执行的任务继续完成。", "Turning this off returns unstarted automatic tasks to Ready. Running tasks will continue.")}</p>
-          <p>{text("开启后仅允许新触发的合格任务自动剪辑，不会自动启动历史任务；学科仍需设为自动并启用。", "Turning this on allows eligible newly triggered tasks to start; it does not start historical tasks. Each subject must also be enabled in automatic mode.")}</p>
-        </section>
-        <p role="status" className="local-settings-status">
+        {(saving || loading || saved) && <p role="status" className="local-settings-status">
           {saving ? text("正在保存…", "Saving…")
             : loading ? text("正在读取…", "Loading…")
-              : saved ? text("已保存", "Saved")
-                : settings ? settings.enabled ? text("已开启", "On") : text("已关闭", "Off")
-                  : text("状态未知", "Status unknown")}
-        </p>
+              : text("已保存", "Saved")}
+        </p>}
         {error && <p role="alert" className="project-dialog-error">{error}</p>}
-        </>}
         <div>
-          {activePanel === "automatic" && !settings && !loading && <button className="button secondary" type="button" onClick={() => void loadSettings()}>{text("重试", "Retry")}</button>}
+          {!settings && !loading && <button className="button secondary" type="button" onClick={() => void loadSettings()}>{text("重试", "Retry")}</button>}
           <button className="button secondary" type="button" disabled={saving} onClick={onClose}>{text("关闭", "Close")}</button>
         </div>
       </section>

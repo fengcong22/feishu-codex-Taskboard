@@ -241,11 +241,14 @@ test("a matching declared resolution publishes a ready acquisition", async (t) =
   assert.deepEqual(result.provenance.expected_resolution, { width: 1280, height: 720 });
 });
 
-test("a declared resolution mismatch cleans up its own material without publishing", async (t) => {
+test("a source below the declared minimum cleans up its own material without publishing", async (t) => {
   const { outputRoot } = await fixture(t);
   await assert.rejects(prepareVmSource(urlRequest({ expected_resolution: { width: 1280, height: 720 } }), {
     outputRoot,
-  }, { download: successfulTransfer([]), validateMedia: validMedia }), { code: "SOURCE_RESOLUTION_MISMATCH" });
+  }, {
+    download: successfulTransfer([]),
+    validateMedia: async () => ({ ...(await validMedia()), video: [{ index: 0, codec: "h264", width: 1279, height: 720 }] }),
+  }), { code: "SOURCE_RESOLUTION_MISMATCH_1279X720_EXPECTED_1280X720" });
 
   const [job] = await readdir(outputRoot);
   assert.deepEqual(await readdir(path.join(outputRoot, job)), []);

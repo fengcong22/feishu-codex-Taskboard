@@ -93,6 +93,31 @@ test("does not update a single-select field that already has the frozen option",
   assert.equal(calls.some(([name]) => name === "update"), false);
 });
 
+test("refuses a delayed VM stage write when the PMO status has advanced", async () => {
+  const { writer, calls } = writerFixture({
+    fields: [{
+      field_id: "fld_status",
+      field_name: "当前状态",
+      type: 3,
+      ui_type: "SingleSelect",
+      property: { options: [
+        { id: "opt_processing", name: "处理中" },
+        { id: "opt_complete", name: "初稿完成" },
+        { id: "opt_review", name: "待修改" },
+      ] },
+    }],
+    recordFields: { fld_status: [{ option_id: "opt_review" }] },
+  });
+
+  await assert.rejects(() => writer.apply(frozenIntent({
+    type: "single_select",
+    fieldId: "fld_status",
+    optionId: "opt_complete",
+    guard: { fieldId: "fld_status", optionIds: ["opt_processing", "opt_complete"] },
+  })), (error) => error.code === "WRITEBACK_REFERENCE_INVALID" && error.status === 409);
+  assert.equal(calls.some(([name]) => name === "update"), false);
+});
+
 test("writes field and single-select display names exactly as returned by Feishu metadata", async () => {
   const { writer, calls } = writerFixture({
     fields: [{

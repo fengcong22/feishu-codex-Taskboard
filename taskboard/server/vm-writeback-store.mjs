@@ -17,10 +17,18 @@ function id(value) { return typeof value === "string" && IDENTIFIER.test(value);
 function exactKeys(value, keys) {
   return object(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
+function statusGuard(value) {
+  if (!exactKeys(value, ["fieldId", "optionIds"]) || !id(value.fieldId)
+    || !Array.isArray(value.optionIds) || value.optionIds.length < 1 || value.optionIds.length > 16
+    || !value.optionIds.every(id) || new Set(value.optionIds).size !== value.optionIds.length) throw fail();
+  return { fieldId: value.fieldId, optionIds: [...value.optionIds] };
+}
 function operation(value) {
-  if (!exactKeys(value, ["type", "fieldId", "optionId"]) || value.type !== "single_select"
-    || !id(value.fieldId) || !id(value.optionId)) throw fail();
-  return { type: "single_select", fieldId: value.fieldId, optionId: value.optionId };
+  if (!object(value) || Object.keys(value).some((key) => !["type", "fieldId", "optionId", "guard"].includes(key))
+    || !["type", "fieldId", "optionId"].every((key) => Object.hasOwn(value, key))
+    || value.type !== "single_select" || !id(value.fieldId) || !id(value.optionId)) throw fail();
+  return { type: "single_select", fieldId: value.fieldId, optionId: value.optionId,
+    ...(Object.hasOwn(value, "guard") ? { guard: statusGuard(value.guard) } : {}) };
 }
 function intent(value) {
   if (!exactKeys(value, ["idempotencyKey", "taskId", "runId", "courseBindingId", "operation"])
@@ -142,6 +150,35 @@ export function createVmWritebackStore({ database, validateIntent, now = Date.no
       return (runId === undefined ? db.prepare("SELECT * FROM vm_writeback_outbox ORDER BY created_at, id").all()
         : db.prepare("SELECT * FROM vm_writeback_outbox WHERE run_id = ? ORDER BY created_at, id").all(runId)).map(rowValue);
     },
+    async retryDeadLetterWritebacks({ taskId, runId } = {}, beforeCommit = () => {}) {
+      if (!id(taskId) || !id(runId) || typeof beforeCommit !== "function") throw fail();
+      const entries = db.prepare(`SELECT * FROM vm_writeback_outbox WHERE run_id = ?
+        ORDER BY CASE moment WHEN 'processing' THEN 0 ELSE 1 END`).all(runId).map(rowValue);
+      if (entries.length !== 2 || entries.some(entry => entry.taskId !== taskId)
+        || entries[0].moment !== "processing" || entries[0].state !== "dead_letter"
+        || entries[1].moment !== "completed" || entries[1].state !== "dead_letter")
+        throw fail("WRITEBACK_RETRY_NOT_ALLOWED", 409);
+      for (const entry of entries) {
+        const trusted = resolution(await validateIntent(intent({ idempotencyKey: entry.idempotencyKey,
+          taskId, runId, courseBindingId: null, operation: entry.operation })));
+        if (JSON.stringify(trusted.target) !== JSON.stringify(entry.target)
+          || JSON.stringify(trusted.operation) !== JSON.stringify(entry.operation))
+          throw fail("WRITEBACK_REFERENCE_INVALID", 409);
+      }
+      return transaction(() => {
+        beforeCommit();
+        for (const entry of entries) {
+          if (JSON.stringify(lookup(entry.id)) !== JSON.stringify(entry)) throw fail("WRITEBACK_RETRY_NOT_ALLOWED", 409);
+        }
+        const at = time();
+        for (const entry of entries.filter(entry => entry.state === "dead_letter")) {
+          db.prepare(`UPDATE vm_writeback_outbox SET state = 'pending', version = version + 1,
+            attempt_count = 0, next_attempt_at = ?, claim_token = NULL, lease_until = NULL,
+            error_code = NULL, updated_at = ? WHERE id = ?`).run(at, at, entry.id);
+        }
+        return entries.map(entry => lookup(entry.id));
+      });
+    },
     getNextWritebackAttemptAt() {
       return db.prepare(`SELECT MIN(q.next_attempt_at) AS at FROM vm_writeback_outbox q WHERE ${READY_SQL}`).get()?.at ?? null;
     },
@@ -185,7 +222,7 @@ export function createVmWritebackStore({ database, validateIntent, now = Date.no
       if (nextAttemptAt <= time()) throw fail();
       const current = lookup(key);
       if (current && current.attemptCount >= MAX_ATTEMPTS) {
-        return transition(key, token, "dead_letter", { code: "WRITEBACK_RETRIES_EXHAUSTED" });
+        return transition(key, token, "dead_letter", { code: errorCode(input) });
       }
       return transition(key, token, "retry_wait", { nextAttemptAt, code: errorCode(input) });
     },

@@ -106,6 +106,98 @@ test("accepts a bound single ordered-segment plan", async (t) => {
   assert.equal(validated.plan.expected_duration_ms, 1000);
 });
 
+test("validates a v2 initial plan with source-bound semantic operations", async (t) => {
+  const current = await fixture(t);
+  const identity = { ...current.identity, schema_version: 2 };
+  const instruction = { ...current.input.instructions[0], raw_text: "0:00 剪掉‘测试词’的声音",
+    must_keep: [], visual_evidence: undefined };
+  delete instruction.visual_evidence;
+  const input = { ...identity, source: current.source, instructions: [instruction],
+    output_profile: current.input.output_profile };
+  await replaceInput(current, input);
+  current.context.schema_version = 2;
+  await writeFile(current.contextPath, JSON.stringify(current.context));
+
+  const alignmentSha256 = "c".repeat(64);
+  const plan = { ...identity, source: current.source, input_sha256: current.context.input_sha256,
+    source_sha256: current.source.sha256,
+    instruction_results: [{ instruction_id: instruction.instruction_id,
+      source_field_id: instruction.source_field_id, raw_text: instruction.raw_text,
+      status: "resolved", segments: ["s1"] }],
+    segments: [{ segment_id: "s1", source_id: current.source.source_id,
+      source_start_us: 0, duration_us: 1_000_000, target_start_us: 0 }],
+    operations: [{ operation_id: "part1/edit1", kind: "mute_word", source_start_us: 200_000,
+      source_end_us: 400_000, target_join_us: 200_000, matched_text: "测试词",
+      match_strategy: "unique_exact_whole_token", alignment_sha256: alignmentSha256,
+      provider: "fixture", model: "fixture", adapter: "fixture", must_keep_evidence: [] }],
+    expected_duration_ms: 1_000, engine_plan_sha256: "b".repeat(64), alignment_sha256: alignmentSha256 };
+  const planBytes = Buffer.from(JSON.stringify(plan));
+  await writeFile(current.paths.plan, planBytes);
+  const planSha256 = hash(planBytes);
+  const receipt = { ...identity, status: "ready", input_sha256: current.context.input_sha256,
+    source_sha256: current.source.sha256, plan_sha256: planSha256,
+    instruction_results: plan.instruction_results, error: null };
+  await writeFile(current.paths["plan-result"], JSON.stringify(receipt));
+
+  const validated = await validateVmPmoPlan({ contextPath: current.contextPath });
+  assert.equal(validated.input.binding.stage_id, "initial");
+  assert.equal(validated.plan.operations[0].kind, "mute_word");
+});
+
+test("validates frozen review text identity without parsing requested edit operations", async (t) => {
+  const current = await fixture(t);
+  const parent = { kind: "managed_run", run_id: "parent-run", artifact_id: "parent-artifact",
+    delivery_id: "delivery-1", sha256: current.source.sha256, bytes: current.source.bytes, duration_ms: 1000 };
+  const identity = { ...current.identity, schema_version: 2,
+    binding: { ...current.identity.binding, stage_id: "review" },
+    review_round: { round_id: "review-run", input_snapshot_id: "review-snapshot", parent } };
+  const source = { ...current.source, timeline_basis: "previous_review_video" };
+  const instructions = [{ ...current.input.instructions[0], raw_text: "剪辑包根据这条原始意见处理",
+    timeline_basis: "previous_review_video" }];
+  const input = { ...identity, source, instructions, output_profile: current.input.output_profile };
+  const inputBytes = Buffer.from(JSON.stringify(input));
+  await writeFile(current.paths.input, inputBytes);
+  current.context.schema_version = 2;
+  current.context.input_sha256 = hash(inputBytes);
+  await writeFile(current.contextPath, JSON.stringify(current.context));
+
+  const alignment = { schema_version: 1, source_sha256: source.sha256, provider: "fixture",
+    model: "fixture", adapter: "fixture", words: [
+      { text: "前", start: 0, end: 0.2 }, { text: "词", start: 0.2, end: 0.4 },
+      { text: "中", start: 0.4, end: 0.6 }, { text: "词", start: 0.6, end: 0.8 },
+      { text: "后", start: 0.8, end: 1 },
+    ] };
+  const alignmentBytes = Buffer.from(JSON.stringify(alignment));
+  await writeFile(path.join(path.dirname(current.contextPath), "alignment.words.json"), alignmentBytes);
+  const plan = { ...identity, source, input_sha256: current.context.input_sha256, source_sha256: source.sha256,
+    instruction_results: [{ instruction_id: instructions[0].instruction_id,
+      source_field_id: instructions[0].source_field_id, raw_text: instructions[0].raw_text,
+      status: "resolved", segments: ["clip-1"] }],
+    segments: [
+      { segment_id: "clip-1", source_id: source.source_id, source_start_us: 0,
+        duration_us: 200_000, target_start_us: 0 },
+      { segment_id: "clip-2", source_id: source.source_id, source_start_us: 400_000,
+        duration_us: 600_000, target_start_us: 200_000 },
+    ],
+    operations: [{ operation_id: "delete-1", kind: "word", source_start_us: 200_000,
+      source_end_us: 400_000, target_join_us: 200_000, matched_text: "词",
+      match_strategy: "unique_exact_whole_token", alignment_sha256: hash(alignmentBytes),
+      provider: "fixture", model: "fixture", adapter: "fixture", must_keep_evidence: [] },
+    { operation_id: "clip-1/start_cue", kind: "start_cue", source_start_us: 0,
+      source_end_us: 200_000, requested_start_us: 0, search_end_us: 200_000,
+      search_radius_us: 3_000_000, matched_text: "前", match_strategy: "unique_exact_whole_token",
+      alignment_sha256: hash(alignmentBytes), provider: "fixture", model: "fixture", adapter: "fixture" }],
+    expected_duration_ms: 800, engine_plan_sha256: "b".repeat(64), alignment_sha256: hash(alignmentBytes) };
+  const planBytes = Buffer.from(JSON.stringify(plan));
+  await writeFile(current.paths.plan, planBytes);
+  const receipt = { ...identity, status: "ready", input_sha256: current.context.input_sha256,
+    source_sha256: source.sha256, plan_sha256: hash(planBytes), instruction_results: plan.instruction_results, error: null };
+  await writeFile(current.paths["plan-result"], JSON.stringify(receipt));
+  const validated = await validateVmPmoPlan({ contextPath: current.contextPath });
+  assert.equal(validated.status, "ready");
+  assert.equal(validated.plan.expected_duration_ms, 800);
+});
+
 test("rejects a stale parent and malformed ordered segments", async (t) => {
   const current = await fixture(t);
   const replacePlan = async (plan) => {

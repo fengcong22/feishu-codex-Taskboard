@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { createVmDownloadSession } from "./vm-download-session.mjs";
-import { enqueueVmApproval, extendVmApprovalWait, processVmApproval, resumeVmApproval, summarizeVmApproval, validateVmApprovalRequest } from "./vm-approval-workflow.mjs";
+import { enqueueVmApproval, extendVmApprovalWait, processVmApproval, recoverVmApprovalAcquisition, resumeVmApproval, summarizeVmApproval,
+  validateVmApprovalRequest, vmApprovalJobIdForTaskRun } from "./vm-approval-workflow.mjs";
 import { VmSourceError } from "./vm-source-transfer.mjs";
 import { prepareVmSource } from "./vm-source-adapter.mjs";
 
 const TERMINAL = new Set(["ready", "rejected", "canceled", "needs_attention", "auth_required", "dead_letter"]);
+const MAX_QUEUE_CLEANUP_ITEMS = 1000;
 const DAY = 86400000;
 const fail = code => { throw new VmSourceError(code); };
 function object(value) { return value && typeof value === "object" && !Array.isArray(value); }
@@ -46,7 +48,23 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
   try { settings = validateSettings(settings); } catch { fail("VM_DOWNLOAD_STATE_INVALID"); }
   let lastAccount = metadata.read("account");
   if (lastAccount !== null && !accountValid(lastAccount)) fail("VM_DOWNLOAD_STATE_INVALID");
-  function publicJob(job) { return summarizeVmApproval(job, { includeLocalRequest: true }); }
+  function publicJob(job) {
+    const configuredOrigin = privateEndpoints.some((endpoint) => job.request.allowed_origins.includes(endpoint.origin));
+    const privateAddressFailure = job.last_error === "VM_SOURCE_ADDRESS_NOT_ALLOWED";
+    const unknownOutcome = job.last_error === "VM_DOWNLOAD_OUTCOME_UNKNOWN";
+    const resourceClaim = job.last_error === "VM_RESOURCE_ALREADY_CLAIMED"
+      && typeof job.application_id === "string" && typeof job.instance_code === "string"
+      && job.approval?.status === "APPROVED" && job.approval.resource_id === job.request?.vmid
+      && job.approval.video_quality === "HIGH" && /^[a-f0-9]{64}$/u.test(job.resource_fingerprint ?? "")
+      && job.receipt_path === undefined && job.acquisition === undefined;
+    const recovery = job.status === "needs_attention"
+      ? resourceClaim ? { kind: "resource_claim" }
+        : configuredOrigin ? privateAddressFailure ? { kind: "private_address" }
+          : unknownOutcome ? { kind: "unknown_outcome" } : null
+        : null
+      : null;
+    return { ...summarizeVmApproval(job, { includeLocalRequest: true }), ...(recovery ? { recovery } : {}) };
+  }
   function owner(job, required = false) {
     const identity = session.identity();
     if (required && !session.client()) fail("VM_AUTH_REQUIRED");
@@ -159,6 +177,30 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     return running;
   }
   function kick() { if (started) void wake(); }
+  function enqueueRequests(input, scope) {
+    if (closed) fail("VM_DOWNLOAD_CLOSED");
+    keys(input, ["vmids", "department", "reason", "outputRoot"]);
+    if (!Array.isArray(input.vmids) || input.vmids.length < 1 || input.vmids.length > 50
+      || (scope && input.vmids.length !== 1)) fail("VM_DOWNLOAD_BATCH_INVALID");
+    const requests = [...new Set(input.vmids)].map(vmid => request(vmid, input));
+    if (scope && requests.length !== 1) fail("VM_DOWNLOAD_BATCH_INVALID");
+    const taskJobId = scope ? vmApprovalJobIdForTaskRun(scope.taskId, scope.runId) : null;
+    // Check all existing ownership before creating any jobs.
+    const existing = store.list();
+    const identity = session.client() ? session.identity() : null;
+    for (const value of requests) {
+      const duplicate = existing.find(job => JSON.stringify(job.request) === JSON.stringify(value));
+      if (duplicate?.requester_id && duplicate.requester_id !== identity?.user_id) fail("VM_APPLICANT_CHANGED");
+    }
+    const jobs = requests.map(value => {
+      let job = enqueueVmApproval(store, value, { now,
+        ...(taskJobId ? { id: taskJobId, dedupeByRequest: false } : {}) });
+      if (job.queue_hidden_at !== undefined) job = store.restoreQueueItem(job.id);
+      if (identity && !job.requester_id) bind(job.id, identity);
+      return publicJob(store.get(job.id));
+    });
+    kick(); return { jobs };
+  }
   return {
     requestFor(input) {
       if (closed) fail("VM_DOWNLOAD_CLOSED");
@@ -182,36 +224,47 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       }
       return { ...publicJob(job), requestFingerprint: job.request_fingerprint };
     },
+    lookupTaskRun(input) {
+      if (closed) fail("VM_DOWNLOAD_CLOSED");
+      keys(input, ["jobId"]);
+      if (typeof input.jobId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u.test(input.jobId)) {
+        fail("VM_DOWNLOAD_INPUT_INVALID");
+      }
+      const job = store.get(input.jobId);
+      if (!job) return null;
+      if (session.client() && job.requester_id && job.requester_id !== session.identity()?.user_id) {
+        fail("VM_APPLICANT_CHANGED");
+      }
+      return { ...publicJob(job), requestFingerprint: job.request_fingerprint,
+        request: structuredClone(job.request) };
+    },
     snapshot() {
       const summary = metadata.summary();
-      return { session: session.snapshot(), settings: structuredClone(settings), jobs: store.list().map(publicJob),
+      return { session: session.snapshot(), settings: structuredClone(settings), jobs: store.list()
+        .filter(job => job.queue_hidden_at === undefined).map(publicJob),
         notifications: { ...summary, available: notifier.available() && Boolean(lastAccount) && !summary.errorCode, enabled: settings.notificationsEnabled,
           errorCode: !notifier.available() ? "VM_NOTIFY_NOT_CONFIGURED" : !lastAccount ? "VM_NOTIFY_RECIPIENT_UNAVAILABLE" : summary.errorCode },
         worker: { running: Boolean(running), errorCode: workerError } };
     },
+    cleanup(jobIds) {
+      if (!Array.isArray(jobIds) || jobIds.length < 1 || jobIds.length > MAX_QUEUE_CLEANUP_ITEMS
+        || jobIds.some(id => typeof id !== "string") || new Set(jobIds).size !== jobIds.length) fail("VM_DOWNLOAD_INPUT_INVALID");
+      return { clearedCount: store.hideFromQueue(jobIds).length };
+    },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); metadata.write("settings", settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },
-    enqueue(input) {
-      if (closed) fail("VM_DOWNLOAD_CLOSED");
-      keys(input, ["vmids", "department", "reason", "outputRoot"]);
-      if (!Array.isArray(input.vmids) || input.vmids.length < 1 || input.vmids.length > 50) fail("VM_DOWNLOAD_BATCH_INVALID");
-      const requests = [...new Set(input.vmids)].map(vmid => request(vmid, input));
-      // Check all existing ownership before creating any jobs.
-      const existing = store.list();
-      const identity = session.client() ? session.identity() : null;
-      for (const value of requests) {
-        const duplicate = existing.find(job => JSON.stringify(job.request) === JSON.stringify(value));
-        if (duplicate?.requester_id && duplicate.requester_id !== identity?.user_id) fail("VM_APPLICANT_CHANGED");
-      }
-      const jobs = requests.map(value => {
-        const job = enqueueVmApproval(store, value, { now });
-        if (identity && !job.requester_id) bind(job.id, identity);
-        return publicJob(store.get(job.id));
-      });
-      kick(); return { jobs };
-    },
+    enqueue(input) { return enqueueRequests(input); },
+    enqueueForTask(input, scope) { return enqueueRequests(input, scope); },
     resume(id) { const job = store.get(id); if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND"); owner(job, true); const result = resumeVmApproval(store, id, { now }); kick(); return { job: publicJob(result) }; },
+    recover(id, input) {
+      keys(input, ["confirmRepeatableResource"]);
+      const job = store.get(id);
+      if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND");
+      owner(job, true);
+      const result = recoverVmApprovalAcquisition(store, id, { confirmRepeatableResource: input.confirmRepeatableResource, privateEndpoints, now });
+      kick(); return { job: publicJob(result) };
+    },
     extend(id) { const job = store.get(id); if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND"); owner(job, true); const result = extendVmApprovalWait(store, id, { now }); kick(); return { job: publicJob(result) }; },
     start() { if (closed || started) return; started = true; timer = setInterval(() => { void wake(); }, tickMs); timer.unref?.(); kick(); },
     wake,

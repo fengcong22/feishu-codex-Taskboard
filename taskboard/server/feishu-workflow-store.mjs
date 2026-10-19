@@ -2637,11 +2637,14 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     try { config = normalizeVmPackageWorkflowConfig(JSON.parse(saved.config_json), subject.metadata).config; }
     catch (error) { throw new ApiError(409, error.code ?? "VM_WORKFLOW_NOT_READY", "VM workflow fields must be repaired before activation"); }
     const stage = config.stages.initial;
-    if (stage.enabled !== true || config.stages.review.enabled !== false || config.finalArchive.enabled !== false
+    const review = config.stages.review;
+    if (stage.enabled !== true
       || [config.fields.vmidFieldId, config.fields.namingFieldId, config.fields.outputAttachmentFieldId,
         stage.statusFieldId, stage.triggerOptionId, stage.instructionFieldId].some((value) => !value)
+      || review.enabled && [review.statusFieldId, review.triggerOptionId, review.instructionFieldId]
+        .some((value) => !value)
       || !config.approval.department || !config.approval.reason) {
-      throw new ApiError(409, "VM_WORKFLOW_NOT_READY", "Only a fully configured initial VM workflow is available");
+      throw new ApiError(409, "VM_WORKFLOW_NOT_READY", "Enabled VM workflow stages must be fully configured");
     }
     const status = subject.metadata.fields.find((field) => field.fieldId === stage.statusFieldId);
     if (!isSingleSelectMetadataField(status)) throw new ApiError(409, "VM_WORKFLOW_NOT_READY", "Initial VM workflow requires a single-select trigger");

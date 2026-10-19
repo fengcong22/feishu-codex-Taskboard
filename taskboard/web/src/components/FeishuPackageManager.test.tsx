@@ -13,6 +13,7 @@ import {
   saveFeishuPackageDraft,
 } from "../api";
 import type { FeishuPackageSummary, FeishuPackageWorkspaceInspection, FeishuSubjectConfig } from "../types";
+import { TaskboardLanguageProvider } from "../i18n";
 import { FeishuPackageManager } from "./FeishuPackageManager";
 import { FeishuWorkflowPanel } from "./FeishuWorkflowPanel";
 
@@ -76,6 +77,27 @@ const inspectionWithZipOutput: FeishuPackageWorkspaceInspection = {
     directory: "D:\\codex\\auto-cut-lite\\output",
   },
 };
+
+it("places VM account and queue controls in the auto-cut-slicing package settings", async () => {
+  const workflowTemplate = { id: "vm_pmo_review_video", version: 1 } as const;
+  const packageEntry = { ...historicalPackage, alias: "auto-cut-slicing", name: "Auto-Cut-Slicing",
+    model: null, reasoningEffort: null, zipSourceDirectory: null, workflowTemplate };
+  vi.mocked(listFeishuPackages).mockResolvedValue([packageEntry]);
+  render(<TaskboardLanguageProvider language="zh"><FeishuPackageManager /></TaskboardLanguageProvider>);
+
+  await screen.findByDisplayValue("historical prompt");
+  fireEvent.click(screen.getByRole("button", { name: "VM 账号与队列" }));
+  expect(await screen.findByRole("region", { name: "VM 账号与队列" })).toBeTruthy();
+  expect(screen.queryByRole("textbox", { name: "Codex 工作区路径" })).toBeNull();
+});
+
+it("does not expose VM account and queue controls for other packages", async () => {
+  vi.mocked(listFeishuPackages).mockResolvedValue([historicalPackage]);
+  render(<FeishuPackageManager />);
+
+  await screen.findByDisplayValue("historical prompt");
+  expect(screen.queryByRole("button", { name: "VM 账号与队列" })).toBeNull();
+});
 
 it("uses the current manifest name in subject routing without changing its saved alias", async () => {
   const currentPackage = { ...historicalPackage, name: "Auto-cut-lite1.6.8", identity: inspection };

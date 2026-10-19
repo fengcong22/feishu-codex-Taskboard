@@ -21,6 +21,10 @@ const VM = { id: "vm_pmo_review_video", version: 1 };
 const VM_INTERFACE = {
   workflowTemplate: VM, contract: VM, driverId: "vm_pmo_review_video_v1", artifactKind: "review_mp4",
 };
+const VM_INTERFACE_V2 = {
+  workflowTemplate: VM, contract: { id: VM.id, version: 2 },
+  driverId: "vm_pmo_review_video_v2", artifactKind: "review_mp4",
+};
 const ROOT = "/api/local/autocut/packages";
 const code = (expected) => (error) => error.code === expected && error.status === 409;
 
@@ -64,11 +68,13 @@ test("manifest validates optional contract, driver and artifact signals without 
   assert.deepEqual(packageWorkflowFromManifest({ artifactKind: "zip" }), LEGACY);
   assert.deepEqual(packageWorkflowFromManifest({ workflowTemplate: VM }), VM);
   assert.deepEqual(packageWorkflowFromManifest(VM_INTERFACE), VM);
+  assert.deepEqual(packageWorkflowFromManifest(VM_INTERFACE_V2), VM);
   const invalid = [
     null, false, [], "raw", { workflowTemplate: null },
     { contract: VM }, { driverId: VM_INTERFACE.driverId }, { artifactKind: "review_mp4" },
     { workflowTemplate: LEGACY, contract: LEGACY }, { workflowTemplate: LEGACY, driverId: "document_draft_zip_v1" },
-    { ...VM_INTERFACE, contract: { id: VM.id } }, { ...VM_INTERFACE, contract: { ...VM, version: 2 } },
+    { ...VM_INTERFACE, contract: { id: VM.id } },
+    { ...VM_INTERFACE_V2, driverId: VM_INTERFACE.driverId },
     { ...VM_INTERFACE, contract: LEGACY }, { ...VM_INTERFACE, driverId: "unknown" },
     { ...VM_INTERFACE, driverId: null }, { ...VM_INTERFACE, artifactKind: "zip" },
   ];

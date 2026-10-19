@@ -55,6 +55,118 @@ test("persists progress across restart and duplicate enqueue does not reset it",
   assert.deepEqual(reopened.get("job-1"), persisted);
 });
 
+test("persists only stable error codes as acquisition diagnostics", async (t) => {
+  const store = (await fixture(t)).open();
+  store.enqueue(job());
+  const claim = store.claim("job-1");
+  assert.throws(() => store.save("job-1", claim.leaseToken,
+    { ...claim.job, last_error_detail: "socket reset at https://media.example.test/private" }),
+  code("VM_APPROVAL_STORE_INPUT_INVALID"));
+  const saved = store.save("job-1", claim.leaseToken, { ...claim.job, last_error_detail: "MEDIA_VALIDATION_FAILED" });
+  assert.equal(saved.last_error_detail, "MEDIA_VALIDATION_FAILED");
+});
+
+test("request deduplication can be scoped to a separate task run", async (t) => {
+  const f = await fixture(t);
+  const store = f.open();
+  const first = store.enqueue(job());
+  const second = store.enqueue(job("job-2"), { dedupeByRequest: false });
+  assert.equal(second.id, "job-2");
+  assert.equal(store.list().length, 2);
+  assert.equal(store.enqueue(job("manual-replay")).id, first.id);
+});
+
+test("queue cleanup hides only settled jobs and preserves their approval and resource reservation records", async (t) => {
+  let time = 5000;
+  const f = await fixture(t);
+  const store = f.open({ now: () => time });
+  store.enqueue(job("ready", { status: "ready" }), { dedupeByRequest: false });
+  store.enqueue(job("rejected", { status: "rejected" }), { dedupeByRequest: false });
+  store.enqueue(job("canceled", { status: "canceled" }), { dedupeByRequest: false });
+  store.enqueue(job("queued", { status: "queued" }), { dedupeByRequest: false });
+  store.enqueue(job("attention", { status: "needs_attention" }), { dedupeByRequest: false });
+  store.enqueue(job("leased", { status: "ready" }), { dedupeByRequest: false });
+
+  const readyLease = store.claim("ready");
+  const fingerprint = "a".repeat(64);
+  store.reserveResource("ready", readyLease.leaseToken, fingerprint);
+  store.save("ready", readyLease.leaseToken, readyLease.job);
+  store.claim("leased");
+
+  assert.throws(() => store.hideFromQueue(["ready", "queued"]), code("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE"));
+  assert.equal(store.get("ready").queue_hidden_at, undefined);
+  assert.throws(() => store.hideFromQueue(["leased"]), code("VM_APPROVAL_JOB_BUSY"));
+  assert.throws(() => store.hideFromQueue(["missing"]), code("VM_APPROVAL_JOB_NOT_FOUND"));
+
+  assert.deepEqual(store.hideFromQueue(["ready", "rejected", "canceled"]), ["ready", "rejected", "canceled"]);
+  assert.equal(store.get("ready").queue_hidden_at, time);
+  assert.equal(store.get("ready").status, "ready");
+  assert.equal(store.get("ready").request.vmid, "video-1");
+
+  const contender = store.enqueue(job("contender", { request_fingerprint: "b".repeat(64), request: { vmid: "video-2" } }));
+  const contenderLease = store.claim(contender.id);
+  assert.deepEqual(store.reserveResource(contender.id, contenderLease.leaseToken, fingerprint), { job_id: "ready", owned: false });
+  const hiddenLease = store.claim("ready");
+  assert.throws(() => store.restoreQueueItem("ready"), code("VM_APPROVAL_JOB_BUSY"));
+  store.save("ready", hiddenLease.leaseToken, hiddenLease.job);
+  assert.equal(store.restoreQueueItem("ready").id, "ready");
+  assert.equal(store.restoreQueueItem("ready").status, "ready");
+  assert.equal(store.get("ready").queue_hidden_at, undefined);
+});
+
+test("migrates the version-one unique request index without losing queued approvals", async (t) => {
+  const f = await fixture(t);
+  const original = f.open();
+  const persisted = original.enqueue(job("job-1", { application_id: "application-1" }));
+  const lease = original.claim("job-1");
+  original.reserveResource("job-1", lease.leaseToken, "c".repeat(64));
+  original.save("job-1", lease.leaseToken, lease.job);
+  original.close();
+
+  const legacy = new DatabaseSync(f.file);
+  legacy.exec(`DROP INDEX vm_approval_request_fingerprint;
+    DROP TABLE vm_approval_resources;
+    CREATE TABLE vm_approval_resources (
+      fingerprint TEXT PRIMARY KEY NOT NULL,
+      job_id TEXT NOT NULL REFERENCES vm_approval_jobs(id)
+    );
+    INSERT INTO vm_approval_resources(fingerprint, job_id) VALUES ('${"c".repeat(64)}', 'job-1');
+    CREATE UNIQUE INDEX vm_approval_request_fingerprint ON vm_approval_jobs(request_fingerprint);
+    PRAGMA user_version = 1;`);
+  legacy.close();
+
+  const migrated = f.open();
+  assert.deepEqual(migrated.get("job-1"), persisted);
+  const version = new DatabaseSync(f.file);
+  assert.equal(version.prepare("PRAGMA user_version").get().user_version, 3);
+  assert.equal(version.prepare("PRAGMA index_list(vm_approval_jobs)").all()
+    .find((item) => item.name === "vm_approval_request_fingerprint").unique, 0);
+  version.close();
+  assert.equal(migrated.enqueue(job("job-2"), { dedupeByRequest: false }).id, "job-2");
+});
+
+test("fails closed on a version-one queue with another unique request constraint", async (t) => {
+  const f = await fixture(t);
+  const original = f.open();
+  original.enqueue(job());
+  original.close();
+
+  const legacy = new DatabaseSync(f.file);
+  legacy.exec(`DROP INDEX vm_approval_request_fingerprint;
+    CREATE UNIQUE INDEX vm_approval_request_fingerprint ON vm_approval_jobs(request_fingerprint);
+    CREATE UNIQUE INDEX unexpected_request_guard ON vm_approval_jobs(request_fingerprint);
+    PRAGMA user_version = 1;`);
+  legacy.close();
+  assert.throws(() => f.open(), code("VM_APPROVAL_STORE_INVALID"));
+
+  const unchanged = new DatabaseSync(f.file);
+  assert.equal(unchanged.prepare("PRAGMA user_version").get().user_version, 1);
+  assert.equal(unchanged.prepare("PRAGMA index_list(vm_approval_jobs)").all()
+    .filter((item) => item.unique && unchanged.prepare(`PRAGMA index_info(${item.name})`).all()
+      .some((column) => column.name === "request_fingerprint")).length, 2);
+  unchanged.close();
+});
+
 test("resource reservations are durable across owners, lease expiry and restarts", async (t) => {
   const f = await fixture(t);
   let time = 1000;
@@ -75,6 +187,55 @@ test("resource reservations are durable across owners, lease expiry and restarts
   const retry = reopened.claim(secondJob.id);
   assert.deepEqual(reopened.reserveResource(secondJob.id, retry.leaseToken, fingerprint), { job_id: firstJob.id, owned: false });
   assert.equal(reopened.reserveResource(secondJob.id, retry.leaseToken, "c".repeat(64)).owned, true);
+});
+
+test("resource reservations are isolated by approval while remaining unique within one approval", async (t) => {
+  const f = await fixture(t);
+  const store = f.open();
+  store.enqueue(job("first", { application_id: "application-1" }), { dedupeByRequest: false });
+  store.enqueue(job("second", { application_id: "application-2" }), { dedupeByRequest: false });
+  store.enqueue(job("same-approval", { application_id: "application-1" }), { dedupeByRequest: false });
+  const first = store.claim("first");
+  const second = store.claim("second");
+  const sameApproval = store.claim("same-approval");
+  const fingerprint = "d".repeat(64);
+
+  assert.equal(store.reserveResource("first", first.leaseToken, fingerprint).owned, true);
+  assert.equal(store.reserveResource("second", second.leaseToken, fingerprint).owned, true);
+  assert.deepEqual(store.reserveResource("same-approval", sameApproval.leaseToken, fingerprint),
+    { job_id: "first", owned: false });
+});
+
+test("migrates legacy global resource reservations to the owning approval without losing claims", async (t) => {
+  const f = await fixture(t);
+  const original = f.open();
+  original.enqueue(job("owner", { application_id: "application-1" }));
+  const owner = original.claim("owner");
+  const fingerprint = "e".repeat(64);
+  original.reserveResource("owner", owner.leaseToken, fingerprint);
+  original.save("owner", owner.leaseToken, owner.job);
+  original.close();
+
+  const legacy = new DatabaseSync(f.file);
+  legacy.exec(`DROP TABLE vm_approval_resources;
+    CREATE TABLE vm_approval_resources (
+      fingerprint TEXT PRIMARY KEY NOT NULL,
+      job_id TEXT NOT NULL REFERENCES vm_approval_jobs(id)
+    );
+    INSERT INTO vm_approval_resources(fingerprint, job_id) VALUES ('${fingerprint}', 'owner');
+    PRAGMA user_version = 2;`);
+  legacy.close();
+
+  const migrated = f.open();
+  migrated.enqueue(job("same-app", { application_id: "application-1" }), { dedupeByRequest: false });
+  migrated.enqueue(job("new-app", { application_id: "application-2" }), { dedupeByRequest: false });
+  const sameApp = migrated.claim("same-app");
+  const newApp = migrated.claim("new-app");
+  assert.deepEqual(migrated.reserveResource("same-app", sameApp.leaseToken, fingerprint), { job_id: "owner", owned: false });
+  assert.equal(migrated.reserveResource("new-app", newApp.leaseToken, fingerprint).owned, true);
+  const version = new DatabaseSync(f.file);
+  assert.equal(version.prepare("PRAGMA user_version").get().user_version, 3);
+  version.close();
 });
 
 test("competing database connections cannot reserve one resource for different jobs", async (t) => {

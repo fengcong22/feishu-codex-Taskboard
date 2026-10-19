@@ -47,7 +47,12 @@ function network(responses = [{}], answers = [{ address: PUBLIC_IP, family: 4 }]
       req.end = () => {
         queueMicrotask(() => {
           if (destroyed) return;
-          if (spec.requestError) { req.emit("error", new Error(spec.requestError)); return; }
+          if (spec.requestError) {
+            const error = new Error(spec.requestError);
+            if (spec.requestErrorCode) error.code = spec.requestErrorCode;
+            req.emit("error", error);
+            return;
+          }
           if (spec.noResponse) return;
           response = new PassThrough();
           response.statusCode = spec.status ?? 200;
@@ -57,7 +62,11 @@ function network(responses = [{}], answers = [{ address: PUBLIC_IP, family: 4 }]
           if (spec.hang) return;
           if (spec.streamError) {
             response.write(spec.body ?? PAYLOAD);
-            setImmediate(() => response.destroy(new Error(spec.streamError)));
+            setImmediate(() => {
+              const error = new Error(spec.streamError);
+              if (spec.streamErrorCode) error.code = spec.streamErrorCode;
+              response.destroy(error);
+            });
           } else response.end(spec.body ?? PAYLOAD);
         });
       };
@@ -230,7 +239,9 @@ test("rejects HTTP, userinfo, URL fragments and an origin with a path", async (t
 test("rejects non-200, HTML and JSON without creating files", async (t) => {
   const { destination } = await fixture(t);
   for (const [spec, code] of [
-    [{ status: 403 }, "VM_SOURCE_HTTP_FAILED"],
+    [{ status: 403 }, "VM_SOURCE_HTTP_DENIED"],
+    [{ status: 404 }, "VM_SOURCE_HTTP_NOT_FOUND"],
+    [{ status: 503 }, "VM_SOURCE_HTTP_SERVER_FAILED"],
     [{ status: 206 }, "VM_SOURCE_HTTP_FAILED"],
     [{ headers: { "content-type": "text/html; charset=utf-8" } }, "VM_SOURCE_CONTENT_TYPE_INVALID"],
     [{ headers: { "content-type": "application/problem+json" } }, "VM_SOURCE_CONTENT_TYPE_INVALID"],
@@ -273,6 +284,23 @@ test("does not leak URLs, credentials or raw transport errors after a broken str
       assert.ok(error instanceof VmSourceError);
       assert.equal(error.cause, undefined);
       assert.doesNotMatch(`${error.stack}\n${JSON.stringify(error)}`, /signature|never-log|https:|raw socket|raw request|raw resolver/u);
+      return true;
+    });
+    assert.equal(await exists(destination), false);
+  }
+});
+
+test("classifies common network failures without exposing their raw messages", async (t) => {
+  const { destination } = await fixture(t);
+  for (const [dependencies, code] of [
+    [network([{ requestError: `reset while fetching ${SIGNED_URL}`, requestErrorCode: "ECONNRESET" }]), "VM_SOURCE_CONNECTION_RESET"],
+    [network([{ streamError: `reset while streaming ${SIGNED_URL}`, streamErrorCode: "ECONNRESET" }]), "VM_SOURCE_CONNECTION_RESET"],
+    [network([{ requestError: `TLS failed for ${SIGNED_URL}`, requestErrorCode: "EPROTO" }]), "VM_SOURCE_TLS_FAILED"],
+  ]) {
+    await assert.rejects(download(destination, dependencies), (error) => {
+      assert.equal(error.code, code);
+      assert.equal(error.cause, undefined);
+      assert.doesNotMatch(`${error.stack}\n${JSON.stringify(error)}`, /signature|never-log|https:|reset while|TLS failed/u);
       return true;
     });
     assert.equal(await exists(destination), false);

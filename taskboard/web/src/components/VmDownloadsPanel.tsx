@@ -2,13 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import {
-  enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads,
-  resumeVmDownload, saveVmDownloadSettings,
+  cleanupVmDownloads, enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads,
+  recoverVmDownload, resumeVmDownload, saveVmDownloadSettings,
   type VmDownloadJob, type VmDownloadSettings, type VmDownloadsSnapshot,
 } from "../vmDownloads";
 
 const EMPTY_SETTINGS: VmDownloadSettings = { outputRoot: "", department: "", reason: "", notificationsEnabled: true };
 const WAIT_EXPIRED = new Set(["VM_APPROVAL_WAIT_EXPIRED", "VM_MEDIA_WAIT_EXPIRED"]);
+const CLEARABLE_STATUSES = new Set(["ready", "rejected", "canceled"]);
 const STATUS_LABELS: Record<string, [string, string]> = {
   queued: ["排队中", "Queued"], submitting: ["正在提交申请", "Submitting application"],
   reconciling: ["正在确认申请", "Confirming application"], waiting_approval: ["等待审批", "Awaiting approval"],
@@ -40,9 +41,11 @@ export function VmDownloadsPanel() {
   const [notice, setNotice] = useState<string | null>(null);
   const [loginUrl, setLoginUrl] = useState<string | null>(null);
   const [popupBlocked, setPopupBlocked] = useState(false);
+  const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(() => new Set());
   const mounted = useRef(false);
   const reading = useRef<AbortController | null>(null);
   const writing = useRef<AbortController | null>(null);
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
   const dirty = useRef(false);
   const vmidsRevision = useRef(0);
   const requestVersion = useRef(0);
@@ -62,6 +65,8 @@ export function VmDownloadsPanel() {
       const next = await getVmDownloads(controller.signal);
       if (!mounted.current || controller.signal.aborted || version !== requestVersion.current) return;
       setSnapshot(next);
+      const clearableIds = new Set(next.jobs.filter((job) => CLEARABLE_STATUSES.has(job.status)).map((job) => job.id));
+      setSelectedJobIds((current) => new Set([...current].filter((id) => clearableIds.has(id))));
       if (!dirty.current) setDraft(next.settings);
       if (next.session.status !== "connecting") { setLoginUrl(null); setPopupBlocked(false); }
       setReadError(null);
@@ -74,6 +79,47 @@ export function VmDownloadsPanel() {
       if (mounted.current && version === requestVersion.current) setLoading(false);
     }
   }, [errorText, text]);
+
+  const clearableJobs = snapshot?.jobs.filter((job) => CLEARABLE_STATUSES.has(job.status)) ?? [];
+  const selectedClearableIds = clearableJobs.filter((job) => selectedJobIds.has(job.id)).map((job) => job.id);
+  const allClearableSelected = clearableJobs.length > 0 && selectedClearableIds.length === clearableJobs.length;
+  const someClearableSelected = selectedClearableIds.length > 0 && !allClearableSelected;
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someClearableSelected;
+  }, [someClearableSelected]);
+
+  function selectJob(id: string, checked: boolean) {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      if (checked) next.add(id); else next.delete(id);
+      return next;
+    });
+  }
+
+  function selectAllClearable(checked: boolean) {
+    const ids = clearableJobs.map((job) => job.id);
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      for (const id of ids) { if (checked) next.add(id); else next.delete(id); }
+      return next;
+    });
+  }
+
+  function clearSelected() {
+    const ids = selectedClearableIds;
+    if (!ids.length) return;
+    const confirmed = window.confirm(text(
+      `确定从下载队列隐藏 ${ids.length} 条已结束记录吗？审批记录、去重信息和下载文件会保留。`,
+      `Hide ${ids.length} settled records from the download queue? Approval history, deduplication records, and downloaded files will be retained.`,
+    ));
+    if (!confirmed) return;
+    void action(async (signal) => {
+      const result = await cleanupVmDownloads(ids, signal);
+      setSelectedJobIds((current) => new Set([...current].filter((id) => !ids.includes(id))));
+      setNotice(text(`已清理 ${result.clearedCount} 条记录；审批记录和下载文件仍保留。`, `${result.clearedCount} records cleared from the queue. Approval history and downloaded files remain.`));
+    });
+  }
 
   useEffect(() => {
     mounted.current = true;
@@ -191,8 +237,21 @@ export function VmDownloadsPanel() {
     const label = STATUS_LABELS[job.status] ?? ["状态待确认", "Unknown status"];
     const code = safeCode(job.error?.code);
     const extendable = job.status === "needs_attention" && code !== null && WAIT_EXPIRED.has(code);
+    const privateAddressBlocked = job.status === "needs_attention" && code === "VM_SOURCE_ADDRESS_NOT_ALLOWED"
+      && job.recovery?.kind === "private_address";
+    const unknownOutcome = job.status === "needs_attention" && code === "VM_DOWNLOAD_OUTCOME_UNKNOWN"
+      && job.recovery?.kind === "unknown_outcome";
+    const claimedResource = job.status === "needs_attention" && code === "VM_RESOURCE_ALREADY_CLAIMED"
+      && job.recovery?.kind === "resource_claim";
     return <li key={job.id} className="vm-downloads-job">
-      <div className="vm-downloads-job-heading"><code>{job.vmid}</code><span className={`vm-downloads-badge vm-downloads-state-${job.status}`}>{text(label[0], label[1])}</span></div>
+      <div className="vm-downloads-job-heading">
+        <label className="vm-downloads-job-select">
+          <input type="checkbox" checked={selectedJobIds.has(job.id)} disabled={busy || !CLEARABLE_STATUSES.has(job.status)}
+            aria-label={text(`选择清理 ${job.vmid}，记录 ${job.id}`, `Select ${job.vmid}, record ${job.id}, for cleanup`)}
+            onChange={(event) => selectJob(job.id, event.target.checked)} />
+        </label>
+        <code>{job.vmid}</code><span className={`vm-downloads-badge vm-downloads-state-${job.status}`}>{text(label[0], label[1])}</span>
+      </div>
       <dl>
         {job.application_id && <><dt>{text("申请编号", "Application")}</dt><dd>{job.application_id}</dd></>}
         {job.instance_code && <><dt>{text("审批编号", "Approval")}</dt><dd>{job.instance_code}</dd></>}
@@ -207,8 +266,29 @@ export function VmDownloadsPanel() {
       {code && <p className="vm-downloads-job-error"><code>{code}</code></p>}
       {job.status === "auth_required" && <p>{text("使用原账号重新连接后自动恢复，不会重新申请。", "Reconnect with the original account to resume without submitting a new application.")}</p>}
       {extendable && <p>{text("已暂停等待。延长后继续检查原申请。", "Waiting is paused. Extending continues to check the original application.")}</p>}
-      {(extendable || job.status === "dead_letter") && <div className="vm-downloads-actions">
+      {privateAddressBlocked && <p>{text("域名解析到未放行的私网地址，下载请求没有发出。更新本机精确白名单后，可继续使用原审批。", "The hostname resolved to an unapproved private address, so no download request was sent. Update the exact local allowlist to continue with the existing approval.")}</p>}
+      {unknownOutcome && <p>{text("上次传输中断，无法确认 VM 是否完整交付。你已确认该素材支持重复获取；继续后会检查本机没有完整视频或回执，再沿用这条已批准申请重新获取，不会重新提交审批。", "The previous transfer stopped before completion, so Taskboard cannot confirm delivery. You confirmed this material can be fetched again. Continuing checks that no complete video or receipt exists locally, then reuses this approved application without submitting another one.")}</p>}
+      {claimedResource && <p>{text("Taskboard 检测到另一条申请已占用相同素材。若当前申请是独立通过的审批，可确认后沿用当前审批重试；不会重新提交审批。", "Taskboard detected another application for the same material. If this request has its own approval, confirm to retry with that approval; no new application will be submitted.")}</p>}
+      {unknownOutcome && job.error?.diagnostic_code && <p className="vm-downloads-job-error">{text("传输诊断", "Transfer diagnostic")}: <code>{job.error.diagnostic_code}</code></p>}
+      {(extendable || privateAddressBlocked || unknownOutcome || claimedResource || job.status === "dead_letter") && <div className="vm-downloads-actions">
         {extendable && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => { await extendVmDownload(job.id, signal); })}>{text("延长等待 7 天", "Extend wait by 7 days")}</button>}
+        {(privateAddressBlocked || unknownOutcome) && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => {
+          const confirmed = window.confirm(unknownOutcome ? text(
+            "请确认 VM 允许这份素材在该审批下重复获取。Taskboard 会检查本机完整视频和回执均不存在，再沿用原审批重新获取；不会提交新审批。",
+            "Confirm the VM allows this material to be fetched again under the approved application. Taskboard checks that no complete video or receipt exists locally, then reuses the original approval without submitting another one.",
+          ) : text(
+            "请确认已配置该素材域名的精确私网白名单。Taskboard 会沿用原审批重新检查资源；不会提交新审批。",
+            "Confirm the exact private-address allowlist for this material host is configured. Taskboard will recheck the existing approved resource without submitting another application.",
+          ));
+          if (confirmed) await recoverVmDownload(job.id, signal);
+        })}>{text(unknownOutcome ? "确认可重复获取并使用原审批重试" : "更新白名单后使用原审批重试", unknownOutcome ? "Confirm repeatable fetch and retry with existing approval" : "Update allowlist and retry with existing approval")}</button>}
+        {claimedResource && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => {
+          const confirmed = window.confirm(text(
+            "请确认当前 VM 申请是独立通过的审批，并允许对这份素材重复获取。Taskboard 会沿用当前审批，不会重新提交申请。",
+            "Confirm this VM request has its own approval and the material may be fetched again. Taskboard will reuse this approval without submitting another application.",
+          ));
+          if (confirmed) await recoverVmDownload(job.id, signal);
+        })}>{text("确认并用当前审批重试", "Confirm and retry with this approval")}</button>}
         {job.status === "dead_letter" && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => { await resumeVmDownload(job.id, signal); })}>{text("重试任务", "Retry job")}</button>}
       </div>}
     </li>;
@@ -217,10 +297,15 @@ export function VmDownloadsPanel() {
   const session = snapshot?.session;
   const sessionLabel = session ? SESSION_LABELS[session.status] ?? SESSION_LABELS.unavailable : null;
   return <section className="vm-downloads-panel" aria-labelledby="vm-downloads-heading">
-    <header className="vm-downloads-heading"><div><h3 id="vm-downloads-heading">{text("VM 账号与队列", "VM account and queue")}</h3><p>{text("管理本机共享的 Shadow 账号和下载队列。关闭面板后，本机队列仍会继续。", "Manage the shared local Shadow account and download queue. The local queue continues when this panel closes.")}</p><p>{text("PMO 的 VMID 字段在「学科 PMO 配置 → 对应 VM 剪辑包 → 视频来源」绑定；该自动剪辑与 MP4 回写流程目前仅可保存草稿。", "Bind the PMO VMID field under Subject PMO configuration → the VM editing package → Video source. Automatic editing and MP4 writeback currently support draft configuration only.")}</p></div>
+    <header className="vm-downloads-heading"><div><h3 id="vm-downloads-heading">{text("VM 账号与队列", "VM account and queue")}</h3><p>{text("管理 auto-cut-slicing 包使用的 Shadow 账号和 VM 下载队列。关闭本页后，队列仍会在本机后台继续。", "Manage the Shadow account and VM download queue used by auto-cut-slicing. The local queue continues after you leave this page.")}</p><p>{text("VMID、申请部门和申请原因在当前学科的“基础与执行”配置中设置；这里负责账号连接和下载队列。", "Set the VMID field, department, and reason under this subject's Basics and execution settings. Manage the account connection and download queue here.")}</p></div>
       <button type="button" className="button secondary" disabled={loading || busy} onClick={() => void refresh()}>{text("刷新下载状态", "Refresh downloads")}</button></header>
     {readError && <p role="alert" className="vm-downloads-error">{readError}</p>}
     {safeCode(snapshot?.worker?.errorCode) && <p role="alert" className="vm-downloads-error">{text("下载队列处理异常，请检查本机服务；已有申请仍保留。", "The download worker encountered an error. Check the local service; existing applications are retained.")} ({safeCode(snapshot?.worker?.errorCode)})</p>}
+    {session?.status === "auth_required" && <section role="alert" aria-label={text("Shadow 登录已失效", "Shadow sign-in expired")} className="vm-downloads-auth-alert">
+      <div><strong>{text("Shadow 登录已失效，下载队列已暂停。", "Shadow sign-in expired. The download queue is paused.")}</strong>
+        <p>{text("重新连接原账号后会继续处理；已提交的审批和下载记录会保留。", "Reconnect the original account to resume processing. Existing approvals and download records are retained.")}</p></div>
+      <button type="button" className="button secondary" disabled={busy} onClick={connect}>{text("从提示重新连接", "Reconnect from alert")}</button>
+    </section>}
     {loading && !snapshot && <p role="status">{text("正在读取下载队列…", "Loading downloads…")}</p>}
     {session && <section className="vm-downloads-session" aria-label={text("Shadow 账号", "Shadow account")}>
       <div className="vm-downloads-session-heading"><strong>{text(sessionLabel![0], sessionLabel![1])}</strong>{session.account && <span>{session.account.name}</span>}</div>
@@ -262,7 +347,18 @@ export function VmDownloadsPanel() {
       </details>
       <div aria-live="polite">{busy && <p role="status">{text("正在处理…", "Working…")}</p>}{notice && <p role="status">{notice}</p>}</div>
       {actionError && <p role="alert" className="vm-downloads-error">{actionError}</p>}
-      <section className="vm-downloads-queue" aria-label={text("下载队列", "Download queue")}><h4>{text("下载队列", "Download queue")} <span>{snapshot.jobs.length}</span></h4>
+      <section className="vm-downloads-queue" aria-label={text("下载队列", "Download queue")}>
+        <div className="vm-downloads-queue-heading">
+          <h4>{text("下载队列", "Download queue")} <span>{snapshot.jobs.length}</span></h4>
+          {clearableJobs.length > 0 && <div className="vm-downloads-queue-tools">
+            <label className="vm-downloads-select-all"><input ref={selectAllRef} type="checkbox" checked={allClearableSelected}
+              disabled={busy} aria-label={text("全选可清理项", "Select all clearable jobs")}
+              onChange={(event) => selectAllClearable(event.target.checked)} />{text("全选可清理项", "Select all clearable")}</label>
+            <button className="button secondary" type="button" disabled={busy || selectedClearableIds.length === 0} onClick={clearSelected}>
+              {text(`清理所选（${selectedClearableIds.length}）`, `Clear selected (${selectedClearableIds.length})`)}
+            </button>
+          </div>}
+        </div>
         {snapshot.jobs.length ? <ul>{snapshot.jobs.map(renderJob)}</ul> : <p className="vm-downloads-help">{text("暂无下载任务。", "No download jobs yet.")}</p>}
       </section>
     </>}

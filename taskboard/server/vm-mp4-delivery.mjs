@@ -32,7 +32,8 @@ function rowValue(row) {
     id: row.id, runId: row.run_id, taskId: row.task_id, artifactId: row.artifact_id,
     target: { baseToken: row.base_token, tableId: row.table_id,
       recordId: row.record_id, fieldId: row.field_id },
-    artifact: { path: row.source_path, filename: row.filename, sha256: row.sha256, bytes: row.bytes },
+    artifact: { path: row.source_path, filename: row.filename, sha256: row.sha256,
+      bytes: row.bytes, durationMs: row.duration_ms },
     fileToken: row.file_token, state: row.state, attemptCount: row.attempt_count,
     nextAttemptAt: row.next_attempt_at, errorCode: row.error_code,
     leaseToken: row.lease_token, leaseUntil: row.lease_until,
@@ -70,7 +71,8 @@ function trustedDelivery(value, runId, artifactId) {
     || value.artifact.filename !== path.basename(value.artifact.filename)
     || !/^[^\u0000-\u001f<>:"/\\|?*]+\.mp4$/iu.test(value.artifact.filename)
     || !SHA256.test(value.artifact.sha256)
-    || !Number.isSafeInteger(value.artifact.bytes) || value.artifact.bytes < 1)
+    || !Number.isSafeInteger(value.artifact.bytes) || value.artifact.bytes < 1
+    || !Number.isSafeInteger(value.artifact.duration_ms) || value.artifact.duration_ms < 1)
     throw failure("VM_DELIVERY_UNTRUSTED");
   return value;
 }
@@ -110,7 +112,8 @@ function immutableMatches(existing, trusted) {
     && existing.artifact.path === trusted.artifact.path
     && existing.artifact.filename === trusted.artifact.filename
     && existing.artifact.sha256 === trusted.artifact.sha256
-    && existing.artifact.bytes === trusted.artifact.bytes;
+    && existing.artifact.bytes === trusted.artifact.bytes
+    && (existing.artifact.durationMs === 0 || existing.artifact.durationMs === trusted.artifact.duration_ms);
 }
 
 /**
@@ -118,20 +121,23 @@ function immutableMatches(existing, trusted) {
  * production Feishu origin from server-owned run/task state; callers provide
  * only run and artifact IDs. The adapter performs Feishu media and Base calls.
  */
-export function createVmMp4DeliveryService({ database, resolveTrustedDelivery, adapter,
+export function createVmMp4DeliveryService({ database, resolveTrustedDelivery, resolveTrustedLineage = null, adapter,
   now = Date.now, idFactory = randomUUID } = {}) {
   const db = connectionFrom(database);
-  if (typeof resolveTrustedDelivery !== "function" || !adapter
+  if (typeof resolveTrustedDelivery !== "function" || resolveTrustedLineage !== null && typeof resolveTrustedLineage !== "function" || !adapter
     || ["listFields", "getRecord", "updateRecord", "uploadMedia"].some((name) => typeof adapter[name] !== "function"))
     throw failure("VM_DELIVERY_SERVICE_INVALID");
   db.exec(`CREATE TABLE IF NOT EXISTS vm_mp4_deliveries (
     id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, artifact_id TEXT NOT NULL,
     base_token TEXT NOT NULL, table_id TEXT NOT NULL, record_id TEXT NOT NULL, field_id TEXT NOT NULL,
     source_path TEXT NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
     file_token TEXT, state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at INTEGER NOT NULL, error_code TEXT, lease_token TEXT, lease_until INTEGER,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
   )`);
+  if (!db.prepare("PRAGMA table_info(vm_mp4_deliveries)").all().some((column) => column.name === "duration_ms"))
+    db.exec("ALTER TABLE vm_mp4_deliveries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0");
   db.exec(`CREATE INDEX IF NOT EXISTS vm_mp4_deliveries_ready
     ON vm_mp4_deliveries(state, next_attempt_at, created_at)`);
 
@@ -139,6 +145,45 @@ export function createVmMp4DeliveryService({ database, resolveTrustedDelivery, a
     assertId(runId);
     return rowValue(db.prepare("SELECT * FROM vm_mp4_deliveries WHERE run_id = ?").get(runId));
   };
+
+  async function latestDelivered({ baseToken, tableId, recordId, fieldId, subjectKey, packageAlias, workflowTemplate } = {}) {
+    if (![baseToken, tableId, recordId, fieldId].every(validId))
+      throw failure("VM_DELIVERY_INPUT_INVALID");
+    const scoped = subjectKey !== undefined || packageAlias !== undefined || workflowTemplate !== undefined;
+    if (scoped && (subjectKey !== `${baseToken}:${tableId}` || typeof packageAlias !== "string" || !packageAlias
+      || !object(workflowTemplate) || typeof workflowTemplate.id !== "string"
+      || !Number.isSafeInteger(workflowTemplate.version))) throw failure("VM_DELIVERY_INPUT_INVALID");
+    const rows = db.prepare(`SELECT * FROM vm_mp4_deliveries
+      WHERE base_token = ? AND table_id = ? AND record_id = ? AND field_id = ? AND state = 'delivered'
+      ORDER BY updated_at DESC, created_at DESC, rowid DESC`)
+      .all(baseToken, tableId, recordId, fieldId);
+    function matchesLineage(lineage) {
+      if (!object(lineage) || typeof lineage.packageAlias !== "string" || !object(lineage.workflowTemplate))
+        throw failure("VM_DELIVERY_UNTRUSTED");
+      return lineage.subjectKey === subjectKey && lineage.packageAlias === packageAlias
+        && lineage.workflowTemplate.id === workflowTemplate.id && lineage.workflowTemplate.version === workflowTemplate.version;
+    }
+    for (const row of rows) {
+      const job = rowValue(row);
+      // Local trusted origin snapshots can exclude another package before touching its retired files.
+      if (scoped && resolveTrustedLineage && !matchesLineage(await resolveTrustedLineage({taskId:job.taskId,runId:job.runId}))) continue;
+      if (job.state !== "delivered" || !validId(job.fileToken)) throw failure("VM_DELIVERY_PARENT_UNCONFIRMED");
+      let trusted;
+      try { trusted = trustedDelivery(await resolveTrustedDelivery({ runId: job.runId,
+        artifactId: job.artifactId }), job.runId, job.artifactId); }
+      catch { throw failure("VM_DELIVERY_UNTRUSTED"); }
+      if (!immutableMatches(job, trusted)) throw failure("VM_DELIVERY_IDENTITY_CONFLICT");
+      if (scoped && !matchesLineage(trusted.lineage)) continue;
+      await verifiedFile(trusted.artifact.path, trusted.artifact.sha256, trusted.artifact.bytes);
+      if (job.artifact.durationMs === 0) {
+        db.prepare("UPDATE vm_mp4_deliveries SET duration_ms = ? WHERE run_id = ? AND state = 'delivered' AND duration_ms = 0")
+          .run(trusted.artifact.duration_ms, job.runId);
+        return get(job.runId);
+      }
+      return job;
+    }
+    return null;
+  }
 
   function change(runId, state, patch = {}, owner = null) {
     const current = get(runId);
@@ -183,12 +228,12 @@ export function createVmMp4DeliveryService({ database, resolveTrustedDelivery, a
       }
       const timestamp = now();
       db.prepare(`INSERT INTO vm_mp4_deliveries (id, run_id, task_id, artifact_id,
-        base_token, table_id, record_id, field_id, source_path, filename, sha256, bytes,
+        base_token, table_id, record_id, field_id, source_path, filename, sha256, bytes, duration_ms,
         state, next_attempt_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'upload_pending', ?, ?, ?)`)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'upload_pending', ?, ?, ?)`)
         .run(idFactory(), runId, trusted.taskId, artifactId, trusted.target.baseToken,
           trusted.target.tableId, trusted.target.recordId, trusted.target.fieldId,
-          artifact.path, artifact.filename, artifact.sha256, artifact.bytes,
+          artifact.path, artifact.filename, artifact.sha256, artifact.bytes, artifact.duration_ms,
           timestamp, timestamp, timestamp);
       db.exec("COMMIT"); return get(runId);
     } catch (error) { db.exec("ROLLBACK"); throw error; }
@@ -248,17 +293,16 @@ export function createVmMp4DeliveryService({ database, resolveTrustedDelivery, a
     const before = attachmentTokens(await adapter.getRecord(record), field);
     await assertTrusted(job);
     if (before.includes(job.fileToken)) return change(job.runId, "delivered", {}, job.leaseToken);
-    if (before.length) return change(job.runId, "conflict",
-      { errorCode: "VM_DELIVERY_EXISTING_ATTACHMENT" }, job.leaseToken);
     // The Base update API has no revision precondition. A second read catches
     // visible changes but cannot make the following update atomic.
     const justBefore = attachmentTokens(await adapter.getRecord(record), field);
     await assertTrusted(job);
     if (justBefore.includes(job.fileToken)) return change(job.runId, "delivered", {}, job.leaseToken);
-    if (justBefore.length) return change(job.runId, "conflict",
-      { errorCode: "VM_DELIVERY_EXISTING_ATTACHMENT" }, job.leaseToken);
+    if (JSON.stringify(before) !== JSON.stringify(justBefore))
+      return change(job.runId, "conflict", { errorCode: "VM_DELIVERY_FIELD_CHANGED" }, job.leaseToken);
     await adapter.updateRecord({ ...record, fieldName: field.name,
-      attachments: [{ file_token: job.fileToken }] });
+      attachments: [...justBefore.map((fileToken) => ({ file_token: fileToken })),
+        { file_token: job.fileToken }] });
     const after = attachmentTokens(await adapter.getRecord(record), field);
     await assertTrusted(job);
     if (!after.includes(job.fileToken))
@@ -318,5 +362,5 @@ export function createVmMp4DeliveryService({ database, resolveTrustedDelivery, a
     }
   }
 
-  return Object.freeze({ enqueue, get, processNext, recover });
+  return Object.freeze({ enqueue, get, latestDelivered, processNext, recover });
 }

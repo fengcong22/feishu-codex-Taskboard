@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, unlink, writeFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createVmApprovalStore } from "../server/vm-approval-store.mjs";
+import * as vmApprovalWorkflow from "../server/vm-approval-workflow.mjs";
 import { prepareVmSource } from "../server/vm-source-adapter.mjs";
 import { VmSourceError } from "../server/vm-source-transfer.mjs";
 import { enqueueVmApproval, extendVmApprovalWait, processVmApproval, resumeVmApproval, summarizeVmApproval,
@@ -58,7 +59,9 @@ async function fixture(t, requestOverrides = {}, options = {}) {
       if (options.downloadFailure) throw new VmSourceError("VM_SOURCE_TIMEOUT");
       await writeFile(destination, PAYLOAD);
       return { bytes: PAYLOAD.length, sha256: createHash("sha256").update(PAYLOAD).digest("hex") };
-    }, validateMedia: async () => options.wrongResolution ? { ...MEDIA, video: [{ width: 1920, height: 1080 }] } : MEDIA,
+    }, validateMedia: async () => options.sourceResolution
+      ? { ...MEDIA, video: [options.sourceResolution] }
+      : options.higherResolution ? { ...MEDIA, video: [{ width: 1920, height: 1080 }] } : MEDIA,
   });
   const enqueue = (overrides) => enqueueVmApproval(store, { ...request, ...overrides }, { now });
   const tick = (id, extras = {}) => processVmApproval(store, id, { client, now, pollMs: 1000, maxAttempts: 3, acquire, ...extras });
@@ -412,14 +415,184 @@ test("read failures retry with finite backoff then remain in dead letter", async
 });
 
 test("failed or interrupted download is not retried against a possibly consumed URL", async (t) => {
-  const f = await fixture(t, { application_id: "application-1" }, { downloadFailure: true });
+  const f = await fixture(t, { application_id: "application-1",
+    private_endpoints: [{ origin: ORIGIN, addresses: ["10.8.8.11"] }] }, { downloadFailure: true });
   f.approve(); const job = f.enqueue();
   const result = await f.tick(job.id);
   assert.equal(result.status, "needs_attention");
   assert.equal(result.last_error, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.equal(result.last_error_detail, "VM_SOURCE_TIMEOUT");
+  assert.equal(summarizeVmApproval(result).error.diagnostic_code, "VM_SOURCE_TIMEOUT");
   f.restart(); f.advance(); await f.tick(job.id);
   assert.equal(f.downloaded, 1);
   assert.throws(() => resumeVmApproval(f.store, job.id, { now: f.now }), { code: "VM_APPROVAL_NOT_RESUMABLE" });
+});
+
+test("unknown acquisition outcomes expose a safe media validation diagnosis", async (t) => {
+  const f = await fixture(t);
+  f.approve();
+  const job = f.enqueue();
+  const failMediaValidation = (raw, config, dependencies) => prepareVmSource(raw, config, { ...dependencies,
+    download: async ({ destination }) => {
+      await writeFile(destination, PAYLOAD);
+      return { bytes: PAYLOAD.length, sha256: createHash("sha256").update(PAYLOAD).digest("hex") };
+    },
+    validateMedia: async () => { throw new VmSourceError("MEDIA_VALIDATION_FAILED"); },
+  });
+
+  const result = await f.tick(job.id, { acquire: failMediaValidation });
+
+  assert.equal(result.status, "needs_attention");
+  assert.equal(result.last_error, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.equal(result.last_error_detail, "MEDIA_VALIDATION_FAILED");
+  assert.equal(summarizeVmApproval(result).error.diagnostic_code, "MEDIA_VALIDATION_FAILED");
+});
+
+test("operator-confirmed repeatable download recovery reuses the approved application", async (t) => {
+  const policy = [{ origin: ORIGIN, addresses: ["10.8.8.11"] }];
+  const f = await fixture(t, { application_id: "application-1", private_endpoints: policy }, { downloadFailure: true });
+  f.approve();
+  const job = f.enqueue();
+  const failed = await f.tick(job.id);
+  assert.equal(failed.status, "needs_attention");
+  assert.equal(failed.last_error, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.equal(f.downloaded, 1);
+
+  f.restart(); f.advance();
+  assert.equal((await f.tick(job.id)).status, "needs_attention");
+  assert.equal(f.downloaded, 1);
+  assert.throws(() => vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, job.id, {
+    confirmRepeatableResource: false, privateEndpoints: policy, now: f.now,
+  }), { code: "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED" });
+
+  const recovered = vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, job.id, {
+    confirmRepeatableResource: true, privateEndpoints: policy, now: f.now,
+  });
+  assert.equal(recovered.status, "waiting_media");
+  assert.equal(recovered.last_error_detail, undefined);
+  assert.equal(recovered.application_id, failed.application_id);
+  assert.equal(recovered.instance_code, failed.instance_code);
+  assert.equal(recovered.submission_attempts, 0);
+
+  let transfers = 0;
+  const successfulAcquire = (raw, config, dependencies) => prepareVmSource(raw, config, { ...dependencies,
+    download: async ({ destination }) => {
+      transfers++;
+      await writeFile(destination, PAYLOAD);
+      return { bytes: PAYLOAD.length, sha256: createHash("sha256").update(PAYLOAD).digest("hex") };
+    }, validateMedia: async () => MEDIA,
+  });
+  f.advance();
+  const ready = await f.tick(job.id, { acquire: successfulAcquire });
+  assert.equal(ready.status, "ready");
+  assert.equal(ready.application_id, failed.application_id);
+  assert.equal(f.submitted, 0);
+  assert.equal(transfers, 1);
+});
+
+test("legacy unknown outcomes require confirmation and exact local files absent before reusing the approved application", async (t) => {
+  const f = await fixture(t, {}, { downloadFailure: true });
+  f.approve(); const queued = f.enqueue();
+  const failed = await f.tick(queued.id);
+  assert.equal(failed.last_error, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.deepEqual(failed.request.private_endpoints, []);
+  const recover = vmApprovalWorkflow.recoverVmApprovalAcquisition;
+  const policy = [{ origin: ORIGIN, addresses: ["10.8.8.11"] }];
+
+  assert.throws(() => recover(f.store, queued.id, { confirmRepeatableResource: false, privateEndpoints: policy, now: f.now }),
+    { code: "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED" });
+  const resumed = recover(f.store, queued.id, { confirmRepeatableResource: true, privateEndpoints: policy, now: f.now });
+  assert.equal(resumed.status, "waiting_media");
+  assert.equal(resumed.application_id, failed.application_id);
+  assert.equal(resumed.instance_code, failed.instance_code);
+  assert.equal(resumed.submission_attempts, 1);
+  assert.deepEqual(resumed.request.private_endpoints, policy);
+
+  const successAcquire = (raw, config, dependencies) => prepareVmSource(raw, config, { ...dependencies,
+    download: async ({ destination }) => {
+      await writeFile(destination, PAYLOAD);
+      return { bytes: PAYLOAD.length, sha256: createHash("sha256").update(PAYLOAD).digest("hex") };
+    }, validateMedia: async () => MEDIA,
+  });
+  f.advance();
+  const ready = await f.tick(queued.id, { acquire: successAcquire });
+  assert.equal(ready.status, "ready");
+  assert.equal(ready.application_id, failed.application_id);
+  assert.equal(f.submitted, 1);
+});
+
+test("private-address policy rejection stays distinguishable from an unknown download outcome", async (t) => {
+  const f = await fixture(t);
+  f.approve(); const job = f.enqueue();
+  const rejectBeforeRequest = (raw, config, dependencies) => prepareVmSource(raw, config, { ...dependencies,
+    download: async () => { throw new VmSourceError("VM_SOURCE_ADDRESS_NOT_ALLOWED"); }, validateMedia: async () => MEDIA,
+  });
+
+  const result = await f.tick(job.id, { acquire: rejectBeforeRequest });
+
+  assert.equal(result.status, "needs_attention");
+  assert.equal(result.last_error, "VM_SOURCE_ADDRESS_NOT_ALLOWED");
+  assert.equal(f.downloaded, 0);
+});
+
+test("confirmed private-address recovery reuses the approved application only when no acquisition files exist", async (t) => {
+  const f = await fixture(t);
+  f.approve(); const job = f.enqueue();
+  const rejectBeforeRequest = (raw, config, dependencies) => prepareVmSource(raw, config, { ...dependencies,
+    download: async () => { throw new VmSourceError("VM_SOURCE_ADDRESS_NOT_ALLOWED"); }, validateMedia: async () => MEDIA,
+  });
+  await f.tick(job.id, { acquire: rejectBeforeRequest });
+  const recover = vmApprovalWorkflow.recoverVmApprovalAcquisition;
+  assert.equal(typeof recover, "function");
+  if (typeof recover !== "function") return;
+
+  const failed = f.store.get(job.id);
+  const jobRoot = path.dirname(failed.receipt_path);
+  const policy = [{ origin: ORIGIN, addresses: ["10.8.8.11"] }];
+  assert.throws(() => recover(f.store, job.id, { confirmRepeatableResource: false, privateEndpoints: policy, now: f.now }),
+    { code: "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED" });
+  for (const filename of ["source.mp4", "source.mp4.part", "acquisition.json", "acquisition.json.part"]) {
+    const artifact = path.join(jobRoot, filename);
+    await writeFile(artifact, "sentinel");
+    assert.throws(() => recover(f.store, job.id, { confirmRepeatableResource: true, privateEndpoints: policy, now: f.now }),
+      { code: "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT" });
+    await unlink(artifact);
+  }
+
+  const beforeResource = failed.resource_fingerprint;
+  const recovered = recover(f.store, job.id, { confirmRepeatableResource: true, privateEndpoints: policy, now: f.now });
+  assert.equal(recovered.status, "waiting_media");
+  assert.equal(recovered.application_id, failed.application_id);
+  assert.equal(recovered.instance_code, failed.instance_code);
+  assert.equal(recovered.submission_attempts, 1);
+  assert.equal(recovered.resource_fingerprint, beforeResource);
+  assert.deepEqual(recovered.request.private_endpoints, policy);
+
+  f.advance();
+  const ready = await f.tick(job.id);
+  assert.equal(ready.status, "ready");
+  assert.equal(ready.application_id, failed.application_id);
+  assert.equal(f.submitted, 1);
+  assert.equal(f.downloaded, 1);
+});
+
+test("confirmed recovery of an unknown outcome still rejects existing acquisition artifacts", async (t) => {
+  const f = await fixture(t, { private_endpoints: [{ origin: ORIGIN, addresses: ["10.8.8.11"] }] }, { downloadFailure: true });
+  f.approve(); const job = f.enqueue();
+  const failed = await f.tick(job.id);
+  const recover = vmApprovalWorkflow.recoverVmApprovalAcquisition;
+  assert.equal(typeof recover, "function");
+  if (typeof recover !== "function") return;
+  assert.equal(failed.last_error, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  const jobRoot = path.dirname(failed.receipt_path);
+  const artifact = path.join(jobRoot, "source.mp4");
+  await writeFile(artifact, "sentinel");
+  assert.throws(() => recover(f.store, job.id, { confirmRepeatableResource: true,
+    privateEndpoints: [{ origin: ORIGIN, addresses: ["10.8.8.11"] }], now: f.now }),
+  { code: "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT" });
+  await unlink(artifact);
+  assert.equal(recover(f.store, job.id, { confirmRepeatableResource: true,
+    privateEndpoints: [{ origin: ORIGIN, addresses: ["10.8.8.11"] }], now: f.now }).status, "waiting_media");
 });
 
 test("download interrupted after receipt publication recovers exact artifact without network", async (t) => {
@@ -448,13 +621,38 @@ test("receipt reuse verifies bytes and exact application without consuming a new
   }), { code: "VM_RECEIPT_INVALID" });
 });
 
-test("wrong resolution does not publish source or receipt", async (t) => {
-  const f = await fixture(t, { application_id: "application-1" }, { wrongResolution: true });
+test("source below the requested minimum width does not publish source or receipt", async (t) => {
+  const f = await fixture(t, { application_id: "application-1" }, { sourceResolution: { width: 1279, height: 720 } });
   f.approve(); const result = await f.tick(f.enqueue().id);
   assert.equal(result.status, "needs_attention");
+  assert.equal(result.last_error, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.equal(result.last_error_detail, "SOURCE_RESOLUTION_MISMATCH_1279X720_EXPECTED_1280X720");
+  assert.equal(summarizeVmApproval(result).error.diagnostic_code,
+    "SOURCE_RESOLUTION_MISMATCH_1279X720_EXPECTED_1280X720");
   const dirs = await readdir(f.request.output_root);
   assert.equal(dirs.length, 1);
   assert.deepEqual(await readdir(path.join(f.request.output_root, dirs[0])), []);
+});
+
+test("source below the requested minimum height does not publish source or receipt", async (t) => {
+  const f = await fixture(t, { application_id: "application-1" }, { sourceResolution: { width: 1280, height: 719 } });
+  f.approve(); const result = await f.tick(f.enqueue().id);
+
+  assert.equal(result.status, "needs_attention");
+  assert.equal(result.last_error_detail, "SOURCE_RESOLUTION_MISMATCH_1280X719_EXPECTED_1280X720");
+  const dirs = await readdir(f.request.output_root);
+  assert.equal(dirs.length, 1);
+  assert.deepEqual(await readdir(path.join(f.request.output_root, dirs[0])), []);
+});
+
+test("approved source at a higher resolution than the requested minimum is accepted", async (t) => {
+  const f = await fixture(t, { application_id: "application-1" }, { higherResolution: true });
+  f.approve(); const result = await f.tick(f.enqueue().id);
+
+  assert.equal(result.status, "ready");
+  assert.equal(result.acquisition.width, 1920);
+  assert.equal(result.acquisition.height, 1080);
+  assert.equal(f.downloaded, 1);
 });
 
 test("request validation refuses path/command/token fields and malformed local policy", async (t) => {
@@ -467,7 +665,7 @@ test("request validation refuses path/command/token fields and malformed local p
   }
 });
 
-test("different jobs cannot consume the same resource even under different approved applications", async (t) => {
+test("different approved applications can independently consume the same resource", async (t) => {
   const f = await fixture(t, { application_id: "application-1" });
   f.approve();
   assert.equal((await f.tick(f.enqueue().id)).status, "ready");
@@ -475,8 +673,52 @@ test("different jobs cannot consume the same resource even under different appro
   f.application(other);
   const second = f.enqueue({ application_id: "application-2" });
   const result = await f.tick(second.id);
+  assert.equal(result.status, "ready");
+  assert.equal(result.application_id, "application-2");
+  assert.equal(f.downloaded, 2);
+});
+
+test("the same approved application cannot consume one resource through multiple jobs", async (t) => {
+  const f = await fixture(t, { application_id: "application-1" });
+  f.approve();
+  const first = f.enqueue();
+  assert.equal((await f.tick(first.id)).status, "ready");
+  const second = f.enqueue({ output_root: path.join(f.root, "second-output") });
+  const result = await f.tick(second.id);
   assert.equal(result.last_error, "VM_RESOURCE_ALREADY_CLAIMED");
   assert.equal(f.downloaded, 1);
+});
+
+test("a prior cross-approval claim error can resume with its own existing approval", async (t) => {
+  const f = await fixture(t, { application_id: "application-1" });
+  f.approve();
+  assert.equal((await f.tick(f.enqueue().id)).status, "ready");
+
+  const application = { ...f.getApplication(), id: "application-2", instanceCode: "approval-2" };
+  f.application(application);
+  const second = f.enqueue({ application_id: "application-2" });
+  const claim = f.store.claim(second.id);
+  Object.assign(claim.job, {
+    status: "needs_attention", last_error: "VM_RESOURCE_ALREADY_CLAIMED",
+    application_id: "application-2", instance_code: "approval-2",
+    approval: { status: "APPROVED", resource_id: VMID, video_quality: "HIGH", checked_at: f.now() },
+    resource_fingerprint: createHash("sha256").update(SECRET_URL).digest("hex"),
+  });
+  f.store.save(second.id, claim.leaseToken, claim.job);
+
+  assert.throws(() => vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, second.id, {
+    confirmRepeatableResource: false, privateEndpoints: [], now: f.now,
+  }), { code: "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED" });
+  const recovered = vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, second.id, {
+    confirmRepeatableResource: true, privateEndpoints: [], now: f.now,
+  });
+  assert.equal(recovered.status, "waiting_media");
+  assert.equal(recovered.application_id, "application-2");
+  assert.equal(recovered.receipt_path, undefined);
+  f.advance();
+  assert.equal((await f.tick(second.id)).status, "ready");
+  assert.equal(f.submitted, 0);
+  assert.equal(f.downloaded, 2);
 });
 
 test("active lease prevents concurrent workers from submitting a second application", async (t) => {

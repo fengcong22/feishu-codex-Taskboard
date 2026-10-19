@@ -111,6 +111,21 @@ test("maps an array-encoded option id to the configured label", () => {
   assert.equal(event.afterValue, "待剪辑");
 });
 
+test("retains sorted option id sets for a changed VM archive multi-select field", () => {
+  const archiveTable = { ...table, subjectKey: `${table.baseToken}:${table.tableId}`,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+    vmWorkflow: { finalArchive: { enabled: true, statusFieldId: "fld_archive", triggerOptionId: "opt_archive" } },
+    metadata: { fields: [{ fieldId: "fld_archive", fieldName: "归档动作", type: 4, uiType: "MultiSelect",
+      options: [{ id: "opt_keep", name: "保留" }, { id: "opt_archive", name: "归档" }] }] } };
+  const payload = rawEvent();
+  payload.event.action_list[0].before_value = [{ field_id: "fld_archive", field_value: JSON.stringify(["opt_keep"]) }];
+  payload.event.action_list[0].after_value = [{ field_id: "fld_archive", field_value: JSON.stringify(["opt_archive", "opt_keep"]) }];
+  const [event] = normalizeBitableRecordChanged(payload, archiveTable);
+  assert.equal(event.statusFieldId, "fld_archive");
+  assert.deepEqual(event.beforeOptionIds, ["opt_keep"]);
+  assert.deepEqual(event.afterOptionIds, ["opt_archive", "opt_keep"]);
+});
+
 test("keeps same-record actions distinct within one callback", () => {
   const payload = rawEvent();
   payload.event.action_list.push({

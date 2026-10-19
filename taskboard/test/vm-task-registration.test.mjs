@@ -37,6 +37,11 @@ function registration(patch = {}) {
     ...patch.event }, binding: { subjectKey: "bas_vm:tbl_vm", configVersion: 4, stageId: "initial", ...patch.binding } };
 }
 
+function reviewRegistration() {
+  return registration({ event: { eventId: "evt_review", beforeOptionId: "opt_initial",
+    afterOptionId: "opt_review" }, binding: { stageId: "review" } });
+}
+
 async function fixture(t) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "vm-registration-"));
   const workspacePath = path.join(directory, "package");
@@ -131,6 +136,16 @@ test("event replay never prepares a new automatic intent for a historical task",
   assert.equal(registrationCounts(f.database).registration_intents, 0);
 });
 
+test("task projections expose the saved package workflow template", async (t) => {
+  const f = await fixture(t);
+  const created = await f.service.register(registration(), ACTOR);
+
+  assert.deepEqual(created.task.feishuPackageSnapshot.workflowTemplate, TEMPLATE);
+  assert.deepEqual(f.database.getTask(created.task.id).feishuPackageSnapshot.workflowTemplate, TEMPLATE);
+  assert.deepEqual(f.database.listTasks({ projectId: f.values.active.projectId })[0]
+    .feishuPackageSnapshot.workflowTemplate, TEMPLATE);
+});
+
 test("parallel event deliveries commit only the winner's intent", async (t) => {
   const f = await fixture(t);
   createIntentTable(f.database);
@@ -199,6 +214,30 @@ test("VM registration preserves instruction whitespace and normalizes only ident
   });
 });
 
+test("VM review registration freezes the latest managed parent and review instruction snapshot", async (t) => {
+  const f = await fixture(t);
+  for (const values of [f.values.active, f.values.frozen]) {
+    values.statusField.options.push({ optionId: "opt_review", name: "待修改" });
+    values.vmWorkflow.stages.review = { enabled: true, statusFieldId: "fld_status",
+      triggerOptionId: "opt_review", instructionFieldId: "fld_review_instruction",
+      instructionAttachmentsFieldId: null, writeback: {
+        processing: { fieldId: null, optionId: null }, completed: { fieldId: null, optionId: null },
+      } };
+  }
+  f.values.record.statusOptionId = "opt_review";
+  f.values.record.instruction = "剪掉‘上一章’三个字，其他不变";
+  const parent = { runId: "run_initial", artifactId: "artifact_initial", deliveryId: "delivery_initial",
+    localPath: "E:\\managed\\initial.mp4", sha256: "a".repeat(64), bytes: 4096,
+    durationMs: 20_000, reviewRound: 0 };
+  const result = await f.create({ resolveReviewParent: async () => structuredClone(parent) })
+    .register(reviewRegistration(), ACTOR);
+  assert.equal(result.origin.stageId, "review");
+  assert.equal(result.origin.stageSnapshot.reviewRound, 1);
+  assert.deepEqual(result.origin.stageSnapshot.reviewParent, parent);
+  assert.match(result.task.title, /第1稿/u);
+  assert.equal(f.values.reads, 1);
+});
+
 test("VM registration accepts the registry's controlled Chinese aliases and resource labels", async (t) => {
   const f = await fixture(t);
   f.values.active.packageRoute.packageAlias = "化学剪辑包";
@@ -208,6 +247,25 @@ test("VM registration accepts the registry's controlled Chinese aliases and reso
   const result = await f.service.register(registration(), ACTOR);
   assert.equal(result.origin.packageAlias, "化学剪辑包");
   assert.deepEqual(f.database.getFeishuTaskPackageSnapshot(result.task.id).resourceGroups, ["剪辑 主机"]);
+});
+
+test("VM review registration uses its separate frozen review status field", async (t) => {
+  const f = await fixture(t);
+  for (const snapshot of [f.values.active, f.values.frozen]) {
+    snapshot.reviewStatusField = {fieldId: "fld_review_status", type: "single_select", options: [
+      {optionId: "opt_review_wait", name: "待审核"}, {optionId: "opt_review", name: "待修改"}]};
+    snapshot.vmWorkflow.stages.review = {enabled: true, statusFieldId: "fld_review_status",
+      triggerOptionId: "opt_review", instructionFieldId: "fld_review_instruction"};
+  }
+  f.values.record.statusOptionId = "opt_review";
+  const service = f.create({resolveReviewParent: async () => ({runId: "run_initial", artifactId: "artifact_initial",
+    deliveryId: "delivery_initial", localPath: path.join(f.values.package.workspacePath, "initial.mp4"),
+    sha256: "a".repeat(64), bytes: 100, durationMs: 1000, reviewRound: 0})});
+  const result = await service.register(registration({event: {eventId: "evt_separate_review",
+    statusFieldId: "fld_review_status", beforeOptionId: "opt_review_wait", afterOptionId: "opt_review"},
+    binding: {stageId: "review"}}), ACTOR);
+  assert.equal(result.origin.triggerValue, "待修改");
+  assert.equal(result.origin.statusFieldId, "fld_review_status");
 });
 
 test("VM registration rejects aliases forbidden by the saved registry contract", async (t) => {
@@ -311,6 +369,36 @@ test("reader resolves exact frozen field IDs using live metadata and safely extr
   await assert.rejects(() => reader({ subject: snapshot, event: registration().event }), { code: "VM_FIELD_BINDING_CHANGED" });
 });
 
+test("real review record reader and registration validate the separate frozen review options", async t => {
+  const f = await fixture(t);
+  for (const snapshot of [f.values.active,f.values.frozen]) {
+    snapshot.reviewStatusField = {fieldId:"fld_review_status",type:"single_select",options:[
+      {optionId:"opt_review_wait",value:"待审核"},{optionId:"opt_review",value:"待修改"}]};
+    snapshot.vmWorkflow.stages.review = {enabled:true,statusFieldId:"fld_review_status",
+      triggerOptionId:"opt_review",instructionFieldId:"fld_review_instruction"};
+    snapshot.metadata.fields.push({fieldId:"fld_review_status",fieldName:"审核状态",type:3,uiType:"SingleSelect",
+      options:[{id:"opt_review_wait",name:"待审核"},{id:"opt_review",name:"待修改"}]},
+      {fieldId:"fld_review_instruction",fieldName:"审核意见",type:1,uiType:"Text"});
+  }
+  const liveFields = structuredClone(f.values.frozen.metadata.fields);
+  const reader = createVmRegistrationRecordReader({listFields:async () => liveFields,getRecord:async () => ({fields:{
+    fld_status:"待剪辑",fld_review_status:{id:"opt_review"},fld_vmid:VMID,fld_name:"化学变化",
+    fld_instruction:"初稿意见",fld_review_instruction:"  删除最后一句  \n"}})});
+  const body = registration({event:{eventId:"evt_reader_review",statusFieldId:"fld_review_status",
+    beforeOptionId:"opt_review_wait",afterOptionId:"opt_review"},binding:{stageId:"review"}});
+  assert.deepEqual(await reader({subject:f.values.frozen,event:body.event,stageId:"review"}),{
+    vmid:VMID,title:"化学变化",instruction:"  删除最后一句  \n",statusOptionId:"opt_review"});
+  const created = await f.create({readCurrentRecord:reader,resolveReviewParent:async () => ({
+    runId:"run_initial",artifactId:"artifact_initial",deliveryId:"delivery_initial",
+    localPath:path.join(f.values.package.workspacePath,"initial.mp4"),sha256:"a".repeat(64),
+    bytes:100,durationMs:1000,reviewRound:0})}).register(body,ACTOR);
+  assert.equal(created.origin.triggerValue,"待修改");
+  assert.equal(created.origin.stageSnapshot.vmContext.instruction,"  删除最后一句  \n");
+  liveFields.find(field => field.fieldId === "fld_review_status").options[1].name = "已改名";
+  await assert.rejects(reader({subject:f.values.frozen,event:body.event,stageId:"review"}),
+    {code:"VM_FIELD_BINDING_CHANGED"});
+});
+
 test("canonical value-based status options and ISO enabled timestamps are supported", async (t) => {
   const f = await fixture(t);
   for (const snapshot of [f.values.active, f.values.frozen]) {
@@ -323,4 +411,26 @@ test("canonical value-based status options and ISO enabled timestamps are suppor
   const reader = createVmRegistrationRecordReader({ listFields: async () => f.values.frozen.metadata.fields,
     getRecord: async () => ({ fields: { fld_status: "待剪辑", fld_vmid: VMID, fld_name: "测试", fld_instruction: "保留00:00–00:20" } }) });
   assert.equal((await reader({ subject: f.values.frozen, event: registration().event })).statusOptionId, "opt_initial");
+});
+
+test("review screenshots are optional but nonempty images cannot be silently ignored", async () => {
+  const snapshot = subject();
+  snapshot.vmWorkflow.stages.review = {enabled:true,statusFieldId:"fld_status",triggerOptionId:"opt_initial",
+    instructionFieldId:"fld_instruction",instructionAttachmentsFieldId:"fld_review_images"};
+  snapshot.metadata.fields.push({fieldId:"fld_review_images",fieldName:"审核意见截图说明",type:17,uiType:"Attachment"});
+  const liveFields = structuredClone(snapshot.metadata.fields);
+  const fields = {fld_status:"待剪辑",fld_vmid:VMID,fld_name:"测试",fld_instruction:"保留00:00–00:20"};
+  const reader = createVmRegistrationRecordReader({listFields:async () => liveFields,getRecord:async () => ({fields})});
+  const request = {subject:snapshot,event:registration().event,stageId:"review"};
+  for (const empty of [undefined,null,[]]) {
+    if (empty === undefined) delete fields.fld_review_images;
+    else fields.fld_review_images = empty;
+    assert.equal((await reader(request)).instruction,"保留00:00–00:20");
+  }
+  fields.fld_review_images = [{file_token:"fixture_private_token",name:"修改截图.png",type:"image/png",size:100}];
+  await assert.rejects(reader(request),error => error.code === "VM_REVIEW_IMAGES_UNSUPPORTED"
+    && !error.message.includes("fixture_private_token"));
+  delete fields.fld_review_images;
+  liveFields.find(field => field.fieldId === "fld_review_images").type = 1;
+  await assert.rejects(reader(request),{code:"VM_FIELD_BINDING_CHANGED"});
 });

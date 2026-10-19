@@ -23,6 +23,7 @@ import {
   deleteTaskArtifact,
   enqueueTaskArtifactUpload,
   getTaskAutoCutRuns,
+  getTaskVmPmoRun,
   getTask,
   listAttachments,
   listComments,
@@ -33,6 +34,8 @@ import {
   resolvePersistedAttachmentUrl,
   retryTaskArtifactUpload,
   retryTaskAutoCut,
+  retryTaskVmPmoPlan,
+  retryTaskVmPmoWriteback,
   uploadAttachment,
   uploadCommentAttachment,
   uploadTaskArtifact,
@@ -59,6 +62,7 @@ import type {
   Task,
   TaskArtifact,
   FeishuAutoCutRun,
+  VmPmoRunSummary,
   AutoCutRunConsent,
   TaskChangeActivity,
   TaskDraft,
@@ -472,6 +476,13 @@ export function TaskDetail({
   const [autoCutRunsLoading, setAutoCutRunsLoading] = useState(false);
   const [autoCutRunsError, setAutoCutRunsError] = useState<TaskDetailError | null>(null);
   const [retryingAutoCut, setRetryingAutoCut] = useState(false);
+  const [vmPmoRun, setVmPmoRun] = useState<VmPmoRunSummary | null>(null);
+  const [vmPmoRunError, setVmPmoRunError] = useState<TaskDetailError | null>(null);
+  const [retryingVmPmoPlan, setRetryingVmPmoPlan] = useState(false);
+  const [retryingVmPmoWriteback, setRetryingVmPmoWriteback] = useState(false);
+  const [showVmPmoRetryConsent, setShowVmPmoRetryConsent] = useState(false);
+  const [allowVmPmoAsr, setAllowVmPmoAsr] = useState(false);
+  const [allowVmPmoLocalWrite, setAllowVmPmoLocalWrite] = useState(false);
   const [uploadingArtifact, setUploadingArtifact] = useState(false);
   const [deletingArtifactId, setDeletingArtifactId] = useState<string | null>(null);
   const [artifactUploads, setArtifactUploads] = useState<ArtifactUpload[]>([]);
@@ -500,6 +511,7 @@ export function TaskDetail({
   const [pendingDelete, setPendingDelete] = useState<Comment | null>(null);
   const [deleting, setDeleting] = useState(false);
   const titleRef = useRef<HTMLTextAreaElement>(null);
+  const currentTaskIdRef = useRef(task.id);
   const descriptionComposerRef = useRef<InlineMediaComposerHandle>(null);
   const descriptionScrollPositionRef = useRef<{ element: HTMLElement; top: number } | null>(null);
   const descriptionCaretRef = useRef<{ text: string; offset: number; occurrence: number } | null>(null);
@@ -564,6 +576,7 @@ export function TaskDetail({
 
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
+    currentTaskIdRef.current = task.id;
     setCurrentTask(task);
     if (document.activeElement !== titleRef.current) setTitle(task.title);
     if (taskChanged || !editingDescription) {
@@ -573,6 +586,12 @@ export function TaskDetail({
     if (taskChanged) {
       setEditingDescription(false);
       setChangeStatusToTodo(false);
+      setVmPmoRun(null);
+      setVmPmoRunError(null);
+      setShowVmPmoRetryConsent(false);
+      setAllowVmPmoAsr(false);
+      setAllowVmPmoLocalWrite(false);
+      setRetryingVmPmoPlan(false);
     }
   }, [task]);
 
@@ -698,6 +717,39 @@ export function TaskDetail({
     );
     return () => controller.abort();
   }, [attachmentsRevision, isPhasedAutoCutTask, task.id, currentTask.version, currentTask.status]);
+
+  useEffect(() => {
+    if (!isPhasedAutoCutTask) {
+      setVmPmoRun(null);
+      setVmPmoRunError(null);
+      return undefined;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    const controller = new AbortController();
+    const load = async () => {
+      try {
+        const run = await getTaskVmPmoRun(task.id, controller.signal);
+        if (cancelled) return;
+        setVmPmoRun(run);
+        setVmPmoRunError(null);
+        const writebackPending = run?.writeback && Object.values(run.writeback).some(entry =>
+          entry && ["pending", "processing", "retry_wait"].includes(entry.state));
+        if (run && (!["completed", "blocked", "needs_attention"].includes(run.state) || writebackPending)) {
+          timer = setTimeout(() => void load(), 2_000);
+        }
+      } catch (error) {
+        if (cancelled || (error as Error).name === "AbortError") return;
+        setVmPmoRunError(messageFor(error));
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [isPhasedAutoCutTask, task.id, currentTask.version, vmPmoRun?.state, vmPmoRun?.canRetryWriteback]);
 
   useEffect(() => {
     if (!isFeishuAutoCutTask) {
@@ -1256,6 +1308,42 @@ export function TaskDetail({
     }
   }
 
+  async function retryVmPmoPlanning() {
+    if (!vmPmoRun?.canRetryPlan || !allowVmPmoAsr || !allowVmPmoLocalWrite || retryingVmPmoPlan) return;
+    const taskId = currentTask.id;
+    setRetryingVmPmoPlan(true);
+    setVmPmoRunError(null);
+    try {
+      const run = await retryTaskVmPmoPlan(taskId, currentTask.version);
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRun(run);
+      setShowVmPmoRetryConsent(false);
+      setAllowVmPmoAsr(false);
+      setAllowVmPmoLocalWrite(false);
+    } catch (error) {
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRunError(messageFor(error));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setRetryingVmPmoPlan(false);
+    }
+  }
+
+  async function retryVmPmoWriteback() {
+    if (!vmPmoRun?.canRetryWriteback || retryingVmPmoWriteback) return;
+    const taskId = currentTask.id;
+    setRetryingVmPmoWriteback(true);
+    setVmPmoRunError(null);
+    try {
+      const run = await retryTaskVmPmoWriteback(taskId, currentTask.version);
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRun(run);
+    } catch (error) {
+      if (currentTaskIdRef.current === taskId) setVmPmoRunError(messageFor(error));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setRetryingVmPmoWriteback(false);
+    }
+  }
+
   function updateArtifactUpload(nextUpload: ArtifactUpload) {
     setArtifactUploads((current) => [
       nextUpload,
@@ -1665,6 +1753,103 @@ export function TaskDetail({
 
             {isFeishuAutoCutTask && (
               <section className="issue-artifacts" aria-labelledby="artifacts-heading">
+                {vmPmoRun && (
+                  <div className="vm-pmo-run-summary" aria-label={text("VM 初稿执行", "VM draft run")}>
+                    <div className="vm-pmo-run-heading">
+                      <strong>{text("VM 剪辑运行", "VM editing run")}</strong>
+                      <span className={`vm-pmo-run-state is-${vmPmoRun.state}`}>
+                        {vmPmoRun.state === "blocked" ? text("需要处理", "Needs attention")
+                          : vmPmoRun.state === "completed" ? text("已完成", "Completed")
+                            : vmPmoRun.state === "needs_attention" ? text("需要检查", "Needs review")
+                              : vmPmoRun.state === "waiting_materials" ? text("等待审批或素材", "Waiting for approval or source")
+                                : vmPmoRun.state === "ready" ? text("等待重新规划", "Ready to plan")
+                                  : vmPmoRun.state === "preparing" ? text("准备输入", "Preparing input")
+                                    : vmPmoRun.state === "prepared" ? text("等待剪辑资源", "Waiting for editing capacity")
+                                      : vmPmoRun.state === "planning" ? text("语音识别与规划中", "Recognizing speech and planning")
+                                        : vmPmoRun.state === "planned" ? text("规划完成", "Plan ready")
+                                          : vmPmoRun.state === "rendering" ? text("生成成片中", "Rendering video")
+                                            : vmPmoRun.state === "rendered" ? text("校验成片中", "Validating video")
+                                              : vmPmoRun.state === "delivery_pending" ? text("上传成片中", "Uploading video")
+                                                : text("确认交付中", "Confirming delivery")}
+                      </span>
+                    </div>
+                    <div className="vm-pmo-run-meta">
+                      <span>{text("规划尝试", "Planning attempt")} {vmPmoRun.planAttempt}/{vmPmoRun.retryLimit}</span>
+                      <code>{vmPmoRun.runId}</code>
+                      {vmPmoRun.errorCode && <code className="vm-pmo-run-error-code">{vmPmoRun.errorCode}</code>}
+                    </div>
+                    {vmPmoRun.writeback && (
+                      <div aria-label={text("飞书进度回写", "Feishu progress writeback")}>
+                        {(["processing", "completed"] as const).map(moment => {
+                          const entry = vmPmoRun.writeback?.[moment];
+                          const state = entry?.state;
+                          return <div key={moment}>
+                            <span>{moment === "processing" ? text("处理中回写", "Processing writeback")
+                              : text("完成回写", "Completion writeback")}：{state === "succeeded" ? text("已同步", "Synced")
+                              : state === "dead_letter" ? text("自动重试已停止", "Automatic retries stopped")
+                                : state === "conflict" ? text("字段已变化，需检查", "Field changed, review required")
+                                  : state === "processing" ? text("同步中", "Syncing")
+                                    : state === "pending" || state === "retry_wait" ? text("等待同步", "Waiting to sync")
+                                      : text("尚未触发", "Not triggered")}</span>
+                            {entry?.errorCode && <code className="vm-pmo-run-error-code">{entry.errorCode}</code>}
+                          </div>;
+                        })}
+                        {vmPmoRun.canRetryWriteback && (
+                          <button type="button" disabled={retryingVmPmoWriteback}
+                            onClick={() => void retryVmPmoWriteback()}>
+                            {retryingVmPmoWriteback ? text("正在重试…", "Retrying…") : text("重试进度回写", "Retry progress writeback")}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {vmPmoRun.retryHistory.length > 0 && (
+                      <ul className="vm-pmo-retry-history">
+                        {vmPmoRun.retryHistory.map((entry) => (
+                          <li key={`${entry.planAttempt}-${entry.failedAt}`}>
+                            {text(`第 ${entry.planAttempt} 次规划`, `Planning attempt ${entry.planAttempt}`)}
+                            <code>{entry.errorCode}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {vmPmoRun.canRetryPlan && !showVmPmoRetryConsent && (
+                      <button type="button" disabled={retryingVmPmoPlan}
+                        onClick={() => setShowVmPmoRetryConsent(true)}>
+                        {text("重试语音识别与规划", "Retry speech recognition and planning")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryPlan && showVmPmoRetryConsent && (
+                      <div className="vm-pmo-retry-consent">
+                        <label>
+                          <input type="checkbox" checked={allowVmPmoAsr}
+                            onChange={(event) => setAllowVmPmoAsr(event.target.checked)} />
+                          {text("允许本次重试重新识别原视频音轨", "Allow speech recognition on the original audio for this retry")}
+                        </label>
+                        <label>
+                          <input type="checkbox" checked={allowVmPmoLocalWrite}
+                            onChange={(event) => setAllowVmPmoLocalWrite(event.target.checked)} />
+                          {text("允许本次重试写入新的本机规划文件", "Allow this retry to write a new local plan")}
+                        </label>
+                        <div className="vm-pmo-retry-actions">
+                          <button type="button" disabled={retryingVmPmoPlan || !allowVmPmoAsr || !allowVmPmoLocalWrite}
+                            onClick={() => void retryVmPmoPlanning()}>
+                            {retryingVmPmoPlan ? text("正在重试…", "Retrying…") : text("确认重试", "Confirm retry")}
+                          </button>
+                          <button type="button" disabled={retryingVmPmoPlan} onClick={() => {
+                            setShowVmPmoRetryConsent(false);
+                            setAllowVmPmoAsr(false);
+                            setAllowVmPmoLocalWrite(false);
+                          }}>{text("取消", "Cancel")}</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {vmPmoRunError && (
+                  <div className="attachments-error" role="alert">
+                    {typeof vmPmoRunError === "string" ? vmPmoRunError : text(vmPmoRunError[0], vmPmoRunError[1])}
+                  </div>
+                )}
                 {isPhasedAutoCutTask && (
                   autoCutRunsLoading
                     ? <div className="attachments-loading" aria-label={text("正在加载 Auto-Cut 运行", "Loading Auto-Cut runs")} aria-busy="true"><i /><i /></div>

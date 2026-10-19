@@ -10,6 +10,7 @@ import { createVmApprovalStore } from "../server/vm-approval-store.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "../server/vm-download-notifier.mjs";
 import { createVmDownloadService } from "../server/vm-download-service.mjs";
 import { prepareVmSource } from "../server/vm-source-adapter.mjs";
+import { VmSourceError } from "../server/vm-source-transfer.mjs";
 
 const vmid = "678465c3d94605d24bb9361a";
 const second = "678465c3d94605d24bb9361b";
@@ -95,6 +96,110 @@ test("internal exact lookup reconciles a job without exposing its request policy
   assert.doesNotMatch(JSON.stringify(found), /allowed_origins|private_endpoints/iu);
   await f.restart();
   assert.equal(f.service.lookupExact({ requestFingerprint: fingerprint, jobId: created.id }).id, created.id);
+});
+
+test("queue cleanup hides settled rows, keeps task lookup intact, and restores a reused request", async (t) => {
+  const f = await fixture(t);
+  const ready = f.service.enqueue(f.input()).jobs[0];
+  f.update(ready.id, (job) => { job.status = "ready"; });
+  assert.equal(f.service.cleanup([ready.id]).clearedCount, 1);
+  assert.deepEqual(f.service.snapshot().jobs, []);
+  assert.equal(f.service.lookupExact({ requestFingerprint: f.store.get(ready.id).request_fingerprint, jobId: ready.id }).status, "ready");
+
+  const reused = f.service.enqueue(f.input()).jobs[0];
+  assert.equal(reused.id, ready.id);
+  assert.equal(f.service.snapshot().jobs.length, 1);
+  assert.equal(f.store.get(ready.id).queue_hidden_at, undefined);
+  assert.equal(f.service.cleanup([ready.id]).clearedCount, 1);
+  assert.deepEqual(f.service.snapshot().jobs, []);
+  assert.throws(() => f.service.cleanup([]), { code: "VM_DOWNLOAD_INPUT_INVALID" });
+});
+
+test("private endpoint recovery applies the restarted service policy without submitting another application", async (t) => {
+  let application;
+  let submitted = 0;
+  let transfers = 0;
+  let allowPrivateAddress = false;
+  const client = {
+    getIdentity: async () => ({ raw: { feishu: identity } }),
+    getVideos: async id => ({ total: 1, videos: [{ id }] }),
+    getDepartments: async () => ({ data: { department_infos: [{ id: "dept", name: "动画组" }] } }),
+    listApplications: async () => ({ list: application ? [application] : [] }),
+    submitApplication: async () => {
+      submitted++;
+      application = { id: "app-recovery", instanceCode: "approval-recovery", createdAt: new Date(1000000000).toISOString(),
+        applyUser: { feishuUserId: identity.user_id }, applyReason: "切片剪辑", videoUse: "ORIGINAL", videoQuality: "HIGH",
+        applyStatus: "APPROVED", urlObjList: [{ id: vmid, status: "finished", url: "https://vm-resource.yangcong345.com/fixture.mp4?signature=private" }] };
+    },
+    getApplication: async () => application,
+  };
+  const acquire = (raw, config, dependencies) => prepareVmSource(raw, config, { ...dependencies,
+    download: async ({ destination }) => {
+      transfers++;
+      if (!allowPrivateAddress) throw new VmSourceError("VM_SOURCE_ADDRESS_NOT_ALLOWED");
+      const payload = Buffer.from("fixture-video");
+      await writeFile(destination, payload);
+      return { bytes: payload.length, sha256: createHash("sha256").update(payload).digest("hex") };
+    },
+    validateMedia: async () => ({ container: "mov,mp4", duration_ms: 2000,
+      video: [{ width: 1280, height: 720 }], audio: [], validation: { metadata: true, full_decode: true } }),
+  });
+  const f = await fixture(t, { client, workerOptions: { acquire } });
+  const queued = f.service.enqueue(f.input()).jobs[0];
+  await f.service.wake();
+  assert.equal(f.store.get(queued.id).last_error, "VM_SOURCE_ADDRESS_NOT_ALLOWED");
+  assert.equal(submitted, 1);
+  allowPrivateAddress = true;
+  await f.restart({ privateEndpoints: [{ origin: "https://vm-resource.yangcong345.com", addresses: ["10.8.8.11"] }] });
+
+  f.service.recover(queued.id, { confirmRepeatableResource: true });
+  await f.service.wake();
+
+  const ready = f.store.get(queued.id);
+  assert.equal(ready.status, "ready");
+  assert.equal(ready.application_id, "app-recovery");
+  assert.equal(ready.instance_code, "approval-recovery");
+  assert.deepEqual(ready.request.private_endpoints, [{ origin: "https://vm-resource.yangcong345.com", addresses: ["10.8.8.11"] }]);
+  assert.equal(submitted, 1);
+  assert.equal(transfers, 2);
+});
+
+test("unknown outcomes expose operator-confirmed recovery when the configured origin is allowed", async (t) => {
+  const policy = [{ origin: "https://vm-resource.yangcong345.com", addresses: ["10.8.8.11"] }];
+  const legacy = await fixture(t);
+  const oldJob = legacy.service.enqueue(legacy.input()).jobs[0];
+  await legacy.restart({ privateEndpoints: policy });
+  legacy.update(oldJob.id, (job) => {
+    job.status = "needs_attention";
+    job.last_error = "VM_DOWNLOAD_OUTCOME_UNKNOWN";
+  });
+  assert.deepEqual(legacy.service.snapshot().jobs[0].recovery, { kind: "unknown_outcome" });
+
+  const current = await fixture(t, { privateEndpoints: policy });
+  const newJob = current.service.enqueue(current.input()).jobs[0];
+  current.update(newJob.id, (job) => {
+    job.status = "needs_attention";
+    job.last_error = "VM_DOWNLOAD_OUTCOME_UNKNOWN";
+  });
+  const currentPublicJob = current.service.snapshot().jobs[0];
+  assert.deepEqual(currentPublicJob.recovery, { kind: "unknown_outcome" });
+});
+
+test("an approved cross-application resource claim exposes a recovery action", async (t) => {
+  const f = await fixture(t);
+  const job = f.service.enqueue(f.input()).jobs[0];
+  f.update(job.id, (value) => {
+    value.status = "needs_attention";
+    value.last_error = "VM_RESOURCE_ALREADY_CLAIMED";
+    value.application_id = "application-2";
+    value.instance_code = "approval-2";
+    value.approval = { status: "APPROVED", resource_id: vmid, video_quality: "HIGH", checked_at: 1000000000 };
+    value.resource_fingerprint = "a".repeat(64);
+  });
+  assert.deepEqual(f.service.snapshot().jobs[0].recovery, { kind: "resource_claim" });
+
+  f.update(job.id, (value) => { delete value.approval; });
+  assert.equal(f.service.snapshot().jobs[0].recovery, undefined);
 });
 
 test("logout before transfer fences the single-use download and original application resumes after reconnect", async (t) => {

@@ -284,6 +284,7 @@ function decisionFromPhasedSnapshot(record, snapshot) {
     reason: snapshot.reason ?? undefined,
     reasonCode: snapshot.reasonCode ?? undefined,
     stage: snapshot.stageId ? (subject.vmWorkflow?.stages ?? subject.stages)?.[snapshot.stageId] : undefined,
+    archive: snapshot.kind === "final_archive" ? subject.vmWorkflow?.finalArchive : undefined,
     operationKind: snapshot.kind === "directory_operation" ? "ensure_final_directory" : undefined,
     controlledContext: snapshot.controlledContext ?? null,
     packageAlias: subject.packageRoute?.packageAlias ?? subject.defaultPackageAlias ?? null,
@@ -692,7 +693,7 @@ export function createBridge({
     const decision = persistedSnapshot
       ? decisionFromPhasedSnapshot(record, persistedSnapshot)
       : decideVmInitialRecordChange(subject, record.event);
-    if (!decision || !["register", "archive_waiting", "ignored", "blocked"].includes(decision.kind)) {
+    if (!decision || !["register", "archive_waiting", "final_archive", "ignored", "blocked"].includes(decision.kind)) {
       throw Object.assign(new Error("VM decision snapshot is invalid"), { code: "DECISION_SNAPSHOT_INVALID" });
     }
     if (decision.kind === "ignored") {
@@ -705,15 +706,47 @@ export function createBridge({
         kind: "blocked", reason: decision.reason, reasonCode: decision.reasonCode,
       }, heartbeat, { requireTaskIdentifier: false });
     }
+    if (decision.kind === "final_archive") {
+      const archive = taskboard?.archiveFeishuVmFinalVideo;
+      if (typeof archive !== "function") {
+        throw Object.assign(new Error("Taskboard VM final archive route is unavailable"), {
+          code: "TASKBOARD_VM_ARCHIVE_UNAVAILABLE", status: 503,
+        });
+      }
+      const event = record.event;
+      await heartbeat.ensureActive();
+      const job = await archive.call(taskboard, {
+        event: {
+          eventId: event.eventId, baseToken: event.baseToken, tableId: event.tableId,
+          recordId: event.recordId, statusFieldId: event.statusFieldId,
+          beforeOptionIds: event.beforeOptionIds, afterOptionIds: event.afterOptionIds,
+          ...(event.eventOccurredAtPresent ? { occurredAt: event.eventOccurredAt } : {}),
+        },
+        binding: { subjectKey: decision.subjectKey, configVersion: decision.configVersion },
+      }, { bridgeSecret });
+      return completePhased(record, "final_archive", {
+        kind: "final_archive", archiveJobId: job.id, archiveState: job.state,
+        subjectKey: decision.subjectKey, configVersion: decision.configVersion,
+      }, heartbeat, { requireTaskIdentifier: false });
+    }
     if (decision.kind === "archive_waiting") {
       await archiveWaitingFeishuStageTasks(taskboard, {
         event: record.event,
         stageId: decision.stageId,
-        statusFieldId: subject.vmWorkflow.stages.initial.statusFieldId,
+        statusFieldId: decision.stage.statusFieldId,
         packageAlias: decision.packageAlias,
       }, { ensureActive: () => heartbeat.ensureActive() });
       return completePhased(record, "ignored", { kind: "ignored", reason: "left_trigger" },
         heartbeat, { requireTaskIdentifier: false });
+    }
+    if (decision.archiveWaiting) {
+      const previousStage = subject.vmWorkflow.stages[decision.previousStageId];
+      await archiveWaitingFeishuStageTasks(taskboard, {
+        event: record.event,
+        stageId: decision.previousStageId,
+        statusFieldId: previousStage.statusFieldId,
+        packageAlias: decision.packageAlias,
+      }, { ensureActive: () => heartbeat.ensureActive() });
     }
     const register = taskboard?.registerFeishuVmTask;
     if (typeof register !== "function") {
@@ -732,7 +765,7 @@ export function createBridge({
           beforeOptionId: event.beforeOptionId, afterOptionId: event.afterOptionId,
           ...(event.eventOccurredAtPresent ? { occurredAt: event.eventOccurredAt } : {}),
         },
-        binding: { subjectKey: decision.subjectKey, configVersion: decision.configVersion, stageId: "initial" },
+        binding: { subjectKey: decision.subjectKey, configVersion: decision.configVersion, stageId: decision.stageId },
       }, { bridgeSecret });
     } catch (error) {
       if (!isPermanentlyDeletedRegistration(error)) throw error;
@@ -741,7 +774,7 @@ export function createBridge({
     }
     return completePhased(record, "register", {
       kind: "register", taskId: task?.id, taskIdentifier: task?.identifier,
-      stageId: "initial", subjectKey: decision.subjectKey, configVersion: decision.configVersion,
+      stageId: decision.stageId, subjectKey: decision.subjectKey, configVersion: decision.configVersion,
       packageAlias: decision.packageAlias,
     }, heartbeat);
   }

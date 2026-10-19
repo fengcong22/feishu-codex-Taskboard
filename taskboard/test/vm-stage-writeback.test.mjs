@@ -11,16 +11,18 @@ function fixture(overrides = {}) {
     tableId: "tbl_vm", configVersion: 4,
     workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
     metadata: { fields: [{ fieldId: "fld_status", fieldName: "制作进度", type: 3,
-      uiType: "SingleSelect", options: [{ id: "opt_processing", name: "剪辑中" },
+      uiType: "SingleSelect", options: [{ id: "opt_ready", name: "待剪辑" },
+        { id: "opt_review", name: "待修改" }, { id: "opt_processing", name: "剪辑中" },
         { id: "opt_complete", name: "初稿完成" }] }] },
     vmWorkflow: { fields: { outputAttachmentFieldId: "fld_output" }, stages: {
-      initial: { enabled: true, writeback: {
+      initial: { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_ready", writeback: {
         processing: { fieldId: "fld_status", optionId: "opt_processing" },
         completed: { fieldId: "fld_status", optionId: "opt_complete" },
       } }, review: { enabled: false },
     }, finalArchive: { enabled: false } } };
   const liveFields = [{ field_id: "fld_status", field_name: "制作进度", type: 3,
     ui_type: "SingleSelect", property: { options: [
+      { id: "opt_ready", name: "待剪辑" }, { id: "opt_review", name: "待修改" },
       { id: "opt_processing", name: "剪辑中" }, { id: "opt_complete", name: "初稿完成" },
     ] } }];
   const delivery = { runId: "run_vm", taskId: "task_vm", state: "delivered",
@@ -33,6 +35,7 @@ function fixture(overrides = {}) {
     getActiveSubject: async () => values.subject,
     listFields: async () => values.liveFields,
     getDelivery: async () => values.delivery,
+    isLatestStageRun: async () => values.latest !== false,
     enqueueWritebackIntent: async (intent) => { enqueued.push(intent); return { id: "intent_vm" }; },
   });
   return { values, service, enqueued };
@@ -43,7 +46,8 @@ test("registers processing only after a production VM runner actually starts", a
   assert.deepEqual(await service.enqueue({ runId: "run_vm", moment: "processing" }), { id: "intent_vm" });
   assert.deepEqual(enqueued, [{ idempotencyKey: "vm:run_vm:processing", taskId: "task_vm",
     runId: "run_vm", courseBindingId: null,
-    operation: { type: "single_select", fieldId: "fld_status", optionId: "opt_processing" } }]);
+    operation: { type: "single_select", fieldId: "fld_status", optionId: "opt_processing",
+      guard: { fieldId: "fld_status", optionIds: ["opt_ready", "opt_processing"] } } }]);
   for (const patch of [{ runnerStartedAt: null }, { state: "prepared" }, { productionOrigin: false }]) {
     const bad = fixture(); Object.assign(bad.values.run, patch);
     await assert.rejects(() => bad.service.enqueue({ runId: "run_vm", moment: "processing" }),
@@ -57,6 +61,8 @@ test("registers completion only after matching MP4 delivery readback", async () 
   await service.enqueue({ runId: "run_vm", moment: "completed" });
   assert.equal(enqueued[0].idempotencyKey, "vm:run_vm:completed");
   assert.equal(enqueued[0].operation.optionId, "opt_complete");
+  assert.deepEqual(enqueued[0].operation.guard,
+    { fieldId: "fld_status", optionIds: ["opt_processing", "opt_complete"] });
   for (const patch of [{ state: "binding" }, { fileToken: null }, { taskId: "other" },
     { target: { baseToken: "bas_vm", tableId: "tbl_vm", recordId: "other", fieldId: "fld_output" } }]) {
     const bad = fixture(); Object.assign(bad.values.delivery, patch);
@@ -66,13 +72,37 @@ test("registers completion only after matching MP4 delivery readback", async () 
   }
 });
 
+test("review completion uses the frozen review-stage writeback option", async () => {
+  const { values, service, enqueued } = fixture();
+  values.run.stageId = "review";
+  values.subject.vmWorkflow.stages.review = { enabled: true, writeback: {
+    processing: { fieldId: "fld_status", optionId: "opt_processing" },
+    completed: { fieldId: "fld_status", optionId: "opt_review_complete" },
+  } };
+  values.subject.metadata.fields[0].options.push({ id: "opt_review_complete", name: "第1稿完成" });
+  values.liveFields[0].property.options.push({ id: "opt_review_complete", name: "第1稿完成" });
+  values.subject.vmWorkflow.stages.review.statusFieldId = "fld_status";
+  values.subject.vmWorkflow.stages.review.triggerOptionId = "opt_review";
+  await service.enqueue({ runId: "run_vm", moment: "completed" });
+  assert.equal(enqueued[0].operation.optionId, "opt_review_complete");
+  assert.deepEqual(enqueued[0].operation.guard,
+    { fieldId: "fld_status", optionIds: ["opt_processing", "opt_review_complete"] });
+});
+
+test("rejects delayed writeback from a stage task replaced by a later review round", async () => {
+  const { service, enqueued } = fixture({ latest: false });
+  await assert.rejects(() => service.enqueue({ runId: "run_vm", moment: "completed" }),
+    { code: "VM_WRITEBACK_STAGE_ADVANCED", status: 409 });
+  assert.equal(enqueued.length, 0);
+});
+
 test("fails closed when active config or live metadata changes", async () => {
   const mutations = [
     (v) => { v.subject.configVersion = 5; },
     (v) => { v.subject.lifecycle = "draft"; },
     (v) => { v.liveFields[0].field_name = "已改名进度"; },
     (v) => { v.liveFields[0].type = 4; },
-    (v) => { v.liveFields[0].property.options[0].name = "已改名选项"; },
+    (v) => { v.liveFields[0].property.options.find((option) => option.id === "opt_processing").name = "已改名选项"; },
     (v) => { v.liveFields[0].property.options.push({ id: "opt_processing", name: "重复项" }); },
     (v) => { v.subject.vmWorkflow.stages.initial.writeback.processing.optionId = null; },
     (v) => { v.subject.metadata.fields = []; },

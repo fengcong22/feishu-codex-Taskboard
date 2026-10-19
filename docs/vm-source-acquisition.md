@@ -2,7 +2,7 @@
 
 `taskboard/cli/vm-approval.mjs` 是独立运行的审批申请与素材领取入口：本机排队 → 正常登录 → 申请 → 等待批准与制作完成 → 下载和媒体校验。`taskboard/cli/vm-source.mjs` 保留为操作者提供已获批 HTTPS 地址或本机 MP4 的采集入口。两者成功后均使用准确文件与回执，不扫描“最新文件”；CLI 仍是独立操作者入口，不直接登记 Bridge 受控任务、启动自动剪辑、上传 PMO 附件或回写。
 
-PMO 业务来源在「学科 PMO 配置 → 对应 VM 剪辑包 → 视频来源」选择 VMID 文本字段并配置申请部门和用途，不需要为每条 PMO 记录手填 VMID。独立 `vm_pmo_review_video` v1 的 `initial` 实现已接通：真实单选状态变化 → Bridge 认证登记 → Taskboard 绑定审批下载队列 → `plan/render` → 唯一 MP4 校验、附件上传与读回 → 阶段完成回写。只开放明确保留区间的初稿，完整配置须显式启用；审核修改、parent 轮次及 NAS 归档保持禁用。实现与离线验证不代表真实整链路已验收，新申请到下载、渲染及 PMO 交付仍须用指定测试记录验证，步骤见 [VM / PMO 联调](vm-pmo-offline-integration.md)。
+PMO 业务来源在「学科 PMO 配置 → 对应 VM 剪辑包 → 视频来源」选择 VMID 文本字段并配置申请部门和用途，不需要为每条 PMO 记录手填 VMID。独立 `vm_pmo_review_video` workflow 已接通 `initial` 与可选 `review`：初稿使用真实审批下载；审核使用 Taskboard 已确认交付的上一轮 MP4，不重复申请 VM 下载。包 manifest 和本机 runtime 须满足 v2 contract/driver 后才能启用审核。Taskboard 冻结原始意见并交给剪辑包；删词、静音和 cue 的语义理解、时间定位及保护词冲突检查均由剪辑包完成，并使用源哈希绑定的词级证据。Taskboard 校验输入/回执身份和最终成片，不重复推导剪辑操作。完整配置仍须显式启用；最终成片 NAS 归档由独立可选 worker 处理。实现与离线验证不代表真实整链路已验收，新申请到下载、渲染、附件读回及归档仍须用指定测试记录验证，步骤见 [VM / PMO 联调](vm-pmo-offline-integration.md)。
 
 全局「VM 账号与队列」负责共享 Shadow 会话和独立下载监控。「手动批量下载（补救入口）」默认折叠，展开后仍可提交临时下载；其申请默认值不会覆盖任何学科或包草稿。
 
@@ -26,7 +26,7 @@ PMO 业务来源在「学科 PMO 配置 → 对应 VM 剪辑包 → 视频来源
 }
 ```
 
-必填字段为 `schema_version: 1`、24 位小写十六进制 `vmid`、纯文本 `department`（最多 100 字符）、`reason`（最多 500 字符）、绝对路径 `output_root` 和精确 HTTPS origin 数组 `allowed_origins`。`private_endpoints` 可选，只能配置操作者已确认的 origin/RFC1918 IPv4 地址。首版用途固定 `ORIGINAL`、质量固定 `HIGH`，实际文件必须为 1280x720。
+必填字段为 `schema_version: 1`、24 位小写十六进制 `vmid`、纯文本 `department`（最多 100 字符）、`reason`（最多 500 字符）、绝对路径 `output_root` 和精确 HTTPS origin 数组 `allowed_origins`。`private_endpoints` 可选，只能配置操作者已确认的 origin/RFC1918 IPv4 地址。首版用途固定 `ORIGINAL`、质量固定 `HIGH`；实际文件宽、高均不得低于 1280x720，允许更高分辨率。
 
 已有申请可增添 `application_id`，直接接管该申请；身份、原因、用途、质量、VMID 与飞书审批实例绑定仍须通过后台校验。可选 `reuse_receipt` 为已有 `acquisition.json` 的绝对路径，必须同时填写 `application_id`，且回执必须绑定同一 VMID、同一申请及同目录的 `source.mp4`。复用重新核对 SHA-256、字节数与既有媒体校验结果，不重新传输或全量解码。人工采集的既有回执继续标为 `operator_asserted`，不会升级成 API 绑定凭证。
 
@@ -60,7 +60,7 @@ node taskboard/cli/vm-approval.mjs run --state .runtime/vm-download-check/approv
 
 缺少登录凭据时 CLI 返回 `VM_AUTH_REQUIRED`，原任务状态保留；只有后台认证拒绝导致任务进入 `auth_required` 才需要先 `resume`。`resume` 不能清除下载结果不明，也不会重新申请。提交后最多核对 6 次仍找不到唯一申请时转人工核对；不能通过换 ID 或删除队列强制重提。
 
-状态库使用 SQLite 事务、进程间锁与可续期租约，损坏状态、符号链接或硬链接路径会关闭处理。下载地址只在内存中，库内仅存摘要并在同一状态库跨任务保留资源占用，防止已消费或结果不明的地址被再次下载。不得用另建数据库、清空状态或手工改写数据解除占用。下载结果不明且精确回执未成功发布时转 `needs_attention`，不重放单次领取地址。
+状态库使用 SQLite 事务、进程间锁与可续期租约，损坏状态、符号链接或硬链接路径会关闭处理。下载地址只在内存中，库内仅存摘要；资源占用按 `(application_id, fingerprint)` 唯一，同一 VM 申请不能由多个队列项重复领取，不同已批准申请可分别领取相同素材。升级旧状态库时，已有全局占用会迁移到原所有者的申请编号，不丢失队列或占用记录。不得用另建数据库、清空状态或手工改写数据解除占用。下载结果不明且精确回执未成功发布时转 `needs_attention`，不自动重放单次领取地址。
 
 申请接口没有已验证的服务端幂等键，因此不承诺绝对 exactly-once。提交意图已落盘但实际 POST 尚未发出的崩溃窗口，会保守进入核对状态；无法唯一找到申请时停止，不自动补发。
 
@@ -76,7 +76,7 @@ node taskboard/cli/vm-approval.mjs run --state .runtime/vm-download-check/approv
 
 VM 下载需要先申请审批。审批通过后，邮件中的 `https://vm.yangcong345.com/applyResult?...` 是审批结果页，不是视频文件。在人工 CLI 路径中，操作者确认结果页为已批准、目标文件制作完成，并核对视频与 VMID 后，将页面提供的实际视频下载地址写入本机请求文件。
 
-人工 `vm-source.mjs` CLI 由操作者核对 VMID，采集回执将这种绑定标为 `operator_asserted`，不代表已通过 VM API 验证。审批 worker 经接口校验后首次下载的回执标为 `vm_api_verified`，记录对应审批实例和资源 ID；复用旧回执不会改变其声明。2026-10-09 的后台接口验证已对测试素材同时核对 `getVideoList.videos[].id`、申请结果 `urlObjList[].id` 与输入 VMID 完全一致；该证据保存在本机验证记录中，不改写既有采集回执，也不能据单个样本推断所有结果条目的 ID 语义。`video_variant` 是操作者的版本声明，实际分辨率、时长、编码和音轨由媒体探测记录。本次学科流程目标为 1280x720，使用 `approved_rendition`，并在请求内填写 `expected_resolution`；分辨率不符时报 `SOURCE_RESOLUTION_MISMATCH`，不发布文件。
+人工 `vm-source.mjs` CLI 由操作者核对 VMID，采集回执将这种绑定标为 `operator_asserted`，不代表已通过 VM API 验证。审批 worker 经接口校验后首次下载的回执标为 `vm_api_verified`，记录对应审批实例和资源 ID；复用旧回执不会改变其声明。2026-10-09 的后台接口验证已对测试素材同时核对 `getVideoList.videos[].id`、申请结果 `urlObjList[].id` 与输入 VMID 完全一致；该证据保存在本机验证记录中，不改写既有采集回执，也不能据单个样本推断所有结果条目的 ID 语义。`video_variant` 是操作者的版本声明，实际分辨率、时长、编码和音轨由媒体探测记录。本次学科流程以 1280x720 为采集最低尺寸，使用 `approved_rendition`，并在请求内填写 `expected_resolution`；任何视频流宽或高低于对应下限时报 `SOURCE_RESOLUTION_MISMATCH`，不发布文件。更高分辨率不会因尺寸不等于 1280x720 被拒绝。
 
 2026-10-09 已完成一条获批文件的真实下载验证：连接公司 VPN 后成功下载并通过全量解码。实测 14,937,774 字节、时长 255.125 秒、1280x720、25 fps、H.264 视频与 AAC 双声道 44.1 kHz 音频，满足用户确认的 720p 要求。连接 VPN 前本机 TCP 443 不可达，下载安全失败；本机生成的测试 MP4 也已跑通离线复制、SHA-256、元数据探测、全量解码与回执发布。
 
@@ -110,11 +110,13 @@ VM 下载需要先申请审批。审批通过后，邮件中的 `https://vm.yang
 
 待审批申请也可能返回 `finished` 和资源 URL。领取 worker 同时要求 `applyStatus === "APPROVED"`、目标资源 ID 精确匹配、条目 `status === "finished"` 和期望质量；有 URL 不能替代审批检查。业务认证头只发给固定 Shadow origin，不能传给素材下载 origin。视频文件最终仍须实测为 1280x720。申请接口未观察到幂等键；提交意图先持久化，响应不明时核对申请列表，无法唯一关联则停止，不能盲目重提。
 
-“原始视频”用途不保证所有素材都为 720p，最终仍须校验 `expected_resolution`。通知声明链接 72 小时后过期、下载一次后失效；自动领取采用上述单次领取保护与精确回执恢复。历史验证的请求文件位于已忽略的 `.runtime/`；新审批状态库不保存下载地址。
+“原始视频”用途不保证所有素材恰为 720p，最终仍须校验 `expected_resolution` 给出的最低尺寸。当前要求宽、高分别至少为 1280 和 720，尺寸更高时可继续使用。通知声明链接 72 小时后过期、下载一次后失效；自动领取采用上述单次领取保护与精确回执恢复。历史验证的请求文件位于已忽略的 `.runtime/`；新审批状态库不保存下载地址。
 
 ## 面板队列的本机配置与恢复
 
-入口为 Taskboard「本机设置 → VM 下载」。面板管理共享账号与持久化下载队列，独立 PMO 初稿运行时使用同一队列并冻结精确申请绑定。「手动批量下载」仍是操作者补救入口，不会通过下载申请获得自动剪辑执行资格。批量是最多 50 条单视频申请，不代表一个审批单合并 50 个视频。相同规范化请求返回原任务；修改部门、用途或输出目录会成为不同请求，应先检查现有任务。
+入口为 Taskboard「本机设置 → VM 下载」。面板管理共享账号与持久化下载队列，独立 PMO 初稿运行时使用同一队列并冻结精确申请绑定。「手动批量下载」仍是操作者补救入口，不会通过下载申请获得自动剪辑执行资格。批量是最多 50 条单视频申请，不代表一个审批单合并 50 个视频。手动下载的相同规范化请求返回原任务；修改部门、用途或输出目录会成为不同请求，应先检查现有任务。受控 VM 初稿按 Taskboard task/run 幂等，同一任务重放复用原审批项，不同任务即使 VMID 与请求一致也可各自申请；资源摘要按 VM `application_id` 隔离，同一申请内防止重复领取，不同已批准申请可各自领取。
+
+升级兼容：旧版同一审批项若已绑定多个初稿任务，启动时按 `created_at`、再按 `task_id` 确定唯一保留者；其他任务解除旧关联，并在后续协调时申请各自的 task/run 审批项。若旧版在审批入队后、任务绑定落库前崩溃，系统会按精确申请指纹恢复 legacy 队列项。旧版审批项没有记录“手动下载”或“任务流程”的来源，因此无法从该队列记录区分其原始用途；恢复仍要求请求指纹和申请内容完全匹配，并继续使用正常审批及获批采集回执。
 
 Taskboard 随服务启动持久化 worker，按 `next_attempt_at` 处理任务；正常待审批不会耗尽网络失败重试次数，没有 CLI 的 30 分钟等待退出限制。唯一匹配申请绑定时开始审批七天计时；审批通过才开始独立的制作七天计时。24 小时待审批、需要重新登录、已知到期前 15 分钟、驳回、撤销、超时和失败可发送飞书提醒。通知以稳定幂等 ID 入本机 outbox，失败最多六次退避；跨进程崩溃仍为至少一次，不承诺永久的绝对去重。
 
@@ -135,6 +137,12 @@ Taskboard 随服务启动持久化 worker，按 `next_attempt_at` 处理任务�
 ```dotenv
 CODEX_VM_DOWNLOAD_PRIVATE_ENDPOINTS_JSON=[{"origin":"https://vm-resource.yangcong345.com","addresses":["10.8.8.11"]}]
 ```
+
+面板对 `VM_SOURCE_ADDRESS_NOT_ALLOWED` 提供“更新白名单后使用原审批重试”。该错误发生在 HTTP 下载请求发出前；更新当前本机精确白名单后，Taskboard 会检查本轮采集目录中的 `source.mp4`、`source.mp4.part`、`acquisition.json` 和 `acquisition.json.part` 均不存在，再用新策略继续查询同一条已批准申请。
+
+面板也允许操作者对 `VM_DOWNLOAD_OUTCOME_UNKNOWN` 手动恢复。该错误表示传输已开始，但没有确认完整交付；Taskboard 不会自动重试。面板的 `diagnostic_code` 会用稳定错误码区分 HTTP 拒绝/资源不存在、TLS 错误、连接重置、超时、媒体校验或采集阶段失败，不包含 URL、响应正文或原始异常信息。操作者须确认 VM 允许在原审批下重复获取，Taskboard 随后检查上述本机采集文件均不存在，核对当前精确白名单、原审批与资源状态后再获取。审批编号、申请编号、资源占用保持不变，不会再次提交审批；只有 VM 仍返回 `APPROVED` 且资源为 `finished` 才会重新采集。存在任一完整视频或回执时恢复会被拒绝。
+
+旧队列中的 `VM_RESOURCE_ALREADY_CLAIMED` 可在状态库迁移后显示“确认并用当前审批重试”。仅当记录保存了与本记录绑定的独立 `APPROVED` 凭据且当前申请此前没有成功采集回执时才允许恢复；操作者确认后，会沿用这条已批准申请并重新检查审批状态，不会新建申请。相同 `application_id` 的资源占用仍会阻止第二个队列项领取；不同已批准申请的资源占用彼此独立。
 
 需要公司网络/VPN，以及 PATH 中的 `ffprobe`、`ffmpeg`。改变本机配置后正常重启 Taskboard；队列会保留，但需再次连接 Shadow。桌面默认值为当前用户主目录下的 `Desktop`；若系统桌面已重定向到 OneDrive 或其他位置，请在面板保存实际绝对路径。完成任务展示校验后的准确文件路径。
 
@@ -185,7 +193,7 @@ CODEX_VM_DOWNLOAD_PRIVATE_ENDPOINTS_JSON=[{"origin":"https://vm-resource.yangcon
 }
 ```
 
-尚未获批使用 `"source": { "kind": "approval_required" }`，返回 `blocked / SOURCE_APPROVAL_REQUIRED`，不创建采集目录。`approved_url` 与 `approved_file` 可选填 `expected_sha256` 和 `expected_bytes`，用于核对已有准确摘要；`expected_resolution` 提供本次采集的像素尺寸要求，当前学科流程使用 1280x720。
+尚未获批使用 `"source": { "kind": "approval_required" }`，返回 `blocked / SOURCE_APPROVAL_REQUIRED`，不创建采集目录。`approved_url` 与 `approved_file` 可选填 `expected_sha256` 和 `expected_bytes`，用于核对已有准确摘要；`expected_resolution` 提供本次采集的最低像素尺寸，当前学科流程使用 1280x720（宽、高分别至少达到该值，允许更高尺寸）。
 
 ## 运行与结果
 

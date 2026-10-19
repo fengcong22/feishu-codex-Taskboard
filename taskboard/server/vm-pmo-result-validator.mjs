@@ -118,7 +118,7 @@ async function loadBoundInput(contextPath, signal, expectedBound) {
   if (expectedBound && (contextSha256 !== expectedBound.contextSha256
     || !same(context, expectedBound.context))) fail("RUN_BINDING_MISMATCH");
   if (!exactKeys(context, CONTEXT_KEYS) || context.protocol !== PROTOCOL
-    || context.schema_version !== 1 || !digest(context.input_sha256)
+    || ![1, 2].includes(context.schema_version) || !digest(context.input_sha256)
     || context.run_dir !== path.dirname(contextPath) || !absoluteCanonical(context.run_dir)
     || !absoluteCanonical(context.source_path)
     || ![context.plan_path, context.plan_result_path, context.result_path,
@@ -139,8 +139,10 @@ async function loadBoundInput(contextPath, signal, expectedBound) {
   const { value: input, sha256: inputSha256 } = await jsonFile(inputPath, "RUN_BINDING_MISMATCH");
   if (expectedBound && (!same(input, expectedBound.input)
     || inputSha256 !== expectedBound.context.input_sha256)) fail("RUN_BINDING_MISMATCH");
+  const version = input?.schema_version;
   if (!exactKeys(input, ["protocol", "schema_version", ...IDENTITY, "source", "instructions", "output_profile"])
-    || input.protocol !== PROTOCOL || input.schema_version !== 1 || inputSha256 !== context.input_sha256
+    || input.protocol !== PROTOCOL || ![1, 2].includes(version) || version !== context.schema_version
+    || inputSha256 !== context.input_sha256
     || !object(input.package) || !object(input.binding) || !object(input.record)
     || !object(input.review_round) || !object(input.source) || !object(input.output_profile)
     || !exactKeys(input.package, ["alias", "name", "version", "manifest_sha256"])
@@ -160,14 +162,35 @@ async function loadBoundInput(contextPath, signal, expectedBound) {
     || ![input.source.source_id, input.source.vmid, input.source.timeline_basis].every(identifier)
     || !Array.isArray(input.instructions) || input.instructions.length < 1
     || input.instructions.some((item) => !exactKeys(item, ["instruction_id",
-      "source_field_id", "raw_text", "timeline_basis", "applicability"])
+      "source_field_id", "raw_text", "timeline_basis", "applicability"],
+      version === 2 ? ["must_keep", "visual_evidence"] : [])
       || ![item.instruction_id, item.source_field_id, item.timeline_basis, item.applicability].every(identifier)
-      || typeof item.raw_text !== "string" || !item.raw_text.trim())
+      || typeof item.raw_text !== "string" || !item.raw_text.trim()
+      || version === 2 && item.must_keep !== undefined && (!Array.isArray(item.must_keep)
+        || item.must_keep.some((phrase) => typeof phrase !== "string" || !phrase.trim() || phrase.includes("\0")))
+      || version === 2 && item.visual_evidence !== undefined && (!exactKeys(item.visual_evidence,
+        ["source_sha256", "frame_time", "end"]) || item.visual_evidence.source_sha256 !== input.source.sha256))
     || new Set(input.instructions.map((item) => item.instruction_id)).size !== input.instructions.length
     || !digest(input.source.sha256)
     || !Number.isSafeInteger(input.source.bytes) || input.source.bytes < 1
     || !Number.isSafeInteger(input.source.duration_ms) || input.source.duration_ms < 1)
     fail("RUN_BINDING_MISMATCH");
+  if (version === 2) {
+    const stageId = input.binding.stage_id;
+    const timeline = stageId === "review" ? "previous_review_video"
+      : stageId === "initial" ? "vm_original" : null;
+    if (!timeline || input.source.timeline_basis !== timeline || input.instructions.length !== 1
+      || input.instructions[0].timeline_basis !== timeline
+      || input.instructions[0].applicability !== "current_round") fail("RUN_BINDING_MISMATCH");
+    if (stageId === "review") {
+      const parent = input.review_round.parent;
+      if (!exactKeys(parent, ["kind", "run_id", "artifact_id", "delivery_id", "sha256", "bytes", "duration_ms"])
+        || parent.kind !== "managed_run" || ![parent.run_id, parent.artifact_id, parent.delivery_id].every(identifier)
+        || parent.run_id === input.binding.run_id || !digest(parent.sha256)
+        || parent.sha256 !== input.source.sha256 || parent.bytes !== input.source.bytes
+        || parent.duration_ms !== input.source.duration_ms) fail("RUN_BINDING_MISMATCH");
+    } else if (input.review_round.parent !== null) fail("RUN_BINDING_MISMATCH");
+  }
   const source = await hashMedia(context.source_path, "SOURCE_HASH_MISMATCH", signal);
   if (source.sha256 !== input.source.sha256 || source.bytes !== input.source.bytes)
     fail("SOURCE_HASH_MISMATCH");
@@ -179,7 +202,7 @@ export async function validateVmPmoInput({ contextPath, signal, expectedBound } 
 }
 
 function assertIdentity(value, input, context, sourceSha256, code) {
-  if (value.protocol !== PROTOCOL || value.schema_version !== 1
+  if (value.protocol !== PROTOCOL || value.schema_version !== input.schema_version
     || value.input_sha256 !== context.input_sha256 || value.source_sha256 !== sourceSha256
     || IDENTITY.some((key) => !same(value[key], input[key]))) fail(code);
 }
@@ -207,6 +230,7 @@ async function assertAbsent(filename, code) {
 }
 
 function validateReadyPlan(plan, input, context, sourceSha256) {
+  if (input.schema_version === 2) return validateReadyV2Plan(plan, input, context, sourceSha256);
   if (input.binding.stage_id !== "initial" || input.review_round.parent !== null
     || input.source.timeline_basis !== "vm_original"
     || !same(input.output_profile, { id: "review_mp4_v1", width: 1920, height: 1080,
@@ -242,6 +266,92 @@ function validateReadyPlan(plan, input, context, sourceSha256) {
   }
   if (!same(disposition.segments, plan.segments.map((segment) => segment.segment_id))
     || !Number.isSafeInteger(duration) || duration !== plan.expected_duration_ms) fail("PLAN_INVALID");
+}
+
+function validateReadyV2Plan(plan, input, context, sourceSha256) {
+  const stageId = input.binding.stage_id;
+  const timeline = stageId === "review" ? "previous_review_video"
+    : stageId === "initial" ? "vm_original" : null;
+  if (!timeline || input.source.timeline_basis !== timeline
+    || stageId === "review" && input.review_round.parent?.kind !== "managed_run"
+    || stageId === "initial" && input.review_round.parent !== null
+    || !same(input.output_profile, { id: "review_mp4_v1", width: 1920, height: 1080,
+      fps: 25, audio: "preserve" }) || input.instructions.length !== 1
+    || input.instructions[0].timeline_basis !== timeline
+    || input.instructions[0].applicability !== "current_round") fail("PLAN_INVALID");
+  if (!exactKeys(plan, ["protocol", "schema_version", ...IDENTITY, "source", "input_sha256",
+    "source_sha256", "instruction_results", "segments", "operations", "expected_duration_ms",
+    "engine_plan_sha256", "alignment_sha256"])) fail("PLAN_INVALID");
+  assertIdentity(plan, input, context, sourceSha256, "RUN_BINDING_MISMATCH");
+  if (!same(plan.source, input.source) || !digest(plan.engine_plan_sha256)
+    || plan.alignment_sha256 !== null && !digest(plan.alignment_sha256)
+    || !Array.isArray(plan.instruction_results) || plan.instruction_results.length !== 1
+    || !Array.isArray(plan.segments) || !plan.segments.length
+    || !Array.isArray(plan.operations)) fail("PLAN_INVALID");
+  const instruction = input.instructions[0], disposition = plan.instruction_results[0];
+  if (!exactKeys(disposition, ["instruction_id", "source_field_id", "raw_text", "status", "segments"])
+    || disposition.instruction_id !== instruction.instruction_id
+    || disposition.source_field_id !== instruction.source_field_id
+    || disposition.raw_text !== instruction.raw_text || disposition.status !== "resolved"
+    || !Array.isArray(disposition.segments) || !disposition.segments.length
+    || disposition.segments.some((segmentId) => !identifier(segmentId))) fail("PLAN_INVALID");
+  let targetOffset = 0;
+  const seen = new Set();
+  let totalDurationUs = 0;
+  for (const segment of plan.segments) {
+    if (!exactKeys(segment, ["segment_id", "source_id", "source_start_us", "duration_us", "target_start_us"])
+      || !identifier(segment.segment_id) || seen.has(segment.segment_id)
+      || segment.source_id !== input.source.source_id
+      || !Number.isSafeInteger(segment.source_start_us) || segment.source_start_us < 0
+      || !Number.isSafeInteger(segment.duration_us) || segment.duration_us < 1
+      || segment.source_start_us + segment.duration_us > input.source.duration_ms * 1000
+      || segment.target_start_us !== targetOffset) fail("PLAN_INVALID");
+    seen.add(segment.segment_id);
+    targetOffset += segment.duration_us;
+    totalDurationUs += segment.duration_us;
+  }
+  if (Math.round(totalDurationUs / 1000) !== plan.expected_duration_ms
+    || !Number.isSafeInteger(plan.expected_duration_ms) || plan.expected_duration_ms < 1
+    || disposition.segments.some((segmentId) => !seen.has(segmentId))) fail("PLAN_INVALID");
+  for (const operation of plan.operations) {
+    if (!object(operation) || !identifier(operation.operation_id)
+      || !Number.isSafeInteger(operation.source_start_us) || operation.source_start_us < 0
+      || !Number.isSafeInteger(operation.source_end_us) || operation.source_end_us <= operation.source_start_us
+      || operation.source_end_us > input.source.duration_ms * 1000) fail("PLAN_INVALID");
+    if (operation.kind === "start_cue") {
+      if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us",
+        "requested_start_us", "search_end_us", "search_radius_us", "matched_text", "match_strategy",
+        "alignment_sha256", "provider", "model", "adapter"])
+        || !Number.isSafeInteger(operation.requested_start_us) || operation.requested_start_us < 0
+        || operation.requested_start_us > input.source.duration_ms * 1000
+        || !Number.isSafeInteger(operation.search_end_us) || operation.search_end_us < operation.source_end_us
+        || operation.search_end_us > input.source.duration_ms * 1000
+        || !Number.isSafeInteger(operation.search_radius_us) || operation.search_radius_us < 0
+        || operation.search_radius_us > input.source.duration_ms * 1_000_000
+        || Math.abs(operation.source_start_us - operation.requested_start_us) > operation.search_radius_us
+        || typeof operation.matched_text !== "string" || !operation.matched_text.trim()
+        || operation.match_strategy !== "unique_exact_whole_token"
+        || operation.alignment_sha256 !== plan.alignment_sha256 || !plan.alignment_sha256
+        || ![operation.provider, operation.model, operation.adapter].every((value) => typeof value === "string" && value.trim()))
+        fail("PLAN_INVALID");
+    } else if (["word", "mute_word"].includes(operation.kind)) {
+      if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us", "target_join_us",
+        "matched_text", "match_strategy", "alignment_sha256", "provider", "model", "adapter", "must_keep_evidence"])
+        || !Number.isSafeInteger(operation.target_join_us) || operation.target_join_us < 0
+        || typeof operation.matched_text !== "string" || !operation.matched_text.trim()
+        || operation.match_strategy !== "unique_exact_whole_token"
+        || operation.alignment_sha256 !== plan.alignment_sha256 || !plan.alignment_sha256
+        || ![operation.provider, operation.model, operation.adapter].every((value) => typeof value === "string" && value.trim())
+        || !Array.isArray(operation.must_keep_evidence)) fail("PLAN_INVALID");
+    } else if (operation.kind === "freeze_frame") {
+      if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us",
+        "target_start_us", "frame_time_us", "alignment_sha256"])
+        || operation.alignment_sha256 !== null
+        || !Number.isSafeInteger(operation.target_start_us) || operation.target_start_us < 0
+        || !Number.isSafeInteger(operation.frame_time_us) || operation.frame_time_us < operation.source_start_us
+        || operation.frame_time_us >= operation.source_end_us) fail("PLAN_INVALID");
+    } else fail("PLAN_INVALID");
+  }
 }
 
 export async function validateVmPmoPlan({ contextPath, signal, ffprobePath = "ffprobe", timeoutMs = 120_000,

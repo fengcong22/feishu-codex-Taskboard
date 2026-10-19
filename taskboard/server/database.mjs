@@ -475,7 +475,7 @@ function normalizeFeishuTaskOrigin(value) {
   if (origin.uploadMode !== undefined && !["manual", "automatic"].includes(origin.uploadMode)) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin uploadMode is invalid");
   }
-  if (origin.stageId !== undefined && !["initial", "first_review", "final_review"].includes(origin.stageId)) {
+  if (origin.stageId !== undefined && !["initial", "review", "first_review", "final_review"].includes(origin.stageId)) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin stageId is invalid");
   }
   if (origin.controlledContext !== undefined) {
@@ -4067,6 +4067,7 @@ export class TaskboardDatabase {
         task.feishuPackageSnapshot = {
           zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
           ...(packageSnapshot.zipOutputMode ? { zipOutputMode: packageSnapshot.zipOutputMode } : {}),
+          ...(packageSnapshot.workflowTemplate ? { workflowTemplate: packageSnapshot.workflowTemplate } : {}),
         };
       }
       return task;
@@ -4094,6 +4095,7 @@ export class TaskboardDatabase {
       enriched.feishuPackageSnapshot = {
         zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
         ...(packageSnapshot.zipOutputMode ? { zipOutputMode: packageSnapshot.zipOutputMode } : {}),
+        ...(packageSnapshot.workflowTemplate ? { workflowTemplate: packageSnapshot.workflowTemplate } : {}),
       };
     }
     return enriched;

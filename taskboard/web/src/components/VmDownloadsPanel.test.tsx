@@ -22,7 +22,8 @@ function snapshot() {
   };
 }
 
-function job(id: string, status: string, errorCode?: string, vmid = VM1) {
+function job(id: string, status: string, errorCode?: string, vmid = VM1,
+  recovery?: { kind: "private_address" | "unknown_outcome" | "resource_claim" }, diagnosticCode?: string) {
   return {
     protocol: "vm_approval_workflow", schema_version: 1, id, vmid, status,
     submission_attempts: 1, attempts: 0, next_attempt_at: null,
@@ -31,7 +32,8 @@ function job(id: string, status: string, errorCode?: string, vmid = VM1) {
     approval_wait_started_at: 1_792_000_000_000, approval_deadline_at: 1_792_604_800_000,
     media_wait_started_at: null, media_deadline_at: null,
     output_root: "E:\\Downloads", department: "动画组", reason: "课程制作",
-    ...(errorCode ? { error: { code: errorCode } } : {}),
+    ...(errorCode ? { error: { code: errorCode, ...(diagnosticCode ? { diagnostic_code: diagnosticCode } : {}) } } : {}),
+    ...(recovery ? { recovery } : {}),
     ...(status === "ready" ? { acquisition: { path: "E:\\Downloads\\source.mp4", receipt_path: "E:\\Downloads\\receipt.json", sha256: "a".repeat(64), bytes: 512, duration_ms: 1000, width: 1280, height: 720, vmid_binding: "vm_api_verified" } } : {}),
   };
 }
@@ -75,6 +77,17 @@ beforeEach(() => {
     if (path === `${ROOT}/logout`) { current.session = snapshot().session; return response({ session: current.session }); }
     if (path === `${ROOT}/settings`) { current.settings = { ...current.settings, ...writes.at(-1)!.body }; return response({ settings: current.settings }); }
     if (path === `${ROOT}/jobs`) { current.jobs = [job("queued-job", "queued")]; return response({ jobs: current.jobs }); }
+    if (path === `${ROOT}/jobs/cleanup`) {
+      const ids = writes.at(-1)!.body.jobIds as string[];
+      current.jobs = current.jobs.filter((candidate) => !ids.includes(candidate.id));
+      return response({ clearedCount: ids.length });
+    }
+    if (path.endsWith("/recover")) {
+      const id = path.split("/").at(-2);
+      const recovered = current.jobs.find((candidate) => candidate.id === id)!;
+      recovered.status = "waiting_media"; delete recovered.error;
+      return response({ job: recovered });
+    }
     if (path.endsWith("/extend")) { current.jobs[0] = job("expired", "waiting_approval"); return response({ job: current.jobs[0] }); }
     if (path.endsWith("/resume")) { current.jobs[1] = job("failed", "queued", undefined, VM2); return response({ job: current.jobs[1] }); }
     throw new Error(`Unexpected fixture route: ${method} ${path}`);
@@ -88,15 +101,13 @@ afterEach(() => {
 });
 
 describe("VM downloads panel", () => {
-  it("opens from local settings and unmounts when returning to automatic editing", async () => {
+  it("keeps VM account and queue controls out of local settings", async () => {
     render(<TaskboardLanguageProvider language="zh"><LocalSettingsDialog revision={0} onSettingsChange={() => {}} onClose={() => {}} /></TaskboardLanguageProvider>);
     expect(screen.queryByRole("region", { name: "VM 账号与队列" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "VM 下载" }));
-    await screen.findByText("尚未连接");
-    expect(screen.getByRole("region", { name: "VM 账号与队列" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "自动剪辑" }));
-    expect(screen.queryByRole("region", { name: "VM 账号与队列" })).toBeNull();
-    expect(screen.getByRole("switch", { name: "允许本机自动剪辑" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "VM 账号与队列" })).toBeNull();
+    const automaticSwitch = screen.getByRole("switch", { name: "自动执行" });
+    expect(automaticSwitch.getAttribute("aria-describedby")).toBeNull();
+    expect(screen.queryByText(/适用于本机所有学科/)).toBeNull();
   });
 
   it("keeps account and queue controls available while manual downloads stay collapsed", async () => {
@@ -157,6 +168,22 @@ describe("VM downloads panel", () => {
     fireEvent.click(screen.getByRole("button", { name: "断开账号" }));
     await screen.findByText("尚未连接");
     expect(writes[0].path).toBe(`${ROOT}/logout`);
+  });
+
+  it("shows a reconnect alert only after the server confirms expired authorization", async () => {
+    current.session = { ...current.session, status: "auth_required", account: { name: "测试用户", userId: "fixture-user" } };
+    mount();
+    const alert = await screen.findByRole("alert", { name: "Shadow 登录已失效" });
+    expect(alert.textContent).toContain("下载队列已暂停");
+    fireEvent.click(screen.getByRole("button", { name: "从提示重新连接" }));
+    await screen.findByText("等待登录完成");
+    expect(writes[0]).toMatchObject({ path: `${ROOT}/login`, method: "POST" });
+
+    cleanup();
+    current.session = { ...current.session, status: "unavailable" };
+    mount();
+    await screen.findByText("暂时无法验证账号");
+    expect(screen.queryByRole("alert", { name: "Shadow 登录已失效" })).toBeNull();
   });
 
   it("validates the entire batch before submitting normalized VMIDs and saved local fields", async () => {
@@ -220,6 +247,39 @@ describe("VM downloads panel", () => {
     expect(screen.queryByRole("button", { name: "延长等待 7 天" })).toBeNull();
   });
 
+  it("selects individual settled jobs, selects all clearable rows, and leaves active rows protected", async () => {
+    current.jobs = [job("ready-1", "ready", undefined, VM1), job("rejected-1", "rejected", undefined, VM2),
+      job("canceled-1", "canceled", undefined, "507f1f77bcf86cd799439015"),
+      job("queued-1", "queued", undefined, "507f1f77bcf86cd799439013"), job("attention-1", "needs_attention", "VM_API_TIMEOUT", "507f1f77bcf86cd799439014")];
+    mount();
+    await screen.findByText("已下载");
+
+    const ready = screen.getByRole("checkbox", { name: `选择清理 ${VM1}，记录 ready-1` }) as HTMLInputElement;
+    const rejected = screen.getByRole("checkbox", { name: `选择清理 ${VM2}，记录 rejected-1` }) as HTMLInputElement;
+    const canceled = screen.getByRole("checkbox", { name: "选择清理 507f1f77bcf86cd799439015，记录 canceled-1" }) as HTMLInputElement;
+    const queued = screen.getByRole("checkbox", { name: "选择清理 507f1f77bcf86cd799439013，记录 queued-1" }) as HTMLInputElement;
+    const attention = screen.getByRole("checkbox", { name: "选择清理 507f1f77bcf86cd799439014，记录 attention-1" }) as HTMLInputElement;
+    expect(queued.disabled).toBe(true);
+    expect(attention.disabled).toBe(true);
+
+    fireEvent.click(ready);
+    fireEvent.click(rejected);
+    expect(screen.getByRole("button", { name: "清理所选（2）" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "全选可清理项" }));
+    expect(ready.checked).toBe(true);
+    expect(rejected.checked).toBe(true);
+    expect(canceled.checked).toBe(true);
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "清理所选（3）" }));
+    await waitFor(() => expect(writes.some(({ path }) => path === `${ROOT}/jobs/cleanup`)).toBe(true));
+    expect(writes.at(-1)).toMatchObject({ method: "POST", path: `${ROOT}/jobs/cleanup`, body: { jobIds: ["ready-1", "rejected-1", "canceled-1"] } });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("VM_API_TIMEOUT")).toBeTruthy();
+    expect(screen.queryByText("已驳回")).toBeNull();
+    expect(screen.queryByText("已下载")).toBeNull();
+  });
+
   it("extends expired waits and retries failed work while auth jobs require reconnecting", async () => {
     current.jobs = [job("expired", "needs_attention", "VM_APPROVAL_WAIT_EXPIRED"),
       job("failed", "dead_letter", "VM_API_TIMEOUT", VM2),
@@ -231,6 +291,53 @@ describe("VM downloads panel", () => {
     fireEvent.click(screen.getByRole("button", { name: "重试任务" }));
     await screen.findByText("排队中");
     expect(writes.map(({ path }) => path)).toEqual([`${ROOT}/jobs/expired/extend`, `${ROOT}/jobs/failed/resume`]);
+  });
+
+  it("offers recovery for a blocked private endpoint and an unknown result only with operator confirmation", async () => {
+    current.jobs = [job("blocked", "needs_attention", "VM_SOURCE_ADDRESS_NOT_ALLOWED", VM1, { kind: "private_address" }),
+      job("unknown", "needs_attention", "VM_DOWNLOAD_OUTCOME_UNKNOWN", VM2)];
+    mount(); await screen.findByText("VM_SOURCE_ADDRESS_NOT_ALLOWED");
+    const recovery = screen.getByRole("button", { name: "更新白名单后使用原审批重试" });
+    expect(screen.getAllByRole("button", { name: "更新白名单后使用原审批重试" })).toHaveLength(1);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    fireEvent.click(recovery);
+    expect(writes).toHaveLength(0);
+    await waitFor(() => expect((screen.getByRole("button", { name: "更新白名单后使用原审批重试" }) as HTMLButtonElement).disabled).toBe(false));
+    confirm.mockReturnValue(true);
+    fireEvent.click(recovery);
+    await screen.findByText("等待素材制作");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ method: "POST", path: `${ROOT}/jobs/blocked/recover`, body: { confirmRepeatableResource: true } });
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers a separate recovery action for an already-approved resource claim", async () => {
+    current.jobs = [job("claimed", "needs_attention", "VM_RESOURCE_ALREADY_CLAIMED", VM1, { kind: "resource_claim" })];
+    mount(); await screen.findByText("VM_RESOURCE_ALREADY_CLAIMED");
+    expect(screen.getByText(/另一条申请已占用相同素材/)).toBeTruthy();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "确认并用当前审批重试" }));
+    await screen.findByText("等待素材制作");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ method: "POST", path: `${ROOT}/jobs/claimed/recover`, body: { confirmRepeatableResource: true } });
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows unknown-outcome recovery only when the service grants that capability", async () => {
+    current.jobs = [
+      job("current", "needs_attention", "VM_DOWNLOAD_OUTCOME_UNKNOWN", VM1, { kind: "unknown_outcome" }, "VM_SOURCE_CONNECTION_RESET"),
+      job("unknown-hidden", "needs_attention", "VM_DOWNLOAD_OUTCOME_UNKNOWN", VM2),
+    ];
+    mount();
+    await screen.findAllByText("VM_DOWNLOAD_OUTCOME_UNKNOWN");
+    expect(screen.getByText("VM_SOURCE_CONNECTION_RESET")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "确认可重复获取并使用原审批重试" })).toHaveLength(1);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "确认可重复获取并使用原审批重试" }));
+    await screen.findByText("等待素材制作");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ method: "POST", path: `${ROOT}/jobs/current/recover`, body: { confirmRepeatableResource: true } });
+    expect(confirm).toHaveBeenCalledTimes(1);
   });
 
   it("preserves jobs and unsaved edits through refresh errors and keeps action errors visible", async () => {

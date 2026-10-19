@@ -28,6 +28,22 @@ test("resolves a frozen writeback intent through the authenticated Taskboard rou
   assert.deepEqual(JSON.parse(calls[0].init.body), claim);
 });
 
+test("accepts a guarded single-select VM writeback intent", async () => {
+  const guarded = {
+    target: resolvedIntent.target,
+    operation: {
+      ...resolvedIntent.operation,
+      guard: { fieldId: "fld_status", optionIds: ["opt_initial", "opt_processing"] },
+    },
+  };
+  const client = new TaskboardClient("http://127.0.0.1:47823", {
+    bridgeSecret: "fixture-bridge-secret",
+    fetchImplementation: async () => Response.json(guarded),
+  });
+
+  assert.deepEqual(await client.resolveFeishuWritebackIntent(claim), guarded);
+});
+
 test("writeback intent resolver fails closed without a secret or with a response that exposes local paths", async () => {
   const missingSecret = new TaskboardClient("http://127.0.0.1:47823", {
     fetchImplementation: async () => assert.fail("a request must not be sent without the Bridge secret"),

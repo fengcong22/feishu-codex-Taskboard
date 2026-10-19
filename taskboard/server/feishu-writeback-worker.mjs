@@ -176,7 +176,7 @@ export function createFeishuWritebackWorker({
         }));
       } else {
         publish(store.markWritebackIntentDeadLetter(intent.id, intent.claimToken, {
-          code: retryable(failure) ? "WRITEBACK_RETRIES_EXHAUSTED" : failure.code,
+          code: failure.code,
           message: retryable(failure) ? "Feishu writeback retry budget exhausted" : failure.message,
         }));
       }

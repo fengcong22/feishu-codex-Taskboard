@@ -70,6 +70,16 @@ const TASK: Task = {
   updatedAt: STARTED_AT,
 };
 
+const VM_TASK: Task = {
+  ...TASK,
+  id: "vm-task-1",
+  identifier: "VM-1",
+  feishuPackageSnapshot: {
+    zipSourceDirectory: null,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+  },
+};
+
 function thread(id = TASK_THREAD_ID, overrides: Partial<AiChatThread> = {}): AiChatThread {
   return {
     id,
@@ -121,12 +131,14 @@ const subscribers = new Map<string, Set<Hint>>();
 const snapshots = new Map<string, AiChatThreadSnapshot>();
 
 function Harness({
+  task = TASK,
   taskThreadIds = EMPTY_IDS,
   now = NOW,
   available = true,
   observeThreads,
   logThreadId,
 }: {
+  task?: Task;
   taskThreadIds?: string[];
   now?: number;
   available?: boolean;
@@ -143,7 +155,7 @@ function Harness({
     <>
       <AiChat
         available={available}
-        projectId={TASK.projectId}
+        projectId={task.projectId}
         issueId={null}
         codexProjectIdentity={null}
         taskThreadIds={taskThreadIds}
@@ -156,8 +168,8 @@ function Harness({
         onClick={() => setOpenThreadRequest({ threadId: logThreadId, requestId: 1 })}
       >Open run log</button>}
       <TaskCard
-        task={TASK}
-        presentation={taskCardPresentation(TASK, threads, false)}
+        task={task}
+        presentation={taskCardPresentation(task, threads, false)}
         now={now}
         isDragging={false}
         dragShift={0}
@@ -327,6 +339,15 @@ describe("AiChat task execution synchronization", () => {
     const callsAfterDiscovery = api.listThreads.mock.calls.length;
     await advance(6_000);
     expect(api.listThreads).toHaveBeenCalledTimes(callsAfterDiscovery);
+  });
+
+  it("shows elapsed VM editing time without waiting for a Codex conversation", async () => {
+    render(<Harness task={VM_TASK} />);
+    await settle();
+
+    expect(screen.getByText("VM editing · 5s")).toBeTruthy();
+    expect(screen.queryByText("Waiting for Codex...")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Codex AI chat" })).toBeNull();
   });
 
   it("subscribes to an initially idle task thread and renders its later running snapshot", async () => {

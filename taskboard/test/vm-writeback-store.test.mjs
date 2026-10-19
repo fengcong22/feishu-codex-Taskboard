@@ -60,6 +60,17 @@ test("VM enqueue refuses untrusted evidence and unsupported caller operations be
   assert.equal(f.store.listWritebackIntents().length, 0);
 });
 
+test("VM outbox preserves the frozen PMO status guard through Bridge resolution", async (t) => {
+  const f = await fixture(t);
+  const guarded = { ...intent(), operation: { ...intent().operation,
+    guard: { fieldId: "fld_status", optionIds: ["opt_ready", "opt_processing"] } } };
+  const queued = await f.store.enqueueWritebackIntent(guarded);
+  assert.deepEqual(queued.operation, guarded.operation);
+  const claim = f.store.claimNextWritebackIntent();
+  assert.deepEqual(await f.store.resolveWritebackIntentForBridge(claimOf(claim)), { target,
+    operation: guarded.operation });
+});
+
 test("VM resolver requires a live claim and revalidates trusted evidence every dispatch", async (t) => {
   const f = await fixture(t);
   const queued = await f.store.enqueueWritebackIntent(intent());
@@ -175,6 +186,43 @@ test("VM repeated worker crashes exhaust a bounded recovery budget", async (t) =
   assert.equal((await f.store.enqueueWritebackIntent(intent())).state, "dead_letter");
 });
 
+test("VM writeback retry requeues only the same task/run dead letters and resets their attempt budget", async (t) => {
+  const f = await fixture(t);
+  const processing = await f.store.enqueueWritebackIntent(intent());
+  const completed = await f.store.enqueueWritebackIntent(intent("completed"));
+  f.database.prepare("UPDATE vm_writeback_outbox SET state='dead_letter',attempt_count=8,error_code='WRITEBACK_UNAVAILABLE'")
+    .run();
+
+  const retried = await f.store.retryDeadLetterWritebacks({ taskId: "task_vm", runId: "run_vm" });
+
+  assert.deepEqual(retried.map((entry) => [entry.id, entry.moment, entry.state, entry.attemptCount, entry.errorCode]), [
+    [processing.id, "processing", "pending", 0, null],
+    [completed.id, "completed", "pending", 0, null],
+  ]);
+  assert.equal(f.validationCalls(), 4);
+  assert.deepEqual([processing.id, completed.id].map(id => f.store.getWritebackIntent(id).operation),
+    [processing.operation, completed.operation]);
+});
+
+test("VM writeback retry refuses partial or changed dead letters without altering the frozen intents", async (t) => {
+  const f = await fixture(t);
+  const processing = await f.store.enqueueWritebackIntent(intent());
+  const completed = await f.store.enqueueWritebackIntent(intent("completed"));
+  f.database.prepare("UPDATE vm_writeback_outbox SET state='dead_letter',attempt_count=8,error_code='WRITEBACK_UNAVAILABLE'")
+    .run();
+  f.database.prepare("UPDATE vm_writeback_outbox SET state='succeeded' WHERE id=?").run(completed.id);
+  await assert.rejects(() => f.store.retryDeadLetterWritebacks({ taskId: "task_vm", runId: "run_vm" }),
+    { code: "WRITEBACK_RETRY_NOT_ALLOWED" });
+  assert.equal(f.store.getWritebackIntent(processing.id).state, "dead_letter");
+
+  f.database.prepare("UPDATE vm_writeback_outbox SET state='dead_letter' WHERE id=?").run(completed.id);
+  f.validateWith(async (input) => ({ target, operation: { ...input.operation, optionId: "changed_option" } }));
+  await assert.rejects(() => f.store.retryDeadLetterWritebacks({ taskId: "task_vm", runId: "run_vm" }),
+    { code: "WRITEBACK_REFERENCE_INVALID" });
+  assert.equal(f.store.getWritebackIntent(processing.id).state, "dead_letter");
+  assert.equal(f.store.getWritebackIntent(completed.id).state, "dead_letter");
+});
+
 test("VM late processing intent cannot follow a completed intent", async (t) => {
   const f = await fixture(t);
   await f.store.enqueueWritebackIntent(intent("completed"));
@@ -182,4 +230,18 @@ test("VM late processing intent cannot follow a completed intent", async (t) => 
   f.store.markWritebackIntentSucceeded(claimed.id, claimed.claimToken);
   await assert.rejects(() => f.store.enqueueWritebackIntent(intent()), { code: "WRITEBACK_REFERENCE_INVALID" });
   assert.equal(f.store.listWritebackIntents().length, 1);
+});
+
+test("VM worker retains the concrete failure code when the automatic retry budget is exhausted", async (t) => {
+  const f = await fixture(t);
+  const queued = await f.store.enqueueWritebackIntent(intent());
+  f.database.prepare("UPDATE vm_writeback_outbox SET attempt_count=7 WHERE id=?").run(queued.id);
+  const worker = createFeishuWritebackWorker({ store: f.store, now: f.now,
+    dispatch: async () => { throw Object.assign(new Error("unavailable"), { code: "WRITEBACK_UNAVAILABLE", status: 503 }); } });
+  t.after(() => worker.close());
+
+  await worker.start();
+
+  assert.equal(f.store.getWritebackIntent(queued.id).state, "dead_letter");
+  assert.equal(f.store.getWritebackIntent(queued.id).errorCode, "WRITEBACK_UNAVAILABLE");
 });

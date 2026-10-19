@@ -161,6 +161,18 @@ test("VM metadata validates the actual initial profile without a legacy trigger"
   }
 });
 
+test("VM metadata validates the configured review fields and options", async () => {
+  const { subject, fields } = vmMetadataFixture();
+  const status = fields[0].property.options;
+  status.push({ id: "opt_review", name: "待修改" });
+  subject.statusField.options.push({ optionId: "opt_review", value: "待修改" });
+  fields.push({ field_id: "fld_review_instruction", field_name: "审核意见", type: 1, ui_type: "Text" });
+  subject.vmWorkflow.stages.review = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_review",
+    instructionFieldId: "fld_review_instruction", instructionAttachmentsFieldId: null,
+    writeback: structuredClone(subject.vmWorkflow.stages.initial.writeback) };
+  await vmMetadataReader(fields).validateSubject(subject);
+});
+
 test("VM metadata validates processing and completed options in their own fields", async () => {
   const { subject, fields } = vmMetadataFixture();
   subject.vmWorkflow.stages.initial.writeback.completed = { fieldId: "fld_delivery", optionId: "opt_delivered" };
@@ -275,7 +287,6 @@ test("VM metadata cannot fall back to legacy validation for incomplete or unsupp
     ["missing VM workflow", (subject) => { delete subject.vmWorkflow; }],
     ["initial disabled", (subject) => { subject.vmWorkflow.stages.initial.enabled = false; }],
     ["review enabled", (subject) => { subject.vmWorkflow.stages.review.enabled = true; }],
-    ["archive enabled", (subject) => { subject.vmWorkflow.finalArchive.enabled = true; }],
   ];
   for (const [name, mutate] of mutations) {
     await t.test(name, async () => {
@@ -285,6 +296,17 @@ test("VM metadata cannot fall back to legacy validation for incomplete or unsupp
       await assert.rejects(vmMetadataReader(fields).validateSubject(subject), { code: "INVALID_FIELD", status: 409 });
     });
   }
+});
+
+test("VM metadata validates an enabled archive trigger and its exact path field", async () => {
+  const { subject, fields } = vmMetadataFixture();
+  fields[0].property.options.push({ id: "opt_archive", name: "待归档" });
+  fields.push({ field_id: "fld_archive_path", field_name: "归档目录", type: 1, ui_type: "Text" });
+  subject.metadata = { fields: fields.map((field) => ({ fieldId: field.field_id, fieldName: field.field_name,
+    type: field.type, uiType: field.ui_type, options: field.property?.options?.map(({ id, name }) => ({ optionId: id, value: name })) ?? [] })) };
+  subject.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "pmo_field", directoryPath: null, pathFieldId: "fld_archive_path" };
+  await vmMetadataReader(fields).validateSubject(subject);
 });
 
 test("Bridge ZIP phased and legacy subjects keep their existing metadata validation paths", async () => {

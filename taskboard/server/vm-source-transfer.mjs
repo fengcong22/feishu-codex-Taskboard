@@ -39,7 +39,24 @@ export class VmSourceError extends Error {
 }
 
 function fail(code) { return new VmSourceError(code); }
-function safeError(error) { return error instanceof VmSourceError ? error : fail("VM_SOURCE_TRANSFER_FAILED"); }
+function safeError(error) {
+  if (error instanceof VmSourceError) return error;
+  const code = error?.code;
+  if (["ECONNRESET", "EPIPE", "ECONNABORTED"].includes(code)) return fail("VM_SOURCE_CONNECTION_RESET");
+  if (code === "ECONNREFUSED") return fail("VM_SOURCE_CONNECT_REFUSED");
+  if (code === "ETIMEDOUT") return fail("VM_SOURCE_CONNECT_TIMEOUT");
+  if (["ENETUNREACH", "EHOSTUNREACH"].includes(code)) return fail("VM_SOURCE_NETWORK_UNREACHABLE");
+  if (typeof code === "string" && (code === "EPROTO" || code.startsWith("ERR_TLS_")
+    || code.startsWith("CERT_") || code.startsWith("UNABLE_TO_"))) return fail("VM_SOURCE_TLS_FAILED");
+  return fail("VM_SOURCE_TRANSFER_FAILED");
+}
+
+function httpFailure(statusCode) {
+  if ([401, 403].includes(statusCode)) return fail("VM_SOURCE_HTTP_DENIED");
+  if ([404, 410].includes(statusCode)) return fail("VM_SOURCE_HTTP_NOT_FOUND");
+  if (Number.isInteger(statusCode) && statusCode >= 500) return fail("VM_SOURCE_HTTP_SERVER_FAILED");
+  return fail("VM_SOURCE_HTTP_FAILED");
+}
 
 function positiveInteger(value, fallback) {
   const result = value ?? fallback;
@@ -188,9 +205,9 @@ function startRequest(url, address, request, signal) {
         if (signal.aborted) abort();
         else resolve(incoming);
       });
-      req.on("error", () => {
+      req.on("error", (cause) => {
         removeAbort();
-        const error = fail(signal.aborted ? "VM_SOURCE_TIMEOUT" : "VM_SOURCE_TRANSFER_FAILED");
+        const error = signal.aborted ? fail("VM_SOURCE_TIMEOUT") : safeError(cause);
         response?.destroy(error);
         reject(error);
       });
@@ -299,7 +316,7 @@ export async function downloadApprovedVideo({ url, allowedOrigins, privateEndpoi
         catch { throw fail("VM_SOURCE_URL_NOT_ALLOWED"); }
         continue;
       }
-      if (response.statusCode !== 200) throw fail("VM_SOURCE_HTTP_FAILED");
+      if (response.statusCode !== 200) throw httpFailure(response.statusCode);
       const contentType = String(response.headers?.["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase();
       if (contentType && !/^video\/[\w.+-]+$/u.test(contentType)
         && !["application/octet-stream", "binary/octet-stream", "application/mp4"].includes(contentType)) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -41,6 +42,11 @@ async function fixture(t) {
         ...(approvalStatus === "ready" ? { acquisition } : {}) }; },
     },
     canExecute: async () => true,
+    verifyRetryInput: async ({ run }) => {
+      calls.push(["verifyRetryInput", run.runId]);
+      if (approvalStatus !== "ready") { const error = new Error("approval not ready");
+        error.code = "VM_PMO_RETRY_APPROVAL_NOT_READY"; throw error; }
+    },
     acquireSlot: async () => { calls.push(["slot"]); return { release: async () => { calls.push(["release"]); } }; },
     prepareInput: async (input) => { calls.push(["prepare", input]); return prepared; },
     runOffline: async ({ mode, onStarted }) => {
@@ -79,6 +85,180 @@ test("registered tasks wait durably for approval without taking an execution slo
   await x.restart();
   assert.equal((await x.f.register({ taskId: "task_vm" })).runId, "run_vm");
   assert.equal(x.f.list().length, 1);
+});
+
+function storeLegacyInitialIdentity(x) {
+  const run = x.f.get("run_vm");
+  const { stageSnapshot, ...identity } = run.identity;
+  const value = JSON.stringify(identity);
+  const sha256 = createHash("sha256").update(value).digest("hex");
+  x.db.prepare("UPDATE vm_pmo_runs SET identity_json = ?, identity_sha256 = ? WHERE run_id = ?")
+    .run(value, sha256, run.runId);
+  return { identity, value, sha256 };
+}
+
+test("pre-upgrade initial identities replay and resume the same approved run after restart", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  const legacy = storeLegacyInitialIdentity(x);
+  await x.restart();
+
+  const replay = await x.f.register({ taskId: "task_vm" });
+  assert.equal(replay.runId, "run_vm");
+  assert.deepEqual(replay.identity, legacy.identity);
+  assert.equal((await x.f.pump("run_vm")).state, "waiting_materials");
+  assert.equal(x.calls.some(([kind]) => kind === "slot"), false);
+  x.setApproval("ready");
+  assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+  assert.deepEqual(x.db.prepare("SELECT identity_json,identity_sha256 FROM vm_pmo_runs WHERE run_id = ?")
+    .get("run_vm"), Object.assign(Object.create(null), { identity_json: legacy.value, identity_sha256: legacy.sha256 }));
+});
+
+test("legacy initial compatibility still rejects a changed frozen origin", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  storeLegacyInitialIdentity(x);
+  x.origin.recordId = "rec_other";
+  await x.restart();
+  await assert.rejects(x.f.register({ taskId: "task_vm" }), { code: "VM_PMO_TASK_IDENTITY_CHANGED" });
+  const blocked = await x.f.pump("run_vm");
+  assert.equal(blocked.errorCode, "VM_PMO_TASK_IDENTITY_CHANGED");
+  assert.equal(x.calls.some(([kind]) => kind === "reconcile"), false);
+});
+
+test("new initial identities still reject a changed stage snapshot", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.origin.stageSnapshot.instructionFieldId = "fld_changed";
+  await x.restart();
+  await assert.rejects(x.f.register({ taskId: "task_vm" }), { code: "VM_PMO_TASK_IDENTITY_CHANGED" });
+  assert.equal((await x.f.pump("run_vm")).errorCode, "VM_PMO_TASK_IDENTITY_CHANGED");
+});
+
+for (const legacyIdentity of [false, true]) test(`a ready approval can recover a binding-conflict run before rendering starts (legacy identity: ${legacyIdentity})`, async (t) => {
+  const x = await fixture(t);
+  const registered = await x.f.register({ taskId: "task_vm" });
+  if (legacyIdentity) storeLegacyInitialIdentity(x);
+  x.db.prepare(`UPDATE vm_pmo_runs SET state = 'needs_attention',error_code = 'VM_TASK_BINDING_CONFLICT',
+    attempt_count = 8 WHERE run_id = ?`).run(registered.runId);
+  x.setApproval("ready");
+
+  await x.f.recoverBindingConflicts();
+
+  const recovered = x.f.get(registered.runId);
+  assert.equal(recovered.state, "delivery_pending");
+  assert.equal(recovered.runId, registered.runId);
+  assert.equal(recovered.approvalStatus, "ready");
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+});
+
+test("a manual alignment retry revalidates the same approval and starts a new planning attempt", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  let planAttempts = 0;
+  x.dependencies.prepareInput = async ({ run }) => {
+    const contextPath = path.join(path.dirname(x.prepared.contextPath), `attempt-${run.planAttempt}.json`);
+    const result = { ...x.prepared, contextPath, inputSha256: String(run.planAttempt).repeat(64),
+      runnerOptions: { ...x.prepared.runnerOptions, contextPath } };
+    x.calls.push(["prepareAttempt", run.planAttempt]);
+    return result;
+  };
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    x.calls.push([mode]);
+    await onStarted({ mode, pid: 42, startedAt: new Date(x.f.get("run_vm").updatedAt).toISOString() });
+    if (mode === "plan" && ++planAttempts === 1) {
+      return { status: "blocked", errorCode: "WORD_ALIGNMENT_UNRESOLVED" };
+    }
+    return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) }
+      : { status: "rendered", planSha256: "d".repeat(64), artifact: x.artifact };
+  };
+  await x.restart();
+
+  const blocked = await x.f.pump("run_vm");
+  assert.equal(blocked.state, "blocked");
+  assert.equal(blocked.errorCode, "WORD_ALIGNMENT_UNRESOLVED");
+  assert.equal(blocked.runnerStartedAt, undefined);
+
+  const queued = await x.f.retryPlan("run_vm");
+  assert.equal(queued.state, "ready");
+  assert.equal(queued.planAttempt, 2);
+  assert.deepEqual(queued.retryHistory.map(entry => entry.errorCode), ["WORD_ALIGNMENT_UNRESOLVED"]);
+
+  const result = await x.f.pump("run_vm");
+  assert.equal(result.state, "delivery_pending");
+  assert.equal(result.planAttempt, 2);
+  assert.deepEqual(x.calls.filter(([kind]) => kind === "prepareAttempt").map(([, attempt]) => attempt), [1, 2]);
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "verifyRetryInput").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "plan").length, 2);
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+});
+
+test("manual alignment retry rejects unready approval and package failures", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    await onStarted({ mode, pid: 42, startedAt: "2026-10-16T00:00:00.000Z" });
+    return { status: "blocked", errorCode: "WORD_ALIGNMENT_UNRESOLVED" };
+  };
+  await x.restart();
+  await x.f.pump("run_vm");
+  x.setApproval("waiting_approval");
+  await assert.rejects(x.f.retryPlan("run_vm"), { code: "VM_PMO_RETRY_APPROVAL_NOT_READY" });
+  assert.equal(x.f.get("run_vm").state, "blocked");
+
+  const y = await fixture(t);
+  await y.f.register({ taskId: "task_vm" });
+  y.setApproval("ready");
+  y.dependencies.runOffline = async ({ mode, onStarted }) => {
+    await onStarted({ mode, pid: 42, startedAt: "2026-10-16T00:00:00.000Z" });
+    return { status: "blocked", errorCode: "OPERATION_UNSUPPORTED" };
+  };
+  await y.restart();
+  await y.f.pump("run_vm");
+  await assert.rejects(y.f.retryPlan("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+  assert.equal(y.f.get("run_vm").state, "blocked");
+});
+
+test("binding-conflict recovery never reruns a run that already started rendering", async (t) => {
+  const x = await fixture(t);
+  const registered = await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  await x.f.pump(registered.runId);
+  x.db.prepare(`UPDATE vm_pmo_runs SET state = 'needs_attention',error_code = 'VM_TASK_BINDING_CONFLICT'
+    WHERE run_id = ?`).run(registered.runId);
+
+  await x.f.recoverBindingConflicts();
+
+  assert.equal(x.f.get(registered.runId).state, "needs_attention");
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+});
+
+test("review tasks reuse their confirmed parent MP4 without any approval lookup or enqueue", async (t) => {
+  const x = await fixture(t);
+  x.origin.stageId = "review";
+  x.origin.stageSnapshot.reviewRound = 1;
+  x.origin.stageSnapshot.reviewParent = { runId: "run_parent", artifactId: "artifact_parent",
+    deliveryId: "delivery_parent", localPath: path.join(path.dirname(x.prepared.contextPath), "parent.mp4"),
+    sha256: "e".repeat(64), bytes: 256, durationMs: 1_000, reviewRound: 0 };
+  x.origin.stageSnapshot.vmWorkflow.stages = { review: { enabled: true } };
+  x.origin.stageSnapshot.vmContext = { vmid: "5dd7753a4723ba416403cbad", title: "课程",
+    instruction: "删除‘上一章’", statusOptionId: "opt_review" };
+
+  const registered = await x.f.register({ taskId: "task_vm" });
+  assert.equal(registered.state, "ready");
+  assert.equal(registered.approvalStatus, "ready");
+  assert.equal(registered.binding.approvalJobId, null);
+  const result = await x.f.pump(registered.runId);
+  assert.equal(result.state, "delivery_pending");
+  assert.equal(x.calls.some(([name]) => ["reserve", "reconcile", "status"].includes(name)), false);
+  assert.equal(x.calls.find(([name]) => name === "prepare")[1].acquisition.path,
+    x.origin.stageSnapshot.reviewParent.localPath);
 });
 
 test("trusted Chinese package aliases retain their identity through approval and rendering", async (t) => {

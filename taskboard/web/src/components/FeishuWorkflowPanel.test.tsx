@@ -1813,9 +1813,11 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     expect(screen.getByRole("tab", { name: "基础与执行" }).getAttribute("aria-selected")).toBe("true");
     expect(screen.getByRole("tabpanel", { name: "基础与执行" })).toBeTruthy();
     expect(screen.queryByRole("tabpanel", { name: "素材与阶段" })).toBeNull();
-    expect(screen.getByRole("combobox", { name: "剪辑模式" })).toBeTruthy();
+    const modeGroup = screen.getByRole("group", { name: "剪辑模式" });
+    expect(within(modeGroup).getByRole("button", { name: "手动" })).toBeTruthy();
+    expect(within(modeGroup).getByRole("button", { name: "自动" })).toBeTruthy();
 
-    fireEvent.change(screen.getByRole("combobox", { name: "剪辑模式" }), { target: { value: "automatic" } });
+    fireEvent.click(within(modeGroup).getByRole("button", { name: "自动" }));
     fireEvent.click(screen.getByRole("tab", { name: "素材与阶段" }));
     const stages = screen.getByRole("tabpanel", { name: "素材与阶段" });
     for (const stageName of ["初稿", "初审修改", "终审修改"]) {
@@ -1840,7 +1842,7 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     expect(screen.queryByLabelText("指定状态进入时创建00成片")).toBeNull();
 
     fireEvent.click(screen.getByRole("tab", { name: "基础与执行" }));
-    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
+    expect(within(screen.getByRole("group", { name: "剪辑模式" })).getByRole("button", { name: "自动" }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("supports keyboard page navigation and resets to basics for another subject", async () => {
@@ -1865,7 +1867,7 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
 
     rerender(<LegacyFeishuWorkflowPanel {...common} selectedSubjectKey={geography.subjectKey} />);
     await waitFor(() => expect(screen.getByRole("tab", { name: "基础与执行" }).getAttribute("aria-selected")).toBe("true"));
-    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
+    expect(within(screen.getByRole("group", { name: "剪辑模式" })).getByRole("button", { name: "自动" }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("renders the approved card hierarchy for subject configuration", () => {
@@ -1873,7 +1875,7 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     render(<LegacyFeishuWorkflowPanel {...panelProps(configured)} />);
 
     expect(screen.getByRole("region", { name: "学科配置" }).className).toContain("feishu-subject-settings");
-    expect(screen.getByRole("group", { name: "通用执行设置" }).className).toContain("feishu-config-card");
+    expect(screen.getByRole("region", { name: "通用执行设置" }).className).toContain("feishu-execution-settings");
     expect(screen.getByRole("group", { name: "Auto-Cut 路由" }).className).toContain("feishu-config-card");
     expect(screen.getByRole("group", { name: "ZIP 与上传" }).className).toContain("feishu-config-card");
 
@@ -1886,16 +1888,16 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     if (kind === "legacy") configured.metadata = { fields: [] };
     render(<LegacyFeishuWorkflowPanel {...panelProps(configured)} />);
 
-    const common = screen.getByRole("group", { name: "通用执行设置" });
-    expect(screen.getAllByRole("combobox", { name: "剪辑模式" })).toHaveLength(1);
-    expect((within(common).getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("manual");
+    const common = screen.getByRole("region", { name: "通用执行设置" });
+    expect(screen.getAllByRole("group", { name: "剪辑模式" })).toHaveLength(1);
+    expect(within(common).getByRole("button", { name: "手动" }).getAttribute("aria-pressed")).toBe("true");
     expect(within(common).queryByRole("textbox", { name: "并发组" })).toBeNull();
     expect(within(common).queryByRole("spinbutton", { name: "并发数" })).toBeNull();
     expect(within(common).queryByRole("textbox", { name: "资源组" })).toBeNull();
     if (kind !== "legacy") {
       fireEvent.click(screen.getByRole("tab", { name: "素材与阶段" }));
       const phases = screen.getByRole("region", { name: "素材与阶段" });
-      expect(within(phases).queryByRole("combobox", { name: "剪辑模式" })).toBeNull();
+      expect(within(phases).queryByRole("group", { name: "剪辑模式" })).toBeNull();
     }
   });
 
@@ -1924,10 +1926,11 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     }
     render(<SavedPanel />);
 
-    const control = screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement;
-    expect(control.value).toBe(originalMode);
-    fireEvent.change(control, { target: { value: nextMode } });
-    expect(control.value).toBe(nextMode);
+    const modeButton = (mode: "manual" | "automatic") => within(screen.getByRole("group", { name: "剪辑模式" }))
+      .getByRole("button", { name: mode === "manual" ? "手动" : "自动" });
+    expect(modeButton(originalMode).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(modeButton(nextMode));
+    expect(modeButton(nextMode).getAttribute("aria-pressed")).toBe("true");
     expect(onSaveDraft).not.toHaveBeenCalled();
     expect(onEnable).not.toHaveBeenCalled();
 
@@ -1958,11 +1961,11 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     automatic.execution!.mode = "automatic";
     const props = { ...panelProps(manual), catalog: catalog(manual, automatic) };
     const { rerender } = render(<LegacyFeishuWorkflowPanel {...props} />);
-    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("manual");
+    expect(within(screen.getByRole("group", { name: "剪辑模式" })).getByRole("button", { name: "手动" }).getAttribute("aria-pressed")).toBe("true");
     rerender(<LegacyFeishuWorkflowPanel {...props} selectedSubjectKey={automatic.subjectKey} />);
-    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
+    expect(within(screen.getByRole("group", { name: "剪辑模式" })).getByRole("button", { name: "自动" }).getAttribute("aria-pressed")).toBe("true");
     rerender(<LegacyFeishuWorkflowPanel {...props} />);
-    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("manual");
+    expect(within(screen.getByRole("group", { name: "剪辑模式" })).getByRole("button", { name: "手动" }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("reports unknown, off and on machine policy without changing the subject mode", () => {
@@ -1970,22 +1973,23 @@ describe("FeishuWorkflowPanel shared execution mode", () => {
     configured.execution!.mode = "automatic";
     const props = panelProps(configured);
     const { rerender } = render(<LegacyFeishuWorkflowPanel {...props} />);
-    const status = () => screen.getByRole("status", { name: "本机自动执行总开关" });
+    const status = () => screen.getByRole("status", { name: "本机自动执行状态" });
     expect(status().textContent).toContain("状态未知");
     rerender(<LegacyFeishuWorkflowPanel {...props} allowAutomaticExecution={false} />);
-    expect(status().textContent).toContain("已关闭");
-    expect(status().textContent).toContain("不会自动启动任务");
+    expect(status().textContent).toContain("关闭");
     rerender(<LegacyFeishuWorkflowPanel {...props} allowAutomaticExecution />);
-    expect(status().textContent).toContain("已开启");
-    expect((screen.getByRole("combobox", { name: "剪辑模式" }) as HTMLSelectElement).value).toBe("automatic");
+    expect(status().textContent).toContain("开启");
+    expect(within(screen.getByRole("group", { name: "剪辑模式" })).getByRole("button", { name: "自动" }).getAttribute("aria-pressed")).toBe("true");
     expect(props.onSubjectChange).not.toHaveBeenCalled();
   });
 
   it("opens machine settings from the global switch status without modifying the subject", () => {
-    const props = panelProps(subject("history", "高中历史"));
+    const configured = subject("history", "高中历史");
+    configured.execution!.mode = "automatic";
+    const props = panelProps(configured);
     const onOpenLocalSettings = vi.fn();
     render(<LegacyFeishuWorkflowPanel {...props} allowAutomaticExecution={false} onOpenLocalSettings={onOpenLocalSettings} />);
-    fireEvent.click(screen.getByRole("button", { name: "修改本机总开关" }));
+    fireEvent.click(screen.getByRole("button", { name: "本机设置" }));
     expect(onOpenLocalSettings).toHaveBeenCalledOnce();
     expect(props.onSubjectChange).not.toHaveBeenCalled();
   });

@@ -311,7 +311,7 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
   return <section aria-label="VM 视频剪辑与 PMO 审核配置" className="feishu-vm-pmo-editor">
     <div className="feishu-vm-pmo-summary">
       {profile && <small>流程草稿版本 {profile.revision}</small>}
-      <span role="status">{vmPmoInitialReady ? "初稿支持审批下载、明确时间范围剪辑和 PMO 附件交付；审核修改与成片归档暂未开放。" : "当前仅保存配置草稿，本机初稿运行能力尚未就绪。"}</span>
+      <span role="status">{vmPmoInitialReady ? "初稿通过审批下载后剪辑并回写 MP4；审核修改复用上一轮成片，成片归档由审核通过状态触发。" : "当前仅保存配置草稿，本机初稿运行能力尚未就绪。"}</span>
     </div>
     <div className="feishu-settings-tabs" role="tablist" aria-label="VM 学科配置分区">
       {SETTINGS_TABS.map((tab, index) => <button key={tab.id} ref={(element) => { tabRefs.current[index] = element; }}
@@ -352,8 +352,8 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
           const stage = config.stages[id];
           const statusField = uniqueFields.find((field) => field.fieldId === stage.statusFieldId && progressField(field));
           const setStage = (patch: Partial<typeof stage>) => update({ ...config, stages: { ...config.stages, [id]: { ...stage, ...patch } } });
-          return <section key={id} aria-label={`VM ${label}配置`}><h4>{label}</h4>
-            <label><input type="checkbox" aria-label={`启用 VM ${label}`} checked={stage.enabled} onChange={(event) => setStage({ enabled: event.target.checked })} />纳入此阶段</label>
+          return <section key={id} aria-label={`VM ${label}配置`}>
+            <h4><label className="feishu-vm-stage-toggle"><input type="checkbox" aria-label={`启用 VM ${label}`} checked={stage.enabled} onChange={(event) => setStage({ enabled: event.target.checked })} />{label}</label></h4>
             <p>{id === "initial" ? "读取初稿意见，首次编辑当前记录的原始 VM 视频。" : "读取审核意见，修改上一轮成片。完成后再次进入触发状态，开始下一轮审核修改。"}</p>
             <div className="feishu-settings-grid">
               {fieldSelect(`VM ${label}进度触发字段`, stage.statusFieldId, uniqueFields.filter(progressField), (value) => setStage({ statusFieldId: value, triggerOptionId: null }))}
@@ -387,7 +387,7 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
         </div>
         <p className="feishu-execution-help">{finalArchive.pathSource === "pmo_field" ? "读取指定 PMO 字段的文本或公式结果，作为该记录的具体目录。" : "填写成片保存的具体目录，可使用 NAS 共享路径或本机映射盘路径。"}</p>
         <p className="feishu-execution-help">目标路径：<code>{archivePathPreview}</code></p>
-        <p className="feishu-execution-help">最终成片使用“基础与执行”设置的共用名称主体。当前仅保存归档配置，成片归档暂未开放。</p>
+        <p className="feishu-execution-help">最终成片使用“基础与执行”设置的共用名称主体。进度进入归档触发状态后，自动将最近一轮已确认交付的 MP4 保存到指定目录。</p>
       </fieldset></>}
       {activeTab === "writeback" && <fieldset className="feishu-config-card">
         <legend>阶段状态回写</legend>

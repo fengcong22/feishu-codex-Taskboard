@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 import { TaskboardLanguageProvider } from "../i18n";
-import type { ActorIdentity, FeishuAutoCutRun, Task } from "../types";
+import type { ActorIdentity, FeishuAutoCutRun, Task, VmPmoRunSummary } from "../types";
 import { TaskDetail } from "./TaskDetail";
 
 // Editor internals are unrelated to execution state. Keep TaskDetail, the
@@ -67,11 +67,13 @@ describe("TaskDetail Auto-Cut execution", () => {
   let runs: FeishuAutoCutRun[];
   let runReads: number;
   let retryTask: Task;
+  let vmRun: VmPmoRunSummary | null;
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     runs = [attempt()];
     runReads = 0;
+    vmRun = null;
     retryTask = { ...TASK, version: 3 };
     fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const pathname = new URL(String(input), "http://localhost/").pathname;
@@ -82,6 +84,19 @@ describe("TaskDetail Auto-Cut execution", () => {
       if (pathname === `/api/local/tasks/${TASK.id}/autocut-retry`) {
         runs = [attempt({ state: "blocked" }), attempt({ runId: "run-2", attempt: 2 })];
         return json({ task: retryTask }, 202);
+      }
+      if (pathname === `/api/local/tasks/${TASK.id}/vm-pmo-run`) {
+        if (init?.method === "POST") {
+          vmRun = { ...vmRun!, state: "ready", canRetryPlan: false };
+          return json({ run: vmRun }, 202);
+        }
+        return json({ run: vmRun });
+      }
+      if (pathname === `/api/local/tasks/${TASK.id}/vm-pmo-writeback-retry`) {
+        vmRun = { ...vmRun!, canRetryWriteback: false,
+          writeback: { processing: { state: "pending", errorCode: null, attemptCount: 0 },
+            completed: { state: "pending", errorCode: null, attemptCount: 0 } } };
+        return json({ run: vmRun }, 202);
       }
       if (pathname === `/api/tasks/${TASK.id}/comments`) return json({ comments: [] });
       if (pathname === `/api/tasks/${TASK.id}/activities`) return json({ activities: [] });
@@ -138,5 +153,48 @@ describe("TaskDetail Auto-Cut execution", () => {
     });
     expect(await screen.findByText("run-2")).toBeTruthy();
     await waitFor(() => expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull());
+  });
+
+  it("requires per-retry ASR and local-plan consent before retrying the same VM run", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "blocked", errorCode: "WORD_ALIGNMENT_UNRESOLVED",
+      approvalStatus: "ready", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: true,
+      canRetryWriteback: false, writeback: { processing: null, completed: null },
+      updatedAt: CREATED_AT };
+    const rendered = render(view(props(TASK)));
+    fireEvent.click(await screen.findByRole("button", { name: "重试语音识别与规划" }));
+
+    const confirm = screen.getByRole("button", { name: "确认重试" });
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText("允许本次重试重新识别原视频音轨"));
+    fireEvent.click(screen.getByLabelText("允许本次重试写入新的本机规划文件"));
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-run") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/vm-pmo-run") && init?.method === "POST")!;
+    expect(JSON.parse(request.body)).toEqual({ version: TASK.version,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true } });
+    await waitFor(() => expect(rendered.container.querySelector(".vm-pmo-run-state")?.textContent).toBe("等待重新规划"));
+  });
+
+  it("retries only the VM run's dead-letter Feishu progress writebacks", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "completed", errorCode: null,
+      approvalStatus: "ready", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,
+      canRetryWriteback: true,
+      writeback: { processing: { state: "dead_letter", errorCode: "WRITEBACK_UNAVAILABLE", attemptCount: 8 },
+        completed: { state: "dead_letter", errorCode: "WRITEBACK_UNAVAILABLE", attemptCount: 8 } },
+      updatedAt: CREATED_AT };
+    const task = { ...TASK, status: "in_review" as const };
+    render(view(props(task)));
+    expect(await screen.findAllByText("WRITEBACK_UNAVAILABLE")).toHaveLength(2);
+    fireEvent.click(await screen.findByRole("button", { name: "重试进度回写" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-writeback-retry") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/vm-pmo-writeback-retry") && init?.method === "POST")!;
+    expect(JSON.parse(request.body)).toEqual({ version: task.version });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试进度回写" })).toBeNull());
   });
 });

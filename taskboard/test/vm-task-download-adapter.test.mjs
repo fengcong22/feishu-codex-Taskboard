@@ -30,11 +30,19 @@ test("the task adapter uses the active download service for exact lookup and enq
   const request = adapter.requestFor({ vmid: VMID, department: "动画组", reason: "切片剪辑", outputRoot: directory });
   const fingerprint = createHash("sha256").update(JSON.stringify(request)).digest("hex");
   assert.equal(adapter.lookup({ requestFingerprint: fingerprint }), null);
-  const enqueued = adapter.enqueue({ vmids: [VMID], department: "动画组", reason: "切片剪辑", outputRoot: directory }).jobs[0];
-  assert.equal(store.list().length, 1);
+  const input = { vmids: [VMID], department: "动画组", reason: "切片剪辑", outputRoot: directory };
+  const enqueued = adapter.enqueue(input, { taskId: "task-a", runId: "run-a" }).jobs[0];
+  assert.equal(adapter.enqueue(input, { taskId: "task-a", runId: "run-a" }).jobs[0].id, enqueued.id);
+  const secondRun = adapter.enqueue(input, { taskId: "task-b", runId: "run-b" }).jobs[0];
+  assert.notEqual(secondRun.id, enqueued.id);
+  assert.equal(store.list().length, 2);
   assert.deepEqual(adapter.lookup({ requestFingerprint: fingerprint, jobId: enqueued.id }),
     service.lookupExact({ requestFingerprint: fingerprint, jobId: enqueued.id }));
   assert.equal(adapter.lookup({ requestFingerprint: "a".repeat(64), jobId: enqueued.id }), null);
+  const taskRunJob = adapter.lookupTaskRun({ jobId: enqueued.id });
+  assert.equal(taskRunJob.requestFingerprint, fingerprint);
+  assert.deepEqual(taskRunJob.request, request);
+  assert.equal(service.enqueue(input).jobs[0].id, enqueued.id);
   await adapter.wake();
-  assert.equal(store.list().length, 1);
+  assert.equal(store.list().length, 2);
 });

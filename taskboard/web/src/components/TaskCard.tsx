@@ -217,7 +217,9 @@ function ProcessingStatusRow({
     conversation.kind === "local-ai"
   ));
   const statusLabel = running
-    ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
+    ? presentation.processing.runner === "vm-pmo"
+      ? (elapsed ? text(`VM 剪辑中 · ${elapsed}`, `VM editing · ${elapsed}`) : text("VM 剪辑处理中...", "VM editing..."))
+      : (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
     : localConversation
       ? text("已暂停 · 等待查看对话", "Paused · open the conversation")
       : text("等待 Codex 连接...", "Waiting for Codex...");

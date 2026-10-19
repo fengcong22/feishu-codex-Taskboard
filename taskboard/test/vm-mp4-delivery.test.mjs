@@ -20,7 +20,7 @@ async function fixture(t, overrides = {}) {
   const trusted = {
     runId: "run-1", taskId: "task-1", artifactId: "artifact-1", productionOrigin: true,
     artifact: { kind: "review_mp4", validationStatus: "verified", path: filename,
-      filename: "lesson_初稿.mp4", sha256: sha256(bytes), bytes: bytes.length }, target,
+      filename: "lesson_初稿.mp4", sha256: sha256(bytes), bytes: bytes.length, duration_ms: 25_000 }, target,
   };
   let resolved = overrides.trusted ?? trusted;
   let current = [];
@@ -61,6 +61,25 @@ test("a verified production MP4 is attached to an empty field and only readback 
   assert.equal(f.calls.upload, 1);
 });
 
+test("latest parent selection uses only the most recent readback-confirmed delivery", async (t) => {
+  const f = await fixture(t);
+  await f.service.enqueue({ runId: "run-1", artifactId: "artifact-1" });
+  assert.equal(await f.service.latestDelivered(f.target), null);
+  assert.equal((await f.service.processNext()).state, "delivered");
+  assert.equal((await f.service.latestDelivered(f.target)).runId, "run-1");
+
+  const second = { ...f.trusted, runId: "run-2", taskId: "task-2", artifactId: "artifact-2" };
+  const resolver = async ({ runId }) => runId === "run-2" ? second : f.trusted;
+  const adapter = { ...f.adapter, async uploadMedia() { return { file_token: "second-token" }; } };
+  const nextService = createVmMp4DeliveryService({ database: f.database, adapter,
+    resolveTrustedDelivery: resolver, now: () => 1_700_000_000_001 });
+  await nextService.enqueue({ runId: "run-2", artifactId: "artifact-2" });
+  assert.equal((await f.service.latestDelivered(f.target)).runId, "run-1");
+  assert.equal((await nextService.processNext()).state, "delivered");
+  assert.equal((await nextService.latestDelivered(f.target)).runId, "run-2");
+  assert.equal(await nextService.latestDelivered({ ...f.target, recordId: "other-record" }), null);
+});
+
 test("an upload reservation loses eligibility when its production source is revoked", async (t) => {
   const f = await fixture(t);
   await f.service.enqueue({ runId: "run-1", artifactId: "artifact-1" });
@@ -70,6 +89,46 @@ test("an upload reservation loses eligibility when its production source is revo
   assert.equal(result.errorCode, "VM_DELIVERY_UNTRUSTED");
   assert.equal(f.calls.upload, 0);
   assert.equal(f.calls.update, 0);
+});
+
+test("package-scoped parent selection skips another package on the same record and output field", async (t) => {
+  const f = await fixture(t);
+  const workflowTemplate = {id: "vm_pmo_review_video", version: 1};
+  const first = {...f.trusted, lineage: {subjectKey: "base-1:table-1", packageAlias: "package-a", workflowTemplate}};
+  const second = {...first, runId: "run-2", taskId: "task-2", artifactId: "artifact-2",
+    lineage: {...first.lineage, packageAlias: "package-b"}};
+  let timestamp = 1_700_000_000_000;
+  const service = createVmMp4DeliveryService({database: f.database, adapter: f.adapter, now: () => timestamp,
+    resolveTrustedDelivery: async ({runId}) => runId === "run-1" ? first : second});
+  await service.enqueue({runId: first.runId, artifactId: first.artifactId});
+  await service.processNext();timestamp++;
+  await service.enqueue({runId: second.runId, artifactId: second.artifactId});
+  await service.processNext();
+  assert.equal((await service.latestDelivered({...f.target, ...first.lineage})).runId, "run-1");
+  assert.equal((await service.latestDelivered({...f.target, ...second.lineage})).runId, "run-2");
+  assert.equal(await service.latestDelivered({...f.target, ...first.lineage, packageAlias: "missing"}), null);
+  assert.equal(await service.latestDelivered({...f.target, ...first.lineage,
+    workflowTemplate: {id: "document_draft_zip", version: 1}}), null);
+});
+
+test("unrelated historical package files do not block the selected package's confirmed parent", async (t) => {
+  const f = await fixture(t);
+  const lineage = {subjectKey:"base-1:table-1",packageAlias:"package-a",
+    workflowTemplate:{id:"vm_pmo_review_video",version:1}};
+  const first = {...f.trusted,lineage};
+  const second = {...first,runId:"run-2",taskId:"task-2",artifactId:"artifact-2",
+    lineage:{...lineage,packageAlias:"package-b"}};
+  let revoked = false;
+  const service = createVmMp4DeliveryService({database:f.database,adapter:f.adapter,
+    resolveTrustedLineage: async ({taskId}) => taskId === first.taskId ? lineage : second.lineage,
+    resolveTrustedDelivery: async ({runId}) => {
+      if (revoked && runId === second.runId) throw new Error("another package's retired files");
+      return runId === first.runId ? first : second;
+    }});
+  await service.enqueue({runId:first.runId,artifactId:first.artifactId});await service.processNext();
+  await service.enqueue({runId:second.runId,artifactId:second.artifactId});await service.processNext();
+  revoked = true;
+  assert.equal((await service.latestDelivered({...f.target,...lineage})).runId,first.runId);
 });
 
 test("changed frozen delivery identity blocks an already persisted upload", async (t) => {
@@ -278,13 +337,13 @@ test("field drift or failed readback never declares an MP4 delivered", async (t)
   assert.equal(readback.calls.update, 1);
 });
 
-test("an existing human attachment blocks binding instead of being rewritten", async (t) => {
+test("an existing human attachment is preserved while the delivered MP4 is appended", async (t) => {
   const f = await fixture(t);
   f.setCurrent([{ file_token: "human-token", name: "human.mp4" }]);
   await f.service.enqueue({ runId: "run-1", artifactId: "artifact-1" });
-  assert.equal((await f.service.processNext()).state, "conflict");
-  assert.deepEqual(f.current().map((entry) => entry.file_token), ["human-token"]);
-  assert.equal(f.calls.update, 0);
+  assert.equal((await f.service.processNext()).state, "delivered");
+  assert.deepEqual(f.current().map((entry) => entry.file_token), ["human-token", "new-token"]);
+  assert.equal(f.calls.update, 1);
 });
 
 test("an attachment appearing between two pre-bind reads blocks the update", async (t) => {

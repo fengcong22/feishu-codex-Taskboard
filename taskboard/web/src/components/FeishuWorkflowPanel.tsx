@@ -1923,21 +1923,28 @@ export function FeishuWorkflowPanel({
         >{tab.label}</button>)}
       </div>
       {activeSettingsTab === "basics" && <section className="feishu-settings-tabpanel" id={settingsPanelDomId("basics")} role="tabpanel" aria-labelledby={settingsTabDomId("basics")} tabIndex={0}>
-        <fieldset className="feishu-config-card" disabled={busy || (!selectedPackage && !onSaveDraft && !onEnable)}>
-          <legend>通用执行设置</legend>
-          <div className="feishu-settings-grid">
-            <label>剪辑模式<select value={subjectForm.executionMode} onChange={(event) => setSubjectForm({ ...subjectForm, executionMode: event.target.value as SubjectForm["executionMode"] })}><option value="manual">手动</option><option value="automatic">自动</option></select></label>
+        <section className="feishu-execution-settings" aria-label="通用执行设置">
+          <div className="feishu-execution-mode-row">
+            <span>剪辑模式</span>
+            <div className="feishu-execution-mode-control" role="group" aria-label="剪辑模式">
+              {(["manual", "automatic"] as const).map((mode) => <button
+                key={mode}
+                type="button"
+                className={subjectForm.executionMode === mode ? "is-active" : ""}
+                aria-pressed={subjectForm.executionMode === mode}
+                disabled={busy || (!selectedPackage && !onSaveDraft && !onEnable)}
+                onClick={() => setSubjectForm({ ...subjectForm, executionMode: mode })}
+              >{mode === "manual" ? "手动" : "自动"}</button>)}
+            </div>
           </div>
-          <p className="feishu-execution-help">剪辑模式适用于当前学科{phased ? "的初稿、初审修改和终审修改三个阶段" : ""}。修改后先保存草稿，再点击启用生效；上传入队单独设置。</p>
-          <p className="feishu-execution-help" role="status" aria-label="本机自动执行总开关">
-            {allowAutomaticExecution === true
-              ? "本机自动执行总开关：已开启。学科启用后，新触发的合格任务可按自动模式执行。"
-              : allowAutomaticExecution === false
-                ? "本机自动执行总开关：已关闭。即使选择自动，也不会自动启动任务，需手动开始。"
-                : "本机自动执行总开关：状态未知。暂时无法确认是否允许自动启动任务。"}
-          </p>
-          {onOpenLocalSettings && <button className="button secondary" type="button" onClick={onOpenLocalSettings}>修改本机总开关</button>}
-        </fieldset>
+          <div className="feishu-execution-policy-row">
+            <span role="status" aria-label="本机自动执行状态">
+              {allowAutomaticExecution === true ? "本机自动执行：已开启"
+                : allowAutomaticExecution === false ? "本机自动执行：已关闭" : "本机自动执行：状态未知"}
+            </span>
+            {onOpenLocalSettings && <button className="button secondary" type="button" onClick={onOpenLocalSettings}>本机设置</button>}
+          </div>
+        </section>
         {!phased && <fieldset className="feishu-config-card" disabled={busy || (!selectedPackage && !onSaveDraft && !onEnable)}>
           <legend>触发配置</legend>
           <div className="feishu-settings-grid">

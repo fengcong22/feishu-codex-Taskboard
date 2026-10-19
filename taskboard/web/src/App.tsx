@@ -70,6 +70,7 @@ import {
   UnifiedWorkflowBoard,
   type UnifiedWorkflowStage,
 } from "./components/UnifiedWorkflowBoard";
+import { PackageWorkflowWorkspace, type PackageBoardScope } from "./components/PackageWorkflowWorkspace";
 import { IssueListView } from "./components/IssueListView";
 import {
   BoardCardDisplayMenu,
@@ -982,6 +983,7 @@ export function App() {
   feishuConfigurationErrorScopeRef.current = feishuConfigurationErrorScope;
   const feishuConfigurationDirtyRef = useRef(false);
   const [unifiedViewsState, setUnifiedViewsState] = useState<UnifiedWorkflowViewsState | null>(null);
+  const [packageBoardScope, setPackageBoardScope] = useState<PackageBoardScope | null>(null);
   const unifiedViewsStateRef = useRef(unifiedViewsState);
   unifiedViewsStateRef.current = unifiedViewsState;
   const [unifiedStageDisplays, setUnifiedStageDisplays] = useState<StageDisplayOverride[]>([]);
@@ -1192,6 +1194,8 @@ export function App() {
       || task.feishuOrigin.subjectKey === selectedFeishuWorkflowSubjectKey
     ));
   }, [selectedFeishuWorkflowSubjectKey, selectedProjectId, tasks]);
+  const packageWorkflowEnabled = Boolean(selectedFeishuSubject?.packageRoute?.packageAlias
+    || unifiedWorkflowTasks.some(task => task.feishuOrigin?.packageAlias));
   const selectedCodexProjectIdentity = useMemo(
     () => selectedProject ? codexProjectContextForTaskProject(selectedProject.id) : null,
     [deviceWorkspacePaths, hostContext, projectCodexIdentities, projects, selectedProject?.id],
@@ -3132,11 +3136,13 @@ export function App() {
     for (const task of filteredTasks) {
       if (!scopedTaskIds.has(task.id)) continue;
       if (!isFeishuWorkflowTask(task)) continue;
+      if (packageWorkflowEnabled && (packageBoardScope?.subjectKey !== selectedFeishuWorkflowSubjectKey
+        || task.feishuOrigin?.packageAlias !== packageBoardScope.packageAlias)) continue;
       if (!["backlog", "canceled"].includes(task.status)) continue;
       grouped[task.status].push(task);
     }
     return grouped;
-  }, [filteredTasks, unifiedWorkflowTasks]);
+  }, [filteredTasks, unifiedWorkflowTasks, packageWorkflowEnabled, packageBoardScope, selectedFeishuWorkflowSubjectKey]);
 
   const unifiedOrdinaryTasks = useMemo(() => {
     const scopedTaskIds = new Set(unifiedWorkflowTasks.map((task) => task.id));
@@ -3151,8 +3157,9 @@ export function App() {
     return scoped.filter((task) => (
       !task.feishuOrigin?.subjectKey
       || task.feishuOrigin.subjectKey === selectedFeishuWorkflowSubjectKey
-    ));
-  }, [filteredArchivedTasks, selectedFeishuWorkflowSubjectKey, selectedProjectId]);
+    ) && (!packageWorkflowEnabled || packageBoardScope?.subjectKey !== selectedFeishuWorkflowSubjectKey
+      || task.feishuOrigin?.packageAlias === packageBoardScope.packageAlias));
+  }, [filteredArchivedTasks, selectedFeishuWorkflowSubjectKey, selectedProjectId, packageWorkflowEnabled, packageBoardScope]);
 
   const completedEditingTasks = useMemo(() => filteredTasks.filter(
     (task) => task.status === "done" && isFeishuWorkflowTask(task),
@@ -3632,7 +3639,9 @@ export function App() {
       const activeView = viewsState?.subjectKey === subjectKey
         ? viewsState.views.find((view) => view.id === viewsState.activeViewId)
         : undefined;
-      const visibleStageIds = activeView?.stageIds ?? [];
+      const packageScope = packageBoardScope?.subjectKey === subjectKey ? packageBoardScope : null;
+      if (packageScope && task.feishuOrigin?.packageAlias !== packageScope.packageAlias) return;
+      const visibleStageIds = packageScope?.stageIds ?? activeView?.stageIds ?? [];
       if (!canDropUnifiedWorkflowTask({
         projectId,
         subjectKey,
@@ -4986,7 +4995,7 @@ export function App() {
               </button>
             )}
           </div>
-          {boardView === "issues" && isSelectedFeishuProject && selectedFeishuWorkflowSubjectKey && (
+          {boardView === "issues" && isSelectedFeishuProject && selectedFeishuWorkflowSubjectKey && !packageWorkflowEnabled && (
             <div className="unified-workflow-toolbar-controls">
               {unifiedViewsState && unifiedViewsState.subjectKey === selectedFeishuWorkflowSubjectKey ? (
                 <UnifiedWorkflowViewControls
@@ -5238,19 +5247,42 @@ export function App() {
             className={`issue-board-layout unified-workflow-layout${otherTasksVisible ? " has-other-tasks" : ""}`}
           >
             <div className="unified-workflow-main">
-              <UnifiedWorkflowBoard
-                key={selectedProjectId}
+              <PackageWorkflowWorkspace
+                enabled={packageWorkflowEnabled}
                 projectId={selectedProjectId}
                 subjectKey={selectedFeishuWorkflowSubjectKey ?? ""}
-                viewId={unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
+                activePackageAlias={selectedFeishuSubject?.packageRoute?.packageAlias}
+                tasks={unifiedWorkflowTasks}
+                historicalTasks={archivedTasks.filter(task => task.projectId === selectedProjectId)}
+                refreshKey={autoCutPackagesRevision}
+                search={search}
+                filters={filters}
+                presentations={taskPresentations}
+                now={processingNow}
+                availableLabels={availableLabels}
+                currentUser={currentUser}
+                showCover={boardDisplaySettings.cover}
+                showBody={boardDisplaySettings.body}
+                onOpenTask={openTaskDetail}
+                onUpdate={updateTaskProperties}
+                onCreateLabel={persistProjectLabel}
+                onOpenConversation={openTaskConversation}
+                onScopeChange={setPackageBoardScope}
+                renderZipBoard={({tasks: packageTasks, settings, packageAlias}) => (
+              <UnifiedWorkflowBoard
+                key={`${selectedProjectId}:${packageAlias ?? "legacy"}`}
+                projectId={selectedProjectId}
+                subjectKey={selectedFeishuWorkflowSubjectKey ?? ""}
+                viewId={settings ? `${packageAlias}:${settings.activeViewId}` : unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
                   ? unifiedViewsState.activeViewId
                   : "all"}
-                stageIds={unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
+                stageIds={settings ? settings.views.find(view => view.id === settings.activeViewId)?.stageIds as UnifiedWorkflowStage[] : unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
                   ? unifiedViewsState.views.find((view) => view.id === unifiedViewsState.activeViewId)?.stageIds
                   : undefined}
-                stageDisplays={unifiedStageDisplays}
+                stageDisplays={settings ? settings.stageDisplays.map(display => ({...display,
+                  stageId: display.stageId as UnifiedWorkflowStage,subjectKey: settings.subjectKey,revision: settings.revision,updatedAt: ""})) : unifiedStageDisplays}
                 searchScope={unifiedSearchScope}
-                tasks={unifiedWorkflowTasks}
+                tasks={packageTasks}
                 uploadItems={artifactUploadItems}
                 artifactSummaries={taskArtifactSummaries}
                 presentations={taskPresentations}
@@ -5287,6 +5319,8 @@ export function App() {
                   boardColumnScrollRefs.current[status] = element;
                 }}
                 onBoardScrollRef={unifiedWorkflowScrollRef}
+              />
+                )}
               />
             </div>
             {otherTasksMounted && (

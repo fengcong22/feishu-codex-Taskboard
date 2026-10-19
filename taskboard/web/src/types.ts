@@ -618,6 +618,73 @@ export interface FeishuAutoCutRun {
   updatedAt: string;
 }
 
+export interface VmPmoRunSummary {
+  runId: string;
+  taskId: string;
+  state: "waiting_materials" | "ready" | "preparing" | "prepared" | "planning" | "planned"
+    | "rendering" | "rendered" | "delivery_pending" | "delivery_confirmed"
+    | "completed" | "blocked" | "needs_attention";
+  errorCode: string | null;
+  approvalStatus: string;
+  planAttempt: number;
+  retryLimit: number;
+  retryHistory: Array<{ planAttempt: number; errorCode: string; failedAt: string }>;
+  canRetryPlan: boolean;
+  canRetryWriteback?: boolean;
+  writeback?: {
+    processing: { state: string; errorCode: string | null; attemptCount: number } | null;
+    completed: { state: string; errorCode: string | null; attemptCount: number } | null;
+  };
+  updatedAt: string;
+}
+
+export type PackageBoardStage = UnifiedWorkflowStage | "materials" | "editing" | "feishu_delivery"
+  | "awaiting_feishu_review" | "nas_upload" | "completed" | "needs_attention";
+
+export interface PackageBoardView {
+  id: string;
+  name: string;
+  stageIds: PackageBoardStage[];
+  isSystem: boolean;
+}
+
+export interface PackageBoardDisplay {
+  stageId: PackageBoardStage;
+  zhName: string | null;
+  enName: string | null;
+  zhDescription: string | null;
+  enDescription: string | null;
+}
+
+export interface PackageBoardSettings {
+  subjectKey: string;
+  packageAlias: string;
+  workflowTemplate: FeishuPackageWorkflowTemplate;
+  revision: number;
+  views: PackageBoardView[];
+  activeViewId: string;
+  defaultViewId: string;
+  stageDisplays: PackageBoardDisplay[];
+}
+
+export interface PackageBoardEvidence extends Pick<VmPmoRunSummary,"taskId" | "errorCode" | "writeback" | "updatedAt"> {
+  runId: string | null;
+  state: VmPmoRunSummary["state"] | "todo";
+  approvalStatus: string | null;
+  parentTaskId?: string | null;
+  waitingForSlot?: boolean;
+  parentRunId?: string | null;
+  latestDelivered?: boolean;
+  runnerStartedAt?: string | null;
+  completedAt?: string | null;
+  archive?: {id?: string; state: string; errorCode: string | null; sourceRunId: string; sourceTaskId?: string; updatedAt?: string} | null;
+}
+
+export interface PackageBoardResponse {
+  settings: PackageBoardSettings;
+  status: {subjectKey: string; packageAlias: string; tasks: PackageBoardEvidence[]};
+}
+
 export interface FeishuSubjectConfig {
   workflowTemplate?: FeishuPackageWorkflowTemplate;
   vmWorkflow?: FeishuVmPmoWorkflowConfig;
@@ -986,6 +1053,7 @@ export interface FeishuTaskOrigin {
 export interface FeishuTaskPackageSnapshot {
   zipSourceDirectory: string | null;
   zipOutputMode?: "package_default" | "custom";
+  workflowTemplate?: FeishuPackageWorkflowTemplate;
 }
 
 export interface ArtifactUpload {

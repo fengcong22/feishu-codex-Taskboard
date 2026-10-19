@@ -250,9 +250,14 @@ export async function prepareVmSource(rawRequest, {
     if ((source.expected_sha256 && source.expected_sha256 !== transfer.sha256)
       || (source.expected_bytes && source.expected_bytes !== transfer.bytes)) fail("SOURCE_IDENTITY_MISMATCH");
     const media = await validate(partial, { ffprobePath, ffmpegPath, timeoutMs });
-    if (source.expected_resolution && media.video.some((stream) =>
-      stream.width !== source.expected_resolution.width || stream.height !== source.expected_resolution.height)) {
-      fail("SOURCE_RESOLUTION_MISMATCH");
+    if (source.expected_resolution) {
+      const mismatch = media.video.find((stream) =>
+        stream.width < source.expected_resolution.width || stream.height < source.expected_resolution.height);
+      if (mismatch) {
+        const diagnostic = `SOURCE_RESOLUTION_MISMATCH_${mismatch.width}X${mismatch.height}`
+          + `_EXPECTED_${source.expected_resolution.width}X${source.expected_resolution.height}`;
+        fail(diagnostic.length <= 80 ? diagnostic : "SOURCE_RESOLUTION_MISMATCH");
+      }
     }
     await verifyOwnedFile(ownedPartial);
     await link(partial, sourcePath);

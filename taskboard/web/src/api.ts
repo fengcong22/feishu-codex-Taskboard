@@ -53,6 +53,7 @@ import type {
   FeishuVmPmoWorkflowConfig,
   FeishuZipWorkflowConfig,
   FeishuAutoCutRun,
+  VmPmoRunSummary,
   AutoCutRunConsent,
   CreateUnifiedWorkflowViewInput,
   StageDisplayOverride,
@@ -1475,6 +1476,49 @@ export async function getTaskAutoCutRuns(
     { signal },
   );
   return data.runs;
+}
+
+export function getPackageWorkflowBoard(subjectKey: string, packageAlias: string, signal?: AbortSignal): Promise<import("./types").PackageBoardResponse> {
+  return request(`/api/local/feishu/package-board?${new URLSearchParams({subjectKey,packageAlias})}`, {signal});
+}
+
+export function savePackageWorkflowBoard(settings: import("./types").PackageBoardSettings): Promise<{settings: import("./types").PackageBoardSettings}> {
+  const {subjectKey,packageAlias,revision,views,activeViewId,defaultViewId,stageDisplays}=settings;
+  return request("/api/local/feishu/package-board", {method:"PATCH",body:JSON.stringify({subjectKey,packageAlias,revision,views,activeViewId,defaultViewId,stageDisplays})});
+}
+
+export async function getTaskVmPmoRun(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<VmPmoRunSummary | null> {
+  const data = await request<{ run: VmPmoRunSummary | null }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-run`,
+    { signal },
+  );
+  return data.run;
+}
+
+export async function retryTaskVmPmoPlan(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-run`,
+    { method: "POST", body: JSON.stringify({ version,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true } }) },
+  );
+  return data.run;
+}
+
+export async function retryTaskVmPmoWriteback(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-writeback-retry`,
+    { method: "POST", body: JSON.stringify({ version }) },
+  );
+  return data.run;
 }
 
 export async function retryTaskAutoCut(

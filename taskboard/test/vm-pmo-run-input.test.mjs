@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { prepareVmPmoRunInput } from "../server/vm-pmo-run-input.mjs";
+import { validateVmPmoInput } from "../server/vm-pmo-result-validator.mjs";
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "vm-input-"));
@@ -40,6 +41,83 @@ test("VM input freezes original instruction and approved source without copying 
   assert.deepEqual(await prepareVmPmoRunInput(args), prepared);
   args.origin.stageSnapshot.vmContext.instruction = "0:10-0:20";
   await assert.rejects(prepareVmPmoRunInput(args), {code: "VM_PMO_INPUT_SNAPSHOT_CONFLICT"});
+});
+
+test("each planning attempt gets an independent immutable input directory", async t => {
+  const args = await fixture(t);
+  const first = await prepareVmPmoRunInput({...args,planAttempt: 1});
+  const firstBytes = await readFile(first.contextPath);
+  const firstContext = JSON.parse(firstBytes.toString("utf8"));
+  const second = await prepareVmPmoRunInput({...args,planAttempt: 2});
+  const secondContext = JSON.parse(await readFile(second.contextPath,"utf8"));
+
+  assert.notEqual(first.contextPath,second.contextPath);
+  assert.notEqual(firstContext.run_dir,secondContext.run_dir);
+  assert.equal(firstContext.source_path,args.acquisition.path);
+  assert.equal(secondContext.source_path,args.acquisition.path);
+  assert.equal(first.inputSha256,second.inputSha256);
+  assert.deepEqual(await readFile(first.contextPath),firstBytes);
+});
+
+test("initial v2 package emits and validates schema v2 input for semantic editing", async t => {
+  const args = await fixture(t);
+  const manifestPath = path.join(args.packageSnapshot.workspacePath, "PACKAGE-MANIFEST.json");
+  await writeFile(manifestPath, JSON.stringify({ name: "auto-cut-slicing", version: "0.3.0",
+    interface: { workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+      contract: { id: "vm_pmo_review_video", version: 2 }, driverId: "vm_pmo_review_video_v2",
+      artifactKind: "review_mp4" } }));
+  args.packageIdentity = { name: "auto-cut-slicing", version: "0.3.0",
+    manifestSha256: createHash("sha256").update(await readFile(manifestPath)).digest("hex"),
+    contractVersion: 2, driverId: "vm_pmo_review_video_v2" };
+  args.origin.stageSnapshot.vmContext.instruction = "0:06-（4:22 剪掉 ‘中学阶段’这几个字的声音，可以用停顿占位）-4:34";
+
+  const prepared = await prepareVmPmoRunInput(args);
+  const context = JSON.parse(await readFile(prepared.contextPath, "utf8"));
+  const input = JSON.parse(await readFile(path.join(context.run_dir, "input.json"), "utf8"));
+  assert.equal(input.binding.stage_id, "initial");
+  assert.equal(input.schema_version, 2);
+  assert.equal(context.schema_version, 2);
+  assert.equal(input.instructions[0].raw_text, args.origin.stageSnapshot.vmContext.instruction);
+  const bound = await validateVmPmoInput({ contextPath: prepared.contextPath });
+  assert.equal(bound.input.schema_version, 2);
+});
+
+test("review input v2 binds the exact delivered parent and emits the persisted draft number", async t => {
+  const args = await fixture(t);
+  const manifestPath = path.join(args.packageSnapshot.workspacePath, "PACKAGE-MANIFEST.json");
+  await writeFile(manifestPath, JSON.stringify({ name: "auto-cut-slicing", version: "0.3.0",
+    interface: { workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+      contract: { id: "vm_pmo_review_video", version: 2 }, driverId: "vm_pmo_review_video_v2",
+      artifactKind: "review_mp4" } }));
+  const bytes = await readFile(args.acquisition.path);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  args.origin.stageId = "review";
+  args.origin.stageSnapshot = { vmContext: { vmid: "vmid-1", title: "test/name",
+    instruction: "剪掉‘上一章’三个字", statusOptionId: "opt-review" }, reviewRound: 2,
+    reviewParent: { runId: "parent-run", artifactId: "parent-artifact", deliveryId: "delivery-1",
+      localPath: args.acquisition.path, sha256, bytes: bytes.length, durationMs: 25_000, reviewRound: 1 } };
+  args.profile.stages.review = { instructionFieldId: "fld-review-instruction" };
+  args.packageIdentity = { name: "auto-cut-slicing", version: "0.3.0",
+    manifestSha256: createHash("sha256").update(await readFile(manifestPath)).digest("hex"),
+    contractVersion: 2, driverId: "vm_pmo_review_video_v2" };
+  args.acquisition = { path: args.acquisition.path, sha256, bytes: bytes.length,
+    duration_ms: 25_000, vmid_binding: "managed_review_parent", vmid: "vmid-1" };
+
+  const prepared = await prepareVmPmoRunInput(args);
+  const context = JSON.parse(await readFile(prepared.contextPath, "utf8"));
+  const input = JSON.parse(await readFile(path.join(context.run_dir, "input.json"), "utf8"));
+  assert.equal(input.schema_version, 2);
+  assert.equal(context.schema_version, 2);
+  assert.equal(input.binding.stage_id, "review");
+  assert.equal(input.review_round.parent.run_id, "parent-run");
+  assert.equal(input.review_round.parent.sha256, sha256);
+  assert.equal(input.source.timeline_basis, "previous_review_video");
+  assert.equal(input.source.sha256, sha256);
+  assert.equal(input.instructions[0].raw_text, "剪掉‘上一章’三个字");
+  assert.equal(input.instructions[0].source_field_id, "fld-review-instruction");
+  assert.equal(prepared.outputFilename, "test_name_第2稿.mp4");
+  const bound = await validateVmPmoInput({ contextPath: prepared.contextPath });
+  assert.equal(bound.input.binding.stage_id, "review");
 });
 
 test("VM input rejects simulation and changed approved source before creating a run", async t => {

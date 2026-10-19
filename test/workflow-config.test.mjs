@@ -145,6 +145,19 @@ test("VM initial subject validates and survives portable active catalog without 
   assert.deepEqual(activeTables(catalog), [portable]);
 });
 
+test("VM subject accepts a fully bound review stage on the configured status field", () => {
+  const base = vmSubject();
+  base.statusField.options.push({ optionId: "opt_review", value: "待修改" });
+  base.vmWorkflow.stages.review = { enabled: true, statusFieldId: "fld_progress",
+    triggerOptionId: "opt_review", instructionFieldId: "fld_review_instructions",
+    instructionAttachmentsFieldId: null, writeback: {
+      processing: { fieldId: null, optionId: null }, completed: { fieldId: null, optionId: null },
+    } };
+  const normalized = validateSubjectConfig(base);
+  assert.equal(normalized.vmWorkflow.stages.review.enabled, true);
+  assert.equal(normalized.vmWorkflow.stages.review.instructionFieldId, "fld_review_instructions");
+});
+
 test("VM active snapshot under a draft remains the active table", () => {
   const active = portableSubject(vmSubject());
   const draft = validSubject({ lifecycle: "draft", configVersion: 3, activeSnapshot: active });
@@ -152,7 +165,7 @@ test("VM active snapshot under a draft remains the active table", () => {
   assert.deepEqual(activeTables(catalog), [active]);
 });
 
-test("VM schema rejects incomplete, multi-select, review, archive, and unknown declarations", () => {
+test("VM schema rejects incomplete, multi-select, review, and unknown declarations", () => {
   const cases = [
     vmSubject({ workflowTemplate: { id: "vm_pmo_review_video", version: 2 } }),
     vmSubject({ workflowTemplate: { id: "unknown", version: 1 } }),
@@ -163,8 +176,6 @@ test("VM schema rejects incomplete, multi-select, review, archive, and unknown d
     vmSubject({ statusField: { ...vmSubject().statusField, options: [] } }),
     vmSubject({ vmWorkflow: { ...vmSubject().vmWorkflow, stages: { ...vmSubject().vmWorkflow.stages,
       review: { ...vmSubject().vmWorkflow.stages.review, enabled: true } } } }),
-    vmSubject({ vmWorkflow: { ...vmSubject().vmWorkflow, finalArchive: {
-      ...vmSubject().vmWorkflow.finalArchive, enabled: true } } }),
     vmSubject({ vmWorkflow: { ...vmSubject().vmWorkflow, stages: { ...vmSubject().vmWorkflow.stages,
       initial: { ...vmSubject().vmWorkflow.stages.initial, triggerOptionId: "opt_unknown" } } } }),
     vmSubject({ packageRoute: { routeMode: "fixed", packageAlias: null } }),
@@ -173,6 +184,16 @@ test("VM schema rejects incomplete, multi-select, review, archive, and unknown d
   assert.throws(() => validateWorkflowConfig(validConfig({
     bases: [{ ...validConfig().bases[0], subjects: [vmSubject({ workflowTemplate: { id: "unknown", version: 1 } })] }],
   })));
+});
+
+test("VM portable config permits final archive while clearing the machine-local manual directory", () => {
+  const configured = vmSubject();
+  configured.statusField.options.push({ optionId: "opt_archive", value: "归档" });
+  configured.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_progress", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: "D:\\vm-archive", pathFieldId: null };
+  const normalized = validateSubjectConfig(configured);
+  assert.equal(normalized.vmWorkflow.finalArchive.enabled, true);
+  assert.equal(portableSubject(normalized).vmWorkflow.finalArchive.directoryPath, null);
 });
 
 test("ZIP subjects cannot acquire a VM workflow by attaching undeclared config", () => {

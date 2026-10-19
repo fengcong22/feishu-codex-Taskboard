@@ -4,7 +4,7 @@
 
 本文用于让新剪辑包与学科剪辑编排器分别开发、按同一接口验收。它是设计文档，不替代根目录 `AGENTS.md`，也不授权生产执行。包配置面板设计见同目录 `2026-10-09-package-workflow-templates-design.md`。
 
-当前可识别固定模板、保存独立 VM 包草稿和学科字段/审批/阶段/共同命名/成片归档配置，并明确阻断启用。纯规则模块可校验并规划阶段文件名和归档目标，不写文件。示例 [vm-pmo-review-video-preview](../../../examples/vm-pmo-review-video-preview) 不包含运行时或渲染器。独立 VM 审批 CLI 已实现，尚未绑定 Taskboard task/run；初稿纯保留范围的 Taskboard→真实剪辑包 plan/render 已完成本机合成媒体联调，见 [离线接入说明](../../vm-pmo-offline-integration.md)。共同名称冻结、审核轮次和最新已交付制品指针的生产持久化、MP4/PMO 交付及 NAS 发布 worker 仍待开发。
+实现状态（2026-10-15）：Taskboard 已接通 `initial` 与可选 `review` 阶段、v2 parent 轮次、MP4 附件读回交付和独立 SHA 校验归档 worker；合成媒体联调见 [离线接入说明](../../vm-pmo-offline-integration.md)。本草案仍定义 UI 与业务边界。历史 schema v1 输入与回执保留读取和离线校验兼容；当前初稿与审核执行均需显式 v2 package contract 和固定 driver；预览示例 [vm-pmo-review-video-preview](../../../examples/vm-pmo-review-video-preview) 仍不包含 runtime 或 renderer。真实测试记录的审批、附件和归档验收需单独完成。
 
 ## 1. 已确认的业务规则
 
@@ -134,7 +134,7 @@ VM 阶段 ID 为 `initial / review`，分别表示初稿和可重复执行的审
 
 ### 3.3 共同命名、阶段后缀与 NAS 成片归档
 
-初稿、审核修改与最终成片统一使用 `fields.namingFieldId` 提供的名称主体：初稿固定追加 `_初稿.mp4`，审核修改固定追加 `_第N稿.mp4`，最终归档仅追加 `.mp4`，不添加初稿或稿次后缀。共同名称、字段快照和审核编号须由后续受控编排器冻结并持久化，同一轮计划、剪辑或上传失败后的重试复用它们；不能扫描目录、解析附件名或按成功上传次数猜测下一编号。公式字段必须提供可作为名称的有效结果；非法文件名字符先替换为下划线，去除尾点和空格，规避 Windows 保留名称；所有输出按同一固定主体预算截短，预留最大合法审核轮次对应的最长审核后缀，确保初稿、各轮审核与最终成片的名称主体一致；按 UTF-16 单元限制完整文件名不超过 180，不拆分代理对，并保留完整后缀。空结果或规范化后仍无效的名称阻断，不把单元格值解析为目录或命令。
+初稿、审核修改与最终成片统一使用 `fields.namingFieldId` 提供的名称主体：初稿固定追加 `_初稿.mp4`，审核修改固定追加 `_第N稿.mp4`，最终归档仅追加 `.mp4`，不添加初稿或稿次后缀。Taskboard 在登记时冻结共同名称、字段快照和审核编号，同一轮计划、剪辑或上传失败后的重试复用它们；不能扫描目录、解析附件名或按成功上传次数猜测下一编号。公式字段必须提供可作为名称的有效结果；非法文件名字符先替换为下划线，去除尾点和空格，规避 Windows 保留名称；所有输出按同一固定主体预算截短，预留最大合法审核轮次对应的最长审核后缀，确保初稿、各轮审核与最终成片的名称主体一致；按 UTF-16 单元限制完整文件名不超过 180，不拆分代理对，并保留完整后缀。空结果或规范化后仍无效的名称阻断，不把单元格值解析为目录或命令。
 
 `finalArchive` 只包含 `enabled / statusFieldId / triggerOptionId / pathSource / directoryPath / pathFieldId` 六键，默认关闭。存储与目录页可配置独立触发字段、触发选项和具体目录来源，视频名引用共同命名字段。`pathSource` 仅为 `manual` 或 `pmo_field`，分别使用 `directoryPath` 或 `pathFieldId`；切换来源保留两侧未保存输入，执行规划只使用所选来源，不回退。触发字段允许单选或多选；开启归档须完整配置触发字段、触发选项、对应路径来源并选定 `fields.namingFieldId`，同时禁止与任何已启用剪辑阶段使用同一触发字段及选项，避免同一状态同时要求剪辑和归档。单选从其他值进入归档选项、多选从不包含变为包含归档选项才触发；持续命中不重复归档。它是归档动作，不新增审核剪辑轮次。
 
@@ -196,7 +196,7 @@ VM 阶段 ID 为 `initial / review`，分别表示初稿和可重复执行的审
 | --- | --- |
 | `protocol`, `schema_version` | `vm_pmo_review_video`、`1`；独立于旧 source-manifest v1。 |
 | `package` | 冻结 alias、name、version、manifest SHA、template ID/version；启动时复核部署身份。 |
-| `binding` | task_id、run_id、subject_key、config_version、stage_id、event_id；原样回传并精确比较。VM 阶段使用 `initial / review`；同一 `review` 的不同轮次仍须独立绑定。当前离线执行仅开放 `initial`，审核输入保持阻断。 |
+| `binding` | task_id、run_id、subject_key、config_version、stage_id、event_id；原样回传并精确比较。VM 阶段使用 `initial / review`；同一 `review` 的不同轮次仍须独立绑定。schema v1 仅支持 `initial`；schema v2 支持经 package/runtime 门禁启用的 `initial / review`。 |
 | `record` | base_token、table_id、record_id；与受控任务及 subject_key 一致。 |
 | `review_round` | 编排器生成的 round_id、本轮 input snapshot ID、parent review-video reference（初稿为 null）。同一阶段可多轮，不能只用 stage_id 标识轮次。 |
 | `source` | source_id、timeline_basis、原始 vmid、本次实际文件 SHA、字节数、探测时长、流信息及来源证明。 |
@@ -319,7 +319,7 @@ MP4 verified → upload pending → media uploaded/token persisted
 
 用户提供的《【生产环境】上传视频自动化说明》描述的是上传、创建制作任务和按任务 ID 查询状态；下载通路来自随后实测的 VM 当前 Shadow 前端契约，尚无正式外部客户端稳定性文档。
 
-VM 适配器至少应交付 `vmid / acquisition_id / status / source file SHA / size / duration` 和准确本机文件映射；`status` 区分 ready、审批阻断和 failed。已实现两个独立 CLI（详见 [VM 素材采集验证](../../vm-source-acquisition.md)）：`vm-source.mjs` 接收操作者提供的获批 URL/本机文件；`vm-approval.mjs` 使用正常 SSO、持久化申请队列、唯一申请匹配、审批查询和获批下载。worker 必须同时核对 `APPROVED`、目标 VMID、`HIGH` 与 `finished`，再验证实际 1280x720 文件；响应不明时不重复提交或消费下载地址。
+VM 适配器至少应交付 `vmid / acquisition_id / status / source file SHA / size / duration` 和准确本机文件映射；`status` 区分 ready、审批阻断和 failed。已实现两个独立 CLI（详见 [VM 素材采集验证](../../vm-source-acquisition.md)）：`vm-source.mjs` 接收操作者提供的获批 URL/本机文件；`vm-approval.mjs` 使用正常 SSO、持久化申请队列、唯一申请匹配、审批查询和获批下载。worker 必须同时核对 `APPROVED`、目标 VMID、`HIGH` 与 `finished`，再验证源视频宽、高均至少为 1280x720；更高分辨率可用。响应不明时不重复提交或消费下载地址。
 
 已在公司 VPN 下验证真实获批视频下载、SHA、元数据和全量解码；后台提交申请也已独立验证。新审批 CLI 已实际接管既有获批申请，通过精确回执复核返回 `ready`，未重新申请或下载；复用的旧回执保持 `operator_asserted`。新 worker 的全新申请到首次下载仍待真实整链路验收。以上状态尚未绑定本接口的 Taskboard task/run、parent 审核轮次或 PMO 交付。令牌只在内存中，重启后重新登录，长期自动续期未实现；凭据和下载 URL 不进入共享 manifest 或普通日志。
 

@@ -121,10 +121,21 @@ function validWritebackIntent(value) {
   }
   const operation = value.operation;
   if (operation.type === "single_select") {
-    return Object.keys(operation).length === 3
+    const guardValid = !Object.hasOwn(operation, "guard") || (
+      objectPayload(operation.guard)
+      && Object.keys(operation.guard).length === 2
+      && validWritebackIdentifier(operation.guard.fieldId)
+      && Array.isArray(operation.guard.optionIds)
+      && operation.guard.optionIds.length >= 1
+      && operation.guard.optionIds.length <= 16
+      && operation.guard.optionIds.every(validWritebackIdentifier)
+      && new Set(operation.guard.optionIds).size === operation.guard.optionIds.length
+    );
+    return (Object.keys(operation).length === 3 || Object.keys(operation).length === 4)
       && ["type", "fieldId", "optionId"].every((key) => Object.hasOwn(operation, key))
       && validWritebackIdentifier(operation.fieldId)
-      && validWritebackIdentifier(operation.optionId);
+      && validWritebackIdentifier(operation.optionId)
+      && guardValid;
   }
   return operation.type === "text"
     && Object.keys(operation).length === 3
@@ -158,7 +169,32 @@ function validVmRegistration(value) {
     && (!Object.hasOwn(event, "occurredAt") || Number.isSafeInteger(event.occurredAt) && event.occurredAt >= 0)
     && Object.keys(binding).length === 3
     && binding.subjectKey === `${event.baseToken}:${event.tableId}`
-    && validVersion(binding.configVersion) && binding.stageId === "initial";
+    && validVersion(binding.configVersion) && ["initial", "review"].includes(binding.stageId);
+}
+
+function validVmFinalArchiveRegistration(value) {
+  if (!objectPayload(value) || Object.keys(value).length !== 2
+    || !objectPayload(value.event) || !objectPayload(value.binding)) return false;
+  const { event, binding } = value;
+  const eventKeys = ["eventId", "baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionIds", "afterOptionIds"];
+  return Object.keys(event).every((key) => eventKeys.includes(key) || key === "occurredAt")
+    && eventKeys.slice(0, 5).every((key) => validWritebackIdentifier(event[key]))
+    && [event.beforeOptionIds, event.afterOptionIds].every((ids) => Array.isArray(ids)
+      && ids.every(validWritebackIdentifier) && new Set(ids).size === ids.length)
+    && JSON.stringify(event.beforeOptionIds) !== JSON.stringify(event.afterOptionIds)
+    && (!Object.hasOwn(event, "occurredAt") || Number.isSafeInteger(event.occurredAt) && event.occurredAt >= 0)
+    && Object.keys(binding).length === 2
+    && binding.subjectKey === `${event.baseToken}:${event.tableId}` && validVersion(binding.configVersion);
+}
+
+function validVmFinalArchiveJob(value, expected) {
+  return objectPayload(value) && Object.keys(value).every((key) => [
+    "id", "eventId", "subjectKey", "configVersion", "record", "filename", "state", "attemptCount",
+    "nextAttemptAt", "errorCode",
+  ].includes(key))
+    && nonEmptyString(value.id) && value.eventId === expected.event.eventId
+    && value.subjectKey === expected.binding.subjectKey && value.configVersion === expected.binding.configVersion
+    && ["pending", "copying", "retry_wait", "published", "conflict", "dead_letter"].includes(value.state);
 }
 
 export class TaskboardError extends Error {
@@ -318,6 +354,21 @@ export class TaskboardClient {
       throw invalidResponse(pathname);
     }
     return task;
+  }
+
+  async archiveFeishuVmFinalVideo(payload, { bridgeSecret = this.bridgeSecret } = {}) {
+    const pathname = "/api/local/feishu/vm/final-archive";
+    if (!validVmFinalArchiveRegistration(payload)) throw invalidResponse(pathname);
+    const secret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : "";
+    if (!secret) throw new TaskboardError("Feishu Bridge secret is not configured", {
+      code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED", status: 503,
+    });
+    const response = await this.#request(pathname, {
+      body: payload,
+      headers: { "x-taskboard-client": "feishu-bridge", "x-feishu-bridge-secret": secret },
+    });
+    if (!validVmFinalArchiveJob(response?.job, payload)) throw invalidResponse(pathname);
+    return response.job;
   }
 
   async ensureFinalDirectory(payload, { bridgeSecret = this.bridgeSecret } = {}) {

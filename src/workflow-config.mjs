@@ -301,26 +301,50 @@ function normalizeVmWorkflow(value, statusField) {
     initial: normalizeVmStage(rawStages.initial, "initial"),
     review: normalizeVmStage(rawStages.review, "review"),
   };
-  if (stages.initial.enabled !== true || stages.review.enabled !== false
-    || stages.initial.statusFieldId !== statusField.fieldId || !stages.initial.instructionFieldId) {
-    fail("vmWorkflow only supports a fully bound initial stage");
+  if (stages.initial.enabled !== true
+    || stages.initial.statusFieldId !== statusField.fieldId || !stages.initial.instructionFieldId
+    || stages.review.enabled && (stages.review.statusFieldId !== statusField.fieldId
+      || !stages.review.instructionFieldId)) {
+    fail("vmWorkflow stages must use fully bound instruction and status fields");
   }
-  const matchingOptions = statusField.options.filter((option) => option.optionId === stages.initial.triggerOptionId);
-  if (matchingOptions.length !== 1) fail("vmWorkflow.stages.initial.triggerOptionId is not in statusField options");
+  for (const stageId of ["initial", "review"]) {
+    const stage = stages[stageId];
+    if (!stage.enabled) continue;
+    const matchingOptions = statusField.options.filter((option) => option.optionId === stage.triggerOptionId);
+    if (matchingOptions.length !== 1) {
+      fail(`vmWorkflow.stages.${stageId}.triggerOptionId is not in statusField options`);
+    }
+  }
+  if (stages.review.enabled && stages.review.triggerOptionId === stages.initial.triggerOptionId) {
+    fail("vmWorkflow enabled stages must use distinct trigger options");
+  }
   const rawArchive = exactKeys(input.finalArchive,
     ["enabled", "statusFieldId", "triggerOptionId", "pathSource", "directoryPath", "pathFieldId"],
     "vmWorkflow.finalArchive");
-  if (rawArchive.enabled !== false || !["manual", "pmo_field"].includes(rawArchive.pathSource)) {
-    fail("vmWorkflow.finalArchive is not supported when enabled");
-  }
+  const archiveEnabled = booleanValue(rawArchive.enabled, "vmWorkflow.finalArchive.enabled");
+  if (!["manual", "pmo_field"].includes(rawArchive.pathSource)) fail("vmWorkflow.finalArchive.pathSource is invalid");
   const finalArchive = {
-    enabled: false,
+    enabled: archiveEnabled,
     statusFieldId: nullableId(rawArchive.statusFieldId, "vmWorkflow.finalArchive.statusFieldId"),
     triggerOptionId: nullableId(rawArchive.triggerOptionId, "vmWorkflow.finalArchive.triggerOptionId"),
     pathSource: rawArchive.pathSource,
     directoryPath: localPath(rawArchive.directoryPath, "vmWorkflow.finalArchive.directoryPath"),
     pathFieldId: nullableId(rawArchive.pathFieldId, "vmWorkflow.finalArchive.pathFieldId"),
   };
+  if (Boolean(finalArchive.statusFieldId) !== Boolean(finalArchive.triggerOptionId)) {
+    fail("vmWorkflow.finalArchive requires a complete trigger binding");
+  }
+  if (archiveEnabled) {
+    if (!finalArchive.statusFieldId || finalArchive.pathSource === "pmo_field" && !finalArchive.pathFieldId
+      || !fields.namingFieldId) {
+      fail("vmWorkflow.finalArchive requires a trigger, path and shared naming binding");
+    }
+    const stageTriggers = Object.values(stages).filter((stage) => stage.enabled)
+      .map((stage) => JSON.stringify([stage.statusFieldId, stage.triggerOptionId]));
+    if (stageTriggers.includes(JSON.stringify([finalArchive.statusFieldId, finalArchive.triggerOptionId]))) {
+      fail("vmWorkflow.finalArchive must use a different trigger from editing stages");
+    }
+  }
   return { fields, approval, stages, finalArchive };
 }
 

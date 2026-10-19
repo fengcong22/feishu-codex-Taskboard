@@ -22,6 +22,7 @@ import type {
 } from "../types";
 import { LinearIcon } from "./LinearIcon";
 import { packageDisplayName } from "../feishuPackageDisplay";
+import { VmDownloadsPanel } from "./VmDownloadsPanel";
 
 type Props = {
   refreshKey?: number;
@@ -148,6 +149,7 @@ function inspectionFailure(error: unknown): string {
 export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false, onPackageChange, onError }: Props) {
   const [packages, setPackages] = useState<FeishuPackageSummary[]>([]);
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
+  const [editorPanel, setEditorPanel] = useState<"package" | "vmDownloads">("package");
   const [form, setForm] = useState<PackageForm>({ ...EMPTY_FORM });
   const [models, setModels] = useState<AiChatModel[]>([]);
   const [busy, setBusy] = useState(false);
@@ -287,6 +289,7 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
   function selectPackage(item: FeishuPackageSummary) {
     resetInspection();
     editorVersion.current += 1;
+    setEditorPanel("package");
     setSelectedAlias(item.alias);
     setForm(asForm(item));
     zipDirectoryBeforeAutofill.current = item.zipSourceDirectory;
@@ -523,6 +526,7 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
         <button type="button" disabled={!catalogLoaded || busy} onClick={() => {
           resetInspection();
           editorVersion.current += 1;
+          setEditorPanel("package");
           setSelectedAlias(null);
           setForm({ ...EMPTY_FORM });
           setModels([]);
@@ -559,16 +563,20 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
       {!catalogLoaded ? <p className="feishu-package-empty">加载成功后可查看和编辑已有配置。</p> : <>
       <div className="feishu-package-editor-header">
         <div>
-          <h2>{selected ? `编辑 ${packageDisplayName(selected)}` : "新增 Auto-Cut 包"}</h2>
+          <h2>{editorPanel === "vmDownloads" ? "Auto-Cut-Slicing · VM 账号与队列" : selected ? `编辑 ${packageDisplayName(selected)}` : "新增 Auto-Cut 包"}</h2>
           {selected && <small>状态：{STATE_LABELS[selected.state]} · 引用：{selected.referenceCount}</small>}
         </div>
-        <div className="feishu-package-actions">
+        {editorPanel === "package" && <div className="feishu-package-actions">
           <button type="button" disabled={operationBusy || !canSave} onClick={() => void save()}>保存草稿</button>
           {selected && selected.state !== "enabled" && <button type="button" disabled={operationBusy || !canSave || (vmWorkflow && !vmPmoInitialReady)} title={vmWorkflow && !vmPmoInitialReady ? "本机初稿运行能力尚未就绪" : undefined} onClick={() => void runEditorAction("enable")}>启用</button>}
           {selected && selected.state === "enabled" && <button type="button" disabled={operationBusy || !canSave} onClick={() => void runEditorAction("disable")}>停用</button>}
           {selected && <button type="button" className="danger" disabled={operationBusy || selected.referenceCount > 0} title={selected.referenceCount > 0 ? "存在引用，不能删除" : "删除"} onClick={() => void runEditorAction("delete")}>删除</button>}
-        </div>
+        </div>}
       </div>
+      {selected?.alias === "auto-cut-slicing" && <div className="feishu-package-editor-tabs" role="group" aria-label="Auto-Cut-Slicing 设置">
+        <button type="button" aria-pressed={editorPanel === "package"} onClick={() => setEditorPanel("package")}>包配置</button>
+        <button type="button" aria-pressed={editorPanel === "vmDownloads"} onClick={() => setEditorPanel("vmDownloads")}>VM 账号与队列</button>
+      </div>}
 
       {referenceDrawer.length > 0 && <aside className="feishu-package-reference-warning" aria-label="包引用详情">
         <div><strong>引用详情</strong><button type="button" title="关闭" aria-label="关闭引用详情" onClick={() => setReferenceDrawer([])}><LinearIcon name="close" /></button></div>
@@ -577,7 +585,10 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
         </li>)}</ul>
       </aside>}
       {actionError && <p className="feishu-package-load-error" role="alert">{actionError}</p>}
-      {vmWorkflow && <p role="status">{vmPmoInitialReady ? "初稿：审批下载 → 按明确时间范围剪辑 → PMO 视频附件。审核修改与成片归档暂未开放。" : "VM 素材 → PMO 审核 → 视频附件。当前可保存草稿，本机初稿运行能力尚未就绪。"}</p>}
+      {editorPanel === "vmDownloads" && selected?.alias === "auto-cut-slicing"
+        ? <VmDownloadsPanel />
+        : <>
+      {vmWorkflow && <p role="status">{vmPmoInitialReady ? "初稿：审批下载 → 剪辑 → PMO 视频附件；审核修改复用上一轮成片，审核通过后自动归档。" : "VM 素材 → PMO 审核 → 视频附件。当前可保存草稿，本机初稿运行能力尚未就绪。"}</p>}
 
       <div className="feishu-package-form">
         <label className="wide">Codex 工作区路径<input value={form.workspacePath ?? ""} onChange={(event) => changeWorkspace(event.target.value)} placeholder="绝对路径" /></label>
@@ -620,6 +631,7 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
         <label>资源组<input value={form.resourceGroups.join(", ")} onChange={(event) => update("resourceGroups", resourceGroupsFrom(event.target.value))} /></label>
         <label className="wide">启动 Prompt<textarea value={form.prompt ?? ""} onChange={(event) => update("prompt", event.target.value || null)} rows={6} /></label>
       </div>
+        </>}
       </>}
     </div>
   </section>;

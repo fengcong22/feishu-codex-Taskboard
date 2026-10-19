@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { lstat, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { prepareVmSource, validateVmSourceRequest } from "./vm-source-adapter.mjs";
@@ -18,6 +19,13 @@ function text(value, max = 200) {
 }
 function localPath(value) { return text(value, 4096) && path.isAbsolute(value); }
 function digest(value) { return createHash("sha256").update(value).digest("hex"); }
+
+export function vmApprovalJobIdForTaskRun(taskId, runId) {
+  if (typeof taskId !== "string" || !ID.test(taskId) || typeof runId !== "string" || !ID.test(runId)) {
+    fail("VM_APPROVAL_REQUEST_INVALID");
+  }
+  return `vm-${digest(JSON.stringify({ scope: "vm-pmo-task-run", taskId, runId }))}`;
+}
 
 export function validateVmApprovalRequest(raw) {
   const keys = ["schema_version", "vmid", "department", "reason", "output_root", "allowed_origins",
@@ -46,16 +54,16 @@ export function validateVmApprovalRequest(raw) {
   };
 }
 
-export function enqueueVmApproval(store, raw, { id, now = Date.now } = {}) {
+export function enqueueVmApproval(store, raw, { id, dedupeByRequest = true, now = Date.now } = {}) {
   const request = validateVmApprovalRequest(raw);
   const fingerprint = digest(JSON.stringify(request));
   id ??= `vm-${fingerprint.slice(0, 24)}`;
-  if (typeof id !== "string" || !ID.test(id)) fail("VM_APPROVAL_REQUEST_INVALID");
+  if (typeof id !== "string" || !ID.test(id) || typeof dedupeByRequest !== "boolean") fail("VM_APPROVAL_REQUEST_INVALID");
   const time = now();
   return store.enqueue({ id, request_fingerprint: fingerprint, request, status: "queued",
     created_at: time, updated_at: time, next_attempt_at: time, attempts: 0,
     submission_attempts: 0, reconciliation_attempts: 0,
-    ...(request.application_id ? { application_id: request.application_id } : {}) });
+    ...(request.application_id ? { application_id: request.application_id } : {}) }, { dedupeByRequest });
 }
 
 export function summarizeVmApproval(job, { includeLocalRequest = false } = {}) {
@@ -72,7 +80,8 @@ export function summarizeVmApproval(job, { includeLocalRequest = false } = {}) {
       department: job.request.department, reason: job.request.reason } : {}),
     ...(job.application_id ? { application_id: job.application_id } : {}),
     ...(job.instance_code ? { instance_code: job.instance_code } : {}),
-    ...(job.last_error ? { error: { code: job.last_error } } : {}),
+    ...(job.last_error ? { error: { code: job.last_error,
+      ...(job.last_error_detail ? { diagnostic_code: job.last_error_detail } : {}) } } : {}),
     ...(job.acquisition ? { acquisition: structuredClone(job.acquisition) } : {}),
   };
 }
@@ -122,7 +131,8 @@ export async function verifyVmAcquisitionReceipt(receiptPath, { vmid, applicatio
       || artifact.media?.validation?.metadata !== true || artifact.media?.validation?.full_decode !== true
       || !Number.isSafeInteger(artifact.media.duration_ms) || artifact.media.duration_ms <= 0
       || !Array.isArray(artifact.media.video) || !artifact.media.video.length
-      || artifact.media.video.some((stream) => stream.width !== 1280 || stream.height !== 720)) fail("VM_RECEIPT_INVALID");
+      || artifact.media.video.some((stream) => !Number.isSafeInteger(stream.width) || stream.width < RESOLUTION.width
+        || !Number.isSafeInteger(stream.height) || stream.height < RESOLUTION.height)) fail("VM_RECEIPT_INVALID");
     const provenance = receipt.provenance;
     const apiVerified = provenance.kind === "vm_api_approval" && provenance.vmid_binding === "vm_api_verified"
       && provenance.resource_id === vmid && provenance.approval_status === "APPROVED"
@@ -142,8 +152,9 @@ export async function verifyVmAcquisitionReceipt(receiptPath, { vmid, applicatio
     if (after.ino !== before.ino || after.dev !== before.dev || after.size !== before.size
       || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs
       || hash.digest("hex") !== artifact.sha256) fail("VM_RECEIPT_INVALID");
+    const video = artifact.media.video[0];
     return { receipt_path: path.resolve(receiptPath), path: artifact.path, sha256: artifact.sha256,
-      bytes: artifact.bytes, duration_ms: artifact.media.duration_ms, width: 1280, height: 720,
+      bytes: artifact.bytes, duration_ms: artifact.media.duration_ms, width: video.width, height: video.height,
       vmid_binding: provenance.vmid_binding };
   } catch (error) {
     if (error instanceof VmSourceError) throw error;
@@ -162,10 +173,85 @@ export function resumeVmApproval(store, id, { now = Date.now } = {}) {
   job.status = job.resume_phase;
   delete job.resume_phase;
   delete job.last_error;
+  delete job.last_error_detail;
   job.attempts = 0;
   job.next_attempt_at = now();
   job.updated_at = now();
   return store.save(id, claim.leaseToken, job);
+}
+
+function assertNoAcquisitionRecoveryArtifacts(job) {
+  try {
+    const outputRootInfo = lstatSync(job.request.output_root);
+    if (!outputRootInfo.isDirectory() || outputRootInfo.isSymbolicLink()) fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
+    const outputRoot = realpathSync(job.request.output_root);
+    const jobRoot = path.dirname(path.resolve(job.receipt_path));
+    const jobRootInfo = lstatSync(jobRoot);
+    if (!jobRootInfo.isDirectory() || jobRootInfo.isSymbolicLink()
+      || !path.basename(jobRoot).startsWith(`vm-${job.request.vmid}-`)
+      || path.basename(path.resolve(job.receipt_path)) !== "acquisition.json") {
+      fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
+    }
+    const realJobRoot = realpathSync(jobRoot);
+    const relative = path.relative(outputRoot, realJobRoot);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
+    }
+    for (const filename of ["source.mp4", "source.mp4.part", "acquisition.json", "acquisition.json.part"]) {
+      try { lstatSync(path.join(realJobRoot, filename)); fail("VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT"); }
+      catch (error) {
+        if (error instanceof VmSourceError) throw error;
+        if (error?.code !== "ENOENT") fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
+      }
+    }
+  } catch (error) {
+    if (error instanceof VmSourceError) throw error;
+    fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
+  }
+}
+
+export function recoverVmApprovalAcquisition(store, id, {
+  confirmRepeatableResource, privateEndpoints, now = Date.now,
+} = {}) {
+  if (confirmRepeatableResource !== true) fail("VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED");
+  const claim = store.claim(id, { leaseMs: 60_000 });
+  if (!claim) fail(store.get(id) ? "VM_APPROVAL_JOB_BUSY" : "VM_APPROVAL_JOB_NOT_FOUND");
+  const job = claim.job;
+  const originalJob = structuredClone(job);
+  try {
+    const resourceClaimFailure = job.last_error === "VM_RESOURCE_ALREADY_CLAIMED";
+    const recoverableFailure = resourceClaimFailure || job.last_error === "VM_SOURCE_ADDRESS_NOT_ALLOWED"
+      || job.last_error === "VM_DOWNLOAD_OUTCOME_UNKNOWN";
+    if (job.status !== "needs_attention" || !recoverableFailure
+      || !job.application_id || !job.instance_code || job.approval?.status !== "APPROVED"
+      || job.approval.resource_id !== job.request?.vmid || job.approval.video_quality !== "HIGH"
+      || !/^[a-f0-9]{64}$/u.test(job.resource_fingerprint ?? "")
+      || (!resourceClaimFailure && !localPath(job.receipt_path))
+      || (resourceClaimFailure && (job.receipt_path !== undefined || job.acquisition !== undefined))
+      || digest(JSON.stringify(job.request)) !== job.request_fingerprint) {
+      fail("VM_DOWNLOAD_RECOVERY_NOT_ALLOWED");
+    }
+    const request = validateVmApprovalRequest(resourceClaimFailure ? job.request : { ...job.request, private_endpoints: privateEndpoints });
+    if (!resourceClaimFailure) {
+      if (!request.private_endpoints.length) fail("VM_DOWNLOAD_PRIVATE_ENDPOINTS_REQUIRED");
+      assertNoAcquisitionRecoveryArtifacts(job);
+    }
+    const resource = store.reserveResource(id, claim.leaseToken, job.resource_fingerprint);
+    if (!resource.owned) fail("VM_RESOURCE_ALREADY_CLAIMED");
+    job.request = request;
+    job.request_fingerprint = digest(JSON.stringify(request));
+    job.status = "waiting_media";
+    job.next_attempt_at = now();
+    job.attempts = 0;
+    job.updated_at = now();
+    delete job.last_error;
+    delete job.last_error_detail;
+    delete job.resume_phase;
+    return store.saveConfirmedAcquisitionRecovery(id, claim.leaseToken, job);
+  } catch (error) {
+    try { store.save(id, claim.leaseToken, originalJob); } catch { /* The lease may already have expired. */ }
+    throw error;
+  }
 }
 
 export function extendVmApprovalWait(store, id, { now = Date.now, waitMs = WAIT_MS } = {}) {
@@ -219,12 +305,16 @@ export async function processVmApproval(store, id, {
     job.attempts = 0;
     if (code) job.last_error = code;
     else delete job.last_error;
+    delete job.last_error_detail;
     return save(true);
   }
-  function stop(status, code) {
+  function stop(status, code, diagnosticCode) {
     job.status = status;
     job.next_attempt_at = null;
     job.last_error = code;
+    if (code === "VM_DOWNLOAD_OUTCOME_UNKNOWN" && /^[A-Z][A-Z0-9_]{1,80}$/u.test(diagnosticCode ?? "")) {
+      job.last_error_detail = diagnosticCode;
+    } else delete job.last_error_detail;
     return save(true);
   }
   function beginWait(phase) {
@@ -253,6 +343,7 @@ export async function processVmApproval(store, id, {
         job.status = "ready";
         job.next_attempt_at = null;
         delete job.last_error;
+        delete job.last_error_detail;
         return save(true);
       } catch { return stop("needs_attention", "VM_DOWNLOAD_OUTCOME_UNKNOWN"); }
     }
@@ -375,11 +466,14 @@ export async function processVmApproval(store, id, {
     job.next_attempt_at = null;
     job.attempts = 0;
     delete job.last_error;
+    delete job.last_error_detail;
     return save(true);
   } catch (error) {
     if (leaseError || error?.code === "VM_APPROVAL_LEASE_LOST") fail("VM_APPROVAL_LEASE_LOST");
     const code = error instanceof VmSourceError ? error.code : "VM_APPROVAL_OPERATION_FAILED";
-    if (job.status === "acquiring") return stop("needs_attention", "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+    if (job.status === "acquiring") return stop("needs_attention",
+      code === "VM_SOURCE_ADDRESS_NOT_ALLOWED" ? code : "VM_DOWNLOAD_OUTCOME_UNKNOWN",
+      code === "VM_SOURCE_ADDRESS_NOT_ALLOWED" ? undefined : code);
     if (code === "VM_AUTH_REQUIRED") {
       job.resume_phase = job.status;
       return stop("auth_required", code);

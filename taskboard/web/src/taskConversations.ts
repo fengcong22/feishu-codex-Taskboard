@@ -28,6 +28,7 @@ export interface TaskProcessingPresentation {
   completed: number | null;
   total: number | null;
   startedAt: string | null;
+  runner?: "vm-pmo";
 }
 
 export interface TaskCardPresentation {
@@ -173,6 +174,8 @@ export function taskCardPresentation(
   } | null | undefined = undefined,
 ): TaskCardPresentation {
   const conversations = taskConversations(task, aiThreads);
+  const isVmPmoTask = task.feishuPackageSnapshot?.workflowTemplate?.id === "vm_pmo_review_video"
+    && task.feishuPackageSnapshot.workflowTemplate.version === 1;
   const runningAi = conversations
     .filter((conversation) => conversation.currentRun?.status === "running")
     .sort((left, right) => (
@@ -202,10 +205,13 @@ export function taskCardPresentation(
     unread,
     processing: {
       running: task.status === "in_progress"
-        && (Boolean(running) || taskNativeSession?.running === true),
+        && (isVmPmoTask || Boolean(running) || taskNativeSession?.running === true),
       completed: latestTodo?.completed ?? null,
       total: latestTodo?.total ?? null,
-      startedAt: runningAi?.currentRun?.startedAt ?? null,
+      startedAt: isVmPmoTask && task.status === "in_progress"
+        ? task.updatedAt
+        : runningAi?.currentRun?.startedAt ?? null,
+      ...(isVmPmoTask ? { runner: "vm-pmo" as const } : {}),
     },
   };
 }

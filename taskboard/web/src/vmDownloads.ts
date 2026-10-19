@@ -27,7 +27,7 @@ export interface VmDownloadJob {
   next_attempt_at: number | null;
   application_id?: string;
   instance_code?: string;
-  error?: { code: string };
+  error?: { code: string; diagnostic_code?: string };
   created_at: number;
   updated_at: number;
   approval_wait_started_at?: number | null;
@@ -38,6 +38,7 @@ export interface VmDownloadJob {
   department: string;
   reason: string;
   acquisition?: { path: string; receipt_path: string; bytes: number };
+  recovery?: { kind: "private_address" | "unknown_outcome" | "resource_claim" };
 }
 
 export interface VmDownloadsSnapshot {
@@ -81,7 +82,11 @@ export async function getVmDownloads(signal?: AbortSignal): Promise<VmDownloadsS
       || (job.application_id !== undefined && typeof job.application_id !== "string")
       || (job.instance_code !== undefined && typeof job.instance_code !== "string")
       || (job.acquisition !== undefined && (!record(job.acquisition) || !strings(job.acquisition, ["path", "receipt_path"])))
-      || (job.error !== undefined && (!record(job.error) || typeof job.error.code !== "string")))) {
+      || (job.error !== undefined && (!record(job.error) || typeof job.error.code !== "string"
+        || (job.error.diagnostic_code !== undefined && (typeof job.error.diagnostic_code !== "string"
+          || !/^[A-Z][A-Z0-9_]{1,80}$/u.test(job.error.diagnostic_code)))))
+      || (job.recovery !== undefined && (!record(job.recovery)
+        || !["private_address", "unknown_outcome", "resource_claim"].includes(String(job.recovery.kind)))))) {
     throw new ApiError(0, { error: { code: "VM_DOWNLOAD_RESPONSE_INVALID" } });
   }
   return value as unknown as VmDownloadsSnapshot;
@@ -96,5 +101,7 @@ export async function loginVmDownloads(signal?: AbortSignal): Promise<{ loginUrl
 }
 export const logoutVmDownloads = (signal?: AbortSignal) => write("/logout", {}, "POST", signal);
 export const enqueueVmDownloads = (input: Omit<VmDownloadSettings, "notificationsEnabled"> & { vmids: string[] }, signal?: AbortSignal) => write<{ jobs: VmDownloadJob[] }>("/jobs", input, "POST", signal);
+export const cleanupVmDownloads = (jobIds: string[], signal?: AbortSignal) => write<{ clearedCount: number }>("/jobs/cleanup", { jobIds }, "POST", signal);
 export const resumeVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/resume`, {}, "POST", signal);
+export const recoverVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/recover`, { confirmRepeatableResource: true }, "POST", signal);
 export const extendVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/extend`, {}, "POST", signal);

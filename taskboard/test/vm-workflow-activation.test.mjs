@@ -16,10 +16,12 @@ const fields = [
   { fieldId: "fld_vmid", fieldName: "原视频vmid", type: 1, uiType: "Text", options: [] },
   { fieldId: "fld_name", fieldName: "视频名", type: 1, uiType: "Text", options: [] },
   { fieldId: "fld_instruction", fieldName: "初稿意见", type: 1, uiType: "Text", options: [] },
+  { fieldId: "fld_review_instruction", fieldName: "审核意见", type: 1, uiType: "Text", options: [] },
   { fieldId: "fld_output", fieldName: "成片", type: 17, uiType: "Attachment", options: [] },
   { fieldId: "fld_status", fieldName: "制作进度", type: 3, uiType: "SingleSelect", options: [
     { id: "opt_other", name: "准备" }, { id: "opt_initial", name: "待剪辑" },
-    { id: "opt_processing", name: "处理中" }, { id: "opt_complete", name: "完成" },
+    { id: "opt_review", name: "待修改" },
+    { id: "opt_processing", name: "处理中" }, { id: "opt_complete", name: "完成" }, { id: "opt_archive", name: "归档" },
   ] },
 ];
 const preview = () => ({ baseToken: "bas_vm", baseName: "测试", tables: [
@@ -76,6 +78,39 @@ test("VM profile activation freezes a canonical initial-only version and syncs w
   assert.deepEqual(portableSubject(f.calls[0].subject).vmWorkflow, f.config);
 });
 
+test("VM activation supports a configured final archive alongside the editing stages", async (t) => {
+  const f = await fixture(t);
+  const config = structuredClone(f.config);
+  config.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: "D:\\vm-archive", pathFieldId: null };
+  await f.save(config);
+  const enabled = (await f.enable(1, 2)).body.subject;
+  assert.equal(enabled.vmWorkflow.finalArchive.enabled, true);
+  assert.equal(enabled.vmWorkflow.finalArchive.directoryPath, "D:\\vm-archive");
+});
+
+test("VM activation freezes and syncs an enabled review stage", async (t) => {
+  const f = await fixture(t);
+  const config = structuredClone(f.config);
+  config.stages.review = {
+    ...config.stages.review,
+    enabled: true,
+    statusFieldId: "fld_status",
+    triggerOptionId: "opt_review",
+    instructionFieldId: "fld_review_instruction",
+    writeback: {
+      processing: { fieldId: "fld_status", optionId: "opt_processing" },
+      completed: { fieldId: "fld_status", optionId: "opt_complete" },
+    },
+  };
+  await f.save(config);
+  const enabled = (await f.enable(1, 2)).body.subject;
+  assert.deepEqual(enabled.vmWorkflow.stages.review, config.stages.review);
+  assert.deepEqual(f.database.getFeishuSubjectVersion(KEY, 2).vmWorkflow.stages.review,
+    config.stages.review);
+  assert.deepEqual(f.calls[0].subject.vmWorkflow.stages.review, config.stages.review);
+});
+
 test("VM activation fails closed without runtime readiness and never synchronizes", async (t) => {
   const f = await fixture(t, { ready: false });
   await assert.rejects(f.enable(), { code: "PACKAGE_WORKFLOW_NOT_READY" });
@@ -116,10 +151,9 @@ test("VM profile draft edits do not replace enabled snapshot and disable closes 
   assert.equal(disabled.activePackageAlias, null);
 });
 
-test("VM activation rejects review/archive/multiselect and missing required bindings", async (t) => {
+test("VM activation rejects missing required bindings", async (t) => {
   const f = await fixture(t);
   for (const mutate of [
-    (config) => { config.stages.review.enabled = true; },
     (config) => { config.fields.namingFieldId = null; },
     (config) => { config.stages.initial.instructionFieldId = null; },
     (config) => { config.approval.department = ""; },

@@ -85,6 +85,111 @@ test("VM initial entry registers through its dedicated narrow Taskboard route on
   assert.equal((await store.get("evt_vm")).deliveryState, "succeeded");
 });
 
+test("VM review entry registers the review stage and archives only the prior todo stage", async (t) => {
+  const registrations = [], archived = [];
+  const { bridge, active } = await fixture(t, {
+    findTaskByBinding: async () => null,
+    listFeishuTasks: async () => [{ id: "initial_todo", status: "todo", archivedAt: null,
+      feishuOrigin: { baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
+        statusFieldId: "fld_status", stageId: "initial", packageAlias: "auto-cut-slicing" } }],
+    getTask: async () => ({ id: "initial_todo", status: "todo", archivedAt: null,
+      feishuOrigin: { baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
+        statusFieldId: "fld_status", stageId: "initial", packageAlias: "auto-cut-slicing" } }),
+    archiveFeishuTask: async (task) => { archived.push(task.id); return task; },
+    registerFeishuVmTask: async (payload) => { registrations.push(payload); return { id: "review_task", identifier: "VM-2" }; },
+  });
+  active.statusField.options.push({ optionId: "opt_review", value: "待修改" });
+  active.vmWorkflow.stages.review = { enabled: true, statusFieldId: "fld_status",
+    triggerOptionId: "opt_review", instructionFieldId: "fld_review_instruction",
+    instructionAttachmentsFieldId: null, writeback: writeback() };
+  const result = await bridge.handle(edge("opt_ready", "opt_review", { eventId: "evt_review" }));
+  assert.equal(result.kind, "register", JSON.stringify(result));
+  assert.equal(result.stageId, "review");
+  assert.equal(registrations[0].binding.stageId, "review");
+  assert.deepEqual(archived, ["initial_todo"]);
+});
+
+test("VM final archive edge uses a dedicated Taskboard operation without creating a clipping task", async (t) => {
+  const calls = [];
+  const configured = subject();
+  configured.statusField.options.push({ optionId: "opt_archive", value: "待归档" });
+  configured.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: "D:\\archive", pathFieldId: null };
+  const { bridge, store } = await fixture(t, {
+    archiveFeishuVmFinalVideo: async (payload) => {
+      calls.push(payload);
+      return { id: "archive_job", eventId: "evt_archive", state: "pending",
+        subjectKey: "bas_vm:tbl_vm", configVersion: 2 };
+    },
+  }, { config: { tables: [configured] }, workflowStore: { resolveSubjectVersionAt: async () => configured } });
+  const result = await bridge.handle(edge("opt_done", "opt_archive", { eventId: "evt_archive",
+    beforeOptionIds: ["opt_done"], afterOptionIds: ["opt_archive"] }));
+  assert.equal(result.kind, "final_archive", JSON.stringify({ result, calls }));
+  assert.equal(result.archiveJobId, "archive_job");
+  assert.deepEqual(calls, [{
+    event: { eventId: "evt_archive", baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
+      statusFieldId: "fld_status", beforeOptionIds: ["opt_done"], afterOptionIds: ["opt_archive"], occurredAt: 1000 },
+    binding: { subjectKey: "bas_vm:tbl_vm", configVersion: 2 },
+  }]);
+});
+
+test("VM same-field SDK edges register initial and review rounds independently from final archive", async (t) => {
+  const operations = [];
+  const configured = subject();
+  configured.statusField.options.push(
+    { optionId: "opt_wait_review", value: "待审核" },
+    { optionId: "opt_review", value: "审核修改" },
+    { optionId: "opt_archive", value: "归档" },
+  );
+  configured.vmWorkflow.stages.review = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_review",
+    instructionFieldId: "fld_review_instruction", instructionAttachmentsFieldId: null, writeback: writeback() };
+  configured.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: "D:\\archive", pathFieldId: null };
+  const { bridge, store } = await fixture(t, {
+    findTaskByBinding: async () => null,
+    listFeishuTasks: async () => [],
+    registerFeishuVmTask: async (payload) => {
+      operations.push({ kind: "register", eventId: payload.event.eventId, stageId: payload.binding.stageId });
+      return { id: `task_${payload.event.eventId}`, identifier: "VM-1" };
+    },
+    archiveFeishuVmFinalVideo: async (payload) => {
+      operations.push({ kind: "final_archive", eventId: payload.event.eventId });
+      return { id: "archive_job", eventId: payload.event.eventId, state: "pending",
+        subjectKey: "bas_vm:tbl_vm", configVersion: 2 };
+    },
+  }, { config: { tables: [configured] }, workflowStore: { resolveSubjectVersionAt: async () => configured } });
+  function sdkEdge(eventId, before, after) {
+    return normalizeBitableRecordChanged({ header: { event_id: eventId },
+      event: { file_token: "bas_vm", table_id: "tbl_vm", record_id: "rec_vm", create_time: 1000,
+        action_list: [{ action: "record_edited",
+          before_value: [{ field_id: "fld_status", field_value: JSON.stringify(before) }],
+          after_value: [{ field_id: "fld_status", field_value: JSON.stringify(after) }],
+        }] },
+    }, configured)[0];
+  }
+  for (const [eventId, before, after, kind] of [
+    ["evt_initial", "opt_wait", "opt_ready", "register"],
+    ["evt_processing", "opt_ready", "opt_done", "ignored"],
+    ["evt_review_one", "opt_wait_review", "opt_review", "register"],
+    ["evt_review_repeat", "opt_review", "opt_review", "ignored"],
+    ["evt_final_archive", "opt_wait_review", "opt_archive", "final_archive"],
+    ["evt_review_two", "opt_archive", "opt_review", "register"],
+  ]) {
+    const result = await bridge.handle(sdkEdge(eventId, before, after));
+    assert.equal(result.kind, kind, eventId);
+  }
+  assert.equal((await bridge.handle(sdkEdge("evt_review_two", "opt_archive", "opt_review"))).duplicate, true);
+  assert.equal((await bridge.handle({ ...sdkEdge("evt_sim_review", "opt_wait_review", "opt_review"),
+    deliverySource: "simulation" })).kind, "ignored");
+  assert.deepEqual(operations, [
+    { kind: "register", eventId: "evt_initial", stageId: "initial" },
+    { kind: "register", eventId: "evt_review_one", stageId: "review" },
+    { kind: "final_archive", eventId: "evt_final_archive" },
+    { kind: "register", eventId: "evt_review_two", stageId: "review" },
+  ]);
+  assert.equal((await store.get("evt_review_two")).deliveryState, "succeeded");
+});
+
 test("VM simulation cannot invoke registration or archive", async (t) => {
   let calls = 0;
   const { bridge } = await fixture(t, {

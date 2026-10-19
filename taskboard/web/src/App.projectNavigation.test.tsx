@@ -70,7 +70,7 @@ vi.mock("./components/FeishuWorkflowPanel", () => ({
       <button type="button" onClick={() => onSelectSubject(selectedSubjectKey!, true)}>
         Return to subject board
       </button>
-      <button type="button" onClick={onOpenLocalSettings}>Manage local automatic editing</button>
+      <button type="button" onClick={onOpenLocalSettings}>Open local settings</button>
       <button type="button" onClick={() => onDirtyChange?.(true)}>Edit configuration draft</button>
       <button type="button" onClick={() => onSelectSubject("second", false)}>Configure second subject</button>
       <span>Editing subject: {selectedSubjectKey}</span>
@@ -366,12 +366,12 @@ describe("App project navigation", () => {
     await renderFirstSubject();
     fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
     const dialog = screen.getByRole("dialog", { name: "Local settings" });
-    const toggle = await within(dialog).findByRole("switch", { name: "Allow automatic editing on this device" });
+    const toggle = await within(dialog).findByRole("switch", { name: "Automatic execution" });
     await waitFor(() => expect((toggle as HTMLInputElement).disabled).toBe(false));
     expect((toggle as HTMLInputElement).checked).toBe(false);
-    expect(within(dialog).getByText(/all subjects on this device/)).toBeTruthy();
-    expect(within(dialog).getByText(/Running tasks will continue/)).toBeTruthy();
-    expect(within(dialog).getByText(/historical tasks/)).toBeTruthy();
+    expect(within(dialog).queryByText(/all subjects on this device/)).toBeNull();
+    expect(within(dialog).queryByText(/Running tasks will continue/)).toBeNull();
+    expect(within(dialog).queryByText(/historical tasks/)).toBeNull();
     fireEvent.click(toggle);
     expect(api.updateAutomaticExecutionSettings).toHaveBeenCalledWith({ enabled: true, expectedVersion: 1 });
     expect((toggle as HTMLInputElement).checked).toBe(false);
@@ -382,7 +382,7 @@ describe("App project navigation", () => {
     openFirstSubjectConfiguration();
     expect(screen.getByText("Machine automatic editing: true")).toBeTruthy();
     vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 3 });
-    fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open local settings" }));
     await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
     expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
   });
@@ -403,7 +403,7 @@ describe("App project navigation", () => {
     await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     openFirstSubjectConfiguration();
-    fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open local settings" }));
     expect(await screen.findByRole("dialog", { name: "Local settings" })).toBeTruthy();
     await act(async () => {});
   });
@@ -510,7 +510,7 @@ describe("App project navigation", () => {
     rerender(view("zh"));
     vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
     await act(async () => pending.resolve({ enabled: true, version: 2 }));
-    expect((screen.getByRole("switch", { name: "允许本机自动剪辑" }) as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByRole("switch", { name: "自动执行" }) as HTMLInputElement).disabled).toBe(false);
     expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(true);
   });
 

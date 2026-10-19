@@ -53,3 +53,28 @@ test("VM local routes reject nonlocal Host/Origin, query, missing web intent and
   assert.equal((await call(f.baseUrl, "/logout", { method: "POST", body: { token: "bad" } })).status, 400);
   assert.equal((await call(f.baseUrl)).body.jobs.length, 0);
 });
+
+test("VM acquisition recovery accepts only the explicit repeatable-resource confirmation payload", async (t) => {
+  const f = await fixture(t);
+  assert.equal((await call(f.baseUrl, "/jobs/missing/recover", { method: "POST", body: { confirmRepeatableResource: false } })).status, 400);
+  assert.equal((await call(f.baseUrl, "/jobs/missing/recover", { method: "POST", body: { confirmRepeatableResource: true, privateEndpoints: [] } })).status, 400);
+  const missing = await call(f.baseUrl, "/jobs/missing/recover", { method: "POST", body: { confirmRepeatableResource: true } });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.error.code, "VM_APPROVAL_JOB_NOT_FOUND");
+});
+
+test("VM queue cleanup validates a bounded id list and rejects unsettled jobs", async (t) => {
+  const f = await fixture(t);
+  const fields = { department: "动画组", reason: "切片剪辑", outputRoot: f.directory };
+  const queued = await call(f.baseUrl, "/jobs", { method: "POST", body: { ...fields, vmids: ["678465c3d94605d24bb9361a"] } });
+  const id = queued.body.jobs[0].id;
+
+  const invalid = await call(f.baseUrl, "/jobs/cleanup", { method: "POST", body: { jobIds: [id], force: true } });
+  assert.equal(invalid.status, 400);
+  const malformed = await call(f.baseUrl, "/jobs/cleanup", { method: "POST", body: { jobIds: ["../queue"] } });
+  assert.equal(malformed.status, 400);
+  const active = await call(f.baseUrl, "/jobs/cleanup", { method: "POST", body: { jobIds: [id] } });
+  assert.equal(active.status, 409);
+  assert.equal(active.body.error.code, "VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
+  assert.equal((await call(f.baseUrl)).body.jobs[0].id, id);
+});

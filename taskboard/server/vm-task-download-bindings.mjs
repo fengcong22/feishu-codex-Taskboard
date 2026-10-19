@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { validateVmApprovalRequest, verifyVmAcquisitionReceipt } from "./vm-approval-workflow.mjs";
+import { validateVmApprovalRequest, verifyVmAcquisitionReceipt, vmApprovalJobIdForTaskRun } from "./vm-approval-workflow.mjs";
 
 const VM_TEMPLATE = "vm_pmo_review_video";
 const ACTIVE_TASK_STATUS = new Set(["todo", "queued"]);
@@ -15,6 +15,10 @@ export class VmTaskBindingError extends Error {
 
 function fail(code) { throw new VmTaskBindingError(code); }
 function digest(value) { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+function requestWithoutPrivateEndpoints(request) {
+  const { private_endpoints: _privateEndpoints, ...rest } = request;
+  return rest;
+}
 function identityFor(origin, snapshot) {
   return {
     eventId: origin.eventId, baseToken: origin.baseToken, tableId: origin.tableId,
@@ -41,7 +45,8 @@ function validIdentity(task, origin, snapshot) {
 
 /**
  * Persist a trusted task's immutable material request before touching the download queue.
- * resolveRequest must read trusted PMO/profile data and local policy, never a task description.
+ * resolveRequest reads trusted task/profile data and local settings once; later checks use
+ * the saved request and task identity rather than allowing settings changes to retarget a run.
  * approval.lookup must return an exact-match internal job with requestFingerprint;
  * approval.enqueue must use the active VM download service so its worker is woken.
  */
@@ -50,7 +55,7 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
   const db = database?.database;
   if (!db || typeof database.getTask !== "function" || typeof database.getFeishuTaskOrigin !== "function"
     || typeof database.getFeishuTaskPackageSnapshot !== "function" || typeof resolveRequest !== "function"
-    || typeof approval?.lookup !== "function" || typeof approval.enqueue !== "function"
+      || typeof approval?.lookup !== "function" || typeof approval.enqueue !== "function"
     || typeof verifyAcquisition !== "function" || typeof now !== "function") {
     throw new TypeError("VM task bindings require Taskboard storage, trusted request resolution, and a download adapter");
   }
@@ -70,6 +75,35 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`);
   const link = db.prepare(`UPDATE vm_task_download_bindings SET approval_job_id = ?, updated_at = ?
     WHERE task_id = ? AND approval_job_id IS NULL AND identity_sha256 = ? AND request_sha256 = ?`);
+  const approvalOwner = db.prepare(`SELECT task_id FROM vm_task_download_bindings
+    WHERE approval_job_id = ? AND task_id <> ? LIMIT 1`);
+  const duplicateApprovals = db.prepare(`SELECT approval_job_id FROM vm_task_download_bindings
+    WHERE approval_job_id IS NOT NULL GROUP BY approval_job_id HAVING COUNT(*) > 1`);
+  const approvalOwnerForMigration = db.prepare(`SELECT task_id FROM vm_task_download_bindings
+    WHERE approval_job_id = ? ORDER BY created_at, task_id LIMIT 1`);
+  const releaseDuplicateApproval = db.prepare(`UPDATE vm_task_download_bindings
+    SET approval_job_id = NULL, updated_at = ? WHERE approval_job_id = ? AND task_id <> ?`);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const duplicates = duplicateApprovals.all();
+    if (duplicates.length) {
+      const timestamp = now();
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0) fail("VM_TASK_BINDING_INVALID");
+      for (const { approval_job_id: jobId } of duplicates) {
+        const owner = approvalOwnerForMigration.get(jobId);
+        if (!owner) fail("VM_TASK_BINDING_INVALID");
+        releaseDuplicateApproval.run(timestamp, jobId, owner.task_id);
+      }
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS vm_task_download_approval_job_unique
+      ON vm_task_download_bindings(approval_job_id) WHERE approval_job_id IS NOT NULL`);
+    const ownershipIndex = db.prepare("PRAGMA index_list(vm_task_download_bindings)").all()
+      .find((index) => index.name === "vm_task_download_approval_job_unique");
+    if (ownershipIndex?.unique !== 1 || ownershipIndex.partial !== 1
+      || db.prepare("PRAGMA index_info(vm_task_download_approval_job_unique)").all()
+        .map((column) => column.name).join(",") !== "approval_job_id") fail("VM_TASK_BINDING_INVALID");
+    db.exec("COMMIT");
+  } catch (error) { db.exec("ROLLBACK"); throw error; }
 
   function read(taskId) {
     const row = select.get(taskId);
@@ -87,25 +121,33 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     return { taskId: row.task_id, runId: row.run_id, vmid: request.vmid,
       approvalJobId: row.approval_job_id, createdAt: row.created_at, updatedAt: row.updated_at };
   }
-  async function current(taskId) {
+  function currentIdentity(taskId) {
     const task = database.getTask(taskId);
     const origin = database.getFeishuTaskOrigin(taskId);
     const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
     if (!validIdentity(task, origin, snapshot)) fail("VM_TASK_NOT_ELIGIBLE");
-    const identityHash = digest(identityFor(origin, snapshot));
+    return { task, origin, snapshot, identityHash: digest(identityFor(origin, snapshot)) };
+  }
+  function requestMatchesTask(request, origin) {
+    const vmWorkflow = origin?.stageSnapshot?.vmWorkflow;
+    return request.vmid === origin?.stageSnapshot?.vmContext?.vmid
+      && request.department === vmWorkflow?.approval?.department
+      && request.reason === vmWorkflow?.approval?.reason;
+  }
+  async function current(taskId) {
+    const current = currentIdentity(taskId);
+    const { task, origin, snapshot, identityHash } = current;
     const request = validateVmApprovalRequest(await resolveRequest({ task, origin, packageSnapshot: snapshot }));
-    const latestTask = database.getTask(taskId);
-    const latestOrigin = database.getFeishuTaskOrigin(taskId);
-    const latestSnapshot = database.getFeishuTaskPackageSnapshot(taskId);
-    if (!validIdentity(latestTask, latestOrigin, latestSnapshot)) fail("VM_TASK_NOT_ELIGIBLE");
-    if (identityHash !== digest(identityFor(latestOrigin, latestSnapshot))) fail("VM_TASK_BINDING_CONFLICT");
+    if (!requestMatchesTask(request, origin)) fail("VM_TASK_BINDING_CONFLICT");
+    const latest = currentIdentity(taskId);
+    if (identityHash !== latest.identityHash || !requestMatchesTask(request, latest.origin)) fail("VM_TASK_BINDING_CONFLICT");
     return { identityHash, request, requestHash: digest(request) };
   }
   async function checked(taskId) {
     const binding = read(taskId);
     if (!binding) fail("VM_TASK_BINDING_NOT_FOUND");
-    const expected = await current(taskId);
-    if (binding.row.identity_sha256 !== expected.identityHash || binding.row.request_sha256 !== expected.requestHash) {
+    const expected = currentIdentity(taskId);
+    if (binding.row.identity_sha256 !== expected.identityHash || !requestMatchesTask(binding.request, expected.origin)) {
       fail("VM_TASK_BINDING_CONFLICT");
     }
     return binding;
@@ -120,12 +162,88 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     }
     return job;
   }
+  async function recoverPrivateEndpointDrift(taskId, binding) {
+    const jobId = binding.row.approval_job_id;
+    if (!jobId || jobId !== vmApprovalJobIdForTaskRun(taskId, binding.row.run_id)
+      || typeof approval.lookupTaskRun !== "function") return null;
+    const job = await approval.lookupTaskRun({ jobId });
+    if (!job || job.id !== jobId || job.status !== "ready" || !job.request
+      || typeof job.request !== "object" || Array.isArray(job.request)) return null;
+    let request;
+    try { request = validateVmApprovalRequest(job.request); }
+    catch { return null; }
+    if (job.requestFingerprint !== digest(request)
+      || JSON.stringify(requestWithoutPrivateEndpoints(request))
+        !== JSON.stringify(requestWithoutPrivateEndpoints(binding.request))
+      || JSON.stringify(request.private_endpoints) === JSON.stringify(binding.request.private_endpoints)
+      || !requestMatchesTask(request, currentIdentity(taskId).origin)) return null;
+    const acquisition = job.acquisition;
+    if (!acquisition?.receipt_path || !job.application_id || !job.instance_code) return null;
+    let verified;
+    try {
+      verified = await verifyAcquisition(acquisition.receipt_path, {
+        vmid: request.vmid, applicationId: job.application_id, instanceCode: job.instance_code,
+      });
+    } catch { fail("VM_TASK_ACQUISITION_INVALID"); }
+    if (verified.vmid_binding !== "vm_api_verified" || ["receipt_path", "path", "sha256", "bytes", "duration_ms"]
+      .some((key) => verified[key] !== acquisition[key])) fail("VM_TASK_ACQUISITION_INVALID");
+
+    const latest = await checked(taskId);
+    if (latest.row.run_id !== binding.row.run_id || latest.row.approval_job_id !== jobId
+      || latest.row.request_sha256 !== binding.row.request_sha256) fail("VM_TASK_BINDING_CONFLICT");
+    const requestJson = JSON.stringify(request);
+    const requestHash = digest(request);
+    const timestamp = now();
+    if (!Number.isSafeInteger(timestamp) || timestamp < 0) fail("VM_TASK_BINDING_INVALID");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const changed = db.prepare(`UPDATE vm_task_download_bindings SET request_sha256 = ?,request_json = ?,updated_at = ?
+        WHERE task_id = ? AND run_id = ? AND identity_sha256 = ? AND request_sha256 = ? AND approval_job_id = ?`)
+        .run(requestHash, requestJson, timestamp, taskId, binding.row.run_id, binding.row.identity_sha256,
+          binding.row.request_sha256, jobId);
+      if (changed.changes !== 1) fail("VM_TASK_BINDING_CONFLICT");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    const migrated = await checked(taskId);
+    if (migrated.row.request_sha256 !== job.requestFingerprint) fail("VM_TASK_BINDING_CONFLICT");
+    return { binding: migrated, job, acquisition: verified };
+  }
+  function linkIfUnclaimed(taskId, binding, jobId) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = read(taskId);
+      if (!existing || existing.row.identity_sha256 !== binding.row.identity_sha256
+        || existing.row.request_sha256 !== binding.row.request_sha256) fail("VM_TASK_BINDING_CONFLICT");
+      if (existing.row.approval_job_id) {
+        db.exec("COMMIT");
+        return existing.row.approval_job_id === jobId;
+      }
+      if (approvalOwner.get(jobId, taskId)) {
+        db.exec("COMMIT");
+        return false;
+      }
+      const timestamp = now();
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0) fail("VM_TASK_BINDING_INVALID");
+      const result = link.run(jobId, timestamp, taskId, binding.row.identity_sha256, binding.row.request_sha256);
+      if (result.changes !== 1) fail("VM_TASK_BINDING_CONFLICT");
+      db.exec("COMMIT");
+      return true;
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  }
   return {
     async reserve(taskId) {
+      let binding = read(taskId);
+      if (binding) {
+        const expected = currentIdentity(taskId);
+        if (binding.row.identity_sha256 !== expected.identityHash || !requestMatchesTask(binding.request, expected.origin)) {
+          fail("VM_TASK_BINDING_CONFLICT");
+        }
+        return summary(binding.row, binding.request);
+      }
       const value = await current(taskId);
       db.exec("BEGIN IMMEDIATE");
       try {
-        let binding = read(taskId);
+        binding = read(taskId);
         if (!binding) {
           const timestamp = now();
           if (!Number.isSafeInteger(timestamp) || timestamp < 0) fail("VM_TASK_BINDING_INVALID");
@@ -133,7 +251,8 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
             JSON.stringify(value.request), timestamp, timestamp);
           binding = read(taskId);
         }
-        if (binding.row.identity_sha256 !== value.identityHash || binding.row.request_sha256 !== value.requestHash) {
+        const latest = currentIdentity(taskId);
+        if (binding.row.identity_sha256 !== latest.identityHash || !requestMatchesTask(binding.request, latest.origin)) {
           fail("VM_TASK_BINDING_CONFLICT");
         }
         db.exec("COMMIT");
@@ -142,49 +261,82 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     },
     async reconcile(taskId) {
       let binding = await checked(taskId);
-      const lookup = { requestFingerprint: binding.row.request_sha256, jobId: binding.row.approval_job_id };
-      let job = await approval.lookup(lookup);
+      const taskRunJobId = vmApprovalJobIdForTaskRun(taskId, binding.row.run_id);
+      let job = await approval.lookup({ requestFingerprint: binding.row.request_sha256,
+        jobId: binding.row.approval_job_id ?? taskRunJobId });
       if (!job && binding.row.approval_job_id) fail("VM_TASK_APPROVAL_JOB_MISSING");
+      if (!job) {
+        const legacyJobId = `vm-${binding.row.request_sha256.slice(0, 24)}`;
+        const legacyJob = await approval.lookup({ requestFingerprint: binding.row.request_sha256, jobId: legacyJobId });
+        if (legacyJob) {
+          validateApproval(legacyJob, binding);
+          binding = await checked(taskId);
+          if (linkIfUnclaimed(taskId, binding, legacyJob.id)) {
+            job = legacyJob;
+            binding = read(taskId);
+          } else {
+            binding = read(taskId);
+            if (binding.row.approval_job_id) {
+              job = await approval.lookup({ requestFingerprint: binding.row.request_sha256,
+                jobId: binding.row.approval_job_id });
+              if (!job) fail("VM_TASK_APPROVAL_JOB_MISSING");
+            }
+          }
+        }
+      }
       if (!job) {
         await checked(taskId);
         const request = binding.request;
         const result = await approval.enqueue({ vmids: [request.vmid], department: request.department,
-          reason: request.reason, outputRoot: request.output_root });
-        if (!Array.isArray(result?.jobs) || result.jobs.length !== 1) fail("VM_TASK_APPROVAL_JOB_MISMATCH");
-        job = await approval.lookup({ requestFingerprint: binding.row.request_sha256, jobId: result.jobs[0]?.id });
+          reason: request.reason, outputRoot: request.output_root }, { taskId, runId: binding.row.run_id });
+        if (!Array.isArray(result?.jobs) || result.jobs.length !== 1 || result.jobs[0]?.id !== taskRunJobId) {
+          fail("VM_TASK_APPROVAL_JOB_MISMATCH");
+        }
+        job = await approval.lookup({ requestFingerprint: binding.row.request_sha256, jobId: taskRunJobId });
       }
       validateApproval(job, binding);
       // The queue may have completed while Taskboard was down. Recheck task and immutable request before linking.
       binding = await checked(taskId);
       if (!binding.row.approval_job_id) {
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          const existing = read(taskId);
-          if (!existing || existing.row.identity_sha256 !== binding.row.identity_sha256
-            || existing.row.request_sha256 !== binding.row.request_sha256) fail("VM_TASK_BINDING_CONFLICT");
-          if (existing.row.approval_job_id && existing.row.approval_job_id !== job.id) fail("VM_TASK_APPROVAL_JOB_MISMATCH");
-          if (!existing.row.approval_job_id) link.run(job.id, now(), taskId, binding.row.identity_sha256, binding.row.request_sha256);
-          db.exec("COMMIT");
-        } catch (error) { db.exec("ROLLBACK"); throw error; }
+        if (!linkIfUnclaimed(taskId, binding, job.id)) {
+          binding = read(taskId);
+          if (!binding.row.approval_job_id) fail("VM_TASK_APPROVAL_JOB_MISMATCH");
+          job = await approval.lookup({ requestFingerprint: binding.row.request_sha256,
+            jobId: binding.row.approval_job_id });
+          if (!job) fail("VM_TASK_APPROVAL_JOB_MISSING");
+          validateApproval(job, binding);
+        }
       }
       await approval.wake?.();
       binding = read(taskId);
       return summary(binding.row, binding.request);
     },
     async status(taskId) {
-      const binding = await checked(taskId);
+      let binding = await checked(taskId);
+      let recoveredAcquisition = null;
+      if (!binding.row.approval_job_id) return { ...summary(binding.row, binding.request), status: "reserved" };
+      let job = await approval.lookup({ requestFingerprint: binding.row.request_sha256,
+        jobId: binding.row.approval_job_id });
+      if (!job || job.requestFingerprint !== binding.row.request_sha256) {
+        const recovered = await recoverPrivateEndpointDrift(taskId, binding);
+        if (recovered) {
+          binding = recovered.binding;
+          job = recovered.job;
+          recoveredAcquisition = recovered.acquisition;
+        }
+      }
+      job = validateApproval(job, binding);
       const base = summary(binding.row, binding.request);
-      if (!binding.row.approval_job_id) return { ...base, status: "reserved" };
-      const job = validateApproval(await approval.lookup({ requestFingerprint: binding.row.request_sha256,
-        jobId: binding.row.approval_job_id }), binding);
       if (job.status !== "ready") return { ...base, status: job.status, ...(job.error ? { error: job.error } : {}) };
       if (!job.acquisition?.receipt_path || !job.application_id || !job.instance_code) fail("VM_TASK_ACQUISITION_INVALID");
-      let verified;
-      try {
-        verified = await verifyAcquisition(job.acquisition.receipt_path, {
-          vmid: binding.request.vmid, applicationId: job.application_id, instanceCode: job.instance_code,
-        });
-      } catch { fail("VM_TASK_ACQUISITION_INVALID"); }
+      let verified = recoveredAcquisition;
+      if (!verified) {
+        try {
+          verified = await verifyAcquisition(job.acquisition.receipt_path, {
+            vmid: binding.request.vmid, applicationId: job.application_id, instanceCode: job.instance_code,
+          });
+        } catch { fail("VM_TASK_ACQUISITION_INVALID"); }
+      }
       if (verified.vmid_binding !== "vm_api_verified" || ["receipt_path", "path", "sha256", "bytes", "duration_ms"]
         .some((key) => verified[key] !== job.acquisition[key])) fail("VM_TASK_ACQUISITION_INVALID");
       await checked(taskId);
