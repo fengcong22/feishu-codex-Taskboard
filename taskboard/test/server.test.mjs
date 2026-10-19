@@ -10,6 +10,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { createTaskboardServer, resolveServerOptions } from "../server/index.mjs";
 import { scanDevelopmentContexts } from "../server/app.mjs";
+import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 
 const runningApps = [];
 
@@ -21,11 +22,11 @@ afterEach(async () => {
   }
 });
 
-async function startServer(configure, listenOptions = {}) {
+async function startServer(configure) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-test-"));
   const options = configure ? await configure(directory) : {};
   const app = createTaskboardServer({ dataDirectory: directory, ...options });
-  const address = await app.listen({ port: 0, ...listenOptions });
+  const address = await listenTaskboardOnFetchSafePort(app);
   runningApps.push({ app, directory });
   return `http://127.0.0.1:${address.port}`;
 }

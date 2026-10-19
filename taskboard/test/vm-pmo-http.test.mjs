@@ -4,12 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import {test} from "node:test";
 import {createTaskboardServer} from "../server/app.mjs";
+import {listenTaskboardOnFetchSafePort} from "../../test/fetch-safe-listen.mjs";
 
 const SECRET = "vm-http-test-secret";
 async function fixture(t, vmPmoRuntime) {
   const root = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-http-"));
   const app = createTaskboardServer({dataDirectory: root, processEnv: {}, feishuBridgeSecret: SECRET, vmPmoRuntime});
-  const address = await app.listen({host: "127.0.0.1", port: 0});
+  const address = await listenTaskboardOnFetchSafePort(app);
   t.after(async () => {await app.close(); await rm(root, {recursive:true,force:true});});
   const request = async (route, body, headers = {}) => {
     const response = await fetch(`http://127.0.0.1:${address.port}${route}`, {
