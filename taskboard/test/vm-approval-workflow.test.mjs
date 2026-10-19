@@ -9,7 +9,7 @@ import { createVmApprovalStore } from "../server/vm-approval-store.mjs";
 import * as vmApprovalWorkflow from "../server/vm-approval-workflow.mjs";
 import { prepareVmSource } from "../server/vm-source-adapter.mjs";
 import { VmSourceError } from "../server/vm-source-transfer.mjs";
-import { isStrictDescendantPath } from "../server/filesystem-path-boundary.mjs";
+import { isStrictFilesystemDescendantPath } from "../server/filesystem-path-boundary.mjs";
 import { enqueueVmApproval, extendVmApprovalWait, processVmApproval, resumeVmApproval, summarizeVmApproval,
   validateVmApprovalRequest, verifyVmAcquisitionReceipt } from "../server/vm-approval-workflow.mjs";
 
@@ -469,7 +469,7 @@ test("operator-confirmed repeatable download recovery reuses the approved applic
 
   const canonicalOutputRoot = realpathSync(f.request.output_root);
   const canonicalJobRoot = realpathSync(path.dirname(failed.receipt_path));
-  assert.ok(isStrictDescendantPath(canonicalOutputRoot, canonicalJobRoot),
+  assert.ok(isStrictFilesystemDescendantPath(canonicalOutputRoot, canonicalJobRoot),
     JSON.stringify({ canonicalOutputRoot, canonicalJobRoot, receiptPath: failed.receipt_path }));
 
   const recovered = vmApprovalWorkflow.recoverVmApprovalAcquisition(f.store, job.id, {
