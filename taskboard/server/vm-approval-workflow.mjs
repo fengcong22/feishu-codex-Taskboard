@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { lstat, open, readFile } from "node:fs/promises";
 import path from "node:path";
+import { isStrictDescendantPath } from "./filesystem-path-boundary.mjs";
 import { prepareVmSource, validateVmSourceRequest } from "./vm-source-adapter.mjs";
 import { VmSourceError } from "./vm-source-transfer.mjs";
 
@@ -193,8 +194,7 @@ function assertNoAcquisitionRecoveryArtifacts(job) {
       fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
     }
     const realJobRoot = realpathSync(jobRoot);
-    const relative = path.relative(outputRoot, realJobRoot);
-    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    if (!isStrictDescendantPath(outputRoot, realJobRoot)) {
       fail("VM_DOWNLOAD_RECOVERY_PATH_INVALID");
     }
     for (const filename of ["source.mp4", "source.mp4.part", "acquisition.json", "acquisition.json.part"]) {

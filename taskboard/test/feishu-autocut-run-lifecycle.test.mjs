@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { listenOnFetchSafePort, listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
@@ -89,10 +90,10 @@ async function createBridge(controlledContext, status = 200) {
         : { error: { code: currentContext } },
     ));
   });
-  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  const address = await listenOnFetchSafePort(bridge);
   return {
     requests,
-    url: `http://127.0.0.1:${bridge.address().port}`,
+    url: `http://127.0.0.1:${address.port}`,
     holdResponses(gate) { responseGate = gate; },
     setResponse(nextContext, nextStatus = 200) {
       currentContext = nextContext;
@@ -198,7 +199,7 @@ if (args[0] === "debug") {
     ...(coursePathResolver ? { coursePathResolver } : {}),
   };
   const app = createTaskboardServer(serverOptions);
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = await listenTaskboardOnFetchSafePort(app);
   return {
     app,
     bridge,
@@ -873,7 +874,7 @@ test("a recovered automatic phased reservation runs locally after policy revalid
     assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id)?.state, "delayed");
     await fixture.app.close();
     fixture.app = createTaskboardServer(fixture.serverOptions);
-    await fixture.app.listen({ host: "127.0.0.1", port: 0 });
+    await listenTaskboardOnFetchSafePort(fixture.app);
     const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
     const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
     assert.deepEqual(invocations, [run.runId]);
