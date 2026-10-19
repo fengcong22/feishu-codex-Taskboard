@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -98,7 +98,7 @@ test("rejects unsafe enabled package bindings and duplicate project ids", () => 
 });
 
 test("loadPackageRegistry fails closed for missing and malformed files", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-package-registry-"));
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "feishu-package-registry-")));
   const filename = path.join(directory, "packages.json");
   try {
     await assert.rejects(
@@ -119,7 +119,7 @@ test("loadPackageRegistry fails closed for missing and malformed files", async (
 const vmTemplate = { id: "vm_pmo_review_video", version: 1 };
 
 async function vmRegistryFixture(t, declaration = vmTemplate) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-vm-registry-"));
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "feishu-vm-registry-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const workspacePath = path.join(directory, "package");
   await mkdir(workspacePath);

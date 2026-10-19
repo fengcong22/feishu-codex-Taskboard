@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { link, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdtemp, realpath, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,7 +13,7 @@ const event = { eventId: "evt_archive_1", subjectKey: "bas_test:tbl_test", confi
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 
 async function fixture(t) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vm-final-archive-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-final-archive-")));
   const database = new TaskboardDatabase(path.join(root, "state.sqlite"));
   t.after(async () => { database.close(); await rm(root, { recursive: true, force: true }); });
   const sourcePath = path.join(root, "source.mp4");

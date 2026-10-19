@@ -267,6 +267,8 @@ Set-Location ..
 
 ## 团队交接与健康检查
 
+完整验证命令为 `npm run test:ci`，依次执行 Node 测试、Taskboard 类型检查、前端构建和组件测试。测试环境需有 Node.js 22.13 或更高版本、Python 3.11，以及 PATH 中可调用的 `ffmpeg`、`ffprobe`（含 H.264/AAC 编解码支持）；CI 会显式安装并检查这些媒体依赖。VM 测试夹具在创建临时目录后通过 `realpath` 取得规范路径，避免 Windows 用户目录短文件名导致测试输入不符合生产路径校验要求。
+
 针对 Windows 升级后 `EBUSY rmdir` 和 `packageSnapshot.zipSourceDirectory is invalid` 的修复及原地更新步骤，见 [Windows 升级问题修复与验收](./docs/windows-upgrade-followup.zh-CN.md)。临时 AI 目录查询在成功和失败时都会等待子进程 `close`，并等待并行模型/技能探测全部结束后返回；超出退出宽限期的技能子进程会被强制终止。`npm test` 不跳过 Windows 用例，也不通过重复删除临时目录隐藏未退出的子进程。
 
 需要让目标电脑上的 Codex 完成 Windows 源码部署，并接入使用者自己的飞书应用，请把 [给 Codex 的 Windows 源码部署 Runbook](./docs/windows-source-install-guide.zh-CN.md) 交给目标电脑上已经可用的 Codex 执行。Runbook 不安装、更新、登录或修复 Codex；源码部署另行要求 Git for Windows 和 Node.js 22.13 或更高版本。它不共享本机凭据、Codex 登录态、路径或运行状态，遇到飞书权限、秘密和真实业务数据时会暂停交还本人。

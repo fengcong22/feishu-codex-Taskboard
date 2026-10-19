@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,7 +11,7 @@ import { createVmMp4DeliveryService } from "../server/vm-mp4-delivery.mjs";
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 async function fixture(t, overrides = {}) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "vm-mp4-delivery-"));
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-mp4-delivery-")));
   const filename = path.join(directory, "result.mp4");
   const bytes = Buffer.from("validated-mp4-fixture");
   await writeFile(filename, bytes);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -18,7 +18,7 @@ const runCommand = promisify(execFile);
 let sourcePromise;
 async function sourceFixture() {
   sourcePromise ??= (async () => {
-    const temporary = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-runner-source-"));
+    const temporary = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-pmo-runner-source-")));
     try {
       const source = path.join(temporary, "source.mp4");
       await runCommand("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
@@ -32,7 +32,7 @@ async function sourceFixture() {
 }
 
 async function fixture(t, body, withPlan = true) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-runner-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-pmo-runner-")));
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   const moduleRoot = path.join(root, "auto_cut_slicing");
   const runDir = path.join(root, "run");

@@ -20,6 +20,19 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             taskboard/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install media test dependencies
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python --version
       - name: Install Bridge dependencies
         run: npm ci
       - name: Install Taskboard dependencies

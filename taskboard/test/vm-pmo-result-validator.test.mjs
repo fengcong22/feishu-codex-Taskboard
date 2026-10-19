@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -14,7 +14,7 @@ const hash = (value) => createHash("sha256").update(value).digest("hex");
 let sourcePromise;
 async function sourceFixture() {
   sourcePromise ??= (async () => {
-    const temporary = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-fixture-source-"));
+    const temporary = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-pmo-fixture-source-")));
     try {
       const source = path.join(temporary, "source.mp4");
       await runCommand("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
@@ -28,7 +28,7 @@ async function sourceFixture() {
 }
 
 async function fixture(t) {
-  const runDir = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-validate-"));
+  const runDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-pmo-validate-")));
   t.after(() => rm(runDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   const paths = Object.fromEntries(["input", "source", "plan", "plan-result", "result", "review"]
     .map((name) => [name, path.join(runDir, `${name}${["source", "review"].includes(name) ? ".mp4" : ".json"}`)]));
@@ -313,7 +313,7 @@ test("accepts blocked render only when no output artifact exists", async (t) => 
 
 test("allows a canonical source outside run directory and rejects path collisions", async (t) => {
   const current = await fixture(t);
-  const store = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-source-store-"));
+  const store = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-pmo-source-store-")));
   t.after(() => rm(store, { recursive: true, force: true }));
   current.context.source_path = path.join(store, "source.mp4");
   await writeFile(current.context.source_path, await readFile(current.paths.source));
@@ -326,7 +326,7 @@ test("allows a canonical source outside run directory and rejects path collision
 
 test("rejects output directory aliases escaping run directory", async (t) => {
   const current = await fixture(t);
-  const external = await mkdtemp(path.join(os.tmpdir(), "vm-pmo-outside-"));
+  const external = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-pmo-outside-")));
   t.after(() => rm(external, { recursive: true, force: true }));
   const alias = path.join(current.context.run_dir, "alias");
   try { await symlink(external, alias, process.platform === "win32" ? "junction" : "dir"); }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, stat } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readFile, writeFile, rm, symlink, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
@@ -8,7 +8,7 @@ import { prepareVmPmoRunInput } from "../server/vm-pmo-run-input.mjs";
 import { validateVmPmoInput } from "../server/vm-pmo-result-validator.mjs";
 
 async function fixture(t) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vm-input-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-input-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const packageRoot = path.join(root, "package");
   await mkdir(packageRoot);

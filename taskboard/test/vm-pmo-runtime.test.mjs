@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createVmPmoRuntime } from "../server/vm-pmo-runtime.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
-import { mkdtemp, mkdir, writeFile, readFile, rm, access } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, writeFile, readFile, rm, access } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -23,7 +23,7 @@ try { PYTHON = execFileSync("python",["-c","import sys; print(sys.executable)"],
 catch { /* Python-dependent composition case skips when unavailable. */ }
 
 async function fixture(t, { enabled = true, alias = "slicing", finalArchive = false, privateEndpoints = [], contractVersion = 2 } = {}) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "vm-runtime-"));
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-runtime-")));
   const archiveDirectory = path.join(directory,"archive");
   if (finalArchive) await mkdir(archiveDirectory);
   const packageRoot = path.join(directory, "package");
