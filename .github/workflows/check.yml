@@ -26,8 +26,19 @@ jobs:
       - name: Install media test dependencies
         shell: pwsh
         run: |
-          choco install ffmpeg --yes --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            choco install ffmpeg --yes --no-progress
+            $installExitCode = $LASTEXITCODE
+            $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+            $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
+            if ($installExitCode -eq 0 -and $ffmpeg -and $ffprobe) { break }
+            if ($attempt -eq $maxAttempts) {
+              throw "FFmpeg install failed after $maxAttempts attempts (exit code: $installExitCode)."
+            }
+            Write-Host "FFmpeg tools unavailable after attempt $attempt/$maxAttempts; retrying."
+            Start-Sleep -Seconds (5 * $attempt)
+          }
           ffmpeg -version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ffprobe -version
