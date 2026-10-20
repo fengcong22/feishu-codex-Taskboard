@@ -323,6 +323,7 @@ export interface AiChatThread {
   createdAt: string;
   updatedAt: string;
   currentRun?: AiChatRun | null;
+  latestRun?: AiChatRun | null;
   latestTodo?: AiChatTodoProgress | null;
 }
 

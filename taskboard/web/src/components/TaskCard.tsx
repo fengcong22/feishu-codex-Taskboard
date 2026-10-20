@@ -281,11 +281,11 @@ function ParticipantAvatars({ participants }: { participants: ActorIdentity[] })
   );
 }
 
-function TaskLabels({ task }: { task: Task }) {
+function TaskLabels({ labels }: { labels: string[] }) {
   const { language } = useTaskboardI18n();
   return (
     <>
-      {task.labels.slice(0, 2).map((label) => {
+      {labels.slice(0, 2).map((label) => {
         const presentation = labelPresentation(label, language);
         return (
           <span className={`label-chip${presentation.tone ? ` label-chip-${presentation.tone}` : ""}`} key={label}>
@@ -294,9 +294,9 @@ function TaskLabels({ task }: { task: Task }) {
           </span>
         );
       })}
-      {task.labels.length > 2 && (
-        <span className="label-more" title={task.labels.slice(2).map((label) => labelPresentation(label, language).name).join(", ")}>
-          +{task.labels.length - 2}
+      {labels.length > 2 && (
+        <span className="label-more" title={labels.slice(2).map((label) => labelPresentation(label, language).name).join(", ")}>
+          +{labels.length - 2}
         </span>
       )}
     </>
@@ -465,14 +465,19 @@ export function TaskCard({
     || task.status === "done"
     || task.status === "canceled";
   const showsConversation = supportsConversation && presentation.conversations.length > 0;
-  const showsInlineParticipants = variant === "main"
+  const isFeishuTask = task.feishuOrigin?.source === "feishu-base";
+  const visibleLabels = isFeishuTask
+    ? task.labels.filter((label) => label !== "feishu")
+    : task.labels;
+  const showsPriority = !isFeishuTask && task.priority !== "none";
+  const showsInlineParticipants = !isFeishuTask && variant === "main"
     && task.participants.length > 0;
   const image = showCover ? firstTaskImage(task) : null;
   const body = useMemo(
     () => showBody ? taskBodyText(task.description) : "",
     [showBody, task.description],
   );
-  const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
+  const hasProperties = showsPriority || visibleLabels.length > 0 || task.dueDate;
   const showsProperties = Boolean(projectName)
     || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
@@ -548,7 +553,7 @@ export function TaskCard({
         )}
         {variant === "sidebar" && (
           <span className="sidebar-card-creator">
-            <AssigneeControl
+            {!isFeishuTask && <AssigneeControl
               task={task}
               participants={task.participants.length ? task.participants : [creator]}
               currentUser={currentUser}
@@ -556,7 +561,7 @@ export function TaskCard({
               open={propertyMenu === "assignee"}
               onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
-            />
+            />}
             <span>{createdDate(task.createdAt, locale, text)}</span>
           </span>
         )}
@@ -578,7 +583,7 @@ export function TaskCard({
               <span>{projectName}</span>
             </span>
           )}
-          {!processingCard && task.priority !== "none" && (
+          {!processingCard && showsPriority && (
             <PriorityControl
               task={task}
               disabled={propertyDisabled}
@@ -587,7 +592,7 @@ export function TaskCard({
               onChange={(priority) => updateProperty({ priority }, "priority")}
             />
           )}
-          {!processingCard && task.labels.length > 0 && (
+          {!processingCard && visibleLabels.length > 0 && (
             <LabelPicker
               availableLabels={availableLabels}
               selectedLabels={task.labels}
@@ -595,7 +600,7 @@ export function TaskCard({
               disabled={propertyDisabled}
               className="card-label-picker card-property-control"
               triggerClassName="card-label-trigger"
-              triggerContent={<TaskLabels task={task} />}
+              triggerContent={<TaskLabels labels={visibleLabels} />}
               onOpenChange={(open) => setPropertyMenu(open ? "labels" : null)}
               onChange={(labels) => updateProperty({ labels }, "labels")}
               onCreateLabel={onCreateLabel}

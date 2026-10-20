@@ -240,6 +240,36 @@ describe("AiChat task execution synchronization", () => {
     vi.useRealTimers();
   });
 
+  it("opens a local editing log from the card without the duplicate native task conversation", async () => {
+    const local = thread(TASK_THREAD_ID, { model: "local-autocut", codexThreadId: null });
+    local.latestRun = { id: "completed-run", threadId: local.id, status: "completed" };
+    const previous = thread("failed-edit", { model: "local-autocut", codexThreadId: null, origin: local.origin });
+    previous.latestRun = { id: "failed-run", threadId: previous.id, status: "failed" };
+    snapshots.set(local.id, { thread: local, events: [], runs: [local.latestRun] });
+    snapshots.set(previous.id, { thread: previous, events: [], runs: [previous.latestRun] });
+    api.listThreads.mockResolvedValue([local, previous]);
+    const task = { ...TASK, conversationRefs: [{
+      threadId: local.id, legacyLocal: true as const, source: "task" as const,
+      sourceId: TASK.id, title: TASK.title, updatedAt: STARTED_AT,
+    }] };
+    render(<Harness task={task} />);
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "View 2 conversations" }));
+    expect(screen.getAllByRole("menuitem")).toHaveLength(2);
+    expect(screen.getAllByText("Editing run log")).toHaveLength(2);
+    expect(screen.queryByText("Task conversation")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Task execution/ }));
+    await settle();
+
+    const panel = screen.getByRole("region", { name: "Auto-Cut execution" });
+    expect(within(panel).getByText("Auto-Cut completed")).toBeTruthy();
+    expect(api.getThread).toHaveBeenCalledWith(local.id);
+    expect(api.createThread).not.toHaveBeenCalled();
+    expect(api.startTurn).not.toHaveBeenCalled();
+    expect(api.startComposerTurn).not.toHaveBeenCalled();
+  });
+
   it("loads an explicitly requested failed local run absent from the cached thread list", async () => {
     const local = thread("failed-local-run", { model: "local-autocut", codexThreadId: null, title: "Failed edit" });
     snapshots.set(local.id, {

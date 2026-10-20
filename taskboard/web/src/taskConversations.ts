@@ -13,13 +13,14 @@ export interface TaskConversationItem {
   projectId: string;
   kind: "native" | "local-ai";
   title: string;
-  source: "task" | "comment" | "local-ai";
+  source: "task" | "comment" | "local-ai" | "autocut";
   nativeThreadId: string | null;
   threadBinding: CodexThreadBinding | null;
   legacyLocalThreadId: string | null;
   aiThreadId: string | null;
   updatedAt: string;
   currentRun: AiChatRun | null;
+  latestRun: AiChatRun | null;
   latestTodo: AiChatTodoProgress | null;
 }
 
@@ -88,10 +89,17 @@ function newerTimestamp(left: string, right: string) {
 
 export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
   const items = new Map<string, TaskConversationItem>();
+  const taskThreads = aiThreads.filter((thread) => (
+    thread.origin.projectId === task.projectId && thread.origin.issueId === task.id
+  ));
+  const localThreadIds = new Set(taskThreads.map((thread) => thread.id));
 
   for (const ref of task.conversationRefs ?? []) {
     const normalizedId = normalizeCodexThreadId(ref.threadId);
     if (!normalizedId) continue;
+    // Legacy task bindings can contain a Taskboard thread ID rather than a Codex ID.
+    // The matching local entry below opens its own execution log or AI chat.
+    if (ref.legacyLocal && localThreadIds.has(normalizedId)) continue;
     const key = `codex:${normalizedId}`;
     const current = items.get(key);
     const next: TaskConversationItem = {
@@ -112,19 +120,20 @@ export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
       aiThreadId: null,
       updatedAt: ref.updatedAt,
       currentRun: null,
+      latestRun: null,
       latestTodo: null,
     };
     if (!current || next.updatedAt >= current.updatedAt) items.set(key, next);
   }
 
-  for (const thread of aiThreads) {
-    if (thread.origin.projectId !== task.projectId || thread.origin.issueId !== task.id) continue;
+  for (const thread of taskThreads) {
     const normalizedId = normalizeCodexThreadId(thread.codexThreadId);
     const key = normalizedId ? `codex:${normalizedId}` : `ai:${thread.id}`;
     const current = items.get(key);
     const threadActivityUpdatedAt = [
       thread.updatedAt,
       thread.currentRun?.startedAt ?? "",
+      thread.latestRun?.finishedAt ?? thread.latestRun?.startedAt ?? "",
       thread.latestTodo?.updatedAt ?? "",
     ].reduce(newerTimestamp);
     const candidate: TaskConversationItem = {
@@ -132,7 +141,7 @@ export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
       projectId: task.projectId,
       kind: "local-ai",
       title: thread.title || thread.origin.issueIdentifier || task.title,
-      source: "local-ai",
+      source: thread.model === "local-autocut" ? "autocut" : "local-ai",
       nativeThreadId: current?.nativeThreadId ?? thread.codexThreadId,
       threadBinding: current?.threadBinding ?? null,
       legacyLocalThreadId: current?.legacyLocalThreadId ?? null,
@@ -141,6 +150,7 @@ export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
         ? newerTimestamp(current.updatedAt, threadActivityUpdatedAt)
         : threadActivityUpdatedAt,
       currentRun: thread.currentRun ?? null,
+      latestRun: thread.latestRun ?? thread.currentRun ?? null,
       latestTodo: thread.latestTodo ?? null,
     };
     if (current?.kind === "local-ai") {

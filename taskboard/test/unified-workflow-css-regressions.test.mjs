@@ -8,11 +8,11 @@ const boardSource = () => readFile(
 );
 const stylesSource = () => readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 
-test("upload loading banner does not share its layout class with card status labels", async () => {
+test("upload loading banner keeps its layout after card summaries are removed", async () => {
   const [board, styles] = await Promise.all([boardSource(), stylesSource()]);
 
   assert.match(board, /className=\{`unified-workflow-upload-banner\$\{uploadError/);
-  assert.match(board, /<span className="unified-workflow-upload-status">\{status\}<\/span>/);
+  assert.doesNotMatch(board, /unified-workflow-upload-status/);
   assert.match(styles, /\.unified-workflow-upload-banner\s*\{/);
   assert.match(styles, /\.unified-workflow-upload-banner\.is-error\s*\{/);
 });
@@ -24,19 +24,6 @@ test("mobile workflow grid creates one column per rendered stage", async () => {
   assert.match(mobileStyles, /\.unified-workflow-board-grid\s*\{[\s\S]*?grid-template-columns:\s*none;/);
   assert.match(mobileStyles, /\.unified-workflow-board-grid\s*\{[\s\S]*?grid-auto-flow:\s*column;/);
   assert.doesNotMatch(mobileStyles, /repeat\(9\s*,/);
-});
-
-test("upload rows keep metadata and actions on explicit grid rows", async () => {
-  const styles = await stylesSource();
-
-  assert.match(styles, /\.unified-workflow-upload-row\s*\{[\s\S]*?grid-template-columns:\s*14px minmax\(0, 1fr\) auto auto auto;/);
-  assert.match(styles, /\.unified-workflow-upload-row > svg\s*\{[\s\S]*?grid-row:\s*1;/);
-  assert.match(styles, /\.unified-workflow-upload-filename\s*\{[\s\S]*?grid-row:\s*1;/);
-  assert.match(styles, /\.unified-workflow-upload-status\s*\{[\s\S]*?grid-row:\s*1;/);
-  assert.match(styles, /\.unified-workflow-upload-row time\s*\{[\s\S]*?grid-row:\s*1;/);
-  assert.match(styles, /\.unified-workflow-upload-retry\s*\{[\s\S]*?grid-row:\s*1;/);
-  assert.match(styles, /\.unified-workflow-upload-error\s*\{[\s\S]*?grid-row:\s*2;/);
-  assert.match(styles, /\.unified-workflow-upload-target\s*\{[\s\S]*?grid-row:\s*2;/);
 });
 
 test("workflow view manager keeps many saved views in a compact scrollable list", async () => {

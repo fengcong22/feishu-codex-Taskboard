@@ -26,11 +26,11 @@ test("App refreshes verified task ZIP summaries for the selected project", async
   assert.match(app, /artifactSummaries=\{taskArtifactSummaries\}/);
 });
 
-test("App routes Feishu subject issues through the unified board and exposes upload retry", async () => {
+test("App routes Feishu subject issues through the unified board", async () => {
   const app = await source();
   assert.match(app, /isSelectedFeishuProject/);
   assert.match(app, /<UnifiedWorkflowBoard[\s\S]*?uploadItems=\{artifactUploadItems\}/);
-  assert.match(app, /onRetryUpload=\{[^}]*retryArtifactUploadFromBoard/);
+  assert.doesNotMatch(app, /retryArtifactUploadFromBoard/);
   assert.doesNotMatch(app, /onClick=\{\(\) => selectBoardView\("upload_queue"\)\}/);
   assert.doesNotMatch(app, /onClick=\{\(\) => selectBoardView\("uploading"\)\}/);
   assert.doesNotMatch(app, /onClick=\{\(\) => selectBoardView\("uploaded"\)\}/);
@@ -65,21 +65,18 @@ test("unified board renders all editing and upload stages", async () => {
   }
   assert.match(board, /groupUnifiedWorkflowItems/);
   assert.match(board, /readOnly/);
-  assert.match(board, /retry/);
+  assert.match(board, /onOpenTask/);
 });
 
-test("completed-editing cards show and search verified ZIP summaries before upload", async () => {
+test("the board retains verified ZIP metadata for classification and search", async () => {
   const [app, board] = await Promise.all([
     source(),
     readFile(new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url), "utf8"),
   ]);
-
   assert.match(app, /artifactSummaries=\{taskArtifactSummaries\}/);
   assert.match(board, /artifactSummaries: TaskArtifactSummary\[\]/);
+  assert.match(board, /groupUnifiedWorkflowItems\(tasks, scopedUploadItems, artifactSummaries\)/);
   assert.match(board, /matchesUnifiedWorkflowMetadataSearch/);
-  assert.match(board, /artifact\.validationStatus/);
-  assert.match(board, /artifact\.updatedAt/);
-  assert.match(board, /已验证|Verified/);
 });
 
 test("TaskCard can be rendered without starting a status drag", async () => {
@@ -99,8 +96,7 @@ test("unified board exposes responsive columns and searchable upload metadata", 
   const styles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
   assert.match(styles, /\.unified-workflow-board/);
   assert.match(styles, /scroll-snap-type:\s*x\s+mandatory/);
-  assert.match(board, /upload\.filename/);
-  assert.match(board, /packageAlias/);
+  assert.match(board, /matchesUnifiedWorkflowMetadataSearch/);
   assert.match(board, /matchesTaskFilters/);
 });
 
@@ -117,34 +113,23 @@ test("unified board uses configurable labels for real task statuses while keepin
     new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
     "utf8",
   );
-  assert.match(board, /const \{ language, locale, statusLabel, text \} = useTaskboardI18n\(\)/);
+  assert.match(board, /const \{ language, statusLabel, text \} = useTaskboardI18n\(\)/);
   assert.match(board, /definition\.taskStatus \? statusLabel\(definition\.taskStatus\) : text\(definition\.label, definition\.englishLabel\)/);
 });
 
-test("unified board summarizes the trusted Auto-Cut alias and execution mode without exposing paths", async () => {
-  const board = await readFile(
-    new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
-    "utf8",
-  );
-  assert.match(board, /task\.feishuOrigin\?\.packageAlias/);
-  assert.match(board, /task\.feishuOrigin\?\.(?:executionMode|mode)/);
-  assert.match(board, /自动|Automatic/);
-  assert.match(board, /手动|Manual/);
-  assert.doesNotMatch(board, /packageSource/);
+test("workflow cards have no execution or ZIP panels below the task card", async () => {
+  const board = await readFile(new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url), "utf8");
+  assert.match(board, /<TaskCard/);
+  assert.doesNotMatch(board, /TaskExecutionSummary|UploadSummary|unified-workflow-card-summary/);
+  assert.doesNotMatch(board, /unified-workflow-zip-disclosure/);
 });
 
-test("unified board disables each failed-upload retry while its request is in flight", async () => {
-  const app = await source();
-  const board = await readFile(
-    new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
-    "utf8",
-  );
-  assert.match(board, /retryingUploadIds\?: ReadonlySet<string>/);
-  assert.match(board, /retryingUploadIds\.has\(upload\.id\)/);
-  assert.match(board, /disabled=\{[^}]*retryingUploadIds\.has\(upload\.id\)/);
-  assert.match(app, /const \[retryingArtifactUploadIds, setRetryingArtifactUploadIds\] = useState<Set<string>>/);
-  assert.match(app, /retryingArtifactUploadIdsRef\.current\.has\(item\.upload\.id\)/);
-  assert.match(app, /retryingUploadIds=\{retryingArtifactUploadIds\}/);
+test("task detail retains ZIP download and upload retry with an in-flight guard", async () => {
+  const detail = await readFile(new URL("../web/src/components/TaskDetail.tsx", import.meta.url), "utf8");
+  assert.match(detail, /href=\{artifactDownloadUrl\(artifact\.id\)\}/);
+  assert.match(detail, /if \(enqueueingArtifactId \|\| retryingUploadId \|\| upload\.status !== "failed"\) return/);
+  assert.match(detail, /retryTaskArtifactUpload\(currentTask\.id, upload\.id\)/);
+  assert.match(detail, /disabled=\{retryingUploadId === upload\.id \|\| enqueueingArtifactId !== null\}/);
 });
 
 test("unified board maps upload error codes to fixed safe copy", async () => {
@@ -155,7 +140,7 @@ test("unified board maps upload error codes to fixed safe copy", async () => {
   assert.match(board, /function uploadErrorLabel\(/);
   assert.match(board, /TARGET_FILE_CONFLICT/);
   assert.match(board, /ARTIFACT_CONTENT_MISSING/);
-  assert.match(board, /upload\.errorCode/);
+  assert.match(board, /uploadErrorLabel\(uploadError, text\)/);
   assert.doesNotMatch(board, /title=\{upload\.errorMessage\}/);
   assert.doesNotMatch(board, />\{upload\.errorMessage\}</);
 });
@@ -226,44 +211,9 @@ test("the selected Feishu header identifies both Base and subject table", async 
   );
 });
 
-test("workflow cards show stage timing and a safe uploaded target alias", async () => {
-  const board = await readFile(
-    new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
-    "utf8",
-  );
-  const types = await readFile(new URL("../web/src/types.ts", import.meta.url), "utf8");
-
-  assert.match(board, /task\.updatedAt/);
-  assert.match(board, /formatTimestamp\(task\.updatedAt, locale\)/);
-  assert.match(types, /targetId: string \| null/);
-  assert.match(board, /upload\.targetId/);
-  assert.match(board, /上传目标|Upload target/);
-  assert.doesNotMatch(board, /upload\.targetPath/);
-});
-
-test("completed editing cards show verified unqueued ZIP summaries", async () => {
-  const board = await readFile(
-    new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(board, /artifactSummaries: TaskArtifactSummary\[\]/);
-  assert.match(board, /item\.artifacts/);
-  assert.match(board, /已验证 ZIP|Verified ZIP/);
-  assert.match(board, /artifact\.filename/);
-  assert.doesNotMatch(board, /artifact\.sha256|artifact\.storageKey|artifact\.draftRoot/);
-});
-
-test("workflow cards keep unqueued ZIPs visible beside other upload states", async () => {
-  const board = await readFile(
-    new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(board, /summarizeUnifiedWorkflowArtifacts/);
-  assert.match(board, /unifiedWorkflowZipEntries/);
-  assert.match(board, /zipEntries\.map\(\(entry\)/);
-  assert.match(board, /zipCount/);
+test("workflow column counts include unqueued ZIPs alongside upload states", async () => {
+  const board = await readFile(new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url), "utf8");
+  assert.match(board, /summarizeUnifiedWorkflowArtifacts\(item\)\.zipCount/);
 });
 
 test("workflow column headers distinguish task and ZIP counts", async () => {
@@ -370,24 +320,6 @@ test("all-stage search exposes safe hidden matches and reveals a stage without m
   assert.doesNotMatch(board, /updateUnifiedWorkflowView|saveUnifiedWorkflowView/);
   assert.doesNotMatch(board, /item\.task\.description/);
   assert.doesNotMatch(board, /upload\.(?:targetPath|storageKey|sha256|errorMessage)/);
-});
-
-test("ZIP details use an accessible disclosure with scoped expansion and automatic failure visibility", async () => {
-  const board = await readFile(
-    new URL("../web/src/components/UnifiedWorkflowBoard.tsx", import.meta.url),
-    "utf8",
-  );
-  assert.match(board, /aria-expanded=\{/);
-  assert.match(board, /aria-controls=/);
-  assert.match(board, /zipExpansion/);
-  assert.match(board, /unifiedWorkflowZipEntries/);
-  assert.match(board, /zipEntries\.map\(\(entry\)/);
-  assert.match(board, /unifiedWorkflowZipExpansionKey\(item\.task\.id, entry\.identity\)/);
-  assert.match(board, /upload\.status === "uploading"/);
-  assert.match(board, /upload\.status === "failed"/);
-  assert.match(board, /search\.trim\(\)/);
-  assert.doesNotMatch(board, /artifact\.(?:sha256|storageKey|draftRoot)/);
-  assert.doesNotMatch(board, /upload\.(?:sha256|storageKey|targetPath|errorMessage)/);
 });
 
 test("upload stages remain read-only drop surfaces", async () => {

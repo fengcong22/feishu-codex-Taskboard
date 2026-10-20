@@ -21,6 +21,42 @@ async function createFixture() {
   };
 }
 
+test("thread summaries retain the latest result while currentRun remains active-only", async () => {
+  const fixture = await createFixture();
+  try {
+    const { database } = fixture;
+    for (const id of ["edit", "other", "empty"]) {
+      database.createAiChatThread({
+        id, title: id, origin: { projectId: "local", projectName: "Example", workspacePath: "/tmp/example" },
+        model: "local-autocut", reasoningEffort: "none", sandbox: "workspace-write",
+      });
+    }
+    function check(expected, active = null) {
+      for (const summary of [database.getAiChatThread("edit"), database.listAiChatThreads().find((item) => item.id === "edit")]) {
+        assert.deepEqual(summary.latestRun, expected);
+        assert.deepEqual(summary.currentRun, active);
+      }
+      assert.equal(database.getAiChatThread("empty").latestRun, null);
+    }
+    check(null);
+    database.createAiChatRun({ id: "unrelated", threadId: "other", status: "failed", startedAt: "2026-10-15T00:00:00Z" });
+    for (const [index, status] of ["failed", "completed", "interrupted"].entries()) {
+      const id = `attempt-${index}`;
+      const running = database.createAiChatRun({ id, threadId: "edit", startedAt: `2026-10-14T09:0${index}:00Z` });
+      check(running, running);
+      const terminal = database.updateAiChatRun(id, { status, finishedAt: `2026-10-14T09:0${index}:30Z` });
+      check(terminal);
+    }
+    // Historical insertion order must not replace a more recent attempt.
+    database.createAiChatRun({ id: "late-import", threadId: "edit", status: "failed", startedAt: "2026-10-13T00:00:00Z" });
+    check(database.getAiChatRun("attempt-2"));
+    const tied = database.createAiChatRun({ id: "z-attempt", threadId: "edit", status: "completed", startedAt: "2026-10-14T09:02:00Z" });
+    check(tied);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("AI chat persistence stores threads, runs, and visible events without hidden prompt fields", async () => {
   const fixture = await createFixture();
   try {

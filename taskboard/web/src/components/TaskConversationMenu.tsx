@@ -13,6 +13,7 @@ function conversationSource(
   conversation: TaskConversationItem,
   text: (chinese: string, english: string) => string,
 ) {
+  if (conversation.source === "autocut") return text("剪辑运行记录", "Editing run log");
   if (conversation.kind === "local-ai") return text("内置 AI", "Built-in AI");
   return conversation.source === "comment"
     ? text("评论对话", "Comment conversation")
@@ -29,7 +30,13 @@ function conversationStatus(
     }
     return text("正在处理", "Processing");
   }
-  return conversation.kind === "local-ai" ? text("已暂停", "Paused") : "Codex";
+  if (conversation.kind !== "local-ai") return "Codex";
+  switch (conversation.latestRun?.status) {
+    case "completed": return text("已完成", "Completed");
+    case "failed": return text("已失败", "Failed");
+    case "interrupted": return text("已中断", "Interrupted");
+    default: return text("尚未运行", "Not started");
+  }
 }
 
 export function TaskConversationMenu({

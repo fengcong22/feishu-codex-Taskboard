@@ -47,7 +47,6 @@ import {
   removeTaskRelation,
   resolveTaskboardWebSocketUrl,
   restoreTask as restoreTaskRequest,
-  retryTaskArtifactUpload,
   setApiText,
   setCurrentUserActor,
   subscribeLocalEvents,
@@ -912,7 +911,6 @@ export function App() {
   const [taskArtifactSummaries, setTaskArtifactSummaries] = useState<TaskArtifactSummary[]>([]);
   const [artifactUploadsLoading, setArtifactUploadsLoading] = useState(false);
   const [artifactUploadsError, setArtifactUploadsError] = useState<string | null>(null);
-  const [retryingArtifactUploadIds, setRetryingArtifactUploadIds] = useState<Set<string>>(() => new Set());
   const [generalLoadError, setGeneralLoadError] = useState<string | null>(null);
   const [projectLoadError, setProjectLoadError] = useState<ProjectLoadError | null>(null);
   const [tasksLoadError, setTasksLoadError] = useState<TasksLoadError | null>(null);
@@ -1045,7 +1043,6 @@ export function App() {
   const projectsRequestRef = useRef(0);
   const tasksRequestRef = useRef(0);
   const artifactUploadsRequestRef = useRef(0);
-  const retryingArtifactUploadIdsRef = useRef(new Set<string>());
   const tasksRef = useRef<Task[]>([]);
   const undoSequenceRef = useRef(0);
   const undoStackRef = useRef<UndoOperation[]>([]);
@@ -2680,8 +2677,6 @@ export function App() {
     setUnifiedViewsLoading(false);
     setUnifiedViewsError(null);
     setUnifiedSearchScope("activeView");
-    retryingArtifactUploadIdsRef.current.clear();
-    setRetryingArtifactUploadIds(new Set());
     setGeneralLoadError(null);
     setProjectLoadError(null);
     setTasksLoadError(null);
@@ -3734,31 +3729,6 @@ export function App() {
     } catch (error) {
       setActionError(errorMessage(error));
       throw error;
-    }
-  }
-
-  async function retryArtifactUploadFromBoard(item: ArtifactUploadListItem) {
-    if (retryingArtifactUploadIdsRef.current.has(item.upload.id)) return;
-    retryingArtifactUploadIdsRef.current.add(item.upload.id);
-    setRetryingArtifactUploadIds(new Set(retryingArtifactUploadIdsRef.current));
-    setActionError(null);
-    try {
-      const upload = await retryTaskArtifactUpload(item.task.id, item.upload.id);
-      if (selectedProjectIdRef.current === item.task.projectId) {
-        setArtifactUploadItems((current) => current.map((candidate) => (
-          candidate.upload.id === upload.id
-            ? { ...candidate, upload }
-            : candidate
-        )));
-        void refreshArtifactUploads(item.task.projectId, { quiet: true });
-      }
-    } catch (error) {
-      if (selectedProjectIdRef.current === item.task.projectId) {
-        setActionError(errorMessage(error));
-      }
-    } finally {
-      retryingArtifactUploadIdsRef.current.delete(item.upload.id);
-      setRetryingArtifactUploadIds(new Set(retryingArtifactUploadIdsRef.current));
     }
   }
 
@@ -5335,8 +5305,6 @@ export function App() {
                 onDragEnter={setDropTarget}
                 onDrop={finishTaskDrop}
                 onOpenConversation={openTaskConversation}
-                onRetryUpload={(item) => void retryArtifactUploadFromBoard(item)}
-                retryingUploadIds={retryingArtifactUploadIds}
                 onColumnScrollRef={(status, element) => {
                   boardColumnScrollRefs.current[status] = element;
                 }}

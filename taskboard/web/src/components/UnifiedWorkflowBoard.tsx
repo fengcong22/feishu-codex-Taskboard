@@ -33,10 +33,10 @@ import { TaskCard } from "./TaskCard";
 import { canDropUnifiedWorkflowTask, hasUnifiedWorkflowDragType } from "../unifiedWorkflowDropGuard.mjs";
 // The classifier is intentionally kept in ESM JavaScript so node:test can use it directly.
 // @ts-expect-error The helper has no runtime-dependent TypeScript surface.
-import { groupUnifiedWorkflowItems, matchesUnifiedWorkflowMetadataSearch, projectUnifiedWorkflowGroups, summarizeHiddenUnifiedWorkflow, summarizeUnifiedWorkflowArtifacts, unifiedWorkflowZipEntries } from "../unifiedWorkflow.mjs";
+import { groupUnifiedWorkflowItems, matchesUnifiedWorkflowMetadataSearch, projectUnifiedWorkflowGroups, summarizeHiddenUnifiedWorkflow, summarizeUnifiedWorkflowArtifacts } from "../unifiedWorkflow.mjs";
 // Layout state is deliberately browser-only and kept in a runtime-independent module.
 // @ts-expect-error The helper's structural contract is covered by node tests.
-import { columnWidthPx, normalizeUnifiedWorkflowLayout, readUnifiedWorkflowLayout, resetUnifiedWorkflowLayout, unifiedWorkflowLayoutStorageKey, unifiedWorkflowZipExpansionKey, writeUnifiedWorkflowLayout } from "../unifiedWorkflowLayout.mjs";
+import { columnWidthPx, normalizeUnifiedWorkflowLayout, readUnifiedWorkflowLayout, resetUnifiedWorkflowLayout, unifiedWorkflowLayoutStorageKey, writeUnifiedWorkflowLayout } from "../unifiedWorkflowLayout.mjs";
 
 export type UnifiedWorkflowStage =
   | "todo"
@@ -54,12 +54,6 @@ interface UnifiedWorkflowItem {
   uploads: ArtifactUpload[];
   artifacts: TaskArtifactSummary[];
   stage: UnifiedWorkflowStage;
-}
-
-interface UnifiedWorkflowZipEntry {
-  identity: string;
-  artifact: TaskArtifactSummary | null;
-  upload: ArtifactUpload | null;
 }
 
 interface UnifiedWorkflowColumnDefinition {
@@ -106,7 +100,6 @@ const EMPTY_PRESENTATION: TaskCardPresentation = {
   unread: false,
 };
 
-const EMPTY_RETRYING_UPLOAD_IDS: ReadonlySet<string> = new Set();
 const PAN_THRESHOLD_PX = 6;
 const EDGE_AUTO_SCROLL_ZONE_PX = 48;
 const EDGE_AUTO_SCROLL_STEP_PX = 20;
@@ -161,8 +154,6 @@ export interface UnifiedWorkflowBoardProps {
   onDragEnter: (status: TaskStatus) => void;
   onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null, sourceSurface?: "board" | "other-tasks-panel" | "unified-board") => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
-  onRetryUpload: (item: ArtifactUploadListItem) => void;
-  retryingUploadIds?: ReadonlySet<string>;
   onColumnScrollRef?: (stage: UnifiedWorkflowStage, element: HTMLDivElement | null) => void;
   onBoardScrollRef?: Ref<HTMLDivElement>;
 }
@@ -184,68 +175,6 @@ function statusColor(stage: UnifiedWorkflowStage) {
   if (stage === "blocked") return "blocked";
   if (stage === "completed_editing") return "done";
   return "todo";
-}
-
-function formatUploadStatus(
-  status: ArtifactUpload["status"],
-  text: (chinese: string, english: string) => string,
-) {
-  return {
-    queued: text("排队中", "Queued"),
-    uploading: text("上传中", "Uploading"),
-    uploaded: text("已上传", "Uploaded"),
-    failed: text("失败", "Failed"),
-  }[status];
-}
-
-function uploadTimestamp(upload: ArtifactUpload) {
-  if (upload.status === "uploaded") return upload.completedAt ?? upload.updatedAt;
-  if (upload.status === "uploading") return upload.startedAt ?? upload.updatedAt;
-  return upload.updatedAt || upload.createdAt;
-}
-
-function formatTimestamp(value: string, locale: string) {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf())) return value;
-  return new Intl.DateTimeFormat(locale, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(parsed);
-}
-
-function TaskExecutionSummary({ task }: { task: Task }) {
-  const { locale, text } = useTaskboardI18n();
-  const packageAlias = task.feishuOrigin?.packageAlias?.trim() ?? "";
-  const executionMode = task.feishuOrigin?.executionMode ?? task.feishuOrigin?.mode;
-  const modeLabel = executionMode === "automatic"
-    ? text("自动执行", "Automatic")
-    : executionMode === "manual"
-      ? text("手动执行", "Manual")
-      : null;
-  return (
-    <div
-      className="unified-workflow-card-summary"
-      aria-label={text("Auto-Cut 执行摘要", "Auto-Cut execution summary")}
-    >
-      {packageAlias && (
-        <span className="unified-workflow-summary-label" title={packageAlias}>
-          {text("Auto-Cut 包", "Auto-Cut package")}: {packageAlias}
-        </span>
-      )}
-      {modeLabel && (
-        <span className="unified-workflow-summary-label">{modeLabel}</span>
-      )}
-      <time
-        className="unified-workflow-summary-label"
-        dateTime={task.updatedAt}
-        title={new Date(task.updatedAt).toLocaleString(locale)}
-      >
-        {text("更新", "Updated")}: {formatTimestamp(task.updatedAt, locale)}
-      </time>
-    </div>
-  );
 }
 
 function matchesBoardSearch(
@@ -296,141 +225,6 @@ function assignRef<T>(ref: Ref<T> | undefined, value: T | null) {
   }
 }
 
-function UploadSummary({
-  item,
-  stage,
-  locale,
-  search,
-  zipExpansion,
-  onToggleZip,
-  onRetryUpload,
-  retryingUploadIds,
-}: {
-  item: UnifiedWorkflowItem;
-  stage: UnifiedWorkflowStage;
-  locale: string;
-  search: string;
-  zipExpansion: Record<string, boolean>;
-  onToggleZip: (key: string, expanded: boolean) => void;
-  onRetryUpload: (item: ArtifactUploadListItem) => void;
-  retryingUploadIds: ReadonlySet<string>;
-}) {
-  const { text } = useTaskboardI18n();
-  const zipEntries = unifiedWorkflowZipEntries(item) as UnifiedWorkflowZipEntry[];
-  const zipCount = zipEntries.length;
-  if (zipCount === 0 && stage === "completed_editing") {
-    return (
-      <div className="unified-workflow-card-summary">
-        <span className="unified-workflow-summary-label">
-          {text("剪辑已完成，等待上传", "Editing complete; waiting for upload")}
-        </span>
-      </div>
-    );
-  }
-  if (zipCount === 0) return null;
-
-  return (
-    <div className="unified-workflow-card-summary" aria-label={text("ZIP 与上传摘要", "ZIP and upload summary")}>
-      {zipEntries.map((entry) => {
-        const artifact = entry.artifact;
-        const upload = entry.upload;
-        const filename = artifact?.filename ?? upload?.filename ?? text("ZIP 文件", "ZIP file");
-        let expansionKey = "";
-        try {
-          expansionKey = unifiedWorkflowZipExpansionKey(item.task.id, entry.identity);
-        } catch {
-          // The identities come from local records; a malformed one remains
-          // visible but does not persist an expansion preference.
-        }
-        const autoExpand = Boolean(upload && (
-          upload.status === "uploading" || upload.status === "failed"
-        ));
-        const expanded = search.trim().length > 0
-          || (expansionKey ? zipExpansion[expansionKey] ?? autoExpand : autoExpand);
-        const detailsId = [
-          "unified-workflow-zip-details",
-          encodeURIComponent(item.task.id),
-          encodeURIComponent(entry.identity),
-        ].join("-");
-
-        return (
-          <div className="unified-workflow-zip-entry" key={entry.identity}>
-            <button
-              type="button"
-              className="unified-workflow-zip-disclosure"
-              aria-expanded={expanded}
-              aria-controls={detailsId}
-              onClick={() => {
-                if (expansionKey) onToggleZip(expansionKey, !expanded);
-              }}
-            >
-              <LinearIcon name={expanded ? "chevronDown" : "chevronRight"} />
-              <span className="unified-workflow-summary-label" title={filename}>{filename}</span>
-            </button>
-            {expanded && (
-              <div id={detailsId} className="unified-workflow-zip-details" role="region">
-                {artifact && !upload && (
-                  <div className="unified-workflow-upload-row unified-workflow-artifact-row status-verified">
-                    <LinearIcon name="check" />
-                    <span className="unified-workflow-upload-filename" title={artifact.filename}>{artifact.filename}</span>
-                    <span className="unified-workflow-upload-status">
-                      {artifact.validationStatus === "verified" ? text("已验证 ZIP", "Verified ZIP") : artifact.validationStatus}
-                    </span>
-                    <time dateTime={artifact.updatedAt} title={new Date(artifact.updatedAt).toLocaleString(locale)}>
-                      {formatTimestamp(artifact.updatedAt, locale)}
-                    </time>
-                  </div>
-                )}
-                {upload && (() => {
-            const retryable = upload.status === "failed";
-            const retrying = retryingUploadIds.has(upload.id);
-            const status = formatUploadStatus(upload.status, text);
-            const errorLabel = uploadErrorLabel(upload.errorCode, text);
-            return (
-              <div className={"unified-workflow-upload-row status-" + upload.status}>
-                <LinearIcon name={upload.status === "failed" ? "alert" : upload.status === "uploaded" ? "check" : "file"} />
-                <span className="unified-workflow-upload-filename" title={upload.filename}>{upload.filename}</span>
-                <span className="unified-workflow-upload-status">{status}</span>
-                {upload.status === "failed" && (
-                  <span className="unified-workflow-upload-error" title={errorLabel}>{errorLabel}</span>
-                )}
-                {upload.status === "uploaded" && upload.targetId && (
-                  <span className="unified-workflow-upload-target" title={upload.targetId}>
-                    {text("上传目标", "Upload target")}: {upload.targetId}
-                  </span>
-                )}
-                <time dateTime={uploadTimestamp(upload)} title={new Date(uploadTimestamp(upload)).toLocaleString(locale)}>
-                  {formatTimestamp(uploadTimestamp(upload), locale)}
-                </time>
-                {retryable && (
-                  <button
-                    type="button"
-                    className="unified-workflow-upload-retry"
-                    disabled={retryingUploadIds.has(upload.id)}
-                    aria-busy={retrying || undefined}
-                    title={retrying ? text("正在重新上传", "Retrying upload") : text("重新上传", "Retry upload")}
-                    aria-label={text("重新上传 " + upload.filename, "Retry upload " + upload.filename)}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      if (retrying) return;
-                      onRetryUpload({ upload, task: item.task });
-                    }}
-                  >
-                    <LinearIcon name="recurrence" />
-                  </button>
-                )}
-              </div>
-            );
-                })()}
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function UnifiedWorkflowColumn({
   definition,
   items,
@@ -465,11 +259,6 @@ function UnifiedWorkflowColumn({
   onDragEnter,
   onDrop,
   onOpenConversation,
-  onRetryUpload,
-  retryingUploadIds,
-  search,
-  zipExpansion,
-  onToggleZip,
   onColumnScrollRef,
   onColumnScroll,
   onColumnPointerDown,
@@ -510,11 +299,6 @@ function UnifiedWorkflowColumn({
   onDragEnter: (status: TaskStatus) => void;
   onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null, sourceSurface?: "board" | "other-tasks-panel" | "unified-board") => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
-  onRetryUpload: (item: ArtifactUploadListItem) => void;
-  retryingUploadIds: ReadonlySet<string>;
-  search: string;
-  zipExpansion: Record<string, boolean>;
-  onToggleZip: (key: string, expanded: boolean) => void;
   onColumnScrollRef?: (stage: UnifiedWorkflowStage, element: HTMLDivElement | null) => void;
   onColumnScroll?: (stage: UnifiedWorkflowStage, scrollTop: number) => void;
   onColumnPointerDown?: (stage: UnifiedWorkflowStage, event: ReactPointerEvent<HTMLDivElement>) => void;
@@ -522,7 +306,7 @@ function UnifiedWorkflowColumn({
   onColumnPointerUp?: (stage: UnifiedWorkflowStage, event: ReactPointerEvent<HTMLDivElement>) => void;
   onColumnPointerCancel?: (stage: UnifiedWorkflowStage, event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
-  const { locale, text } = useTaskboardI18n();
+  const { text } = useTaskboardI18n();
   const zipCount = items.reduce((total, item) => (
     total + summarizeUnifiedWorkflowArtifacts(item).zipCount
   ), 0);
@@ -696,19 +480,6 @@ function UnifiedWorkflowColumn({
                 onDragEnd={onDragEnd}
                 onOpenConversation={onOpenConversation}
               />
-              <TaskExecutionSummary task={task} />
-              {(definition.upload || item.artifacts.length > 0 || item.uploads.length > 0) && (
-                <UploadSummary
-                  item={item}
-                  stage={definition.id}
-                  locale={locale}
-                  search={search}
-                  zipExpansion={zipExpansion}
-                  onToggleZip={onToggleZip}
-                  onRetryUpload={onRetryUpload}
-                  retryingUploadIds={retryingUploadIds}
-                />
-              )}
             </div>
           );
         })}
@@ -755,12 +526,10 @@ export function UnifiedWorkflowBoard({
   onDragEnter,
   onDrop,
   onOpenConversation,
-  onRetryUpload,
-  retryingUploadIds = EMPTY_RETRYING_UPLOAD_IDS,
   onColumnScrollRef,
   onBoardScrollRef,
 }: UnifiedWorkflowBoardProps) {
-  const { language, locale, statusLabel, text } = useTaskboardI18n();
+  const { language, statusLabel, text } = useTaskboardI18n();
   const activeFilters = filters ?? EMPTY_TASK_FILTERS;
   const taskById = useMemo(
     () => new Map(tasks.map((task) => [task.id, task])),
@@ -976,10 +745,6 @@ export function UnifiedWorkflowBoard({
     setLayout(next);
     queueLayoutWrite();
   }, [layoutStageIds, queueLayoutWrite]);
-
-  const handleToggleZip = useCallback((key: string, expanded: boolean) => {
-    applyLayoutPatch({ zipExpansion: { [key]: expanded } });
-  }, [applyLayoutPatch]);
 
   const assignBoardElement = useCallback((element: HTMLDivElement | null) => {
     boardElementRef.current = element;
@@ -1380,11 +1145,6 @@ export function UnifiedWorkflowBoard({
               onDragEnter={onDragEnter}
               onDrop={onDrop}
               onOpenConversation={onOpenConversation}
-              onRetryUpload={onRetryUpload}
-              retryingUploadIds={retryingUploadIds}
-              search={search}
-              zipExpansion={layout.zipExpansion}
-              onToggleZip={handleToggleZip}
               onColumnScrollRef={assignColumnElement}
               onColumnScroll={handleColumnScroll}
               onColumnPointerDown={handleColumnPointerDown}

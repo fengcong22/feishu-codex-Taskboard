@@ -895,6 +895,7 @@ function aiChatThreadFromRow(row) {
     reasoningEffort: row.reasoning_effort,
     sandbox: row.sandbox,
     currentRun: null,
+    latestRun: null,
     latestTodo: null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -3778,6 +3779,16 @@ export class TaskboardDatabase {
       if (!currentRuns.has(row.thread_id)) currentRuns.set(row.thread_id, aiChatRunFromRow(row));
     }
 
+    const latestRuns = new Map(this.database.prepare(`
+      SELECT run.* FROM ai_chat_threads AS thread
+      JOIN ai_chat_runs AS run ON run.id = (
+        SELECT id FROM ai_chat_runs
+        WHERE thread_id = thread.id
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      )
+    `).all().map((row) => [row.thread_id, aiChatRunFromRow(row)]));
+
     const latestTodos = new Map();
     for (const row of this.database.prepare(`
       SELECT id, thread_id, run_id, data, created_at
@@ -3795,6 +3806,7 @@ export class TaskboardDatabase {
     return rows.map((row) => {
       const thread = aiChatThreadFromRow(row);
       thread.currentRun = currentRuns.get(thread.id) ?? null;
+      thread.latestRun = latestRuns.get(thread.id) ?? null;
       thread.latestTodo = latestTodos.get(thread.id) ?? null;
       return thread;
     });
@@ -7227,6 +7239,13 @@ export class TaskboardDatabase {
       LIMIT 1
     `).get(thread.id);
     thread.currentRun = currentRun ? aiChatRunFromRow(currentRun) : null;
+    const latestRun = this.database.prepare(`
+      SELECT * FROM ai_chat_runs
+      WHERE thread_id = ?
+      ORDER BY started_at DESC, id DESC
+      LIMIT 1
+    `).get(thread.id);
+    thread.latestRun = latestRun ? aiChatRunFromRow(latestRun) : null;
     const todoRows = this.database.prepare(`
       SELECT id, thread_id, run_id, data, created_at
       FROM ai_chat_events
