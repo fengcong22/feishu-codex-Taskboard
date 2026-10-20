@@ -116,24 +116,37 @@ export function decideVmWorkflowRecordChange(subject, event) {
     const options = archiveField?.options ?? [];
     const before = event.beforeOptionIds;
     const after = event.afterOptionIds;
-    if (event.fieldId !== archiveFieldId || event.statusFieldId !== archiveFieldId
-      || event.beforePresent !== true || event.afterPresent !== true
-      || !identifier(event.eventId, EVENT_ID) || !identifier(event.recordId)
-      || !Array.isArray(before) || !Array.isArray(after)
-      || before.some((id) => !identifier(id)) || after.some((id) => !identifier(id))
-      || new Set(before).size !== before.length || new Set(after).size !== after.length
-      || [...before, ...after].some((id) => options.filter((option) => (option?.optionId ?? option?.id) === id).length !== 1)) {
-      return blocked("MISSING_STATUS_EDGE", subject, event);
-    }
-    if (!before.includes(archive.triggerOptionId) && after.includes(archive.triggerOptionId)) return {
-      kind: "final_archive", subject, event, subjectKey: subject.subjectKey,
-      configVersion: subject.configVersion, archive,
-    };
-    // Stage dispatch consumes scalar IDs; shared fields must prove the same edge.
-    if (stages.some(([, stage]) => stage.statusFieldId === archiveFieldId)
-      && (before.length !== 1 || after.length !== 1
-        || before[0] !== event.beforeOptionId || after[0] !== event.afterOptionId)) {
-      return blocked("MISSING_STATUS_EDGE", subject, event);
+    const initialStageWithoutPreviousOption = stages.some(([stageId, stage]) => (
+      stageId === "initial"
+      && stage.statusFieldId === archiveFieldId
+      && stage.triggerOptionId === event.afterOptionId
+    )) && event.fieldId === archiveFieldId && event.statusFieldId === archiveFieldId
+      && (event.beforePresent === true || event.beforePresent === false)
+      && event.beforeOptionId === null && event.afterPresent === true
+      && identifier(event.eventId, EVENT_ID) && identifier(event.recordId)
+      && Array.isArray(before) && before.length === 0
+      && Array.isArray(after) && after.length === 1 && after[0] === event.afterOptionId
+      && options.filter((option) => (option?.optionId ?? option?.id) === event.afterOptionId).length === 1;
+    if (!initialStageWithoutPreviousOption) {
+      if (event.fieldId !== archiveFieldId || event.statusFieldId !== archiveFieldId
+        || event.beforePresent !== true || event.afterPresent !== true
+        || !identifier(event.eventId, EVENT_ID) || !identifier(event.recordId)
+        || !Array.isArray(before) || !Array.isArray(after)
+        || before.some((id) => !identifier(id)) || after.some((id) => !identifier(id))
+        || new Set(before).size !== before.length || new Set(after).size !== after.length
+        || [...before, ...after].some((id) => options.filter((option) => (option?.optionId ?? option?.id) === id).length !== 1)) {
+        return blocked("MISSING_STATUS_EDGE", subject, event);
+      }
+      if (!before.includes(archive.triggerOptionId) && after.includes(archive.triggerOptionId)) return {
+        kind: "final_archive", subject, event, subjectKey: subject.subjectKey,
+        configVersion: subject.configVersion, archive,
+      };
+      // Stage dispatch consumes scalar IDs; shared fields must prove the same edge.
+      if (stages.some(([, stage]) => stage.statusFieldId === archiveFieldId)
+        && (before.length !== 1 || after.length !== 1
+          || before[0] !== event.beforeOptionId || after[0] !== event.afterOptionId)) {
+        return blocked("MISSING_STATUS_EDGE", subject, event);
+      }
     }
   }
   const matching = stages.map(([stageId, stage]) => ({
@@ -145,23 +158,31 @@ export function decideVmWorkflowRecordChange(subject, event) {
   }
   const fieldIds = new Set(matching.map(({ stage }) => stage.statusFieldId));
   const expectedFieldId = matching[0].stage.statusFieldId;
+  const hasPreviousOption = identifier(event.beforeOptionId) && event.beforePresent === true;
+  const hasNoPreviousOption = event.beforeOptionId === null
+    && (event.beforePresent === true || event.beforePresent === false);
   if (fieldIds.size !== 1 || event.fieldId !== expectedFieldId || event.statusFieldId !== expectedFieldId
-    || event.beforePresent !== true || event.afterPresent !== true
+    || event.afterPresent !== true
     || !identifier(event.eventId, EVENT_ID) || !identifier(event.recordId)
-    || !identifier(event.beforeOptionId) || !identifier(event.afterOptionId)) {
+    || (!hasPreviousOption && !hasNoPreviousOption) || !identifier(event.afterOptionId)) {
     return blocked("MISSING_STATUS_EDGE", subject, event);
   }
 
   const options = matching[0].field.options;
-  if (options.filter((option) => option?.optionId === event.beforeOptionId).length !== 1
+  if ((hasPreviousOption && options.filter((option) => option?.optionId === event.beforeOptionId).length !== 1)
     || options.filter((option) => option?.optionId === event.afterOptionId).length !== 1) {
     return blocked("UNKNOWN_STATUS_OPTION", subject, event);
   }
-  if (event.beforeOptionId === event.afterOptionId) {
+  if (hasPreviousOption && event.beforeOptionId === event.afterOptionId) {
     return { kind: "ignored", reason: "already_at_trigger", subject, event };
   }
   const entered = matching.find(({ stage }) => stage.triggerOptionId === event.afterOptionId);
-  const leaving = matching.find(({ stage }) => stage.triggerOptionId === event.beforeOptionId);
+  if (hasNoPreviousOption && entered?.stageId !== "initial") {
+    return blocked("MISSING_STATUS_EDGE", subject, event);
+  }
+  const leaving = hasPreviousOption
+    ? matching.find(({ stage }) => stage.triggerOptionId === event.beforeOptionId)
+    : null;
   if (entered) {
     const common = {
       subject,

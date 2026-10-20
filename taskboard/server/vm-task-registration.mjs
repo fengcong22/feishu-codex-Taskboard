@@ -36,8 +36,10 @@ export function parseVmTaskRegistration(body) {
   if (body.event?.deliverySource === "simulation") throw fail("SIMULATION_VM_TASK_FORBIDDEN");
   shape(body.event, ["eventId", "baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionId", "afterOptionId", "occurredAt"]);
   shape(body.binding, ["subjectKey", "configVersion", "stageId"]);
-  const event = Object.fromEntries(["baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionId", "afterOptionId"]
+  const event = Object.fromEntries(["baseToken", "tableId", "recordId", "statusFieldId", "afterOptionId"]
     .map((key) => [key, id(body.event[key])]));
+  event.beforeOptionId = body.event.beforeOptionId === null && body.binding.stageId === "initial"
+    ? null : id(body.event.beforeOptionId);
   event.eventId = id(body.event.eventId, EVENT_ID);
   if (body.event.occurredAt !== undefined) {
     if (!Number.isSafeInteger(body.event.occurredAt) || body.event.occurredAt < 0) throw fail("VM_REGISTRATION_INVALID", 400);
@@ -87,10 +89,14 @@ function assertSubject(subject, registration) {
       stage.instructionFieldId].every((value) => typeof value === "string" && ID.test(value))) throw fail("VM_WORKFLOW_NOT_READY");
   const status = stageStatusField(subject, binding.stageId);
   const options = status?.options;
+  const previousOptionValid = event.beforeOptionId === null
+    ? binding.stageId === "initial"
+    : event.beforeOptionId !== event.afterOptionId
+      && options?.filter((option) => option?.optionId === event.beforeOptionId).length === 1;
   if (status?.fieldId !== event.statusFieldId || ![3, "3", "single_select"].includes(status?.type)
     || stage.statusFieldId !== event.statusFieldId || stage.triggerOptionId !== event.afterOptionId
-    || event.beforeOptionId === event.afterOptionId || !Array.isArray(options)
-    || [event.beforeOptionId, event.afterOptionId].some((value) => options.filter((option) => option?.optionId === value).length !== 1))
+    || !Array.isArray(options) || !previousOptionValid
+    || options.filter((option) => option?.optionId === event.afterOptionId).length !== 1)
     throw fail("FEISHU_STAGE_BINDING_MISMATCH");
   return stage;
 }

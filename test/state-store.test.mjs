@@ -33,6 +33,33 @@ test("claims an event into a versioned processing record", async () => {
   assert.deepEqual((await store.get(original.eventId)).event.fields, {});
 });
 
+test("claims a phased initial-stage event without a previous status option", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  const initialEvent = {
+    eventId: "evt_initial_without_previous_option",
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    recordId: "rec_demo",
+    fieldId: "fld_status",
+    statusFieldId: "fld_status",
+    beforePresent: false,
+    afterPresent: true,
+    beforeOptionId: null,
+    afterOptionId: "opt_initial",
+    fields: {},
+    fieldValuesById: {},
+  };
+
+  const result = await store.claimEvent(initialEvent, {
+    ownerId: "initial-worker", now: 100, leaseMs: 1_000,
+  });
+
+  assert.equal(result.kind, "claimed");
+  assert.equal(result.record.event.beforePresent, false);
+  assert.equal(result.record.event.beforeOptionId, null);
+  assert.equal(result.record.event.afterOptionId, "opt_initial");
+});
+
 test("persists explicit provenance for current Feishu and simulated deliveries", async () => {
   const filename = await stateFilename();
   const store = new JsonStateStore(filename);

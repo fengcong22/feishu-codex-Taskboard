@@ -785,8 +785,9 @@ function hasEventSnapshot(event) {
   const legacyEdge = typeof event.fieldName === "string" && event.fieldName.trim() !== ""
     && Object.hasOwn(event, "beforeValue") && Object.hasOwn(event, "afterValue");
   const phasedEdge = typeof event.statusFieldId === "string" && event.statusFieldId.trim() !== ""
-    && event.beforePresent === true && event.afterPresent === true
-    && typeof event.beforeOptionId === "string" && event.beforeOptionId.trim() !== ""
+    && event.afterPresent === true
+    && ((event.beforePresent === true && typeof event.beforeOptionId === "string" && event.beforeOptionId.trim() !== "")
+      || ((event.beforePresent === true || event.beforePresent === false) && event.beforeOptionId === null))
     && typeof event.afterOptionId === "string" && event.afterOptionId.trim() !== "";
   if (!legacyEdge && !phasedEdge) return false;
   return Boolean(event.fields && typeof event.fields === "object" && !Array.isArray(event.fields));
