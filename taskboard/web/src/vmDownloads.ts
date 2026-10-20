@@ -1,5 +1,20 @@
 import { ApiError, requestVmDownloads } from "./api";
 
+export const VM_DOWNLOAD_REFRESH_INTERVAL_KEY = "taskboard.vm-status-refresh.v1";
+export const VM_DOWNLOAD_REFRESH_CHANGE_EVENT = "taskboard-vm-download-refresh-change";
+export const VM_DOWNLOAD_REFRESH_INTERVALS = new Set([0, 15_000, 30_000, 60_000, 300_000]);
+
+export function getVmDownloadRefreshInterval(): number {
+  try {
+    const value = window.localStorage.getItem(VM_DOWNLOAD_REFRESH_INTERVAL_KEY);
+    if (value === null) return 30_000;
+    const interval = Number(value);
+    return VM_DOWNLOAD_REFRESH_INTERVALS.has(interval) ? interval : 30_000;
+  } catch {
+    return 30_000;
+  }
+}
+
 export interface VmDownloadSession {
   status: "disconnected" | "connecting" | "connected" | "auth_required" | "unavailable";
   account: { name: string; userId: string } | null;
@@ -101,7 +116,8 @@ export async function loginVmDownloads(signal?: AbortSignal): Promise<{ loginUrl
 }
 export const logoutVmDownloads = (signal?: AbortSignal) => write("/logout", {}, "POST", signal);
 export const enqueueVmDownloads = (input: Omit<VmDownloadSettings, "notificationsEnabled"> & { vmids: string[] }, signal?: AbortSignal) => write<{ jobs: VmDownloadJob[] }>("/jobs", input, "POST", signal);
-export const cleanupVmDownloads = (jobIds: string[], signal?: AbortSignal) => write<{ clearedCount: number }>("/jobs/cleanup", { jobIds }, "POST", signal);
+export const removeVmDownloads = (jobIds: string[], signal?: AbortSignal) => write<{ removedCount: number }>("/jobs/cleanup", { jobIds }, "POST", signal);
+export const removeVmDownload = (id: string, signal?: AbortSignal) => write<{ removed: boolean }>(`/jobs/${encodeURIComponent(id)}/remove`, {}, "POST", signal);
 export const resumeVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/resume`, {}, "POST", signal);
 export const recoverVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/recover`, { confirmRepeatableResource: true }, "POST", signal);
 export const extendVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/extend`, {}, "POST", signal);

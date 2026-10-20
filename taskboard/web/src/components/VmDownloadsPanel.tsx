@@ -2,14 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import {
-  cleanupVmDownloads, enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads,
-  recoverVmDownload, resumeVmDownload, saveVmDownloadSettings,
+  enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads,
+  getVmDownloadRefreshInterval, recoverVmDownload, removeVmDownload, removeVmDownloads, resumeVmDownload, saveVmDownloadSettings,
+  VM_DOWNLOAD_REFRESH_CHANGE_EVENT, VM_DOWNLOAD_REFRESH_INTERVAL_KEY,
   type VmDownloadJob, type VmDownloadSettings, type VmDownloadsSnapshot,
 } from "../vmDownloads";
 
 const EMPTY_SETTINGS: VmDownloadSettings = { outputRoot: "", department: "", reason: "", notificationsEnabled: true };
 const WAIT_EXPIRED = new Set(["VM_APPROVAL_WAIT_EXPIRED", "VM_MEDIA_WAIT_EXPIRED"]);
-const CLEARABLE_STATUSES = new Set(["ready", "rejected", "canceled"]);
+const REMOVABLE_STATUSES = new Set(["ready", "rejected", "canceled", "needs_attention"]);
 const STATUS_LABELS: Record<string, [string, string]> = {
   queued: ["排队中", "Queued"], submitting: ["正在提交申请", "Submitting application"],
   reconciling: ["正在确认申请", "Confirming application"], waiting_approval: ["等待审批", "Awaiting approval"],
@@ -35,6 +36,7 @@ export function VmDownloadsPanel() {
   const [vmidsText, setVmidsText] = useState("");
   const [manualOpen, setManualOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshInterval, setRefreshInterval] = useState(getVmDownloadRefreshInterval);
   const [busy, setBusy] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -65,8 +67,8 @@ export function VmDownloadsPanel() {
       const next = await getVmDownloads(controller.signal);
       if (!mounted.current || controller.signal.aborted || version !== requestVersion.current) return;
       setSnapshot(next);
-      const clearableIds = new Set(next.jobs.filter((job) => CLEARABLE_STATUSES.has(job.status)).map((job) => job.id));
-      setSelectedJobIds((current) => new Set([...current].filter((id) => clearableIds.has(id))));
+      const removableIds = new Set(next.jobs.filter((job) => REMOVABLE_STATUSES.has(job.status)).map((job) => job.id));
+      setSelectedJobIds((current) => new Set([...current].filter((id) => removableIds.has(id))));
       if (!dirty.current) setDraft(next.settings);
       if (next.session.status !== "connecting") { setLoginUrl(null); setPopupBlocked(false); }
       setReadError(null);
@@ -80,14 +82,14 @@ export function VmDownloadsPanel() {
     }
   }, [errorText, text]);
 
-  const clearableJobs = snapshot?.jobs.filter((job) => CLEARABLE_STATUSES.has(job.status)) ?? [];
-  const selectedClearableIds = clearableJobs.filter((job) => selectedJobIds.has(job.id)).map((job) => job.id);
-  const allClearableSelected = clearableJobs.length > 0 && selectedClearableIds.length === clearableJobs.length;
-  const someClearableSelected = selectedClearableIds.length > 0 && !allClearableSelected;
+  const removableJobs = snapshot?.jobs.filter((job) => REMOVABLE_STATUSES.has(job.status)) ?? [];
+  const selectedRemovableIds = removableJobs.filter((job) => selectedJobIds.has(job.id)).map((job) => job.id);
+  const allRemovableSelected = removableJobs.length > 0 && selectedRemovableIds.length === removableJobs.length;
+  const someRemovableSelected = selectedRemovableIds.length > 0 && !allRemovableSelected;
 
   useEffect(() => {
-    if (selectAllRef.current) selectAllRef.current.indeterminate = someClearableSelected;
-  }, [someClearableSelected]);
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someRemovableSelected;
+  }, [someRemovableSelected]);
 
   function selectJob(id: string, checked: boolean) {
     setSelectedJobIds((current) => {
@@ -97,8 +99,8 @@ export function VmDownloadsPanel() {
     });
   }
 
-  function selectAllClearable(checked: boolean) {
-    const ids = clearableJobs.map((job) => job.id);
+  function selectAllRemovable(checked: boolean) {
+    const ids = removableJobs.map((job) => job.id);
     setSelectedJobIds((current) => {
       const next = new Set(current);
       for (const id of ids) { if (checked) next.add(id); else next.delete(id); }
@@ -106,36 +108,62 @@ export function VmDownloadsPanel() {
     });
   }
 
-  function clearSelected() {
-    const ids = selectedClearableIds;
+  function removeSelected() {
+    const ids = selectedRemovableIds;
     if (!ids.length) return;
     const confirmed = window.confirm(text(
-      `确定从下载队列隐藏 ${ids.length} 条已结束记录吗？审批记录、去重信息和下载文件会保留。`,
-      `Hide ${ids.length} settled records from the download queue? Approval history, deduplication records, and downloaded files will be retained.`,
+      `确定从下载队列删除 ${ids.length} 条记录吗？审批记录、任务绑定、素材占用证据和已下载文件仍会保留。`,
+      `Remove ${ids.length} records from the download queue? Approval history, task bindings, resource claims, and downloaded files will remain.`,
     ));
     if (!confirmed) return;
     void action(async (signal) => {
-      const result = await cleanupVmDownloads(ids, signal);
+      const result = await removeVmDownloads(ids, signal);
       setSelectedJobIds((current) => new Set([...current].filter((id) => !ids.includes(id))));
-      setNotice(text(`已清理 ${result.clearedCount} 条记录；审批记录和下载文件仍保留。`, `${result.clearedCount} records cleared from the queue. Approval history and downloaded files remain.`));
+      setNotice(text(`已从队列删除 ${result.removedCount} 条记录；审批及素材证据仍保留。`, `Removed ${result.removedCount} records from the queue. Approval and material evidence remain.`));
+    });
+  }
+
+  function removeJob(jobId: string) {
+    const confirmed = window.confirm(text(
+      "确定从下载队列删除此记录吗？审批记录、任务绑定和素材占用证据仍会保留，不会释放已占用素材。",
+      "Remove this record from the download queue? Approval history, task binding, and resource-claim evidence will remain; claimed resources will not be released.",
+    ));
+    if (!confirmed) return;
+    void action(async (signal) => {
+      await removeVmDownload(jobId, signal);
+      setSelectedJobIds((current) => { const next = new Set(current); next.delete(jobId); return next; });
+      setNotice(text("已从队列删除记录；审批及素材占用证据仍保留。", "Removed the record from the queue. Approval and resource-claim evidence remain."));
     });
   }
 
   useEffect(() => {
     mounted.current = true;
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5_000);
     const onFocus = () => void refresh();
     window.addEventListener("focus", onFocus);
     return () => {
       mounted.current = false;
       ++requestVersion.current;
-      window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
       reading.current?.abort(); reading.current = null;
       writing.current?.abort(); writing.current = null;
     };
   }, [refresh]);
+
+  useEffect(() => {
+    const updateInterval = () => setRefreshInterval(getVmDownloadRefreshInterval());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === VM_DOWNLOAD_REFRESH_INTERVAL_KEY) updateInterval();
+    };
+    window.addEventListener(VM_DOWNLOAD_REFRESH_CHANGE_EVENT, updateInterval);
+    window.addEventListener("storage", onStorage);
+    const timer = refreshInterval > 0 ? window.setInterval(() => void refresh(), refreshInterval) : null;
+    return () => {
+      window.removeEventListener(VM_DOWNLOAD_REFRESH_CHANGE_EVENT, updateInterval);
+      window.removeEventListener("storage", onStorage);
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [refresh, refreshInterval]);
 
   function edit<K extends keyof VmDownloadSettings>(field: K, value: VmDownloadSettings[K]) {
     dirty.current = true;
@@ -246,8 +274,8 @@ export function VmDownloadsPanel() {
     return <li key={job.id} className="vm-downloads-job">
       <div className="vm-downloads-job-heading">
         <label className="vm-downloads-job-select">
-          <input type="checkbox" checked={selectedJobIds.has(job.id)} disabled={busy || !CLEARABLE_STATUSES.has(job.status)}
-            aria-label={text(`选择清理 ${job.vmid}，记录 ${job.id}`, `Select ${job.vmid}, record ${job.id}, for cleanup`)}
+          <input type="checkbox" checked={selectedJobIds.has(job.id)} disabled={busy || !REMOVABLE_STATUSES.has(job.status)}
+            aria-label={text(`选择删除 ${job.vmid}，记录 ${job.id}`, `Select ${job.vmid}, record ${job.id}, for removal`)}
             onChange={(event) => selectJob(job.id, event.target.checked)} />
         </label>
         <code>{job.vmid}</code><span className={`vm-downloads-badge vm-downloads-state-${job.status}`}>{text(label[0], label[1])}</span>
@@ -290,6 +318,9 @@ export function VmDownloadsPanel() {
           if (confirmed) await recoverVmDownload(job.id, signal);
         })}>{text("确认并用当前审批重试", "Confirm and retry with this approval")}</button>}
         {job.status === "dead_letter" && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => { await resumeVmDownload(job.id, signal); })}>{text("重试任务", "Retry job")}</button>}
+      </div>}
+      {REMOVABLE_STATUSES.has(job.status) && <div className="vm-downloads-actions">
+        <button className="button secondary" type="button" disabled={busy} onClick={() => removeJob(job.id)}>{text("从队列删除", "Remove from queue")}</button>
       </div>}
     </li>;
   }
@@ -350,12 +381,12 @@ export function VmDownloadsPanel() {
       <section className="vm-downloads-queue" aria-label={text("下载队列", "Download queue")}>
         <div className="vm-downloads-queue-heading">
           <h4>{text("下载队列", "Download queue")} <span>{snapshot.jobs.length}</span></h4>
-          {clearableJobs.length > 0 && <div className="vm-downloads-queue-tools">
-            <label className="vm-downloads-select-all"><input ref={selectAllRef} type="checkbox" checked={allClearableSelected}
-              disabled={busy} aria-label={text("全选可清理项", "Select all clearable jobs")}
-              onChange={(event) => selectAllClearable(event.target.checked)} />{text("全选可清理项", "Select all clearable")}</label>
-            <button className="button secondary" type="button" disabled={busy || selectedClearableIds.length === 0} onClick={clearSelected}>
-              {text(`清理所选（${selectedClearableIds.length}）`, `Clear selected (${selectedClearableIds.length})`)}
+          {removableJobs.length > 0 && <div className="vm-downloads-queue-tools">
+            <label className="vm-downloads-select-all"><input ref={selectAllRef} type="checkbox" checked={allRemovableSelected}
+              disabled={busy} aria-label={text("全选可删除项", "Select all removable jobs")}
+              onChange={(event) => selectAllRemovable(event.target.checked)} />{text("全选可删除项", "Select all removable")}</label>
+            <button className="button secondary" type="button" disabled={busy || selectedRemovableIds.length === 0} onClick={removeSelected}>
+              {text(`删除所选（${selectedRemovableIds.length}）`, `Remove selected (${selectedRemovableIds.length})`)}
             </button>
           </div>}
         </div>

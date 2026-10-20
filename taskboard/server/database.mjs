@@ -430,8 +430,10 @@ function normalizeFeishuTaskOrigin(value) {
       ? { triggerValue: value.triggerValue.trim() } : {}),
     ...(typeof value.statusFieldId === "string" && value.statusFieldId.trim()
       ? { statusFieldId: value.statusFieldId.trim() } : {}),
-    ...(typeof value.beforeOptionId === "string" && value.beforeOptionId.trim()
-      ? { beforeOptionId: value.beforeOptionId.trim() } : {}),
+    ...(value.stageId === "initial" && value.beforeOptionId === null
+      ? { beforeOptionId: null }
+      : typeof value.beforeOptionId === "string" && value.beforeOptionId.trim()
+        ? { beforeOptionId: value.beforeOptionId.trim() } : {}),
     ...(typeof value.afterOptionId === "string" && value.afterOptionId.trim()
       ? { afterOptionId: value.afterOptionId.trim() } : {}),
     ...(typeof value.stageId === "string" && value.stageId.trim()

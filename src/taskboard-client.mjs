@@ -164,8 +164,10 @@ function validVmRegistration(value) {
   const { event, binding } = value;
   const eventKeys = ["eventId", "baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionId", "afterOptionId"];
   return Object.keys(event).every((key) => eventKeys.includes(key) || key === "occurredAt")
-    && eventKeys.every((key) => validWritebackIdentifier(event[key]))
-    && event.beforeOptionId !== event.afterOptionId
+    && eventKeys.filter((key) => key !== "beforeOptionId").every((key) => validWritebackIdentifier(event[key]))
+    && (event.beforeOptionId === null
+      ? binding.stageId === "initial"
+      : validWritebackIdentifier(event.beforeOptionId) && event.beforeOptionId !== event.afterOptionId)
     && (!Object.hasOwn(event, "occurredAt") || Number.isSafeInteger(event.occurredAt) && event.occurredAt >= 0)
     && Object.keys(binding).length === 3
     && binding.subjectKey === `${event.baseToken}:${event.tableId}`

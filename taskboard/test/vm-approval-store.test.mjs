@@ -76,7 +76,7 @@ test("request deduplication can be scoped to a separate task run", async (t) => 
   assert.equal(store.enqueue(job("manual-replay")).id, first.id);
 });
 
-test("queue cleanup hides only settled jobs and preserves their approval and resource reservation records", async (t) => {
+test("queue removal accepts settled and needs-attention jobs but protects active work", async (t) => {
   let time = 5000;
   const f = await fixture(t);
   const store = f.open({ now: () => time });
@@ -93,25 +93,48 @@ test("queue cleanup hides only settled jobs and preserves their approval and res
   store.save("ready", readyLease.leaseToken, readyLease.job);
   store.claim("leased");
 
-  assert.throws(() => store.hideFromQueue(["ready", "queued"]), code("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE"));
+  assert.throws(() => store.removeFromQueue(["ready", "queued"]), code("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE"));
   assert.equal(store.get("ready").queue_hidden_at, undefined);
-  assert.throws(() => store.hideFromQueue(["leased"]), code("VM_APPROVAL_JOB_BUSY"));
-  assert.throws(() => store.hideFromQueue(["missing"]), code("VM_APPROVAL_JOB_NOT_FOUND"));
+  assert.throws(() => store.removeFromQueue(["leased"]), code("VM_APPROVAL_JOB_BUSY"));
+  assert.throws(() => store.removeFromQueue(["missing"]), code("VM_APPROVAL_JOB_NOT_FOUND"));
 
-  assert.deepEqual(store.hideFromQueue(["ready", "rejected", "canceled"]), ["ready", "rejected", "canceled"]);
-  assert.equal(store.get("ready").queue_hidden_at, time);
+  assert.deepEqual(store.removeFromQueue(["ready", "rejected", "canceled", "attention"]), ["ready", "rejected", "canceled", "attention"]);
+  assert.equal(store.get("ready").queue_removed_at, time);
   assert.equal(store.get("ready").status, "ready");
   assert.equal(store.get("ready").request.vmid, "video-1");
+  assert.equal(store.get("attention").queue_removed_at, time);
 
   const contender = store.enqueue(job("contender", { request_fingerprint: "b".repeat(64), request: { vmid: "video-2" } }));
   const contenderLease = store.claim(contender.id);
   assert.deepEqual(store.reserveResource(contender.id, contenderLease.leaseToken, fingerprint), { job_id: "ready", owned: false });
-  const hiddenLease = store.claim("ready");
-  assert.throws(() => store.restoreQueueItem("ready"), code("VM_APPROVAL_JOB_BUSY"));
-  store.save("ready", hiddenLease.leaseToken, hiddenLease.job);
-  assert.equal(store.restoreQueueItem("ready").id, "ready");
-  assert.equal(store.restoreQueueItem("ready").status, "ready");
+  const removedLease = store.claim("ready");
+  assert.throws(() => store.requeueItem("ready"), code("VM_APPROVAL_JOB_BUSY"));
+  store.save("ready", removedLease.leaseToken, removedLease.job);
+  assert.equal(store.requeueItem("ready").id, "ready");
+  assert.equal(store.requeueItem("ready").status, "ready");
   assert.equal(store.get("ready").queue_hidden_at, undefined);
+});
+
+test("single queue removal preserves needs-attention approval and resource evidence", async (t) => {
+  let time = 5000;
+  const f = await fixture(t);
+  const store = f.open({ now: () => time });
+  store.enqueue(job("attention", { status: "needs_attention", application_id: "application-1" }), { dedupeByRequest: false });
+  const lease = store.claim("attention");
+  const fingerprint = "a".repeat(64);
+  store.reserveResource("attention", lease.leaseToken, fingerprint);
+  assert.throws(() => store.removeFromQueue(["attention"]), code("VM_APPROVAL_JOB_BUSY"));
+  store.save("attention", lease.leaseToken, lease.job);
+
+  assert.deepEqual(store.removeFromQueue(["attention"]), ["attention"]);
+  const removed = store.get("attention");
+  assert.equal(removed.status, "needs_attention");
+  assert.equal(removed.queue_removed_at, time);
+  assert.equal(store.get("attention").request.vmid, "video-1");
+  const contender = store.enqueue(job("contender", { request_fingerprint: "b".repeat(64), application_id: "application-1" }), { dedupeByRequest: false });
+  const contenderLease = store.claim(contender.id);
+  assert.deepEqual(store.reserveResource(contender.id, contenderLease.leaseToken, fingerprint), { job_id: "attention", owned: false });
+  assert.throws(() => store.removeFromQueue(["contender"]), code("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE"));
 });
 
 test("migrates the version-one unique request index without losing queued approvals", async (t) => {

@@ -46,6 +46,22 @@ test("VM registration accepts an explicit review stage on the same authenticated
   assert.equal((await client.registerFeishuVmTask(payload)).feishuOrigin.stageId, "review");
 });
 
+test("VM registration allows an initial stage with no previous status option", async () => {
+  const payload = registration();
+  payload.event.beforeOptionId = null;
+  let sent;
+  const client = new TaskboardClient("http://127.0.0.1:5178", {
+    bridgeSecret: "test-bridge-secret",
+    fetchImplementation: async (_url, options) => {
+      sent = JSON.parse(options.body);
+      return Response.json({ task: task() });
+    },
+  });
+
+  assert.equal((await client.registerFeishuVmTask(payload)).id, "task_vm");
+  assert.equal(sent.event.beforeOptionId, null);
+});
+
 test("VM registration rejects missing credentials before a network request", async () => {
   let requests = 0;
   const client = new TaskboardClient("http://127.0.0.1:5178", { bridgeSecret: null,
@@ -61,6 +77,8 @@ test("VM registration rejects mixed or widened payloads before a network request
   for (const changed of [
     { ...registration(), controlledContext: {} },
     { ...registration(), binding: { ...registration().binding, stageId: "finalArchive" } },
+    { ...registration(), event: { ...registration().event, beforeOptionId: null },
+      binding: { ...registration().binding, stageId: "review" } },
     { ...registration(), event: { ...registration().event, deliverySource: "simulation" } },
     { ...registration(), event: { ...registration().event, command: "ignored" } },
     { ...registration(), event: { ...registration().event, occurredAt: -1 } },

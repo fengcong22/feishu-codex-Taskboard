@@ -80,7 +80,12 @@ beforeEach(() => {
     if (path === `${ROOT}/jobs/cleanup`) {
       const ids = writes.at(-1)!.body.jobIds as string[];
       current.jobs = current.jobs.filter((candidate) => !ids.includes(candidate.id));
-      return response({ clearedCount: ids.length });
+      return response({ removedCount: ids.length });
+    }
+    if (path.endsWith("/remove")) {
+      const id = path.split("/").at(-2);
+      current.jobs = current.jobs.filter((candidate) => candidate.id !== id);
+      return response({ removed: true });
     }
     if (path.endsWith("/recover")) {
       const id = path.split("/").at(-2);
@@ -247,37 +252,56 @@ describe("VM downloads panel", () => {
     expect(screen.queryByRole("button", { name: "延长等待 7 天" })).toBeNull();
   });
 
-  it("selects individual settled jobs, selects all clearable rows, and leaves active rows protected", async () => {
+  it("lets every settled or needs-attention row be deleted while active rows stay protected", async () => {
     current.jobs = [job("ready-1", "ready", undefined, VM1), job("rejected-1", "rejected", undefined, VM2),
       job("canceled-1", "canceled", undefined, "507f1f77bcf86cd799439015"),
       job("queued-1", "queued", undefined, "507f1f77bcf86cd799439013"), job("attention-1", "needs_attention", "VM_API_TIMEOUT", "507f1f77bcf86cd799439014")];
     mount();
     await screen.findByText("已下载");
 
-    const ready = screen.getByRole("checkbox", { name: `选择清理 ${VM1}，记录 ready-1` }) as HTMLInputElement;
-    const rejected = screen.getByRole("checkbox", { name: `选择清理 ${VM2}，记录 rejected-1` }) as HTMLInputElement;
-    const canceled = screen.getByRole("checkbox", { name: "选择清理 507f1f77bcf86cd799439015，记录 canceled-1" }) as HTMLInputElement;
-    const queued = screen.getByRole("checkbox", { name: "选择清理 507f1f77bcf86cd799439013，记录 queued-1" }) as HTMLInputElement;
-    const attention = screen.getByRole("checkbox", { name: "选择清理 507f1f77bcf86cd799439014，记录 attention-1" }) as HTMLInputElement;
+    const ready = screen.getByRole("checkbox", { name: `选择删除 ${VM1}，记录 ready-1` }) as HTMLInputElement;
+    const rejected = screen.getByRole("checkbox", { name: `选择删除 ${VM2}，记录 rejected-1` }) as HTMLInputElement;
+    const canceled = screen.getByRole("checkbox", { name: "选择删除 507f1f77bcf86cd799439015，记录 canceled-1" }) as HTMLInputElement;
+    const queued = screen.getByRole("checkbox", { name: "选择删除 507f1f77bcf86cd799439013，记录 queued-1" }) as HTMLInputElement;
+    const attention = screen.getByRole("checkbox", { name: "选择删除 507f1f77bcf86cd799439014，记录 attention-1" }) as HTMLInputElement;
     expect(queued.disabled).toBe(true);
-    expect(attention.disabled).toBe(true);
+    expect(attention.disabled).toBe(false);
+    expect(screen.getAllByRole("button", { name: "从队列删除" })).toHaveLength(4);
 
     fireEvent.click(ready);
     fireEvent.click(rejected);
-    expect(screen.getByRole("button", { name: "清理所选（2）" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("checkbox", { name: "全选可清理项" }));
+    expect(screen.getByRole("button", { name: "删除所选（2）" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "全选可删除项" }));
     expect(ready.checked).toBe(true);
     expect(rejected.checked).toBe(true);
     expect(canceled.checked).toBe(true);
+    expect(attention.checked).toBe(true);
 
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    fireEvent.click(screen.getByRole("button", { name: "清理所选（3）" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除所选（4）" }));
     await waitFor(() => expect(writes.some(({ path }) => path === `${ROOT}/jobs/cleanup`)).toBe(true));
-    expect(writes.at(-1)).toMatchObject({ method: "POST", path: `${ROOT}/jobs/cleanup`, body: { jobIds: ["ready-1", "rejected-1", "canceled-1"] } });
+    expect(writes.at(-1)).toMatchObject({ method: "POST", path: `${ROOT}/jobs/cleanup`, body: { jobIds: ["ready-1", "rejected-1", "canceled-1", "attention-1"] } });
     expect(confirm).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("VM_API_TIMEOUT")).toBeTruthy();
+    expect(screen.queryByText("VM_API_TIMEOUT")).toBeNull();
     expect(screen.queryByText("已驳回")).toBeNull();
     expect(screen.queryByText("已下载")).toBeNull();
+  });
+
+  it("lets the user remove any needs-attention row directly from the queue", async () => {
+    current.jobs = [job("attention-1", "needs_attention", "VM_API_TIMEOUT")];
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mount();
+    await screen.findByText("VM_API_TIMEOUT");
+
+    fireEvent.click(screen.getByRole("button", { name: "从队列删除" }));
+    expect(writes).toHaveLength(0);
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "从队列删除" }));
+    expect(confirm.mock.calls[0][0]).toContain("素材占用证据仍会保留");
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toMatchObject({ method: "POST", path: `${ROOT}/jobs/attention-1/remove`, body: {} });
+    expect(await screen.findByText("暂无下载任务。" )).toBeTruthy();
+    expect(screen.queryByText(/已隐藏的需处理项/u)).toBeNull();
   });
 
   it("extends expired waits and retries failed work while auth jobs require reconnecting", async () => {
@@ -387,11 +411,12 @@ describe("VM downloads panel", () => {
 
   it("polls for completed background login and stops requests after unmount", async () => {
     vi.useFakeTimers();
+    window.localStorage.setItem("taskboard.vm-status-refresh.v1", "15000");
     const view = mount();
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(screen.getByText("尚未连接")).toBeTruthy();
     current.session = { ...current.session, status: "connected", account: { name: "回调用户", userId: "fixture-user" } };
-    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
     expect(screen.getByText("回调用户")).toBeTruthy();
     view.unmount();
     const requestCount = fetchMock.mock.calls.length;

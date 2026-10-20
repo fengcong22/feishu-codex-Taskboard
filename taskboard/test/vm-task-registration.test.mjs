@@ -202,6 +202,36 @@ test("VM registration creates trusted todo origin and frozen package/PMO context
   assert.match(result.task.title, /化学变化中微粒怎么变/);
 });
 
+test("VM initial registration without a previous option is trusted and idempotent", async (t) => {
+  const f = await fixture(t);
+  const body = registration({ event: { beforeOptionId: null } });
+
+  const first = await f.service.register(body, ACTOR);
+  const replay = await f.service.register(body, ACTOR);
+
+  assert.equal(first.created, true);
+  assert.equal(first.origin.beforeOptionId, null);
+  assert.equal(replay.created, false);
+  assert.equal(replay.task.id, first.task.id);
+  assert.equal(replay.origin.beforeOptionId, null);
+  assert.equal(f.database.listFeishuTasks().length, 1);
+});
+
+test("VM review registration still requires a previous status option", async (t) => {
+  const f = await fixture(t);
+  for (const values of [f.values.active, f.values.frozen]) {
+    values.statusField.options.push({ optionId: "opt_review", name: "待修改" });
+    values.vmWorkflow.stages.review = { enabled: true, statusFieldId: "fld_status",
+      triggerOptionId: "opt_review", instructionFieldId: "fld_review_instruction" };
+  }
+
+  await assert.rejects(() => f.service.register(registration({
+    event: { eventId: "evt_review_no_previous", beforeOptionId: null, afterOptionId: "opt_review" },
+    binding: { stageId: "review" },
+  }), ACTOR), { code: "VM_REGISTRATION_INVALID" });
+  assert.equal(f.database.listFeishuTasks().length, 0);
+});
+
 test("VM registration preserves instruction whitespace and normalizes only identifiers and names", async (t) => {
   const f = await fixture(t);
   f.values.record.vmid = ` ${VMID} `;

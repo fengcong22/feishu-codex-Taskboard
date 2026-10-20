@@ -46,6 +46,7 @@ npm test
 
 ## 事件不变量
 
+- `vm_pmo_review_video` 的 `initial` 阶段允许记录首次创建或首次填写状态时没有有效前选项、当前值直接为已启用触发项的事件登记初稿任务；仅限初稿阶段，`review` 仍要求从另一有效选项进入触发项，启用前已经停在触发项的历史记录不扫描、不补跑。
 - 旧版 `tables` 配置只有从其他值变化到配置的可开始值（当前示例为 `待剪辑`）才创建任务；离开该值时，只归档同一 Base、表、记录和触发字段流程下仍为 Taskboard `todo` 的任务。
 - Taskboard 管理的受控工作流按活动配置中的 `initial`、`first_review`、`final_review` 三个阶段处理；只有从其他 option 进入某个已启用阶段的 option 才创建该阶段任务。离开已启用阶段或进入另一已启用阶段时，只归档上一阶段同一记录仍为 `todo` 的任务；不会把飞书状态直接映射为 Taskboard 的 `in_progress`、`in_review` 或 `done`。
 - 已是 `in_progress`、`in_review`、`done` 或其他非 `todo` 状态的任务不得被 Bridge 自动归档或中止。

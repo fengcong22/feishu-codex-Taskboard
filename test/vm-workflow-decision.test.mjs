@@ -189,6 +189,42 @@ test("leaving the initial trigger yields a todo-only archive intent", () => {
   assert.equal(actual.statusConstraint, "todo");
 });
 
+test("registers an initial stage when the status has no previous option", () => {
+  for (const changed of [
+    { beforePresent: false, beforeOptionId: null },
+    { beforePresent: true, beforeOptionId: null },
+  ]) {
+    const actual = decideVmInitialRecordChange(subject(), event(changed));
+    assert.equal(actual.kind, "register");
+    assert.equal(actual.stageId, "initial");
+  }
+});
+
+test("still requires a previous option when first entering a review stage", () => {
+  const configured = sharedProgressSubject();
+  const actual = decideVmInitialRecordChange(configured, sharedProgressEvent(null, "opt_review", {
+    beforePresent: false,
+    afterOptionId: "opt_review",
+    beforeOptionIds: undefined,
+    afterOptionIds: ["opt_review"],
+  }));
+  assert.equal(actual.kind, "blocked");
+  assert.equal(actual.reasonCode, "MISSING_STATUS_EDGE");
+});
+
+test("shared progress field registers an initial stage without a previous option", () => {
+  const actual = decideVmInitialRecordChange(sharedProgressSubject(), sharedProgressEvent(null, "opt_edit", {
+    beforePresent: false,
+    afterPresent: true,
+    beforeOptionId: null,
+    afterOptionId: "opt_edit",
+    beforeOptionIds: [],
+    afterOptionIds: ["opt_edit"],
+  }));
+  assert.equal(actual.kind, "register");
+  assert.equal(actual.stageId, "initial");
+});
+
 test("does not re-register unchanged or unrelated option edges", () => {
   assert.equal(decideVmInitialRecordChange(subject(), event({ beforeOptionId: "opt_edit" })).kind, "ignored");
   assert.equal(decideVmInitialRecordChange(subject(), event({ afterOptionId: "opt_done" })).kind, "ignored");
@@ -198,7 +234,7 @@ test("does not re-register unchanged or unrelated option edges", () => {
 
 test("blocks an unproven status edge", () => {
   for (const changed of [
-    { beforePresent: false }, { afterPresent: false }, { beforeOptionId: null },
+    { beforePresent: false }, { afterPresent: false },
     { statusFieldId: "fld_other" }, { fieldId: "fld_other" },
   ]) {
     const actual = decideVmInitialRecordChange(subject(), event(changed));

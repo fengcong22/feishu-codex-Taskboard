@@ -92,15 +92,27 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       lastClient = client;
     }
   }
+  function hasActiveWork(jobs) {
+    return jobs.some(job => job.requester_id === lastAccount?.userId
+      && (!TERMINAL.has(job.status) || job.status === "auth_required"));
+  }
+  function queueExpiryReminder(jobs) {
+    if (!settings.notificationsEnabled || !lastAccount) return null;
+    const state = session.snapshot();
+    const remainingMs = state.expiresAt === null ? 0 : state.expiresAt - now();
+    if (hasActiveWork(jobs) && state.status === "connected" && state.expirySource === "token"
+      && remainingMs > 0 && remainingMs <= 30 * 60000) {
+      return metadata.enqueue({ key: `expiry:${lastAccount.userId}:${state.expiresAt}`,
+        kind: "expiring", recipient: lastAccount.email });
+    }
+    return null;
+  }
   function queueNotifications(jobs) {
     if (!settings.notificationsEnabled || !lastAccount) return;
     const state = session.snapshot();
-    const active = jobs.filter(job => job.requester_id === lastAccount.userId && (!TERMINAL.has(job.status) || job.status === "auth_required"));
     const enqueue = (key, kind, vmid) => metadata.enqueue({ key, kind, vmid, recipient: lastAccount.email });
-    if (active.length && ["disconnected", "auth_required"].includes(state.status)) enqueue(`auth:${lastAccount.epoch}`, "auth_required");
-    if (active.length && state.status === "connected" && state.expiresAt !== null && state.expiresAt - now() <= 15 * 60000) {
-      enqueue(`expiry:${lastAccount.userId}:${state.expiresAt}`, "expiring");
-    }
+    if (hasActiveWork(jobs) && ["disconnected", "auth_required"].includes(state.status)) enqueue(`auth:${lastAccount.epoch}`, "auth_required");
+    queueExpiryReminder(jobs);
     for (const job of jobs) {
       if (job.requester_id !== lastAccount.userId) continue;
       if (job.status === "waiting_approval" && Number.isSafeInteger(job.approval_wait_started_at) && now() - job.approval_wait_started_at >= DAY) {
@@ -118,6 +130,10 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     for (let count = 0; count < 10 && !closed && settings.notificationsEnabled; count++) {
       const item = metadata.claim();
       if (!item) break;
+      if (item.kind === "expiring" && item.id !== queueExpiryReminder(store.list())) {
+        metadata.dismiss(item);
+        continue;
+      }
       let success = false;
       try { await notifier.send({ id: item.id, recipient: item.recipient, kind: item.kind, vmid: item.vmid }); success = true; }
       catch { /* Persist only a known error, never an SDK response or request. */ }
@@ -195,7 +211,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     const jobs = requests.map(value => {
       let job = enqueueVmApproval(store, value, { now,
         ...(taskJobId ? { id: taskJobId, dedupeByRequest: false } : {}) });
-      if (job.queue_hidden_at !== undefined) job = store.restoreQueueItem(job.id);
+      if (job.queue_hidden_at !== undefined || job.queue_removed_at !== undefined) job = store.requeueItem(job.id);
       if (identity && !job.requester_id) bind(job.id, identity);
       return publicJob(store.get(job.id));
     });
@@ -240,8 +256,9 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     },
     snapshot() {
       const summary = metadata.summary();
-      return { session: session.snapshot(), settings: structuredClone(settings), jobs: store.list()
-        .filter(job => job.queue_hidden_at === undefined).map(publicJob),
+      const jobs = store.list();
+      return { session: session.snapshot(), settings: structuredClone(settings), jobs: jobs
+        .filter(job => job.queue_removed_at === undefined && (job.queue_hidden_at === undefined || job.status === "needs_attention")).map(publicJob),
         notifications: { ...summary, available: notifier.available() && Boolean(lastAccount) && !summary.errorCode, enabled: settings.notificationsEnabled,
           errorCode: !notifier.available() ? "VM_NOTIFY_NOT_CONFIGURED" : !lastAccount ? "VM_NOTIFY_RECIPIENT_UNAVAILABLE" : summary.errorCode },
         worker: { running: Boolean(running), errorCode: workerError } };
@@ -249,8 +266,9 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     cleanup(jobIds) {
       if (!Array.isArray(jobIds) || jobIds.length < 1 || jobIds.length > MAX_QUEUE_CLEANUP_ITEMS
         || jobIds.some(id => typeof id !== "string") || new Set(jobIds).size !== jobIds.length) fail("VM_DOWNLOAD_INPUT_INVALID");
-      return { clearedCount: store.hideFromQueue(jobIds).length };
+      return { removedCount: store.removeFromQueue(jobIds).length };
     },
+    remove(id) { store.removeFromQueue([id]); return { removed: true }; },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); metadata.write("settings", settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },

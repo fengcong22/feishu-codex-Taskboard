@@ -14,7 +14,8 @@ type RecoverableWorkflowPanelProps = FeishuWorkflowPanelProps & {
   onErrorClear?: (message?: string, context?: string) => void;
 };
 let workflowPanelCallbacks: RecoverableWorkflowPanelProps;
-let packageManagerCallbacks: { onError?: (message: string) => void };
+let packageManagerCallbacks: { onError?: (message: string) => void; vmDownloadsRequest?: number };
+let vmStatusMenuCallbacks: { onOpenQueue: () => void };
 
 vi.mock("./api", async (importOriginal) => ({
   ...await importOriginal<typeof import("./api")>(),
@@ -55,9 +56,16 @@ vi.mock("./storage", () => ({
 // The destination page is unrelated to project selection; navigation, App state,
 // UnifiedWorkflowBoard and TaskCard remain real throughout these regressions.
 vi.mock("./components/FeishuPackageManager", () => ({
-  FeishuPackageManager: (props: { onError?: (message: string) => void }) => {
+  FeishuPackageManager: (props: { onError?: (message: string) => void; vmDownloadsRequest?: number }) => {
     packageManagerCallbacks = props;
     return <div role="region" aria-label="Package manager" />;
+  },
+}));
+
+vi.mock("./components/VmStatusMenu", () => ({
+  VmStatusMenu: (props: { onOpenQueue: () => void }) => {
+    vmStatusMenuCallbacks = props;
+    return <button type="button" aria-label="Open full VM queue" onClick={props.onOpenQueue}>VM status</button>;
   },
 }));
 
@@ -406,6 +414,17 @@ describe("App project navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open local settings" }));
     expect(await screen.findByRole("dialog", { name: "Local settings" })).toBeTruthy();
     await act(async () => {});
+  });
+
+  it("opens the full VM queue directly from the workspace header", async () => {
+    await renderFirstSubject();
+    const header = document.querySelector(".workspace-header") as HTMLElement;
+    fireEvent.click(within(header).getByRole("button", { name: "Open full VM queue" }));
+
+    await waitFor(() => expect(packageManagerCallbacks).toBeTruthy());
+    expect(screen.getByRole("region", { name: "Package manager" })).toBeTruthy();
+    expect(vmStatusMenuCallbacks.onOpenQueue).toBeTypeOf("function");
+    expect(packageManagerCallbacks.vmDownloadsRequest).toBe(1);
   });
 
   it("refreshes after a conflicting update without reporting the attempted change as saved", async () => {
