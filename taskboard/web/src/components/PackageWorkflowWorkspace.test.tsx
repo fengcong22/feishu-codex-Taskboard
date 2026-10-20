@@ -22,15 +22,20 @@ vi.mock("./TaskCard", () => ({
     task,
     onEdit,
     onComplete,
+    actions,
   }: {
     task: Task;
     onEdit: (t: Task) => void;
     onComplete?: unknown;
+    actions?: import("react").ReactNode;
   }) => (
-    <button onClick={() => onEdit(task)}>
-      {task.title}
-      {onComplete ? " manual acceptance" : ""}
-    </button>
+    <article className="task-card">
+      <button onClick={() => onEdit(task)}>
+        {task.title}
+        {onComplete ? " manual acceptance" : ""}
+      </button>
+      {actions}
+    </article>
   ),
 }));
 const subjectKey = "base:table";
@@ -111,7 +116,7 @@ function response(alias = "slicing"): PackageBoardResponse {
     },
   };
 }
-function mount() {
+function mount(actions = { onArchiveTask: vi.fn(), onDeleteTask: vi.fn() }) {
   return render(
     <TaskboardLanguageProvider language="zh">
       <PackageWorkflowWorkspace
@@ -132,6 +137,7 @@ function mount() {
         showCover={false}
         showBody={false}
         onOpenTask={vi.fn()}
+        {...actions}
         onUpdate={vi.fn()}
         onCreateLabel={vi.fn()}
         onOpenConversation={vi.fn()}
@@ -163,11 +169,39 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+it("offers archive and delete for NAS-completed cards and forwards the exact task", async () => {
+  const board = response();
+  board.status.tasks[0].archive = { state: "published", sourceRunId: "run-vm", errorCode: null };
+  vi.mocked(api.getPackageWorkflowBoard).mockResolvedValue(board);
+  const actions = { onArchiveTask: vi.fn(), onDeleteTask: vi.fn() };
+  mount(actions);
+  const completed = await screen.findByRole("region", { name: "已完成" });
+  const archiveButton = within(completed).getByRole("button", { name: "归档任务" });
+  expect(archiveButton.closest(".task-card")).toBeTruthy();
+  fireEvent.click(archiveButton);
+  expect(actions.onArchiveTask).toHaveBeenCalledExactlyOnceWith(tasks[0]);
+  expect(actions.onDeleteTask).not.toHaveBeenCalled();
+  fireEvent.click(within(completed).getByRole("button", { name: "删除任务" }));
+  expect(actions.onDeleteTask).toHaveBeenCalledExactlyOnceWith(tasks[0]);
+});
+
+it("does not offer completed-card cleanup while NAS publication is pending", async () => {
+  const board = response();
+  board.status.tasks[0].archive = { state: "copying", sourceRunId: "run-vm", errorCode: null };
+  vi.mocked(api.getPackageWorkflowBoard).mockResolvedValue(board);
+  mount();
+  await screen.findByText("VM video");
+  expect(screen.queryByRole("button", { name: "归档任务" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "删除任务" })).toBeNull();
+});
+
 it("shows awaiting Feishu review without a manual acceptance action and isolates package switching", async () => {
   mount();
   const review = await screen.findByRole("region", { name: "等待飞书审核" });
   expect(within(review).getByText("VM video")).toBeTruthy();
   expect(screen.queryByText(/manual acceptance/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "归档任务" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "删除任务" })).toBeNull();
   expect(screen.queryByText("ZIP draft")).toBeNull();
   fireEvent.change(screen.getByLabelText("剪辑包流程"), {
     target: { value: "lite" },

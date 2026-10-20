@@ -108,6 +108,19 @@ test("restoring with an enabled package preserves the snapshot and does not sche
   assert.equal(removed.body.error.code, "PACKAGE_IN_USE");
 });
 
+test("restoring an enabled preview-only VM package does not require execution readiness", async (t) => {
+  const { app, store, request, create, archive } = await fixture(t);
+  const archived = await archive(create());
+  const record = await store.get(alias);
+  store.setInline({ [alias]: { ...record, workflowTemplate: { id: "vm_pmo_review_video", version: 1 } } });
+
+  const result = await request(`/api/tasks/${archived.id}/restore`, "POST", { version: archived.version });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.task.archivedAt, null);
+  assert.equal(app.database.getFeishuExecution(archived.id), null);
+});
+
 test("ordinary tasks with copied Feishu markers restore without acquiring trusted origin", async (t) => {
   const { app, store, request, create, archive } = await fixture(t);
   const archived = await archive(create(false));

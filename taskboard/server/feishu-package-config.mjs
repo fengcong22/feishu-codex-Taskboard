@@ -490,7 +490,7 @@ export function createFeishuPackageStore({
 
   // Keep validation and the dependent task mutation in the same queue as
   // remove/disable. A separate get() followed by a restore can race deletion.
-  function withEnabledPackage(alias, operation) {
+  function withEnabledPackageRecord(alias, operation, validateExecutable) {
     return enqueueMutation(async () => {
       const { record } = await current(alias);
       if (!record) {
@@ -499,9 +499,17 @@ export function createFeishuPackageStore({
       if (record.state !== "enabled") {
         throw new PackageConfigError("PACKAGE_DISABLED", "原 Auto-Cut 包尚未启用，无法恢复任务；请先启用原包");
       }
-      await assertExecutablePackageWorkflow(record);
+      if (validateExecutable) await assertExecutablePackageWorkflow(record);
       return operation(clone(record));
     });
+  }
+
+  function withEnabledPackage(alias, operation) {
+    return withEnabledPackageRecord(alias, operation, true);
+  }
+
+  function withEnabledPackageForRestore(alias, operation) {
+    return withEnabledPackageRecord(alias, operation, false);
   }
 
   return {
@@ -516,6 +524,7 @@ export function createFeishuPackageStore({
     disable,
     remove,
     withEnabledPackage,
+    withEnabledPackageForRestore,
     async references(alias) { return clone(await listReferences(packageAlias(alias))); },
     async snapshot(alias) {
       const result = await current(alias);

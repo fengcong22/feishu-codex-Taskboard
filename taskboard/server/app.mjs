@@ -8291,7 +8291,7 @@ export function createTaskboardServer(options = {}) {
           let task;
           try {
             task = origin?.packageAlias
-              ? await feishuPackages.withEnabledPackage(origin.packageAlias, restore)
+              ? await feishuPackages.withEnabledPackageForRestore(origin.packageAlias, restore)
               : restore();
           } catch (error) {
             if (error instanceof PackageConfigError) {

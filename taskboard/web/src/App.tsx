@@ -3932,8 +3932,19 @@ export function App() {
     setActionError(null);
     setDeletingArchivedTaskId(task.id);
     try {
-      await deleteArchivedTaskRequest(task);
-      setArchivedTasks((current) => current.filter((candidate) => candidate.id !== task.id));
+      const archived = task.archivedAt === null
+        ? await archiveTaskRequest(task)
+        : task;
+      if (task.archivedAt === null) {
+        setTasks((current) => current.filter((candidate) => candidate.id !== task.id));
+        setArchivedTasks((current) => sortTasks([
+          ...current.filter((candidate) => candidate.id !== archived.id),
+          archived,
+        ]));
+        setPendingArchivedTaskDelete(archived);
+      }
+      await deleteArchivedTaskRequest(archived);
+      setArchivedTasks((current) => current.filter((candidate) => candidate.id !== archived.id));
       setPendingArchivedTaskDelete(null);
       setAnnouncement(text(
         `${task.identifier} 已永久删除。`,
@@ -5274,6 +5285,8 @@ export function App() {
                 showBody={boardDisplaySettings.body}
                 onOpenTask={openTaskDetail}
                 onUpdate={updateTaskProperties}
+                onArchiveTask={(task) => void archiveTask(task)}
+                onDeleteTask={requestArchivedTaskDelete}
                 onCreateLabel={persistProjectLabel}
                 onOpenConversation={openTaskConversation}
                 onScopeChange={setPackageBoardScope}

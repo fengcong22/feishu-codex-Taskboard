@@ -28,6 +28,7 @@ import type {
 } from "../taskConversations";
 import { TaskCard } from "./TaskCard";
 import { PackageWorkflowControls } from "./PackageWorkflowControls";
+import { ArchiveIcon, DeleteIcon } from "./SemanticIcons";
 import {
   matchesTaskFilters,
   matchesTaskSearch,
@@ -73,6 +74,8 @@ type Props = {
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onCreateLabel: (label: string) => Promise<void>;
   onOpenConversation: (conversation: TaskConversationItem) => void;
+  onArchiveTask: (task: Task) => void;
+  onDeleteTask: (task: Task) => void;
   onScopeChange?: (scope: PackageBoardScope | null) => void;
   renderZipBoard: (scope: {
     tasks: Task[];
@@ -419,6 +422,27 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
                             onDragStart={() => {}}
                             onDragEnd={() => {}}
                             onOpenConversation={props.onOpenConversation}
+                            actions={stage === "completed" ? (
+                              <div className="package-workflow-card-actions">
+                                <button
+                                  type="button"
+                                  aria-label={text("归档任务", "Archive task")}
+                                  title={text("归档任务", "Archive task")}
+                                  onClick={() => props.onArchiveTask(item.task)}
+                                >
+                                  <ArchiveIcon />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="is-danger"
+                                  aria-label={text("删除任务", "Delete task")}
+                                  title={text("删除任务", "Delete task")}
+                                  onClick={() => props.onDeleteTask(item.task)}
+                                >
+                                  <DeleteIcon />
+                                </button>
+                              </div>
+                            ) : null}
                           />
                           <div className="package-workflow-card-evidence">
                             {item.evidence?.approvalStatus &&

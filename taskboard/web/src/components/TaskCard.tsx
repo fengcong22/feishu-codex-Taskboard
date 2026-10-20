@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
@@ -52,6 +52,7 @@ interface TaskCardProps {
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete?: (task: Task) => Promise<void>;
+  actions?: ReactNode;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -441,6 +442,7 @@ export function TaskCard({
   onEdit,
   onUpdate,
   onComplete,
+  actions,
   onContextMenu,
   onDragStart,
   onDragEnd,
@@ -484,7 +486,7 @@ export function TaskCard({
 
   return (
     <article
-      className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
+      className={`task-card task-card-${variant} status-${task.status}${actions ? " has-package-actions" : ""}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
       style={{
         viewTransitionName: task.status === "in_review" ? `review-task-${task.id}` : "none",
         ...(dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : {}),
@@ -640,6 +642,7 @@ export function TaskCard({
           />
         </>
       )}
+      {actions}
     </article>
   );
 }

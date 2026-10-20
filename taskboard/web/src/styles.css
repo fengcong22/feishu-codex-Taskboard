@@ -13988,6 +13988,14 @@ kbd {
 .package-workflow-error { padding: 10px; color: var(--text-primary); }
 .package-workflow-error button { margin-left: 8px; }
 .package-workflow-card-evidence { display: flex; flex-direction: column; gap: 4px; padding: 4px 8px 8px; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.task-card.has-package-actions > .package-workflow-card-actions { position: absolute; right: 5px; bottom: 5px; z-index: 4; display: flex; gap: 3px; padding: 2px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-raised); box-shadow: var(--card-shadow); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 100ms ease; }
+.task-card.has-package-actions:hover > .package-workflow-card-actions, .task-card.has-package-actions:focus-within > .package-workflow-card-actions { opacity: 1; visibility: visible; pointer-events: auto; }
+.package-workflow-card-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-secondary); cursor: pointer; }
+.package-workflow-card-actions button:hover { background: var(--surface-hover); color: var(--text-primary); }
+.package-workflow-card-actions button.is-danger:hover { color: var(--danger); }
+@media (hover: none), (pointer: coarse) {
+  .task-card.has-package-actions > .package-workflow-card-actions { opacity: 1; visibility: visible; pointer-events: auto; }
+}
 .package-workflow-history { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 10px; max-height: 140px; overflow: auto; }
 .package-workflow-workspace .unified-workflow-column-header h2 { margin: 0; font-size: 12px; }
 

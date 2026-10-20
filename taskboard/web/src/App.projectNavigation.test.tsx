@@ -28,7 +28,10 @@ vi.mock("./api", async (importOriginal) => ({
   getJiraConnection: vi.fn(),
   listTasks: vi.fn(),
   listArchivedTasks: vi.fn(),
+  archiveTask: vi.fn(),
   deleteArchivedTask: vi.fn(),
+  listFeishuPackages: vi.fn(),
+  getPackageWorkflowBoard: vi.fn(),
   listArtifactUploads: vi.fn(),
   listTaskArtifactSummaries: vi.fn(),
   getWorkflowWorkspace: vi.fn(),
@@ -195,6 +198,36 @@ function task(entry: FeishuSubjectConfig): Task {
 const FIRST_TASK = task(FIRST_SUBJECT);
 const SECOND_TASK = task(SECOND_SUBJECT);
 
+function completedVmTask() {
+  const template = { id: "vm_pmo_review_video", version: 1 } as const;
+  const completed = {
+    ...FIRST_TASK,
+    status: "in_review",
+    feishuOrigin: { ...FIRST_TASK.feishuOrigin!, packageAlias: "slicing" },
+    feishuPackageSnapshot: { workflowTemplate: template },
+  } as Task;
+  vi.mocked(api.listTasks).mockResolvedValue([completed]);
+  vi.mocked(api.listFeishuPackages).mockResolvedValue([
+    { alias: "slicing", name: "Auto-cut-slicing", workflowTemplate: template },
+  ] as Awaited<ReturnType<typeof api.listFeishuPackages>>);
+  vi.mocked(api.getPackageWorkflowBoard).mockResolvedValue({
+    settings: {
+      subjectKey: FIRST_SUBJECT.subjectKey, packageAlias: "slicing", workflowTemplate: template,
+      revision: 1, activeViewId: "all", defaultViewId: "all", stageDisplays: [],
+      views: [{ id: "all", name: "All stages", isSystem: true, stageIds: ["completed"] }],
+    },
+    status: {
+      subjectKey: FIRST_SUBJECT.subjectKey, packageAlias: "slicing",
+      tasks: [{
+        taskId: completed.id, runId: "vm-run", state: "completed", approvalStatus: "ready",
+        errorCode: null, updatedAt: NOW, writeback: { processing: null, completed: null },
+        archive: { state: "published", sourceRunId: "vm-run", errorCode: null },
+      }],
+    },
+  });
+  return completed;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
@@ -265,6 +298,7 @@ describe("App project navigation", () => {
       [FIRST_TASK, SECOND_TASK].filter((entry) => entry.projectId === projectId)
     ));
     vi.mocked(api.listArchivedTasks).mockResolvedValue([]);
+    vi.mocked(api.listFeishuPackages).mockResolvedValue([]);
     vi.mocked(api.listArtifactUploads).mockResolvedValue([]);
     vi.mocked(api.listTaskArtifactSummaries).mockResolvedValue([]);
     vi.mocked(api.getWorkflowWorkspace).mockImplementation(async (projectId) => ({
@@ -762,6 +796,62 @@ describe("App project navigation", () => {
     expect(await within(dialog).findByText(message)).toBeTruthy();
     expect(screen.getByText(archived.title)).toBeTruthy();
     expect(api.deleteArchivedTask).toHaveBeenCalledWith(archived);
+  });
+
+  it("archives a completed VM card and restores it with undo", async () => {
+    const completed = completedVmTask();
+    const archived = { ...completed, archivedAt: NOW, version: 2 };
+    vi.mocked(api.archiveTask).mockResolvedValue(archived);
+    const restore = vi.spyOn(api, "restoreTask").mockResolvedValue({ ...completed, version: 3 });
+    await renderFirstSubject();
+    fireEvent.click(await screen.findByRole("button", { name: "Archive task" }));
+    await waitFor(() => expect(screen.queryByText(completed.title)).toBeNull());
+    expect(api.archiveTask).toHaveBeenCalledExactlyOnceWith(completed);
+    fireEvent.click(screen.getByRole("button", { name: /Undo/ }));
+    expect(await screen.findByText(completed.title)).toBeTruthy();
+    expect(restore).toHaveBeenCalledWith(archived);
+    restore.mockRestore();
+  });
+
+  it("confirms completed VM deletion before archiving and deletes with the returned version", async () => {
+    const completed = completedVmTask();
+    const archived = { ...completed, archivedAt: NOW, version: 2 };
+    vi.mocked(api.archiveTask).mockResolvedValue(archived);
+    vi.mocked(api.deleteArchivedTask).mockResolvedValue(undefined);
+    await renderFirstSubject();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete task" }));
+    expect(api.archiveTask).not.toHaveBeenCalled();
+    expect(api.deleteArchivedTask).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
+    expect(screen.getByText(completed.title)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete permanently" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(api.archiveTask).toHaveBeenCalledExactlyOnceWith(completed);
+    expect(api.deleteArchivedTask).toHaveBeenCalledExactlyOnceWith(archived);
+    expect(screen.queryByText(completed.title)).toBeNull();
+  });
+
+  it("keeps the archived version after a completed-card delete fails so retry skips archiving", async () => {
+    const completed = completedVmTask();
+    const archived = { ...completed, archivedAt: NOW, version: 2 };
+    vi.mocked(api.archiveTask).mockResolvedValue(archived);
+    vi.mocked(api.deleteArchivedTask).mockRejectedValueOnce(new api.ApiError(409, {
+      error: { code: "TASK_EXECUTION_ACTIVE", message: "Execution active" },
+    })).mockResolvedValueOnce(undefined);
+    vi.mocked(api.listTasks).mockImplementation(async () =>
+      vi.mocked(api.archiveTask).mock.calls.length ? [] : [completed]);
+    vi.mocked(api.listArchivedTasks).mockImplementation(async () =>
+      vi.mocked(api.archiveTask).mock.calls.length ? [archived] : []);
+    await renderFirstSubject();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete task" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete permanently" }));
+    await within(screen.getByRole("alertdialog")).findByText(/pending or running execution/);
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete permanently" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(api.archiveTask).toHaveBeenCalledOnce();
+    expect(api.deleteArchivedTask).toHaveBeenNthCalledWith(1, archived);
+    expect(api.deleteArchivedTask).toHaveBeenNthCalledWith(2, archived);
   });
 
   it("deletes an archived Feishu card only after confirmation", async () => {
