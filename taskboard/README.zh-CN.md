@@ -22,7 +22,7 @@ npm start
 
 打开 <http://127.0.0.1:47823>。SQLite 数据库存储在 `.data/taskboard.sqlite`。
 
-飞书 Bridge 接入的 `vm_pmo_review_video` 包使用独立初稿流程：状态变化登记受控任务，等待正常 VM 下载审批，通过 `plan/render` 生成唯一 MP4，再上传并读回 PMO 附件后完成阶段。启用要求本机 Python、包白名单、自动剪辑开关及完整的 initial-only 学科配置；审核修改和 NAS 归档暂未开放。保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。
+飞书 Bridge 接入的 `vm_pmo_review_video` 包包含独立的初稿与审核修改流程：初稿通过正常 VM 审批队列获取源视频，审核修改复用 Taskboard 已确认交付的上一轮 MP4。每轮通过 `plan/render` 生成唯一 MP4，上传并读回 PMO 附件后完成阶段。可选的最终归档 worker 会校验 SHA 并以无覆盖方式发布成片。启用要求本机 Python、包白名单、自动剪辑开关及完整学科配置；保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。
 
 如需在前端实时重载模式下开发：
 
