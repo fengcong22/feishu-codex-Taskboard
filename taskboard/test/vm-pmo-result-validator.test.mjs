@@ -7,7 +7,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 
-import { validateVmPmoInput, validateVmPmoPlan, validateVmPmoRender } from "../server/vm-pmo-result-validator.mjs";
+import * as validators from "../server/vm-pmo-result-validator.mjs";
+const { validateVmPmoInput, validateVmPmoPlan, validateVmPmoRender } = validators;
 
 const runCommand = promisify(execFile);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -104,6 +105,21 @@ test("accepts a bound single ordered-segment plan", async (t) => {
   const validated = await validateVmPmoPlan({ contextPath: current.contextPath });
   assert.equal(validated.planSha256, current.planSha256);
   assert.equal(validated.plan.expected_duration_ms, 1000);
+});
+
+test("delivered input snapshots retain frozen identity after original media cleanup", async t => {
+  const current = await fixture(t);
+  const expectedBound = await validateVmPmoInput({contextPath: current.contextPath});
+  await rm(current.paths.source);
+  const frozen = await validators.validateVmPmoInputSnapshot({contextPath: current.contextPath,expectedBound});
+  assert.deepEqual(frozen.input,expectedBound.input);
+  await assert.rejects(validateVmPmoInput({contextPath: current.contextPath,expectedBound}));
+  await assert.rejects(validators.validateVmPmoInputSnapshot({contextPath: current.contextPath}),
+    {code:"RUN_BINDING_MISMATCH"});
+  const rebound = {...current.input,binding:{...current.input.binding,task_id:"different-task"}};
+  await replaceInput(current,rebound);
+  await assert.rejects(validators.validateVmPmoInputSnapshot({contextPath: current.contextPath,expectedBound}),
+    {code:"RUN_BINDING_MISMATCH"});
 });
 
 test("validates a v2 initial plan with source-bound semantic operations", async (t) => {

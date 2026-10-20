@@ -163,6 +163,9 @@ const app = createBridgeServer({
     packages: Object.keys(packageCatalog),
   },
   handleEvent: (event) => bridge.handle(event),
+  retryFinalArchiveDeadLetter: (eventId, expectedSource) => (
+    bridge.retryFinalArchiveDeadLetter(eventId, expectedSource)
+  ),
   simulationEnabled: async () => listenerEnabled === false
     && (await taskboard.getAutomaticExecutionEnabled()) === false,
   workflowStore: workflowRuntime,

@@ -74,6 +74,9 @@ async function start(handler, getHealth, baseMetadataReader, workflowStore, opti
     ...(Object.hasOwn(options, "bridgeSecret")
       ? { bridgeSecret: options.bridgeSecret }
       : {}),
+    ...(Object.hasOwn(options, "retryFinalArchiveDeadLetter")
+      ? { retryFinalArchiveDeadLetter: options.retryFinalArchiveDeadLetter }
+      : {}),
   });
   const address = await app.listen();
   return {
@@ -842,4 +845,75 @@ test("sanitizes unexpected simulation failures", async (t) => {
   assert.deepEqual(body, {
     error: { code: "BRIDGE_FAILURE", message: "Bridge request failed" },
   });
+});
+
+test("manual VM archive recovery is a loopback local-operator action with exact fields", async (t) => {
+  const requests = [];
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    retryFinalArchiveDeadLetter: async (eventId, expectedSource) => {
+      requests.push({ eventId, expectedSource });
+      return { eventId, deliveryState: "retry_wait", attempts: 0 };
+    },
+  });
+  t.after(app.close);
+  const endpoint = `${app.url}/api/local/bridge/vm/final-archive-dead-letter/retry`;
+  const source = { runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1",
+    sha256: "a".repeat(64), bytes: 20_368_266 };
+  const denied = await localRequest(endpoint, { method: "POST", headers: TASKBOARD_WRITE_HEADERS,
+    body: JSON.stringify({ eventId: "evt_archive", expectedSource: source }) });
+  assert.equal(denied.status, 403);
+  const accepted = await localRequest(endpoint, { method: "POST", headers: SIMULATION_WRITE_HEADERS,
+    body: JSON.stringify({ eventId: "evt_archive", expectedSource: source }) });
+  assert.equal(accepted.status, 202);
+  assert.deepEqual(await accepted.json(), { eventId: "evt_archive", deliveryState: "retry_wait", attempts: 0 });
+  assert.deepEqual(requests, [{ eventId: "evt_archive", expectedSource: source }]);
+
+  const extraPath = await localRequest(endpoint, { method: "POST", headers: SIMULATION_WRITE_HEADERS,
+    body: JSON.stringify({ eventId: "evt_archive", expectedSource: source, destinationPath: "Z:\\untrusted" }) });
+  assert.equal(extraPath.status, 400);
+  assert.equal((await extraPath.json()).error.code, "INVALID_FINAL_ARCHIVE_RECOVERY_REQUEST");
+  assert.equal(requests.length, 1);
+});
+
+test("manual VM archive recovery rejects cross-site, malformed and unauthenticated local writes", async (t) => {
+  let calls = 0;
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    retryFinalArchiveDeadLetter: async () => { calls += 1; assert.fail("invalid recovery reached handler"); },
+  });
+  t.after(app.close);
+  const endpoint = `${app.url}/api/local/bridge/vm/final-archive-dead-letter/retry`;
+  const body = JSON.stringify({ eventId: "evt_archive", expectedSource: {
+    runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1", sha256: "a".repeat(64), bytes: 42,
+  } });
+  for (const [headers, status] of [
+    [{ ...SIMULATION_WRITE_HEADERS, host: "example.com" }, 403],
+    [{ ...SIMULATION_WRITE_HEADERS, origin: "https://example.com" }, 403],
+    [{ ...SIMULATION_WRITE_HEADERS, "content-type": "text/plain" }, 415],
+    [{ "content-type": "application/json" }, 403],
+  ]) {
+    assert.equal((await localRequest(endpoint, { method: "POST", headers, body })).status, status);
+  }
+  assert.equal((await localRequest(endpoint, { method: "GET" })).status, 405);
+  assert.equal((await localRequest(endpoint, { method: "POST", headers: SIMULATION_WRITE_HEADERS,
+    body: body.replace('"bytes":42', '"bytes":0') })).status, 400);
+  assert.equal(calls, 0);
+});
+
+test("manual VM archive recovery exposes only safe recovery failure codes", async (t) => {
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    retryFinalArchiveDeadLetter: async () => {
+      throw Object.assign(new Error("private source detail"), { code: "FINAL_ARCHIVE_RECOVERY_CONFLICT", status: 409 });
+    },
+  });
+  t.after(app.close);
+  const result = await localRequest(`${app.url}/api/local/bridge/vm/final-archive-dead-letter/retry`, {
+    method: "POST", headers: SIMULATION_WRITE_HEADERS,
+    body: JSON.stringify({ eventId: "evt_archive", expectedSource: {
+      runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1", sha256: "a".repeat(64), bytes: 42,
+    } }),
+  });
+  assert.equal(result.status, 409);
+  assert.deepEqual(await result.json(), { error: {
+    code: "FINAL_ARCHIVE_RECOVERY_CONFLICT", message: "Bridge request failed",
+  } });
 });

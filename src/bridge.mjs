@@ -723,6 +723,9 @@ export function createBridge({
           ...(event.eventOccurredAtPresent ? { occurredAt: event.eventOccurredAt } : {}),
         },
         binding: { subjectKey: decision.subjectKey, configVersion: decision.configVersion },
+        ...(record.archiveRecoverySource
+          ? { expectedSource: structuredClone(record.archiveRecoverySource) }
+          : {}),
       }, { bridgeSecret });
       return completePhased(record, "final_archive", {
         kind: "final_archive", archiveJobId: job.id, archiveState: job.state,
@@ -1093,6 +1096,21 @@ export function createBridge({
       const active = inFlight.get(event.eventId);
       if (active) return active.then((outcome) => ({ ...outcome, duplicate: true }));
       return trackDelivery(event.eventId, () => processEvent(event));
+    },
+
+    async retryFinalArchiveDeadLetter(eventId, expectedSource) {
+      if (inFlight.has(eventId)) {
+        throw Object.assign(new Error("final archive event is currently processing"), {
+          code: "FINAL_ARCHIVE_RECOVERY_BUSY",
+          status: 409,
+        });
+      }
+      const record = await store.retryFinalArchiveDeadLetter(eventId, expectedSource, { now });
+      return {
+        eventId: record.eventId,
+        deliveryState: record.deliveryState,
+        attempts: record.attempts,
+      };
     },
 
     recover() {

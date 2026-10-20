@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
+import * as archiveModule from "../server/vm-pmo-final-archive.mjs";
 
 const record = { baseToken: "bas_test", tableId: "tbl_test", recordId: "rec_test" };
 const event = { eventId: "evt_archive_1", subjectKey: "bas_test:tbl_test", configVersion: 3, record,
@@ -117,6 +118,98 @@ test("final archive requests reject caller-supplied local paths and malformed st
   await assert.rejects(service.enqueue({...event,statusEdge: {...event.statusEdge,afterOptionIds: []}}),
     {code: "VM_ARCHIVE_REQUEST_INVALID"});
   assert.equal(await service.get(event.eventId),null);
+});
+
+test("mapped archive directories must resolve to the frozen UNC destination", async () => {
+  const plan = {destinationDirectory:"Z:\\lessons\\final",filename:"lesson.mp4",
+    canonicalLocationKey:"\\\\nas\\approved\\lessons\\final\\lesson.mp4"};
+  const options = {platform:"win32",inspect:async () => ({isDirectory:()=>true,isSymbolicLink:()=>false}),
+    resolve:async () => "\\\\NAS\\approved\\lessons\\final"};
+  assert.equal(await archiveModule.resolveVmArchiveDirectory(plan,options),"\\\\NAS\\approved\\lessons\\final");
+  await assert.rejects(archiveModule.resolveVmArchiveDirectory(plan,{...options,
+    resolve:async () => "\\\\nas\\different\\lessons\\final"}),{code:"VM_ARCHIVE_DIRECTORY_INVALID"});
+  await assert.rejects(archiveModule.resolveVmArchiveDirectory(plan,{...options,
+    resolve:async () => plan.destinationDirectory}),{code:"VM_ARCHIVE_DIRECTORY_INVALID"});
+  await assert.rejects(archiveModule.resolveVmArchiveDirectory(plan,{...options,
+    inspect:async () => ({isDirectory:()=>true,isSymbolicLink:()=>true})}),{code:"VM_ARCHIVE_DIRECTORY_INVALID"});
+});
+
+test("explicit directory recovery retains the frozen plan and rejects other conflicts", async t => {
+  const f=await fixture(t);
+  const service=await f.load();
+  await service.enqueue(event);
+  // Persist a historical pre-copy directory compatibility failure.
+  f.database.database.prepare("UPDATE vm_final_archive_jobs SET state='conflict',error_code='VM_ARCHIVE_DIRECTORY_INVALID' WHERE event_id=?")
+    .run(event.eventId);
+  const expectedSource=Object.fromEntries(["runId","deliveryId","artifactId","sha256","bytes"].map(k=>[k,f.plan().source[k]]));
+  await assert.rejects(service.retryDirectoryConflict({...event,expectedSource:{...expectedSource,sha256:"f".repeat(64)}}),
+    {code:"VM_ARCHIVE_SOURCE_SUPERSEDED"});
+  const restarted=await f.load({resolveArchivePlan:async () => assert.fail("must retain frozen destination and source")});
+  assert.equal((await restarted.retryDirectoryConflict({...event,expectedSource})).state,"pending");
+  assert.equal((await restarted.processNext()).state,"published");
+  assert.equal((await restarted.retryDirectoryConflict({...event,expectedSource})).state,"published");
+  const audit=f.database.database.prepare("SELECT error_code,plan_sha256 FROM vm_final_archive_recoveries").all();
+  assert.equal(audit.length,1);
+  assert.equal(audit[0].error_code,"VM_ARCHIVE_DIRECTORY_INVALID");
+  assert.match(audit[0].plan_sha256,/^[a-f0-9]{64}$/u);
+  f.database.database.prepare("UPDATE vm_final_archive_jobs SET state='conflict',error_code='VM_ARCHIVE_DESTINATION_CONFLICT' WHERE event_id=?")
+    .run(event.eventId);
+  await assert.rejects(restarted.retryDirectoryConflict({...event,expectedSource}),{code:"VM_ARCHIVE_RECOVERY_NOT_ALLOWED"});
+});
+
+test("directory recovery cannot bypass a changed source or latest-round validation",async t=>{
+  const f=await fixture(t);
+  const service=await f.load();await service.enqueue(event);
+  f.database.database.prepare("UPDATE vm_final_archive_jobs SET state='conflict',error_code='VM_ARCHIVE_DIRECTORY_INVALID' WHERE event_id=?")
+    .run(event.eventId);
+  const expectedSource=Object.fromEntries(["runId","deliveryId","artifactId","sha256","bytes"].map(k=>[k,f.plan().source[k]]));
+  await assert.rejects(service.retryDirectoryConflict(event),{code:"VM_ARCHIVE_RECOVERY_NOT_ALLOWED"});
+  const invalid=await f.load({validateArchiveSource:async()=>{throw Object.assign(new Error("changed"),{code:"VM_ARCHIVE_SOURCE_SUPERSEDED"});}});
+  await assert.rejects(invalid.retryDirectoryConflict({...event,expectedSource}),{code:"VM_ARCHIVE_SOURCE_SUPERSEDED"});
+  await writeFile(f.sourcePath,"tampered");
+  await assert.rejects(service.retryDirectoryConflict({...event,expectedSource}),{code:"VM_ARCHIVE_SOURCE_CHANGED"});
+  assert.equal(service.get(event.eventId).state,"conflict");
+  assert.equal(f.database.database.prepare("SELECT COUNT(*) AS n FROM vm_final_archive_recoveries").get().n,0);
+});
+
+test("manual recovery binds a new archive job to the verified source identity", async (t) => {
+  const f = await fixture(t);
+  const plan = f.plan();
+  const expectedSource = {
+    runId: plan.source.runId,
+    deliveryId: plan.source.deliveryId,
+    artifactId: plan.source.artifactId,
+    sha256: plan.source.sha256,
+    bytes: plan.source.bytes,
+  };
+  const service = await f.load();
+
+  await assert.rejects(service.enqueue({ ...event, expectedSource: { ...expectedSource, runId: "run_other" } }),
+    { code: "VM_ARCHIVE_SOURCE_SUPERSEDED" });
+  assert.equal(await service.get(event.eventId), null);
+
+  const job = await service.enqueue({ ...event, expectedSource });
+  assert.equal(job.state, "pending");
+  const replay = await service.enqueue({ ...event, expectedSource });
+  assert.equal(replay.id, job.id);
+  assert.equal((await service.processNext()).state, "published");
+});
+
+test("manual recovery checks a frozen existing job without resolving a newer source", async (t) => {
+  const f = await fixture(t);
+  const expectedSource = {
+    runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1",
+    sha256: digest(await readFile(f.sourcePath)), bytes: Buffer.byteLength("verified mp4 bytes"),
+  };
+  const first = await f.load();
+  const accepted = await first.enqueue(event);
+  const restarted = await f.load({ resolveArchivePlan: async () => {
+    assert.fail("recovery must retain the archive job's frozen plan");
+  } });
+
+  assert.equal((await restarted.enqueue({ ...event, expectedSource })).id, accepted.id);
+  await assert.rejects(restarted.enqueue({ ...event, expectedSource: { ...expectedSource, sha256: "f".repeat(64) } }),
+    { code: "VM_ARCHIVE_SOURCE_SUPERSEDED" });
 });
 
 test("final archive never switches its frozen source and rejects a superseded round before publication", async (t) => {

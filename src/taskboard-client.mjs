@@ -175,10 +175,21 @@ function validVmRegistration(value) {
 }
 
 function validVmFinalArchiveRegistration(value) {
-  if (!objectPayload(value) || Object.keys(value).length !== 2
+  if (!objectPayload(value) || Object.keys(value).some((key) => !["event", "binding", "expectedSource"].includes(key))
     || !objectPayload(value.event) || !objectPayload(value.binding)) return false;
   const { event, binding } = value;
   const eventKeys = ["eventId", "baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionIds", "afterOptionIds"];
+  const source = value.expectedSource;
+  const sourceValid = source === undefined || (
+    objectPayload(source)
+    && Object.keys(source).length === 5
+    && Object.keys(source).every((key) => ["runId", "deliveryId", "artifactId", "sha256", "bytes"].includes(key))
+    && [source.runId, source.deliveryId, source.artifactId].every((entry) => (
+      typeof entry === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(entry)
+    ))
+    && typeof source.sha256 === "string" && /^[a-f0-9]{64}$/u.test(source.sha256)
+    && Number.isSafeInteger(source.bytes) && source.bytes > 0
+  );
   return Object.keys(event).every((key) => eventKeys.includes(key) || key === "occurredAt")
     && eventKeys.slice(0, 5).every((key) => validWritebackIdentifier(event[key]))
     && [event.beforeOptionIds, event.afterOptionIds].every((ids) => Array.isArray(ids)
@@ -186,7 +197,8 @@ function validVmFinalArchiveRegistration(value) {
     && JSON.stringify(event.beforeOptionIds) !== JSON.stringify(event.afterOptionIds)
     && (!Object.hasOwn(event, "occurredAt") || Number.isSafeInteger(event.occurredAt) && event.occurredAt >= 0)
     && Object.keys(binding).length === 2
-    && binding.subjectKey === `${event.baseToken}:${event.tableId}` && validVersion(binding.configVersion);
+    && binding.subjectKey === `${event.baseToken}:${event.tableId}` && validVersion(binding.configVersion)
+    && sourceValid;
 }
 
 function validVmFinalArchiveJob(value, expected) {
@@ -220,7 +232,7 @@ export class TaskboardClient {
     this.bridgeSecret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : null;
   }
 
-  async #request(pathname, { method = "POST", body, headers = {} } = {}) {
+  async #request(pathname, { method = "POST", body, headers = {}, timeoutMs = this.timeoutMs } = {}) {
     let response;
     try {
       const requestHeaders = { ...headers };
@@ -230,7 +242,7 @@ export class TaskboardClient {
       const options = {
         method,
         headers: requestHeaders,
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       };
       if (body !== undefined) {
         options.headers["content-type"] = "application/json";
@@ -367,6 +379,9 @@ export class TaskboardClient {
     });
     const response = await this.#request(pathname, {
       body: payload,
+      // Live field/record reads and verified media checks exceed the short local
+      // task API budget. Retries retain the same persisted event identity.
+      timeoutMs: Math.max(this.timeoutMs,30_000),
       headers: { "x-taskboard-client": "feishu-bridge", "x-feishu-bridge-secret": secret },
     });
     if (!validVmFinalArchiveJob(response?.job, payload)) throw invalidResponse(pathname);

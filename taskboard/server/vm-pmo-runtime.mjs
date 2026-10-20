@@ -11,7 +11,7 @@ import { createVmTaskDownloadBindings } from "./vm-task-download-bindings.mjs";
 import { createVmPmoOrchestrator } from "./vm-pmo-orchestrator.mjs";
 import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import { runVmPmoOffline } from "./vm-pmo-offline-runner.mjs";
-import { validateVmPmoInput, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
+import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
 import { createVmStageWriteback } from "./vm-stage-writeback.mjs";
 import { createVmWritebackStore } from "./vm-writeback-store.mjs";
@@ -36,7 +36,8 @@ const template = value => value?.id === TEMPLATE.id && value.version === 1;
 function parseFinalArchiveRegistration(value) {
   const eventKeys = ["eventId", "baseToken", "tableId", "recordId", "statusFieldId",
     "beforeOptionIds", "afterOptionIds", "occurredAt"];
-  if (!object(value) || Object.keys(value).length !== 2 || !object(value.event) || !object(value.binding)
+  if (!object(value) || Object.keys(value).some(key => !["event", "binding", "expectedSource"].includes(key))
+    || !object(value.event) || !object(value.binding)
     || Object.keys(value.event).some(key => !eventKeys.includes(key))
     || Object.keys(value.binding).some(key => !["subjectKey", "configVersion"].includes(key)))
     throw fail("VM_ARCHIVE_REQUEST_INVALID",400);
@@ -49,6 +50,18 @@ function parseFinalArchiveRegistration(value) {
     || value.binding.subjectKey !== `${event.baseToken}:${event.tableId}`
     || !Number.isSafeInteger(value.binding.configVersion) || value.binding.configVersion < 1)
     throw fail("VM_ARCHIVE_REQUEST_INVALID",400);
+  let expectedSource;
+  if (Object.hasOwn(value, "expectedSource")) {
+    const source = value.expectedSource;
+    if (!object(source) || Object.keys(source).length !== 5
+      || Object.keys(source).some(key => !["runId", "deliveryId", "artifactId", "sha256", "bytes"].includes(key))
+      || ![source.runId,source.deliveryId,source.artifactId].every(id => ID.test(id ?? ""))
+      || typeof source.sha256 !== "string" || !HASH.test(source.sha256)
+      || !Number.isSafeInteger(source.bytes) || source.bytes < 1)
+      throw fail("VM_ARCHIVE_REQUEST_INVALID",400);
+    expectedSource = {runId:source.runId,deliveryId:source.deliveryId,artifactId:source.artifactId,
+      sha256:source.sha256,bytes:source.bytes};
+  }
   return {
     event: {
       eventId:event.eventId,baseToken:event.baseToken,tableId:event.tableId,recordId:event.recordId,
@@ -56,6 +69,7 @@ function parseFinalArchiveRegistration(value) {
       ...(Object.hasOwn(event,"occurredAt") ? {occurredAt:event.occurredAt} : {}),
     },
     binding:{subjectKey:value.binding.subjectKey,configVersion:value.binding.configVersion},
+    ...(expectedSource ? {expectedSource} : {}),
   };
 }
 
@@ -342,7 +356,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       return {...run,productionOrigin: true,stageId: origin.stageId,
         subjectKey: origin.subjectKey,configVersion: origin.configVersion,target};
     }
-    async function boundFor(options, expected = {}) {
+    async function boundFor(options, expected = {}, deliveredSnapshot = false) {
       const local = db.prepare("SELECT * FROM vm_pmo_attempt_inputs WHERE context_path = ?").get(options.contextPath)
         ?? db.prepare("SELECT * FROM vm_pmo_runtime_bindings WHERE context_path = ?").get(options.contextPath);
       if (!local?.bound_json || digest(local.bound_json) !== local.bound_sha256) throw fail("VM_PMO_INPUT_CHANGED");
@@ -358,7 +372,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         || bound.input?.binding?.task_id !== local.task_id || bound.input?.binding?.run_id !== local.run_id
         || local.plan_attempt !== undefined && (!Number.isSafeInteger(local.plan_attempt) || local.plan_attempt < 1))
         throw fail("VM_PMO_INPUT_CHANGED");
-      try {return await validateVmPmoInput({...options,expectedBound: bound});}
+      const validate = deliveredSnapshot ? validateVmPmoInputSnapshot : validateVmPmoInput;
+      try {return await validate({...options,expectedBound: bound});}
       catch {throw fail("VM_PMO_INPUT_CHANGED");}
     }
     delivery = createVmMp4DeliveryService({database,adapter: localAdapter,now,
@@ -367,7 +382,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       if (!row || row.run_id !== runId || row.task_id !== run.taskId || digest(row.artifact_json) !== row.artifact_sha256
         || run.artifactId !== artifactId) throw fail("VM_DELIVERY_UNTRUSTED");
       await boundFor(run.prepared.runnerOptions,{runId:run.runId,taskId:run.taskId,
-        planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256});
+        planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256},
+      run.state === "completed" && delivery.get(runId)?.state === "delivered");
       let artifact;
       try {artifact = JSON.parse(row.artifact_json);} catch {throw fail("VM_DELIVERY_UNTRUSTED");}
       return {runId,taskId: run.taskId,artifactId,productionOrigin: true,artifact,
@@ -392,7 +408,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         || parentOrigin.stageId !== "initial" && parentOrigin.stageId !== "review")
         throw fail("VM_REVIEW_PARENT_UNAVAILABLE");
       await boundFor(parentRun.prepared.runnerOptions,{runId:parentRun.runId,taskId:parentRun.taskId,
-        planAttempt:parentRun.planAttempt ?? 1,inputSha256:parentRun.prepared.inputSha256});
+        planAttempt:parentRun.planAttempt ?? 1,inputSha256:parentRun.prepared.inputSha256},true);
       const reviewRound = parentOrigin.stageId === "review"
         ? parentOrigin.stageSnapshot?.reviewRound : 0;
       if (!Number.isSafeInteger(reviewRound) || reviewRound < 0) throw fail("VM_REVIEW_PARENT_UNAVAILABLE");
@@ -443,7 +459,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         || parent.target.recordId !== target.recordId || !["initial","review"].includes(parent.stageId))
         throw fail("VM_ARCHIVE_SOURCE_UNAVAILABLE");
       await boundFor(parent.prepared.runnerOptions,{runId:parent.runId,taskId:parent.taskId,
-        planAttempt:parent.planAttempt ?? 1,inputSha256:parent.prepared.inputSha256});
+        planAttempt:parent.planAttempt ?? 1,inputSha256:parent.prepared.inputSha256},true);
       const plan = await planVmFinalArchive({config:workflow,metadata:{fields:liveFields.map(archiveFieldView).filter(Boolean)},
         record:target,fields:values,latestDeliveredVideo:{status:"confirmed",artifactKind:"review_mp4",
           record:target,artifactId:delivered.artifactId,runId:delivered.runId,deliveryId:delivered.id,
@@ -731,7 +747,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     }
     return result;
   }
-  async function enqueueFinalArchive(body) {
+  async function enqueueFinalArchive(body,{retryDirectoryConflict=false}={}) {
     if (closed || !db || typeof getActiveSubject !== "function") throw fail("VM_PMO_RUNTIME_UNAVAILABLE",503);
     const registration = parseFinalArchiveRegistration(body), {event,binding} = registration;
     const active = await getActiveSubject(binding.subjectKey,event.occurredAt);
@@ -751,7 +767,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       statusEdge:{statusFieldId:event.statusFieldId,beforeOptionIds:event.beforeOptionIds,
         afterOptionIds:event.afterOptionIds,...(Object.hasOwn(event,"occurredAt") ? {occurredAt:event.occurredAt} : {})}};
     const existing = service.get(event.eventId);
-    const job = await service.enqueue(request);
+    const register=retryDirectoryConflict ? service.retryDirectoryConflict : service.enqueue;
+    const job = await register({ ...request,
+      ...(registration.expectedSource ? {expectedSource:registration.expectedSource} : {}) });
     void wakeFinalArchive().catch(() => {});
     return {job,created:existing === null};
   }
@@ -804,6 +822,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),
     list: () => services?.orchestrator.list() ?? [],
     enqueueFinalArchive,
+    retryFinalArchiveDirectory:body=>enqueueFinalArchive(body,{retryDirectoryConflict:true}),
     startFinalArchive,
     resolveWriteback: async claim => {await ready();return initialize().writebackStore.resolveWritebackIntentForBridge(claim);},
     async start() {

@@ -88,6 +88,9 @@ const CONTROLLED_CONTEXT_FIELDS = new Set([
 const MAX_FAILURE_HISTORY = 10;
 const DELIVERY_PROVENANCE_VERSION = 1;
 const DELIVERY_PROVENANCE_SOURCES = new Set(["feishu", "simulation"]);
+const FINAL_ARCHIVE_RECOVERY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
+const FINAL_ARCHIVE_RECOVERY_EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
   "LEGACY_EVENT_SNAPSHOT_MISSING",
   "EVENT_SNAPSHOT_MISSING",
@@ -457,6 +460,72 @@ function normalizeDecisionSnapshot(value) {
     : normalizePhasedDecisionSnapshot(value);
 }
 
+function archiveRecoveryError(code, status = 409) {
+  const error = new Error(code);
+  error.code = code;
+  error.status = status;
+  return error;
+}
+
+function normalizeFinalArchiveRecoverySource(value) {
+  const keys = ["runId", "deliveryId", "artifactId", "sha256", "bytes"];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key))
+    || ![value.runId, value.deliveryId, value.artifactId].every((entry) => (
+      typeof entry === "string" && FINAL_ARCHIVE_RECOVERY_ID.test(entry)
+    ))
+    || typeof value.sha256 !== "string" || !SHA256.test(value.sha256)
+    || !Number.isSafeInteger(value.bytes) || value.bytes < 1) {
+    throw archiveRecoveryError("INVALID_FINAL_ARCHIVE_RECOVERY_SOURCE", 400);
+  }
+  return {
+    runId: value.runId,
+    deliveryId: value.deliveryId,
+    artifactId: value.artifactId,
+    sha256: value.sha256,
+    bytes: value.bytes,
+  };
+}
+
+function sameFinalArchiveRecoverySource(left, right) {
+  return left.runId === right.runId
+    && left.deliveryId === right.deliveryId
+    && left.artifactId === right.artifactId
+    && left.sha256 === right.sha256
+    && left.bytes === right.bytes;
+}
+
+function assertFinalArchiveRecoveryRecord(record) {
+  const snapshot = record?.decisionSnapshot;
+  const event = record?.event;
+  const snapshotEvent = snapshot?.event;
+  const subject = snapshot?.subject;
+  const archive = subject?.vmWorkflow?.finalArchive;
+  const validEdge = event && snapshotEvent
+    && event.eventId === record.eventId
+    && snapshotEvent.eventId === record.eventId
+    && ["baseToken", "tableId", "recordId", "fieldId", "statusFieldId"].every((field) => (
+      typeof event[field] === "string" && event[field] === snapshotEvent[field]
+    ))
+    && event.fieldId === event.statusFieldId
+    && Array.isArray(event.beforeOptionIds) && Array.isArray(event.afterOptionIds)
+    && JSON.stringify(event.beforeOptionIds) === JSON.stringify(snapshotEvent.beforeOptionIds)
+    && JSON.stringify(event.afterOptionIds) === JSON.stringify(snapshotEvent.afterOptionIds)
+    && typeof archive?.triggerOptionId === "string"
+    && !event.beforeOptionIds.includes(archive.triggerOptionId)
+    && event.afterOptionIds.includes(archive.triggerOptionId);
+  if (record?.deliveryProvenance?.source !== "feishu"
+    || snapshot?.action !== "final_archive" || snapshot?.kind !== "final_archive"
+    || subject?.workflowTemplate?.id !== "vm_pmo_review_video"
+    || subject.workflowTemplate.version !== 1 || subject.lifecycle !== "enabled"
+    || subject.subjectKey !== snapshot.subjectKey || subject.configVersion !== snapshot.configVersion
+    || `${event?.baseToken}:${event?.tableId}` !== snapshot.subjectKey
+    || archive?.enabled !== true || archive.statusFieldId !== event?.statusFieldId
+    || !validEdge) {
+    throw archiveRecoveryError("FINAL_ARCHIVE_RECOVERY_NOT_ALLOWED");
+  }
+}
+
 function snapshotMatchesEvent(snapshot, event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return true;
   if (snapshot.table) {
@@ -733,6 +802,14 @@ function normalizeRecord(eventId, value, now) {
     }
     if (record.decisionSnapshot && !snapshotMatchesEvent(record.decisionSnapshot, record.event)) {
       return invalidRecord(eventId, record, now, "DECISION_SNAPSHOT_INVALID");
+    }
+    if (record.archiveRecoverySource !== undefined && record.archiveRecoverySource !== null) {
+      try {
+        record.archiveRecoverySource = normalizeFinalArchiveRecoverySource(record.archiveRecoverySource);
+        assertFinalArchiveRecoveryRecord(record);
+      } catch {
+        return invalidRecord(eventId, record, now, "FINAL_ARCHIVE_RECOVERY_INVALID");
+      }
     }
     return record;
   }
@@ -1103,6 +1180,35 @@ export class JsonStateStore {
       record.updatedAt = currentNow;
       return structuredClone(record);
     }, now, clock);
+  }
+
+  async retryFinalArchiveDeadLetter(eventId, expectedSource, { now = Date.now } = {}) {
+    if (typeof eventId !== "string" || !FINAL_ARCHIVE_RECOVERY_EVENT_ID.test(eventId)) {
+      throw archiveRecoveryError("INVALID_FINAL_ARCHIVE_RECOVERY_REQUEST", 400);
+    }
+    const source = normalizeFinalArchiveRecoverySource(expectedSource);
+    return this.#mutate((state, currentNow) => {
+      const record = state[eventId];
+      if (!record) throw archiveRecoveryError("FINAL_ARCHIVE_RECOVERY_NOT_ALLOWED");
+      if (record.archiveRecoverySource) {
+        if (!sameFinalArchiveRecoverySource(record.archiveRecoverySource, source)) {
+          throw archiveRecoveryError("FINAL_ARCHIVE_RECOVERY_CONFLICT");
+        }
+        if (record.deliveryState !== "dead_letter") return structuredClone(record);
+      }
+      if (record.deliveryState !== "dead_letter") {
+        throw archiveRecoveryError("FINAL_ARCHIVE_RECOVERY_NOT_ALLOWED");
+      }
+      assertFinalArchiveRecoveryRecord(record);
+      record.archiveRecoverySource = source;
+      record.deliveryState = "retry_wait";
+      record.attempts = 0;
+      record.nextAttemptAt = currentNow;
+      record.lease = null;
+      record.outcome = null;
+      record.updatedAt = currentNow;
+      return structuredClone(record);
+    }, undefined, now);
   }
 
   async renewLease(eventId, { ownerId, token, now, leaseMs, clock }) {

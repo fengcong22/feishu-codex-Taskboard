@@ -97,7 +97,9 @@ test("VM registration rejects malformed success and mismatched provenance", asyn
   ]) await assert.rejects(() => client.registerFeishuVmTask(registration()), { code: "TASKBOARD_INVALID_RESPONSE" });
 });
 
-test("VM final archive sends only a status edge to the authenticated archive route", async () => {
+test("VM final archive sends only a status edge and allows time for live validation", async t => {
+  const budgets = [];
+  t.mock.method(AbortSignal,"timeout",ms => {budgets.push(ms);return new AbortController().signal;});
   const payload = { event: { eventId: "evt_archive", baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
     statusFieldId: "fld_archive", beforeOptionIds: ["opt_keep"], afterOptionIds: ["opt_archive", "opt_keep"], occurredAt: 1000 },
   binding: { subjectKey: "bas_vm:tbl_vm", configVersion: 2 } };
@@ -113,4 +115,30 @@ test("VM final archive sends only a status edge to the authenticated archive rou
   assert.equal(requests[0].headers["x-feishu-bridge-secret"], "test-secret");
   assert.deepEqual(requests[0].body, payload);
   assert.equal(Object.hasOwn(requests[0].body.event, "path"), false);
+  assert.deepEqual(budgets,[30_000]);
+  const ordinary = new TaskboardClient("http://127.0.0.1:5178",{bridgeSecret:"test-secret",
+    fetchImplementation:async () => Response.json({task:task()})});
+  await ordinary.registerFeishuVmTask(registration());
+  assert.deepEqual(budgets,[30_000,5_000]);
+});
+
+test("VM final archive recovery sends a path-free expected source guard", async () => {
+  const payload = { event: { eventId: "evt_archive", baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
+    statusFieldId: "fld_archive", beforeOptionIds: ["opt_keep"], afterOptionIds: ["opt_archive"], occurredAt: 1000 },
+  binding: { subjectKey: "bas_vm:tbl_vm", configVersion: 2 },
+  expectedSource: { runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1",
+    sha256: "a".repeat(64), bytes: 20_368_266 } };
+  let sent;
+  const client = new TaskboardClient("http://127.0.0.1:5178", { bridgeSecret: "test-secret",
+    fetchImplementation: async (_url, options) => {
+      sent = JSON.parse(options.body);
+      return Response.json({ job: { id: "archive_job", eventId: "evt_archive", state: "pending",
+        subjectKey: "bas_vm:tbl_vm", configVersion: 2 } }, { status: 202 });
+    } });
+  await client.archiveFeishuVmFinalVideo(payload);
+  assert.deepEqual(sent.expectedSource, payload.expectedSource);
+  assert.equal(Object.hasOwn(sent.expectedSource, "localPath"), false);
+  await assert.rejects(client.archiveFeishuVmFinalVideo({ ...payload,
+    expectedSource: { ...payload.expectedSource, localPath: "C:\\source.mp4" } }),
+  { code: "TASKBOARD_INVALID_RESPONSE" });
 });

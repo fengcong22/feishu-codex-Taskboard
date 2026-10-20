@@ -163,6 +163,42 @@ function writebackClaim(body) {
   }
 }
 
+function finalArchiveRecoveryInput(body) {
+  const invalid = () => {
+    const error = new Error("final archive recovery request is invalid");
+    error.code = "INVALID_FINAL_ARCHIVE_RECOVERY_REQUEST";
+    error.status = 400;
+    throw error;
+  };
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).length !== 2 || Object.keys(body).some((key) => !["eventId", "expectedSource"].includes(key))) {
+    invalid();
+  }
+  const eventId = body.eventId;
+  const source = body.expectedSource;
+  const sourceKeys = ["runId", "deliveryId", "artifactId", "sha256", "bytes"];
+  if (typeof eventId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u.test(eventId)
+    || !source || typeof source !== "object" || Array.isArray(source)
+    || Object.keys(source).length !== sourceKeys.length || Object.keys(source).some((key) => !sourceKeys.includes(key))
+    || ![source.runId, source.deliveryId, source.artifactId].every((entry) => (
+      typeof entry === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(entry)
+    ))
+    || typeof source.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.sha256)
+    || !Number.isSafeInteger(source.bytes) || source.bytes < 1) {
+    invalid();
+  }
+  return {
+    eventId,
+    expectedSource: {
+      runId: source.runId,
+      deliveryId: source.deliveryId,
+      artifactId: source.artifactId,
+      sha256: source.sha256,
+      bytes: source.bytes,
+    },
+  };
+}
+
 function portableWorkflowSubject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const subject = structuredClone(value);
@@ -338,6 +374,7 @@ export function createBridgeServer({
   resolveWritebackIntent = null,
   recordWriter = null,
   simulationEnabled = false,
+  retryFinalArchiveDeadLetter = null,
 }) {
   let address = null;
   const server = createServer(async (request, response) => {
@@ -349,6 +386,26 @@ export function createBridgeServer({
       }
       if (request.method === "GET" && url.pathname === "/api/config-summary") {
         return sendJson(response, 200, configSummary);
+      }
+      if (url.pathname === "/api/local/bridge/vm/final-archive-dead-letter/retry") {
+        if (request.method !== "POST") return sendJson(response, 405, {
+          error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed" },
+        });
+        if (!requireLocalJsonWrite(request, response, "local-operator")) return;
+        if (typeof retryFinalArchiveDeadLetter !== "function") return sendJson(response, 503, {
+          error: { code: "FINAL_ARCHIVE_RECOVERY_UNAVAILABLE", message: "Bridge request failed" },
+        });
+        let input;
+        try { input = finalArchiveRecoveryInput(await readJson(request)); }
+        catch (error) {
+          return sendJson(response, 400, { error: publicFailure(error) });
+        }
+        try {
+          const result = await retryFinalArchiveDeadLetter(input.eventId, input.expectedSource);
+          return sendJson(response, 202, result);
+        } catch (error) {
+          return sendJson(response, controlledErrorStatus(error), { error: publicFailure(error) });
+        }
       }
       const subscriptionMatch = url.pathname.match(/^\/api\/feishu\/workflow\/bases\/([^/]+)\/subscription$/);
       if (subscriptionMatch) {

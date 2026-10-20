@@ -4,6 +4,7 @@ import { copyFile, link, lstat, open, realpath, unlink } from "node:fs/promises"
 import path from "node:path";
 
 import { canonicalJson } from "./feishu-source-manifest.mjs";
+import { isSameFilesystemPath } from "./filesystem-path-boundary.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
 const LOCAL_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -65,8 +66,25 @@ function planShape(plan, request) {
   return structuredClone(plan);
 }
 
+function normalizedExpectedSource(value) {
+  const keys = ["runId", "deliveryId", "artifactId", "sha256", "bytes"];
+  if (!object(value) || Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))
+    || ![value.runId, value.deliveryId, value.artifactId].every(entry => validId(entry))
+    || typeof value.sha256 !== "string" || !SHA256.test(value.sha256)
+    || !Number.isSafeInteger(value.bytes) || value.bytes < 1) throw fail("VM_ARCHIVE_REQUEST_INVALID");
+  return {
+    runId: value.runId, deliveryId: value.deliveryId, artifactId: value.artifactId,
+    sha256: value.sha256, bytes: value.bytes,
+  };
+}
+
+function assertExpectedSource(plan, expectedSource) {
+  if (expectedSource && ["runId", "deliveryId", "artifactId", "sha256", "bytes"]
+    .some(key => plan.source[key] !== expectedSource[key])) throw fail("VM_ARCHIVE_SOURCE_SUPERSEDED");
+}
+
 function validRequest(value) {
-  if (!object(value) || Object.keys(value).some((key) => !["eventId", "subjectKey", "configVersion", "record", "statusEdge"].includes(key))
+  if (!object(value) || Object.keys(value).some((key) => !["eventId", "subjectKey", "configVersion", "record", "statusEdge", "expectedSource"].includes(key))
     || !validId(value.eventId, ID)
     || typeof value.subjectKey !== "string"
     || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,255}:[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(value.subjectKey)
@@ -85,11 +103,33 @@ function validRequest(value) {
     throw fail("VM_ARCHIVE_REQUEST_INVALID");
   }
   if (`${value.record.baseToken}:${value.record.tableId}` !== value.subjectKey) throw fail("VM_ARCHIVE_REQUEST_INVALID");
-  return structuredClone(value);
+  const request = structuredClone(value);
+  delete request.expectedSource;
+  return {
+    request,
+    expectedSource: Object.hasOwn(value, "expectedSource") ? normalizedExpectedSource(value.expectedSource) : null,
+  };
 }
 
 function samePath(left, right) {
-  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+  return isSameFilesystemPath(left,right);
+}
+
+export async function resolveVmArchiveDirectory(plan,{inspect=lstat,resolve=realpath,platform=process.platform}={}) {
+  try {
+    const info=await inspect(plan.destinationDirectory);
+    const canonical=await resolve(plan.destinationDirectory);
+    const pathApi=platform === "win32" ? path.win32 : path.posix;
+    const frozenTarget=platform === "win32"
+      ? isSameFilesystemPath(pathApi.join(canonical,plan.filename),plan.canonicalLocationKey,platform)
+      : isSameFilesystemPath(canonical,plan.destinationDirectory,platform);
+    if (info.isSymbolicLink() || !info.isDirectory() || !frozenTarget)
+      throw fail("VM_ARCHIVE_DIRECTORY_INVALID");
+    return canonical;
+  } catch(error) {
+    if (error?.code === "VM_ARCHIVE_DIRECTORY_INVALID") throw error;
+    throw fail("VM_ARCHIVE_DIRECTORY_UNAVAILABLE");
+  }
 }
 
 async function stablePath(target, { directory = false } = {}) {
@@ -169,7 +209,11 @@ export function createVmFinalArchiveService({ database, resolveArchivePlan, now 
   CREATE INDEX IF NOT EXISTS vm_final_archive_ready
     ON vm_final_archive_jobs(state, next_attempt_at, created_at);
   CREATE INDEX IF NOT EXISTS vm_final_archive_destination
-    ON vm_final_archive_jobs(destination_key, state, lease_until);`);
+    ON vm_final_archive_jobs(destination_key, state, lease_until);
+  CREATE TABLE IF NOT EXISTS vm_final_archive_recoveries (
+    id TEXT PRIMARY KEY, job_id TEXT NOT NULL, error_code TEXT NOT NULL,
+    plan_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL
+  );`);
 
   function get(eventId) {
     if (!validId(eventId, ID)) throw fail("VM_ARCHIVE_REQUEST_INVALID");
@@ -194,22 +238,28 @@ export function createVmFinalArchiveService({ database, resolveArchivePlan, now 
   }
 
   async function enqueue(value) {
-    const request = validRequest(value);
+    const { request, expectedSource } = validRequest(value);
     const requestJson = canonicalJson(request);
-    const existing = db.prepare("SELECT * FROM vm_final_archive_jobs WHERE event_id = ?").get(request.eventId);
-    if (existing) {
+    function existingPlan(existing) {
       if (existing.request_json !== requestJson) throw fail("VM_ARCHIVE_EVENT_CONFLICT");
+      let plan;
+      try { plan = planShape(JSON.parse(existing.plan_json), request); }
+      catch { throw fail("VM_ARCHIVE_STORE_CORRUPT"); }
+      assertExpectedSource(plan, expectedSource);
       return publicJob(existing);
     }
+    const existing = db.prepare("SELECT * FROM vm_final_archive_jobs WHERE event_id = ?").get(request.eventId);
+    if (existing) return existingPlan(existing);
     const plan = planShape(await resolveArchivePlan(structuredClone(request)), request);
+    assertExpectedSource(plan, expectedSource);
     const planJson = canonicalJson(plan);
     db.exec("BEGIN IMMEDIATE");
     try {
       const winner = db.prepare("SELECT * FROM vm_final_archive_jobs WHERE event_id = ?").get(request.eventId);
       if (winner) {
-        if (winner.request_json !== requestJson) throw fail("VM_ARCHIVE_EVENT_CONFLICT");
+        const job = existingPlan(winner);
         db.exec("COMMIT");
-        return publicJob(winner);
+        return job;
       }
       const timestamp = now();
       const id = idFactory();
@@ -224,6 +274,32 @@ export function createVmFinalArchiveService({ database, resolveArchivePlan, now 
       db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  async function retryDirectoryConflict(value) {
+    const {request,expectedSource}=validRequest(value);
+    if (!expectedSource) throw fail("VM_ARCHIVE_RECOVERY_NOT_ALLOWED");
+    const row=db.prepare("SELECT * FROM vm_final_archive_jobs WHERE event_id=?").get(request.eventId);
+    if (!row || row.request_json !== canonicalJson(request)) throw fail("VM_ARCHIVE_EVENT_CONFLICT");
+    const plan=planShape(JSON.parse(row.plan_json),request);
+    assertExpectedSource(plan,expectedSource);
+    if (["published","pending","copying","retry_wait"].includes(row.state)) return publicJob(row);
+    if (row.state !== "conflict" || row.error_code !== "VM_ARCHIVE_DIRECTORY_INVALID" || row.attempt_count !== 0)
+      throw fail("VM_ARCHIVE_RECOVERY_NOT_ALLOWED");
+    await validateArchiveSource({request,plan:structuredClone(plan)});
+    await resolveVmArchiveDirectory(plan);
+    await hashStableFile(plan.source.localPath,plan.source.sha256,plan.source.bytes,{source:true});
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const changed=db.prepare(`UPDATE vm_final_archive_jobs SET state='pending',error_code=NULL,
+        next_attempt_at=?,updated_at=? WHERE id=? AND state='conflict' AND error_code='VM_ARCHIVE_DIRECTORY_INVALID'
+        AND attempt_count=0 AND plan_json=? AND request_json=?`).run(now(),now(),row.id,row.plan_json,row.request_json);
+      if (changed.changes !== 1) throw fail("VM_ARCHIVE_RECOVERY_NOT_ALLOWED");
+      db.prepare("INSERT INTO vm_final_archive_recoveries(id,job_id,error_code,plan_sha256,created_at) VALUES(?,?,?,?,?)")
+        .run(randomUUID(),row.id,row.error_code,createHash("sha256").update(row.plan_json).digest("hex"),now());
+      db.exec("COMMIT");
+      return get(request.eventId);
+    } catch(error) {db.exec("ROLLBACK");throw error;}
   }
 
   function claim() {
@@ -283,12 +359,14 @@ export function createVmFinalArchiveService({ database, resolveArchivePlan, now 
       assertOwner(row, token);
     };
     await validate();
-    await stablePath(plan.destinationDirectory, { directory: true });
+    const directory=await resolveVmArchiveDirectory(plan);
+    await stablePath(directory, { directory: true });
     assertOwner(row, token);
-    const tempPath = path.join(plan.destinationDirectory, `.${row.id}.${plan.filename}.tmp`);
-    if (await removePublishedTempLink(tempPath, plan.destinationPath)
-      && await existingDestination(plan.destinationPath, source)) return "published";
-    if (await existingDestination(plan.destinationPath, source)) return "published";
+    const destinationPath=path.join(directory,plan.filename);
+    const tempPath = path.join(directory, `.${row.id}.${plan.filename}.tmp`);
+    if (await removePublishedTempLink(tempPath, destinationPath)
+      && await existingDestination(destinationPath, source)) return "published";
+    if (await existingDestination(destinationPath, source)) return "published";
     await removeOwnedTemp(tempPath);
     await hashStableFile(source.localPath, source.sha256, source.bytes, { source: true });
     assertOwner(row, token);
@@ -297,19 +375,19 @@ export function createVmFinalArchiveService({ database, resolveArchivePlan, now 
       await hashStableFile(tempPath, source.sha256, source.bytes);
       await hashStableFile(source.localPath, source.sha256, source.bytes, { source: true });
       await validate();
-      try { await publish(tempPath, plan.destinationPath); }
+      try { await publish(tempPath, destinationPath); }
       catch (error) {
         if (error?.code !== "EEXIST") {
           if (["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"].includes(error?.code))
             throw fail("VM_ARCHIVE_ATOMIC_PUBLISH_UNSUPPORTED");
           throw error;
         }
-        if (!await existingDestination(plan.destinationPath, source)) throw fail("VM_ARCHIVE_DESTINATION_CONFLICT");
+        if (!await existingDestination(destinationPath, source)) throw fail("VM_ARCHIVE_DESTINATION_CONFLICT");
       }
       const handle = await open(tempPath, "r+");
       try { await handle.sync(); } finally { await handle.close(); }
       await removeOwnedTemp(tempPath);
-      await hashStableFile(plan.destinationPath, source.sha256, source.bytes);
+      await hashStableFile(destinationPath, source.sha256, source.bytes);
       return "published";
     } finally {
       await removeOwnedTemp(tempPath).catch(() => {});
@@ -343,5 +421,5 @@ export function createVmFinalArchiveService({ database, resolveArchivePlan, now 
   }
 
   recover();
-  return Object.freeze({ enqueue, get, processNext, recover });
+  return Object.freeze({ enqueue, get, processNext, recover, retryDirectoryConflict });
 }

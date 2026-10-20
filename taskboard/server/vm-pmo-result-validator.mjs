@@ -110,7 +110,7 @@ async function hashMedia(filename, code, signal) {
   return { sha256: hash.digest("hex"), bytes, info: after };
 }
 
-async function loadBoundInput(contextPath, signal, expectedBound) {
+async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginalMedia = true) {
   interrupted(signal);
   if (!absoluteCanonical(contextPath)
     || path.basename(contextPath) !== "execution-context.json") fail("RUN_BINDING_MISMATCH");
@@ -133,7 +133,7 @@ async function loadBoundInput(contextPath, signal, expectedBound) {
     if (await realpath(context.run_dir) !== context.run_dir) fail("RUN_BINDING_MISMATCH");
   } catch { fail("RUN_BINDING_MISMATCH"); }
   for (const file of [contextPath, path.join(context.run_dir, "input.json"),
-    context.source_path, context.plan_path, context.plan_result_path,
+    ...(verifyOriginalMedia ? [context.source_path] : []), context.plan_path, context.plan_result_path,
     context.result_path, context.output_path]) await assertCanonicalLocation(file, "RUN_BINDING_MISMATCH");
   const inputPath = path.join(context.run_dir, "input.json");
   const { value: input, sha256: inputSha256 } = await jsonFile(inputPath, "RUN_BINDING_MISMATCH");
@@ -191,6 +191,9 @@ async function loadBoundInput(contextPath, signal, expectedBound) {
         || parent.duration_ms !== input.source.duration_ms) fail("RUN_BINDING_MISMATCH");
     } else if (input.review_round.parent !== null) fail("RUN_BINDING_MISMATCH");
   }
+  // Completed deliveries are verified against their own MP4. Their frozen input
+  // identity must remain intact, but the acquired original may have been retired.
+  if (!verifyOriginalMedia) return {context,contextSha256,input,sourceSha256:input.source.sha256};
   const source = await hashMedia(context.source_path, "SOURCE_HASH_MISMATCH", signal);
   if (source.sha256 !== input.source.sha256 || source.bytes !== input.source.bytes)
     fail("SOURCE_HASH_MISMATCH");
@@ -199,6 +202,12 @@ async function loadBoundInput(contextPath, signal, expectedBound) {
 
 export async function validateVmPmoInput({ contextPath, signal, expectedBound } = {}) {
   return loadBoundInput(contextPath, signal, expectedBound);
+}
+
+export async function validateVmPmoInputSnapshot({contextPath,signal,expectedBound} = {}) {
+  if (!object(expectedBound?.context) || !object(expectedBound?.input)
+    || !digest(expectedBound.contextSha256)) fail("RUN_BINDING_MISMATCH");
+  return loadBoundInput(contextPath,signal,expectedBound,false);
 }
 
 function assertIdentity(value, input, context, sourceSha256, code) {

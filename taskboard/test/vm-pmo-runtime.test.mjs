@@ -483,13 +483,38 @@ else:
   assert.deepEqual(effects,["processing","upload","attachment","completed","processing","completed"]);
   await assert.rejects(f.runtime.retryWriteback(created.task.id,
     {version:f.database.getTask(created.task.id).version}),{code:"VM_PMO_WRITEBACK_RETRY_NOT_ALLOWED"});
+  // Cleanup of approved original media must not invalidate the confirmed MP4.
+  await rm(path.join(f.directory,"source.mp4"));
   f.record.fields.fld_status = "待归档";
+  const delivery = f.database.database.prepare("SELECT id FROM vm_mp4_deliveries WHERE run_id = ?").get(run.runId);
+  const expectedSource = {runId:run.runId,deliveryId:delivery.id,artifactId:run.artifactId,
+    sha256:run.renderResult.artifact.sha256,bytes:run.renderResult.artifact.bytes};
   const archiveRequest = {event: {eventId: "evt_final_archive",baseToken: "bas_vm",tableId: "tbl_vm",recordId: "rec_vm",
     statusFieldId: "fld_status",beforeOptionIds: ["opt_complete"],afterOptionIds: ["opt_archive"],occurredAt: 500},
-    binding: {subjectKey: "bas_vm:tbl_vm",configVersion: 4}};
+    binding: {subjectKey: "bas_vm:tbl_vm",configVersion: 4},expectedSource};
+  await assert.rejects(f.runtime.enqueueFinalArchive({...archiveRequest,event:{...archiveRequest.event,
+    eventId:"evt_final_archive_wrong_source"},expectedSource:{...expectedSource,runId:"run_wrong"}}),
+  {code:"VM_ARCHIVE_SOURCE_SUPERSEDED"});
+  const frozenInputPath = path.join(path.dirname(run.prepared.contextPath),"input.json");
+  const frozenInputBytes = await readFile(frozenInputPath);
+  await writeFile(frozenInputPath,Buffer.concat([frozenInputBytes,Buffer.from(" ")]));
+  await assert.rejects(f.runtime.enqueueFinalArchive({...archiveRequest,event:{...archiveRequest.event,
+    eventId:"evt_archive_changed_input"}}),{code:"VM_DELIVERY_UNTRUSTED"});
+  await writeFile(frozenInputPath,frozenInputBytes);
+  const deliveredBytes = await readFile(run.renderResult.artifact.path);
+  await writeFile(run.renderResult.artifact.path,Buffer.concat([deliveredBytes,Buffer.from("changed")]));
+  await assert.rejects(f.runtime.enqueueFinalArchive({...archiveRequest,event:{...archiveRequest.event,
+    eventId:"evt_archive_changed_mp4"}}),{code:"VM_DELIVERY_ARTIFACT_CHANGED"});
+  await writeFile(run.renderResult.artifact.path,deliveredBytes);
   const queuedArchive = await f.runtime.enqueueFinalArchive(archiveRequest);
   assert.equal(queuedArchive.created,true);
   assert.equal(queuedArchive.job.state,"pending");
+  await f.runtime.wake();
+  f.database.database.prepare("UPDATE vm_final_archive_jobs SET state='conflict',error_code='VM_ARCHIVE_DIRECTORY_INVALID' WHERE event_id=?")
+    .run(archiveRequest.event.eventId);
+  const recoveredDirectory=await f.runtime.retryFinalArchiveDirectory(archiveRequest);
+  assert.equal(recoveredDirectory.job.id,queuedArchive.job.id);
+  assert.equal(recoveredDirectory.created,false);
   await f.runtime.wake();
   const archivedReplay = await f.runtime.enqueueFinalArchive(archiveRequest);
   assert.equal(archivedReplay.created,false);
@@ -502,6 +527,8 @@ else:
   assert.equal(f.runtime.list()[0].state,"completed");
   assert.equal((await readFile(log,"utf8")).replaceAll("\r\n","\n"),"plan\nrender\n");
   assert.deepEqual(effects,["processing","upload","attachment","completed","processing","completed"]);
+
+  const {expectedSource: _expectedSource, ...unguardedArchiveRequest} = archiveRequest;
 
   f.subject.statusField.options.push({optionId: "opt_review",name: "待修改"},
     {optionId: "opt_review_complete",name: "第1稿完成"});
@@ -522,7 +549,7 @@ else:
   await assert.rejects(f.runtime.register({...reviewBody,event:{...reviewBody.event,eventId:"evt_other_package"}},ACTOR),
     {code:"VM_REVIEW_PARENT_UNAVAILABLE"});
   f.record.fields.fld_status = "待归档";
-  await assert.rejects(f.runtime.enqueueFinalArchive({...archiveRequest,event:{...archiveRequest.event,
+  await assert.rejects(f.runtime.enqueueFinalArchive({...unguardedArchiveRequest,event:{...unguardedArchiveRequest.event,
     eventId:"evt_other_package_archive",occurredAt:550}}),{code:"VM_ARCHIVE_SOURCE_UNAVAILABLE"});
   f.subject.packageRoute.packageAlias = "切片初稿";f.packageRecord.alias = "切片初稿";
   f.record.fields.fld_status = "待修改";
@@ -597,7 +624,7 @@ else:
   assert.equal(boardBeforeRender.tasks.find(item => item.taskId === review.task.id).supersededByTaskId,secondReview.task.id);
   assert.equal(boardBeforeRender.tasks.find(item => item.taskId === secondReview.task.id).parentTaskId,review.task.id);
   f.record.fields.fld_status = "待归档";
-  await assert.rejects(f.runtime.enqueueFinalArchive({...archiveRequest,event:{...archiveRequest.event,
+  await assert.rejects(f.runtime.enqueueFinalArchive({...unguardedArchiveRequest,event:{...unguardedArchiveRequest.event,
     eventId:"evt_archive_obsolete_round",occurredAt:650}}),{code:"VM_ARCHIVE_SOURCE_SUPERSEDED"});
   f.record.fields.fld_status = "待修改";
   await f.runtime.wake();
@@ -609,7 +636,7 @@ else:
   const replayedReview = await f.runtime.register(secondReviewBody,ACTOR);
   assert.equal(replayedReview.created,false);assert.equal(replayedReview.task.id,secondReview.task.id);
   f.record.fields.fld_status = "待归档";f.record.fields.fld_name = "审核成片";
-  const finalReviewArchive = {...archiveRequest,event:{...archiveRequest.event,eventId:"evt_archive_review_2",occurredAt:800}};
+  const finalReviewArchive = {...unguardedArchiveRequest,event:{...unguardedArchiveRequest.event,eventId:"evt_archive_review_2",occurredAt:800}};
   await f.runtime.enqueueFinalArchive(finalReviewArchive);await f.runtime.wake();
   const finalBoard = await f.runtime.getPackageBoard({subjectKey:f.subject.subjectKey,packageAlias:"切片初稿"});
   const finalEvidence = finalBoard.tasks.find(item => item.taskId === secondReview.task.id);

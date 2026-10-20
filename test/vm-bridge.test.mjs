@@ -133,6 +133,95 @@ test("VM final archive edge uses a dedicated Taskboard operation without creatin
   }]);
 });
 
+test("manual recovery replays only a real final-archive dead letter with its exact source identity", async (t) => {
+  const calls = [];
+  const configured = subject();
+  configured.statusField.options.push({ optionId: "opt_archive", value: "待归档" });
+  configured.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: null, pathFieldId: null };
+  const source = { runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1",
+    sha256: "a".repeat(64), bytes: 20_368_266 };
+  let attempts = 0;
+  const { bridge, store } = await fixture(t, {
+    archiveFeishuVmFinalVideo: async (payload) => {
+      attempts += 1;
+      calls.push(payload);
+      if (attempts === 1) throw Object.assign(new Error("offline"), { status: 503 });
+      return { id: "archive_job", eventId: "evt_archive_recovery", state: "pending",
+        subjectKey: "bas_vm:tbl_vm", configVersion: 2 };
+    },
+  }, {
+    config: { tables: [configured], delivery: { maxAttempts: 1, initialDelayMs: 5, maxDelayMs: 5,
+      leaseMs: 1_000, pollIntervalMs: 100 } },
+    workflowStore: { resolveSubjectVersionAt: async () => configured },
+  });
+  const archiveEvent = edge("opt_done", "opt_archive", { eventId: "evt_archive_recovery",
+    beforeOptionIds: ["opt_done"], afterOptionIds: ["opt_archive"] });
+  assert.equal((await bridge.handle(archiveEvent)).kind, "dead_letter");
+  const before = await store.get(archiveEvent.eventId);
+  assert.equal(before.deliveryState, "dead_letter");
+
+  const queued = await bridge.retryFinalArchiveDeadLetter(archiveEvent.eventId, source);
+  assert.equal(queued.deliveryState, "retry_wait");
+  assert.equal(queued.attempts, 0);
+  assert.equal((await store.get(archiveEvent.eventId)).decisionSnapshot.kind, "final_archive");
+  assert.equal((await store.get(archiveEvent.eventId)).lastError.code, before.lastError.code);
+
+  const replay = await bridge.processDue();
+  assert.equal(replay.kind, "final_archive");
+  assert.deepEqual(calls[1].expectedSource, source);
+  assert.equal(calls[1].event.eventId, archiveEvent.eventId);
+});
+
+test("manual recovery rejects a different source identity after one has been frozen", async (t) => {
+  const configured = subject();
+  configured.statusField.options.push({ optionId: "opt_archive", value: "待归档" });
+  configured.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: null, pathFieldId: null };
+  const { bridge } = await fixture(t, {
+    archiveFeishuVmFinalVideo: async () => { throw Object.assign(new Error("offline"), { status: 503 }); },
+  }, {
+    config: { tables: [configured], delivery: { maxAttempts: 1, initialDelayMs: 5, maxDelayMs: 5,
+      leaseMs: 1_000, pollIntervalMs: 100 } },
+    workflowStore: { resolveSubjectVersionAt: async () => configured },
+  });
+  const archiveEvent = edge("opt_done", "opt_archive", { eventId: "evt_archive_guard",
+    beforeOptionIds: ["opt_done"], afterOptionIds: ["opt_archive"] });
+  await bridge.handle(archiveEvent);
+  const source = { runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1",
+    sha256: "b".repeat(64), bytes: 20_368_266 };
+  await bridge.retryFinalArchiveDeadLetter(archiveEvent.eventId, source);
+  await assert.rejects(
+    bridge.retryFinalArchiveDeadLetter(archiveEvent.eventId, { ...source, sha256: "c".repeat(64) }),
+    { code: "FINAL_ARCHIVE_RECOVERY_CONFLICT" },
+  );
+});
+
+test("manual recovery refuses initial-stage dead letters and simulated archive events", async (t) => {
+  const configured = subject();
+  configured.statusField.options.push({ optionId: "opt_archive", value: "待归档" });
+  configured.vmWorkflow.finalArchive = { enabled: true, statusFieldId: "fld_status", triggerOptionId: "opt_archive",
+    pathSource: "manual", directoryPath: null, pathFieldId: null };
+  const { bridge, store } = await fixture(t, {
+    findTaskByBinding: async () => null,
+    registerFeishuVmTask: async () => { throw Object.assign(new Error("offline"), { status: 503 }); },
+    archiveFeishuVmFinalVideo: assert.fail,
+  }, { config: { tables: [configured], delivery: { maxAttempts: 1, initialDelayMs: 5, maxDelayMs: 5,
+    leaseMs: 1_000, pollIntervalMs: 100 } }, workflowStore: { resolveSubjectVersionAt: async () => configured } });
+  const source = { runId: "run_1", deliveryId: "delivery_1", artifactId: "artifact_1",
+    sha256: "b".repeat(64), bytes: 42 };
+  assert.equal((await bridge.handle(edge("opt_wait", "opt_ready", {
+    beforeOptionIds: ["opt_wait"], afterOptionIds: ["opt_ready"],
+  }))).kind, "dead_letter");
+  await assert.rejects(bridge.retryFinalArchiveDeadLetter("evt_vm", source), { code: "FINAL_ARCHIVE_RECOVERY_NOT_ALLOWED" });
+  assert.equal((await store.get("evt_vm")).deliveryState, "dead_letter");
+  const simulated = edge("opt_done", "opt_archive", { eventId: "evt_sim_archive", deliverySource: "simulation",
+    beforeOptionIds: ["opt_done"], afterOptionIds: ["opt_archive"] });
+  assert.equal((await bridge.handle(simulated)).kind, "ignored");
+  await assert.rejects(bridge.retryFinalArchiveDeadLetter(simulated.eventId, source), { code: "FINAL_ARCHIVE_RECOVERY_NOT_ALLOWED" });
+  assert.equal((await store.get(simulated.eventId)).deliveryProvenance.source, "simulation");
+});
+
 test("VM same-field SDK edges register initial and review rounds independently from final archive", async (t) => {
   const operations = [];
   const configured = subject();

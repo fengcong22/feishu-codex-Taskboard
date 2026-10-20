@@ -70,6 +70,21 @@ test("VM final archive uses an authenticated dedicated route", async t => {
   assert.deepEqual(calls,[body]);
 });
 
+test("VM archive directory recovery requires the dedicated Bridge credentials",async t=>{
+  const calls=[];
+  const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
+    retryFinalArchiveDirectory:async body=>{calls.push(body);return {job:{id:"archive_job",state:"pending"}};}};
+  const {request}=await fixture(t,runtime);
+  const route="/api/local/feishu/vm/final-archive/retry-directory";
+  const body={event:{eventId:"evt_archive"},expectedSource:{runId:"run_1"}};
+  assert.equal((await request(route,body)).status,403);
+  assert.equal((await request(route,body,{...bridgeHeaders,origin:"https://example.com"})).status,403);
+  assert.equal((await request(`${route}?ignored=1`,body,bridgeHeaders)).status,400);
+  assert.deepEqual(calls,[]);
+  assert.equal((await request(route,body,bridgeHeaders)).status,202);
+  assert.deepEqual(calls,[body]);
+});
+
 test("VM plan retry is loopback-local and requires the task version plus explicit one-run consent",async t=>{
   const calls=[];
   const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
