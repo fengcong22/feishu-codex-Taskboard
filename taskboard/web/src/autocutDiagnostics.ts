@@ -23,7 +23,7 @@ const PHASES: Record<string, { label: string; checks: string[] }> = {
   artifact_report: { label: "校验并登记 ZIP", checks: ["检查 Taskboard 本机服务是否正常，以及剪辑包生成的 ZIP 和结果回执是否通过校验。"] },
 };
 
-const FIX_THEN_RETRY = "处理上述问题后，再点击「重试 Auto-Cut」。同一错误反复出现时，先查看本次日志。";
+const FIX_THEN_RETRY = "处理上述问题后，再点击「按当前配置重新执行」。同一错误反复出现时，先查看本次日志。";
 const GUIDANCE = new Map<string, Guidance>();
 function register(codes: string[], summary: string, checks: string[], retryHint = FIX_THEN_RETRY) {
   for (const code of codes) GUIDANCE.set(code.toLowerCase(), { summary, checks, retryHint });

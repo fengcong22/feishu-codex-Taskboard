@@ -1521,18 +1521,14 @@ export async function retryTaskVmPmoWriteback(
   return data.run;
 }
 
-export async function retryTaskAutoCut(
+export async function rerunTaskAutoCutCurrent(
   taskId: string,
   version: number,
   runConsent: AutoCutRunConsent,
-): Promise<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }> {
-  return request<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }>(
-    `/api/local/tasks/${encodeURIComponent(taskId)}/autocut-retry`,
-    {
-      method: "POST",
-      body: JSON.stringify({ version, runConsent }),
-    },
-  );
+): Promise<{ task: Task }> {
+  return request<{ task: Task }>(`/api/local/tasks/${encodeURIComponent(taskId)}/autocut-rerun-current`, {
+    method: "POST", body: JSON.stringify({ version, runConsent }),
+  });
 }
 
 export async function uploadAttachment(

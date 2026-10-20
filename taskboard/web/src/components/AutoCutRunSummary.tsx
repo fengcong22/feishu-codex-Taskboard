@@ -6,6 +6,7 @@ import { LinearIcon } from "./LinearIcon";
 export interface AutoCutAttemptSummary {
   runId: string;
   attempt: number;
+  configVersion?: number;
   stageId: string;
   state: string;
   manifestSha256?: string | null;
@@ -20,10 +21,10 @@ export interface AutoCutAttemptSummary {
 }
 
 export interface AutoCutRunSummaryProps {
-  task: { id: string; version: number; status: string };
+  task: { id: string; version: number; status: string; archivedAt?: string | null };
   attempts: AutoCutAttemptSummary[];
   retrying: boolean;
-  onRetry: (taskId: string, version: number, runConsent: AutoCutRunConsent) => void | Promise<void>;
+  onRerunCurrent?: (taskId: string, version: number, runConsent: AutoCutRunConsent) => void | Promise<void>;
   onOpenLog?: (threadId: string) => void;
   onCopy?: (value: string, announcement: string) => void;
 }
@@ -47,13 +48,13 @@ function digestPrefix(value: string | null | undefined): string {
   return value ? value.slice(0, 12) : "未生成";
 }
 
-export function AutoCutRunSummary({ task, attempts, retrying, onRetry, onOpenLog, onCopy }: AutoCutRunSummaryProps) {
+export function AutoCutRunSummary({ task, attempts, retrying, onRerunCurrent, onOpenLog, onCopy }: AutoCutRunSummaryProps) {
   const ordered = useMemo(
     () => [...attempts].sort((left, right) => left.attempt - right.attempt),
     [attempts],
   );
   if (ordered.length === 0) return null;
-  const canRetry = task.status === "blocked" && !retrying;
+  const canRetry = task.status === "blocked" && !task.archivedAt && !retrying;
 
   return <section className="autocut-run-summary" aria-labelledby="autocut-run-summary-heading">
     <header className="autocut-run-summary-heading">
@@ -61,22 +62,19 @@ export function AutoCutRunSummary({ task, attempts, retrying, onRetry, onOpenLog
         <h2 id="autocut-run-summary-heading">Auto-Cut 运行</h2>
         <span>{ordered.length} 次尝试</span>
       </div>
-      {canRetry && <button
-        type="button"
-        className="button secondary"
-        aria-describedby="autocut-retry-consent"
-        onClick={() => void onRetry(task.id, task.version, {
-          allowVideoAudioAsr: true,
-          allowConfiguredLocalOutput: true,
-        })}
-      >
+      {canRetry && onRerunCurrent && <div className="autocut-diagnostic-actions"><button type="button" className="button secondary"
+        aria-describedby="autocut-rerun-current-consent"
+        onClick={() => void onRerunCurrent(task.id, task.version, {
+          allowVideoAudioAsr: true, allowConfiguredLocalOutput: true,
+        })}>
         <LinearIcon name="recurrence" />
-        重试 Auto-Cut
-      </button>}
-      {retrying && <span className="autocut-run-retrying" role="status">重试中…</span>}
+        按当前配置重新执行
+      </button>
+      </div>}
+      {retrying && <span className="autocut-run-retrying" role="status">重新执行中…</span>}
     </header>
-    {canRetry && <p id="autocut-retry-consent" className="autocut-retry-consent">
-      点击重试，即允许本次 Auto-Cut 将视频原音发送至火山语音服务进行语音识别，并写入已配置的本机输出目录。
+    {canRetry && onRerunCurrent && <p id="autocut-rerun-current-consent" className="autocut-retry-consent">
+      「按当前配置重新执行」使用当前已启用配置，在原任务中启动新一轮运行并保留历史；点击即允许本次将视频原音发送至火山语音服务进行语音识别，并写入该配置的本机输出目录。无需改动飞书状态。
     </p>}
     <ol className="autocut-run-list">
       {ordered.map((attempt) => {
@@ -88,6 +86,7 @@ export function AutoCutRunSummary({ task, attempts, retrying, onRetry, onOpenLog
           <span className="autocut-run-state">{STATE_LABELS[attempt.state] ?? attempt.state}</span>
         </div>
         <div className="autocut-run-row-meta">
+          {attempt.configVersion !== undefined && <span>配置 v{attempt.configVersion}</span>}
           <span>运行 ID <code>{attempt.runId}</code></span>
           <span>清单 <code title={attempt.manifestSha256 ?? undefined}>{digestPrefix(attempt.manifestSha256)}</code></span>
         </div>

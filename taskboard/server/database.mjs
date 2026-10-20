@@ -419,6 +419,8 @@ function normalizeFeishuTaskOrigin(value) {
     version: value.version === undefined ? 1 : value.version,
     source: "feishu-base",
     eventId: value.eventId.trim(),
+    ...(typeof value.rerunOfTaskId === "string" && value.rerunOfTaskId.trim()
+      ? { rerunOfTaskId: value.rerunOfTaskId.trim() } : {}),
     baseToken: value.baseToken.trim(),
     tableId: value.tableId.trim(),
     recordId: value.recordId.trim(),
@@ -1087,6 +1089,7 @@ export class TaskboardDatabase {
         stage_id TEXT,
         event_id TEXT,
         registration_event_id TEXT,
+        rerun_of_task_id TEXT,
         base_token TEXT,
         table_id TEXT,
         record_id TEXT,
@@ -1107,12 +1110,29 @@ export class TaskboardDatabase {
         deleted_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS feishu_config_rerun_deletions (
+        parent_task_id TEXT NOT NULL,
+        config_version INTEGER NOT NULL,
+        deleted_at TEXT NOT NULL,
+        PRIMARY KEY (parent_task_id, config_version)
+      );
+
       CREATE TABLE IF NOT EXISTS feishu_task_package_snapshots (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
         package_alias TEXT NOT NULL,
         package_revision INTEGER NOT NULL CHECK (package_revision > 0),
         snapshot_json TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS feishu_task_configuration_history (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        task_version INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL,
+        package_snapshot_json TEXT NOT NULL,
+        description TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, task_version)
       );
 
       CREATE INDEX IF NOT EXISTS feishu_task_package_snapshots_alias
@@ -1504,7 +1524,7 @@ export class TaskboardDatabase {
 
     const feishuOriginColumns = this.database.prepare("PRAGMA table_info(feishu_task_origins)").all();
     for (const column of [
-      "subject_key", "config_version", "stage_id", "event_id", "registration_event_id",
+      "subject_key", "config_version", "stage_id", "event_id", "registration_event_id", "rerun_of_task_id",
       "base_token", "table_id", "record_id",
       "status_field_id", "before_option_id", "after_option_id", "event_occurred_at",
       "stage_snapshot_json", "controlled_context_json",
@@ -1537,10 +1557,11 @@ export class TaskboardDatabase {
         SET registration_event_id = event_id
         WHERE event_id IS NOT NULL
           AND registration_event_id IS NULL
+          AND rerun_of_task_id IS NULL
           AND task_id = (
             SELECT MIN(candidate.task_id)
             FROM feishu_task_origins AS candidate
-            WHERE candidate.event_id = origin.event_id
+            WHERE candidate.event_id = origin.event_id AND candidate.rerun_of_task_id IS NULL
           )
           AND NOT EXISTS (
             SELECT 1
@@ -1550,9 +1571,13 @@ export class TaskboardDatabase {
         CREATE UNIQUE INDEX IF NOT EXISTS feishu_task_origins_event_id_unique
           ON feishu_task_origins(registration_event_id)
           WHERE registration_event_id IS NOT NULL;
-        CREATE TRIGGER IF NOT EXISTS feishu_task_origins_reserve_legacy_event_id
+        CREATE UNIQUE INDEX IF NOT EXISTS feishu_task_config_rerun_unique
+          ON feishu_task_origins(rerun_of_task_id, config_version)
+          WHERE rerun_of_task_id IS NOT NULL;
+        DROP TRIGGER IF EXISTS feishu_task_origins_reserve_legacy_event_id;
+        CREATE TRIGGER feishu_task_origins_reserve_legacy_event_id
         AFTER INSERT ON feishu_task_origins
-        WHEN NEW.registration_event_id IS NULL AND NEW.event_id IS NOT NULL
+        WHEN NEW.registration_event_id IS NULL AND NEW.event_id IS NOT NULL AND NEW.rerun_of_task_id IS NULL
         BEGIN
           UPDATE feishu_task_origins
           SET registration_event_id = NEW.event_id
@@ -1567,6 +1592,15 @@ export class TaskboardDatabase {
         )
         BEGIN
           SELECT RAISE(ABORT, 'FEISHU_TASK_DELETED');
+        END;
+        CREATE TRIGGER IF NOT EXISTS feishu_task_origins_reject_deleted_config_rerun
+        BEFORE INSERT ON feishu_task_origins
+        WHEN EXISTS (
+          SELECT 1 FROM feishu_config_rerun_deletions
+          WHERE parent_task_id = NEW.rerun_of_task_id AND config_version = NEW.config_version
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'FEISHU_CONFIG_RERUN_DELETED');
         END;
       `);
       this.database.exec("COMMIT");
@@ -4177,7 +4211,11 @@ export class TaskboardDatabase {
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      if (input.feishuOrigin) this.assertFeishuEventNotDeleted(input.feishuOrigin);
+      if (input.feishuOrigin) {
+        this.assertFeishuEventNotDeleted(input.feishuOrigin);
+        const origin = normalizeFeishuTaskOrigin(input.feishuOrigin);
+        if (origin.rerunOfTaskId) this.assertFeishuConfigRerunNotDeleted(origin.rerunOfTaskId, origin.configVersion);
+      }
       const project = this.database.prepare(`
         SELECT
           projects.id,
@@ -4275,10 +4313,10 @@ export class TaskboardDatabase {
         this.database.prepare(`
           INSERT INTO feishu_task_origins (
             task_id, metadata_json, subject_key, config_version, stage_id, event_id,
-            registration_event_id, base_token, table_id, record_id, status_field_id,
+            registration_event_id, rerun_of_task_id, base_token, table_id, record_id, status_field_id,
             before_option_id, after_option_id,
             event_occurred_at, stage_snapshot_json, controlled_context_json, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           id,
           JSON.stringify(origin),
@@ -4286,7 +4324,8 @@ export class TaskboardDatabase {
           origin.configVersion ?? null,
           origin.stageId ?? null,
           origin.eventId ?? null,
-          origin.eventId ?? null,
+          origin.rerunOfTaskId ? null : origin.eventId ?? null,
+          origin.rerunOfTaskId ?? null,
           origin.baseToken ?? null,
           origin.tableId ?? null,
           origin.recordId ?? null,
@@ -5046,7 +5085,7 @@ export class TaskboardDatabase {
   transitionFeishuTaskExecution(taskId, expectedVersion, status, actor = {
     type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null,
   }) {
-    if (!['todo', 'queued', 'in_progress'].includes(status)) {
+    if (!['todo', 'queued', 'in_progress', 'blocked'].includes(status)) {
       throw new ApiError(400, "INVALID_FIELD", "Invalid Feishu execution task status");
     }
     const current = this.#requireTask(taskId);
@@ -5138,6 +5177,7 @@ export class TaskboardDatabase {
       FROM feishu_task_origins
       JOIN tasks ON tasks.id = feishu_task_origins.task_id
       WHERE feishu_task_origins.event_id = ?
+        AND feishu_task_origins.rerun_of_task_id IS NULL
         AND (? IS NULL OR tasks.project_id = ?)
       ORDER BY CASE WHEN feishu_task_origins.registration_event_id = ? THEN 0 ELSE 1 END,
         tasks.created_at, tasks.id
@@ -5147,7 +5187,7 @@ export class TaskboardDatabase {
     const rows = this.database.prepare(`
       SELECT feishu_task_origins.task_id, feishu_task_origins.metadata_json
       FROM feishu_task_origins JOIN tasks ON tasks.id = feishu_task_origins.task_id
-      WHERE (? IS NULL OR tasks.project_id = ?)
+      WHERE (? IS NULL OR tasks.project_id = ?) AND feishu_task_origins.rerun_of_task_id IS NULL
       ORDER BY tasks.created_at, tasks.id
     `).all(projectId, projectId);
     for (const row of rows) {
@@ -5178,6 +5218,7 @@ export class TaskboardDatabase {
       FROM feishu_task_origins
       WHERE base_token = ? AND table_id = ? AND record_id = ?
         AND status_field_id = ? AND stage_id = ? AND event_id = ?
+        AND rerun_of_task_id IS NULL
       LIMIT 1
     `).get(...values.map((value) => value.trim()));
     return row ? this.getTask(row.task_id) : null;
@@ -5192,6 +5233,7 @@ export class TaskboardDatabase {
       FROM feishu_task_origins
       WHERE base_token = ? AND table_id = ? AND record_id = ?
         AND status_field_id = ? AND event_id = ?
+        AND rerun_of_task_id IS NULL
       ORDER BY task_id
     `).all(...values.map((value) => value.trim()));
     return rows.map((row) => ({
@@ -5201,6 +5243,104 @@ export class TaskboardDatabase {
       configVersion: row.config_version,
       eventId: row.event_id,
     }));
+  }
+
+  findFeishuConfigRerun(parentTaskId, configVersion) {
+    this.assertFeishuConfigRerunNotDeleted(parentTaskId, configVersion);
+    const row = this.database.prepare(`SELECT task_id FROM feishu_task_origins
+      WHERE rerun_of_task_id = ? AND config_version = ?`).get(parentTaskId, configVersion);
+    return row ? this.getTask(row.task_id) : null;
+  }
+
+  getFeishuTaskRegistrationOrigin(taskId) {
+    const row = this.database.prepare(`SELECT metadata_json FROM feishu_task_configuration_history
+      WHERE task_id = ? ORDER BY task_version LIMIT 1`).get(taskId);
+    return row ? normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json)) : this.getFeishuTaskOrigin(taskId);
+  }
+
+  hasFeishuCurrentConfigRerun(taskId) {
+    return Boolean(this.database.prepare(`SELECT 1 FROM feishu_task_configuration_history WHERE task_id = ? LIMIT 1`).get(taskId));
+  }
+
+  getFeishuTaskConfigurationByVersion(taskId, configVersion) {
+    const currentOrigin = this.getFeishuTaskOrigin(taskId);
+    if (currentOrigin?.configVersion === configVersion) {
+      return {
+        metadata: currentOrigin,
+        packageSnapshot: this.getFeishuTaskPackageSnapshot(taskId),
+      };
+    }
+    const rows = this.database.prepare(`SELECT metadata_json, package_snapshot_json
+      FROM feishu_task_configuration_history WHERE task_id = ? ORDER BY task_version`).all(taskId);
+    for (const row of rows) {
+      try {
+        const metadata = normalizeFeishuTaskOrigin(JSON.parse(row.metadata_json));
+        if (metadata.configVersion !== configVersion) continue;
+        return {
+          metadata,
+          packageSnapshot: normalizeFeishuPackageSnapshot(JSON.parse(row.package_snapshot_json)),
+        };
+      } catch {}
+    }
+    return null;
+  }
+
+  prepareFeishuCurrentConfigRerun(taskId, expectedVersion, input, validate) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      // Validate again after asynchronous record/package/path reads, inside the
+      // same transaction that moves the original card and freezes this attempt.
+      validate();
+      const current = this.getTask(taskId);
+      this.#requireVersion(current, expectedVersion);
+      const previousOrigin = this.getFeishuTaskOrigin(taskId);
+      const previousPackage = this.getFeishuTaskPackageSnapshot(taskId);
+      const origin = normalizeFeishuTaskOrigin(input.feishuOrigin);
+      const snapshot = normalizeFeishuPackageSnapshot(input.packageSnapshot);
+      for (const key of ["eventId", "baseToken", "tableId", "recordId", "subjectKey", "stageId", "packageAlias", "rerunOfTaskId"]) {
+        if (origin[key] !== previousOrigin[key]) {
+          throw new ApiError(409, "AUTOCUT_RERUN_BINDING_MISMATCH", "The task cannot switch its trusted identity or package");
+        }
+      }
+      if (!workflowTemplatesEqual(previousPackage.workflowTemplate, snapshot.workflowTemplate)) {
+        throw new ApiError(409, "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "The task cannot switch its package workflow");
+      }
+      const timestamp = now();
+      const history = this.database.prepare(`INSERT INTO feishu_task_configuration_history
+        (task_id, task_version, metadata_json, package_snapshot_json, description, created_at) VALUES (?, ?, ?, ?, ?, ?)`);
+      // The original event envelope remains available for replay and deletion.
+      if (!this.hasFeishuCurrentConfigRerun(taskId)) {
+        history.run(taskId, current.version, JSON.stringify(previousOrigin), JSON.stringify(previousPackage), current.description, timestamp);
+      }
+      history.run(taskId, current.version + 1, JSON.stringify(origin), JSON.stringify(snapshot), input.description, timestamp);
+      this.database.prepare(`UPDATE feishu_task_origins SET metadata_json = ?, config_version = ?,
+        status_field_id = ?, before_option_id = ?, after_option_id = ?, event_occurred_at = ?,
+        stage_snapshot_json = ?, controlled_context_json = ?, updated_at = ? WHERE task_id = ?`)
+        .run(JSON.stringify(origin), origin.configVersion, origin.statusFieldId, origin.beforeOptionId ?? null,
+          origin.afterOptionId ?? null, origin.eventOccurredAt ?? null, JSON.stringify(origin.stageSnapshot),
+          JSON.stringify(origin.controlledContext), timestamp, taskId);
+      this.database.prepare(`UPDATE feishu_task_package_snapshots SET package_alias = ?, package_revision = ?,
+        snapshot_json = ?, created_at = ? WHERE task_id = ?`)
+        .run(snapshot.packageAlias, snapshot.packageRevision, JSON.stringify(snapshot), timestamp, taskId);
+      this.database.prepare(`UPDATE tasks SET title = ?, description = ?, status = 'todo', thread_id = NULL,
+        thread_codex_project_id = NULL, thread_codex_project_kind = NULL, thread_codex_host_id = NULL,
+        thread_workspace_path = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ?`)
+        .run(input.title, input.description, timestamp, taskId, expectedVersion);
+      this.#recordTaskActivity(taskId, input.actor, taskFieldChanges(current, { status: "todo", threadId: null }), timestamp);
+      this.database.prepare("DELETE FROM task_completion_artifacts WHERE task_id = ?").run(taskId);
+      this.database.exec("COMMIT");
+      return this.getTask(taskId);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  assertFeishuConfigRerunNotDeleted(parentTaskId, configVersion) {
+    if (this.database.prepare(`SELECT 1 FROM feishu_config_rerun_deletions
+      WHERE parent_task_id = ? AND config_version = ?`).get(parentTaskId, configVersion)) {
+      throw new ApiError(410, "FEISHU_CONFIG_RERUN_DELETED", "The rerun for this parent and configuration was permanently deleted");
+    }
   }
 
   listFeishuTasks(scope = {}) {
@@ -5963,7 +6103,7 @@ export class TaskboardDatabase {
       if (storedOrigin) {
         let metadata;
         try {
-          metadata = normalizeFeishuTaskOrigin(this.getFeishuTaskOrigin(current.id));
+          metadata = normalizeFeishuTaskOrigin(this.getFeishuTaskRegistrationOrigin(current.id));
           const rawMetadata = normalizeFeishuTaskOrigin(JSON.parse(storedOrigin.metadata_json));
           if (rawMetadata.eventId !== metadata.eventId
             || (storedOrigin.registration_event_id && storedOrigin.registration_event_id !== metadata.eventId)) {
@@ -5978,7 +6118,12 @@ export class TaskboardDatabase {
         // Historical duplicates must not replace a live canonical owner's identity.
         // That owner continues reserving the event until its own deletion. Once
         // deleted, its FK-free digests survive all later duplicate deletions.
-        if (!eventOwner || eventOwner.task_id === current.id) {
+        if (metadata.rerunOfTaskId) {
+          this.database.prepare(`INSERT INTO feishu_config_rerun_deletions
+            (parent_task_id, config_version, deleted_at) VALUES (?, ?, ?)
+            ON CONFLICT(parent_task_id, config_version) DO NOTHING`)
+          .run(metadata.rerunOfTaskId, metadata.configVersion, now());
+        } else if (!eventOwner || eventOwner.task_id === current.id) {
           this.database.prepare(`INSERT INTO feishu_task_deletions
             (event_id, origin_sha256, registration_sha256, deleted_at) VALUES (?, ?, ?, ?)
             ON CONFLICT(event_id) DO NOTHING`)

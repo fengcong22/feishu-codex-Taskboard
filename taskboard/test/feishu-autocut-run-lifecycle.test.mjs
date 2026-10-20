@@ -2308,6 +2308,302 @@ test("an explicit phased retry creates a new attempt and preserves the blocked r
   }
 });
 
+const configRerunConsent = { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true };
+
+async function blockedConfigRerunFixture({ executionMode = "manual", ...options } = {}) {
+  const fixture = await createFixture({ controlledContext: "document_link_missing", bridgeStatus: 409,
+    autoCutRunner: async ({ run }) => { await writePassingRunResult(run); return { exitCode: 0 }; }, ...options });
+  const subject = await registerSubject(fixture, { executionMode });
+  const context = { documentLinks: ["https://guanghe.feishu.cn/docx/old"],
+    namingDisplayValue: "旧课程", namingValueUnique: true };
+  const envelope = registration(subject, context);
+  const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", envelope);
+  const start = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+  assert.equal(start.response.status, 409, JSON.stringify(start.body));
+  const task = fixture.app.database.getTask(created.body.task.id);
+  assert.equal(task.status, "blocked");
+  return { ...fixture, subject, task, envelope };
+}
+
+async function enableRepairedConfig(fixture, { executionMode = "manual", targetPath = undefined } = {}) {
+  const route = `/api/local/feishu/workflow/subjects/${encodeURIComponent(SUBJECT_KEY)}`;
+  const stages = structuredClone(fixture.subject.stages);
+  stages.initial.videoSource.anchorText = "五、视频录制";
+  if (targetPath) stages.initial.artifactTargetPath = targetPath;
+  const saved = await jsonRequest(fixture.baseUrl, route, {
+    stages,
+    execution: { ...fixture.subject.execution, mode: executionMode },
+  }, { method: "PATCH" });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.body));
+  const enabled = await jsonRequest(fixture.baseUrl, `${route}/enable`, {
+    expectedVersion: saved.body.subject.configVersion,
+  });
+  assert.equal(enabled.response.status, 200, JSON.stringify(enabled.body));
+  return enabled.body.subject;
+}
+
+test("configuration rerun uses the active anchor on the same card and preserves attempts and event deduplication", async () => {
+  const f = await blockedConfigRerunFixture();
+  let reopened;
+  try {
+    const [oldRun] = f.app.database.listFeishuAutoCutRuns(f.task.id);
+    const oldOrigin = f.app.database.getFeishuTaskOrigin(f.task.id);
+    const oldTargetPath = path.join(f.directory, "stage-output");
+    const currentTargetPath = path.join(f.directory, "stage-output-current");
+    const current = await enableRepairedConfig(f, { targetPath: currentTargetPath });
+    f.bridge.setResponse({ documentLinks: ["https://guanghe.feishu.cn/docx/current"],
+      namingDisplayValue: "新课程", namingValueUnique: true });
+    const rerun = await jsonRequest(f.baseUrl, `/api/local/tasks/${f.task.id}/autocut-rerun-current`, {
+      version: f.task.version, runConsent: configRerunConsent,
+    });
+    assert.equal(rerun.response.status, 202, JSON.stringify(rerun.body));
+    const newTask = await waitForTaskStatus(f.app, rerun.body.task.id, "in_review");
+    assert.equal(newTask.id, f.task.id);
+    assert.equal(newTask.identifier, f.task.identifier);
+    assert.equal(f.app.database.listFeishuTasks().length, 1);
+    assert.equal(newTask.feishuOrigin.configVersion, current.configVersion);
+    assert.equal(newTask.feishuOrigin.eventId, f.envelope.event.eventId, "keep the original real event identity");
+    const newOrigin = f.app.database.getFeishuTaskOrigin(newTask.id);
+    assert.equal(newOrigin.beforeOptionId, undefined, "a local rerun does not manufacture a status edge");
+    assert.equal(newOrigin.eventOccurredAt, undefined);
+    const [preservedRun, newRun] = f.app.database.listFeishuAutoCutRuns(newTask.id);
+    assert.deepEqual(preservedRun, oldRun);
+    assert.equal(newRun.attempt, 2);
+    const manifest = JSON.parse(await readFile(newRun.manifestPath, "utf8"));
+    assert.equal(manifest.sources.video.anchor_text, "五、视频录制");
+    assert.match(JSON.stringify(manifest), /docx\/current/);
+    assert.equal(newRun.configVersion, current.configVersion);
+    assert.equal(f.app.database.getTaskArtifactForRun(newTask.id, newRun.runId).validationStatus, "verified");
+    assert.equal(oldOrigin.configVersion, oldRun.configVersion);
+    const replay = await jsonRequest(f.baseUrl, "/api/local/feishu/tasks", f.envelope);
+    assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.task.id, f.task.id);
+
+    const actor = { type: "user", id: "local-user", name: "Local user", avatarUrl: null };
+    f.app.database.database.prepare(`INSERT INTO task_artifacts (
+      id, task_id, run_id, storage_key, filename, content_type, size, sha256,
+      source_mode, validation_status, entry_count, draft_root, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'driver_report', 'verified', 2, 'draft', ?, ?)`)
+      .run("historical-config-artifact", newTask.id, oldRun.runId, "historical-config-artifact.zip",
+        "historical.zip", "application/zip", 10, "a".repeat(64), newTask.createdAt, newTask.updatedAt);
+    const historicalArtifact = f.app.database.getTaskArtifactForRun(newTask.id, oldRun.runId);
+    assert.ok(historicalArtifact);
+    f.app.database.updateTask(newTask.id, newTask.version, { status: "done" }, null, null, actor);
+    const historicalUpload = await jsonRequest(f.baseUrl, `/api/local/tasks/${newTask.id}/upload-queue`, {
+      artifactId: historicalArtifact.id,
+    });
+    assert.equal(historicalUpload.response.status, 202, JSON.stringify(historicalUpload.body));
+    assert.equal(f.app.database.database.prepare("SELECT target_path FROM artifact_uploads WHERE id = ?")
+      .get(historicalUpload.body.upload.id).target_path, oldTargetPath);
+    const currentUpload = await jsonRequest(f.baseUrl, `/api/local/tasks/${newTask.id}/upload-queue`, {
+      artifactId: f.app.database.getTaskArtifactForRun(newTask.id, newRun.runId).id,
+    });
+    assert.equal(currentUpload.response.status, 202, JSON.stringify(currentUpload.body));
+    assert.equal(f.app.database.database.prepare("SELECT target_path FROM artifact_uploads WHERE id = ?")
+      .get(currentUpload.body.upload.id).target_path, currentTargetPath);
+
+    const repeat = await jsonRequest(f.baseUrl, `/api/local/tasks/${f.task.id}/autocut-rerun-current`, {
+      version: f.task.version, runConsent: configRerunConsent,
+    });
+    assert.equal(repeat.response.status, 409, JSON.stringify(repeat.body));
+    assert.equal(f.app.database.listFeishuAutoCutRuns(newTask.id).length, 2);
+    // Opening the same database must not migrate the derived origin into the
+    // unique real-event reservation or make the completed run execute again.
+    await f.app.close();
+    reopened = createTaskboardServer(f.serverOptions);
+    const address = await listenTaskboardOnFetchSafePort(reopened);
+    assert.equal(reopened.database.findFeishuTaskByEventId(f.envelope.event.eventId).id, f.task.id);
+    const afterRestart = await jsonRequest(`http://127.0.0.1:${address.port}`,
+      `/api/local/tasks/${f.task.id}/autocut-rerun-current`, { version: f.task.version, runConsent: configRerunConsent });
+    assert.equal(afterRestart.response.status, 409, JSON.stringify(afterRestart.body));
+    assert.deepEqual(reopened.database.listFeishuAutoCutRuns(newTask.id), [oldRun, newRun]);
+    const archived = reopened.database.archiveTask(newTask.id, reopened.database.getTask(newTask.id).version, null, null,
+      { type: "user", id: "local-user", name: "Local user", avatarUrl: null });
+    reopened.database.deleteArchivedTask(newTask.id, archived.version);
+    assert.throws(() => reopened.database.assertFeishuEventNotDeleted({
+      source: "feishu-base", ...f.envelope.event, ...f.envelope.binding, controlledContext: f.envelope.controlledContext,
+    }, { registration: true }), { code: "FEISHU_TASK_DELETED" });
+  } finally {
+    await (reopened ?? f.app).close();
+    await f.bridge.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("replaying the original automatic event preserves a queued same-card rerun reservation", async () => {
+  let releaseFirstRunner;
+  let firstRunnerStarted;
+  const firstStarted = new Promise(resolve => { firstRunnerStarted = resolve; });
+  const firstRunnerGate = new Promise(resolve => { releaseFirstRunner = resolve; });
+  let invocations = 0;
+  const runner = async ({ run }) => {
+    if (++invocations === 1) {
+      firstRunnerStarted();
+      await firstRunnerGate;
+    }
+    await writePassingRunResult(run);
+    return { exitCode: 0 };
+  };
+  const f = await blockedConfigRerunFixture({ allowAutomaticExecution: true, autoCutRunner: runner });
+  try {
+    const current = await enableRepairedConfig(f, { executionMode: "automatic" });
+    const context = { documentLinks: ["https://guanghe.feishu.cn/docx/current"],
+      namingDisplayValue: "新课程", namingValueUnique: true };
+    f.bridge.setResponse(context);
+    const blockerEnvelope = registration(current, context, { eventId: "evt-rerun-slot-blocker" });
+    blockerEnvelope.event.recordId = "rec_slot_blocker";
+    const blocker = await jsonRequest(f.baseUrl, "/api/local/feishu/tasks", blockerEnvelope);
+    assert.equal(blocker.response.status, 201, JSON.stringify(blocker.body));
+    let blockerTimeout;
+    try {
+      await Promise.race([
+        firstStarted,
+        new Promise((_, reject) => { blockerTimeout = setTimeout(() => reject(new Error("Timed out waiting for the slot blocker")), 9_000); }),
+      ]);
+    } finally {
+      clearTimeout(blockerTimeout);
+    }
+
+    const rerun = await jsonRequest(f.baseUrl, `/api/local/tasks/${f.task.id}/autocut-rerun-current`, {
+      version: f.task.version, runConsent: configRerunConsent,
+    });
+    assert.equal(rerun.response.status, 202, JSON.stringify(rerun.body));
+    assert.equal(rerun.body.execution.state, "queued");
+    const reservedExecution = f.app.database.getFeishuExecution(f.task.id);
+    assert.equal(f.app.database.getTask(f.task.id).status, "queued");
+
+    const replay = await jsonRequest(f.baseUrl, "/api/local/feishu/tasks", f.envelope);
+    assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.task.id, f.task.id);
+    assert.deepEqual(f.app.database.getFeishuExecution(f.task.id), reservedExecution);
+    assert.equal(f.app.database.getTask(f.task.id).status, "queued");
+
+    releaseFirstRunner();
+    await waitForRuns(f.app, f.task.id, 2);
+    await waitForTaskStatus(f.app, f.task.id, "done");
+    assert.equal(invocations, 2);
+    assert.equal(f.app.database.listFeishuTasks().length, 2);
+  } finally {
+    releaseFirstRunner?.();
+    await f.app.close(); await f.bridge.close(); await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("configuration rerun rejects missing consent, stale versions, copied markers and simulated sources without creating tasks", async () => {
+  const f = await blockedConfigRerunFixture();
+  try {
+    const request = (task, body) => jsonRequest(f.baseUrl, `/api/local/tasks/${task.id}/autocut-rerun-current`, body);
+    const noConsent = await request(f.task, { version: f.task.version });
+    assert.equal(noConsent.response.status, 400);
+    const stale = await request(f.task, { version: f.task.version + 1, runConsent: configRerunConsent });
+    assert.equal(stale.body.error.code, "VERSION_CONFLICT");
+    const actor = { type: "user", id: "local-user", name: "本地用户", avatarUrl: null };
+    const copied = f.app.database.createTask({ projectId: f.task.projectId, title: "copied",
+      description: f.task.description, status: "blocked", priority: "none", labels: ["feishu"],
+      actor, assignee: actor, startDate: null, dueDate: null });
+    const forged = await request(copied, { version: copied.version, runConsent: configRerunConsent });
+    assert.equal(forged.body.error.code, "TASK_NOT_STARTABLE");
+    const simulation = await jsonRequest(f.baseUrl, "/api/local/feishu/tasks", {
+      ...f.envelope, event: { ...f.envelope.event, eventId: "simulation-config-rerun", deliverySource: "simulation" },
+    });
+    const simulated = await request(simulation.body.task, { version: simulation.body.task.version, runConsent: configRerunConsent });
+    assert.equal(simulated.body.error.code, "AUTOCUT_RERUN_NOT_ALLOWED");
+    assert.equal(f.app.database.listFeishuTasks().length, 2);
+  } finally {
+    await f.app.close(); await f.bridge.close(); await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("configuration rerun rechecks the parent and active version after reading current record values", async () => {
+  const f = await blockedConfigRerunFixture();
+  let release;
+  try {
+    const current = await enableRepairedConfig(f);
+    f.bridge.setResponse({ documentLinks: ["https://guanghe.feishu.cn/docx/current"],
+      namingDisplayValue: "新课程", namingValueUnique: true });
+    const gate = new Promise(resolve => { release = resolve; });
+    f.bridge.holdResponses(gate);
+    const reads = f.bridge.requests.length;
+    const pending = jsonRequest(f.baseUrl, `/api/local/tasks/${f.task.id}/autocut-rerun-current`, {
+      version: f.task.version, runConsent: configRerunConsent,
+    });
+    const deadline = Date.now() + 2000;
+    while (f.bridge.requests.length === reads && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(f.bridge.requests.length > reads);
+    const route = `/api/local/feishu/workflow/subjects/${encodeURIComponent(SUBJECT_KEY)}`;
+    const disabled = await jsonRequest(f.baseUrl, `${route}/disable`, { expectedVersion: current.configVersion });
+    assert.equal(disabled.response.status, 200, JSON.stringify(disabled.body));
+    release();
+    const result = await pending;
+    assert.equal(result.response.status, 409, JSON.stringify(result.body));
+    assert.equal(f.app.database.listFeishuTasks().length, 1);
+    assert.deepEqual(f.app.database.getTask(f.task.id), f.task);
+  } finally {
+    release?.(); await f.app.close(); await f.bridge.close(); await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("configuration rerun rejects concurrent stale clicks before a single local execution", async () => {
+  const f = await blockedConfigRerunFixture();
+  let release;
+  try {
+    await enableRepairedConfig(f);
+    f.bridge.setResponse({ documentLinks: ["https://guanghe.feishu.cn/docx/current"],
+      namingDisplayValue: "新课程", namingValueUnique: true });
+    f.bridge.holdResponses(new Promise(resolve => { release = resolve; }));
+    const reads = f.bridge.requests.length;
+    const send = () => jsonRequest(f.baseUrl, `/api/local/tasks/${f.task.id}/autocut-rerun-current`, {
+      version: f.task.version, runConsent: configRerunConsent,
+    });
+    const pending = [send(), send()];
+    const deadline = Date.now() + 2000;
+    while (f.bridge.requests.length < reads + 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(f.bridge.requests.length, reads + 2);
+    release();
+    const responses = await Promise.all(pending);
+    assert.equal(responses.filter(r => r.response.status === 202).length, 1);
+    assert.equal(responses.filter(r => r.response.status === 409).length, 1);
+    await waitForTaskStatus(f.app, f.task.id, "in_review");
+    assert.equal(f.app.database.listFeishuTasks().length, 1);
+    assert.equal(f.app.database.listFeishuAutoCutRuns(f.task.id).length, 2);
+  } finally {
+    release?.(); await f.app.close(); await f.bridge.close(); await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("configuration rerun failure rejects an unconsented retry without changing its task or attempts", async () => {
+  let invocations = 0;
+  const f = await blockedConfigRerunFixture({ autoCutRunner: async ({ run }) => {
+    if (++invocations === 1) throw Object.assign(new Error("fixture failure"), { code: "fixture_failed" });
+    await writePassingRunResult(run); return { exitCode: 0 };
+  } });
+  try {
+    await enableRepairedConfig(f);
+    f.bridge.setResponse({ documentLinks: ["https://guanghe.feishu.cn/docx/current"],
+      namingDisplayValue: "新课程", namingValueUnique: true });
+    const created = await jsonRequest(f.baseUrl, `/api/local/tasks/${f.task.id}/autocut-rerun-current`, {
+      version: f.task.version, runConsent: configRerunConsent,
+    });
+    assert.equal(created.response.status, 202, JSON.stringify(created.body));
+    const blocked = await waitForTaskStatus(f.app, created.body.task.id, "blocked");
+    const oldRuns = f.app.database.listFeishuAutoCutRuns(blocked.id);
+    const rejected = await jsonRequest(f.baseUrl, `/api/local/tasks/${blocked.id}/autocut-rerun-current`, { version: blocked.version });
+    assert.equal(rejected.response.status, 400, JSON.stringify(rejected.body));
+    assert.deepEqual(f.app.database.getTask(blocked.id), blocked);
+    assert.deepEqual(f.app.database.listFeishuAutoCutRuns(blocked.id), oldRuns);
+    const retry = await jsonRequest(f.baseUrl, `/api/local/tasks/${blocked.id}/autocut-rerun-current`, {
+      version: blocked.version, runConsent: configRerunConsent,
+    });
+    assert.equal(retry.response.status, 202, JSON.stringify(retry.body));
+    await waitForTaskStatus(f.app, blocked.id, "in_review");
+    assert.equal(invocations, 2);
+    assert.equal(f.app.database.listFeishuTasks().length, 1);
+    assert.equal(f.app.database.listFeishuAutoCutRuns(blocked.id).length, 3);
+  } finally {
+    await f.app.close(); await f.bridge.close(); await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
 test("Auto-Cut retry rejects non-blocked, copied-marker, and legacy tasks", async () => {
   const controlledContext = {
     documentLinks: ["https://guanghe.feishu.cn/docx/retry-eligibility"],

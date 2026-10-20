@@ -1079,6 +1079,55 @@ test("retry scheduling carries consent only on its in-memory entry", async () =>
   assert.equal(fixture.starts[0].trigger, "retry");
 });
 
+test("a queued configuration rerun loses its reservation on restart and requires fresh single-run consent", async () => {
+  const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });
+  const derived = metadata("Auto-cut-copyA", { rerunOfTaskId: "parent-task" });
+  fixture.tasks.set("running", task("running"));
+  fixture.tasks.set("derived", task("derived"));
+  fixture.origins.set("derived", derived);
+  await fixture.coordinator.schedule(fixture.tasks.get("running"), metadata("Auto-cut-copyA"));
+  await fixture.coordinator.schedule(fixture.tasks.get("derived"), derived, "retry", {
+    autoCutRunConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+  });
+  assert.equal(fixture.tasks.get("derived").status, "queued");
+  await fixture.coordinator.close();
+  const recovered = fixture.createCoordinator();
+  await recovered.recover();
+  assert.equal(fixture.database.getFeishuExecution("derived"), null);
+  assert.equal(fixture.tasks.get("derived").status, "todo");
+  fixture.scheduler.release(fixture.scheduler.snapshot().active[0]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(fixture.starts.map(entry => entry.taskId), ["running"]);
+  await recovered.schedule(fixture.tasks.get("derived"), derived, "retry", {
+    autoCutRunConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+  });
+  assert.deepEqual(fixture.starts.map(entry => entry.taskId), ["running", "derived"]);
+  await recovered.close();
+});
+
+test("same-card configuration reruns return to blocked after restart without fresh consent", async () => {
+  const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });
+  const origin = metadata("Auto-cut-copyA");
+  fixture.database.hasFeishuCurrentConfigRerun = taskId => taskId === "same-card";
+  fixture.tasks.set("running", task("running"));
+  fixture.tasks.set("same-card", task("same-card"));
+  fixture.origins.set("same-card", origin);
+  await fixture.coordinator.schedule(fixture.tasks.get("running"), metadata("Auto-cut-copyA"));
+  await fixture.coordinator.schedule(fixture.tasks.get("same-card"), origin, "retry", {
+    autoCutRunConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
+  });
+  assert.equal(fixture.tasks.get("same-card").status, "queued");
+  await fixture.coordinator.close();
+  const recovered = fixture.createCoordinator();
+  await recovered.recover();
+  assert.equal(fixture.database.getFeishuExecution("same-card"), null);
+  assert.equal(fixture.tasks.get("same-card").status, "blocked");
+  fixture.scheduler.release(fixture.scheduler.snapshot().active[0]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(fixture.starts.map(entry => entry.taskId), ["running"]);
+  await recovered.close();
+});
+
 test("repeated manual scheduling of the same task is idempotent while the first start is pending", async () => {
   const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });
   fixture.tasks.set("task-1", task("task-1"));

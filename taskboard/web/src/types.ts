@@ -1025,6 +1025,8 @@ export interface TaskArtifactSummary {
 }
 
 export interface FeishuTaskOrigin {
+  rerunOfTaskId?: string;
+  deliverySource?: "simulation";
   taskId?: string;
   version: number;
   source: "feishu-base";

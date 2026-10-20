@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AutoCutRunSummary } from "./AutoCutRunSummary";
-import { retryTaskAutoCut } from "../api";
+import { rerunTaskAutoCutCurrent } from "../api";
 
 describe("AutoCutRunSummary", () => {
   afterEach(() => {
@@ -21,14 +21,15 @@ describe("AutoCutRunSummary", () => {
       errorCode: "docx_anchor_missing",
       errorMessage: "未找到录屏目录",
     };
-    render(<AutoCutRunSummary task={task} attempts={[attempt]} retrying={false} onRetry={onRetry} />);
+    render(<AutoCutRunSummary task={task} attempts={[attempt]} retrying={false} onRerunCurrent={onRetry} />);
 
     expect(screen.getByText("docx_anchor_missing")).toBeTruthy();
     expect(screen.getByText("run-1")).toBeTruthy();
-    const retryButton = screen.getByRole("button", { name: "重试 Auto-Cut" });
+    const retryButton = screen.getByRole("button", { name: "按当前配置重新执行" });
+    expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull();
     expect(retryButton.getAttribute("aria-describedby")).toBeTruthy();
     expect(document.getElementById(retryButton.getAttribute("aria-describedby")!)?.textContent)
-      .toMatch(/本次.*视频原音.*语音识别.*已配置的本机输出目录/);
+      .toMatch(/本次.*视频原音.*语音识别.*本机输出目录/);
     fireEvent.click(retryButton);
     expect(onRetry).toHaveBeenCalledWith("task-1", 4, {
       allowVideoAudioAsr: true,
@@ -45,12 +46,12 @@ describe("AutoCutRunSummary", () => {
       task={{ id: "task-1", version: 4, status: "blocked" }}
       attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked" }]}
       retrying={false}
-      onRetry={async (taskId, version, runConsent) => { await retryTaskAutoCut(taskId, version, runConsent); }}
+      onRerunCurrent={async (taskId, version, runConsent) => { await rerunTaskAutoCutCurrent(taskId, version, runConsent); }}
     />);
 
     expect(fetchMock).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "重试 Auto-Cut" }));
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/local/tasks/task-1/autocut-retry"),
+    fireEvent.click(screen.getByRole("button", { name: "按当前配置重新执行" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/local/tasks/task-1/autocut-rerun-current"),
       expect.objectContaining({ method: "POST", body: JSON.stringify({
         version: 4,
         runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true },
@@ -66,7 +67,7 @@ describe("AutoCutRunSummary", () => {
       task={{ id: "task-1", version: 4, status }}
       attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked" }]}
       retrying={retrying}
-      onRetry={onRetry}
+      onRerunCurrent={onRetry}
     />);
     expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull();
     expect(onRetry).not.toHaveBeenCalled();
@@ -78,7 +79,7 @@ describe("AutoCutRunSummary", () => {
         task={{ id: "task-1", version: 4, status: "in_progress" }}
         attempts={[{ runId: "run-2", attempt: 2, stageId: "first_review", state: "prepared", manifestSha256: "b".repeat(64) }]}
         retrying={false}
-        onRetry={vi.fn()}
+        onRerunCurrent={vi.fn()}
       />,
     );
     expect(document.body.textContent).not.toMatch(/C:\\|tmp|token|secret|feishu\.cn/i);
@@ -93,7 +94,7 @@ describe("AutoCutRunSummary", () => {
         { runId: "old-run", attempt: 1, stageId: "initial", state: "blocked", threadId: "old-thread", errorCode: "autocut_result_missing" },
         { runId: "latest-run", attempt: 2, stageId: "initial", state: "blocked", threadId: "latest-thread", executionKind: "local", errorCode: "autocut_failed", failedPhase: "document_fetch", lastPhase: "package_publish" },
       ]}
-      retrying={false} onRetry={vi.fn()} onOpenLog={onOpenLog} onCopy={onCopy}
+      retrying={false} onRerunCurrent={vi.fn()} onOpenLog={onOpenLog} onCopy={onCopy}
     />);
     const rows = screen.getAllByRole("listitem").filter((row) => row.classList.contains("autocut-run-row"));
     const latest = within(rows[1]);
@@ -113,7 +114,7 @@ describe("AutoCutRunSummary", () => {
     render(<AutoCutRunSummary
       task={{ id: "task-1", version: 8, status: "blocked" }}
       attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked", errorCode: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE", failedPhase: "environment_check" }]}
-      retrying={false} onRetry={vi.fn()}
+      retrying={false} onRerunCurrent={vi.fn()}
     />);
     expect(screen.getByText("无法读取有效的飞书登录身份。")).toBeTruthy();
     expect(screen.getByText(/运行 Taskboard 的 Windows 账户/)).toBeTruthy();
@@ -125,7 +126,7 @@ describe("AutoCutRunSummary", () => {
     render(<AutoCutRunSummary
       task={{ id: "task-1", version: 8, status: "blocked" }}
       attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked", errorCode: "source_pair_asr_integrity", failedPhase: "source_asr" }]}
-      retrying={false} onRetry={vi.fn()} onCopy={onCopy}
+      retrying={false} onRerunCurrent={vi.fn()} onCopy={onCopy}
     />);
     expect(screen.getByText("source_pair_asr_integrity")).toBeTruthy();
     expect(screen.getByText("源音频或语音对齐数据未通过完整性校验，剪辑已停止。")).toBeTruthy();
@@ -141,7 +142,7 @@ describe("AutoCutRunSummary", () => {
     render(<AutoCutRunSummary
       task={{ id: "task-1", version: 8, status: "blocked" }}
       attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked", errorCode: "secret-token-123", errorMessage: "C:\\private\\auth token=secret-token-123", lastPhase: "preflight" }]}
-      retrying={false} onRetry={vi.fn()} onCopy={onCopy}
+      retrying={false} onRerunCurrent={vi.fn()} onCopy={onCopy}
     />);
     expect(screen.getByText("最后记录阶段：运行预检（未确认失败位置）")).toBeTruthy();
     expect(screen.getByText("本次运行受阻，现有记录不足以确定具体原因。")).toBeTruthy();
@@ -155,7 +156,7 @@ describe("AutoCutRunSummary", () => {
     render(<AutoCutRunSummary
       task={{ id: "task-1", version: 8, status: "blocked" }}
       attempts={[{ runId: "run-1", attempt: 1, stageId: "initial", state: "blocked", errorCode: "autocut_result_missing", executionKind: "codex" }]}
-      retrying={false} onRetry={vi.fn()}
+      retrying={false} onRerunCurrent={vi.fn()}
     />);
     expect(screen.getByText("剪辑包没有提交本次运行的结果回执，尚不能确定具体失败原因。")).toBeTruthy();
     expect(screen.getByText("失败阶段：未记录")).toBeTruthy();

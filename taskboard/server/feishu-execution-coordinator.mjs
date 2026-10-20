@@ -72,6 +72,10 @@ export function createFeishuExecutionCoordinator({
       fallbackMetadata: entry.metadata,
     });
     if (!metadata) return null;
+    if ((metadata.rerunOfTaskId || database.hasFeishuCurrentConfigRerun?.(task.id)) && entry.trigger === "retry" && (
+      entry.autoCutRunConsent?.allowVideoAudioAsr !== true
+      || entry.autoCutRunConsent?.allowConfiguredLocalOutput !== true
+    )) return null;
     if (entry.trigger === "automatic" && (
       !automaticExecutionAllowed()
       || Object.hasOwn(metadata, "deliverySource")
@@ -143,7 +147,10 @@ export function createFeishuExecutionCoordinator({
     if (lease) scheduler.release(lease);
     cancel(entry.task.id);
     const task = database.getTask(entry.task.id);
-    if (task?.status === "queued") updateTaskStatus(task.id, "todo");
+    const needsConsent = entry.trigger === "retry" && database.hasFeishuCurrentConfigRerun?.(entry.task.id)
+      && (entry.autoCutRunConsent?.allowVideoAudioAsr !== true || entry.autoCutRunConsent?.allowConfiguredLocalOutput !== true);
+    if (needsConsent && ["todo", "queued"].includes(task?.status)) updateTaskStatus(task.id, "blocked");
+    else if (task?.status === "queued") updateTaskStatus(task.id, "todo");
     return executionResult(entry.task.id);
   }
 
@@ -476,7 +483,7 @@ export function createFeishuExecutionCoordinator({
       throw new ApiError(409, "AUTOMATIC_EXECUTION_DISABLED", "Automatic Codex execution is disabled by the local policy");
     }
     if (!task?.id) throw new TypeError("task.id is required");
-    const entryCandidate = { task, metadata, trigger };
+    const entryCandidate = { task, metadata, trigger, autoCutRunConsent };
     const currentTask = database.getTask(task.id) ?? task;
     const currentMetadata = eligibleMetadata(entryCandidate, currentTask);
     if (!currentMetadata) {

@@ -68,41 +68,50 @@ describe("TaskDetail Auto-Cut execution", () => {
   let runReads: number;
   let retryTask: Task;
   let vmRun: VmPmoRunSummary | null;
+  let rerunGate: Promise<Response> | null;
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     runs = [attempt()];
     runReads = 0;
     vmRun = null;
+    rerunGate = null;
     retryTask = { ...TASK, version: 3 };
     fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const pathname = new URL(String(input), "http://localhost/").pathname;
-      if (pathname === `/api/local/tasks/${TASK.id}/autocut-runs`) {
+      if (/^\/api\/local\/tasks\/[^/]+\/autocut-runs$/.test(pathname)) {
         runReads += 1;
         return json({ runs });
       }
-      if (pathname === `/api/local/tasks/${TASK.id}/autocut-retry`) {
+      if (/^\/api\/local\/tasks\/[^/]+\/autocut-retry$/.test(pathname)) {
         runs = [attempt({ state: "blocked" }), attempt({ runId: "run-2", attempt: 2 })];
         return json({ task: retryTask }, 202);
       }
-      if (pathname === `/api/local/tasks/${TASK.id}/vm-pmo-run`) {
+      if (/^\/api\/local\/tasks\/[^/]+\/autocut-rerun-current$/.test(pathname)) {
+        if (rerunGate) return rerunGate;
+        runs = [...runs, attempt({ runId: "run-2", attempt: 2, configVersion: 2 })];
+        const taskId = new URL(String(input), "http://localhost/").pathname.split("/")[4];
+        return json({ task: { ...TASK, id: taskId, version: 3, status: "in_progress",
+          feishuOrigin: { ...TASK.feishuOrigin, configVersion: 2 } } }, 202);
+      }
+      if (/^\/api\/local\/tasks\/[^/]+\/vm-pmo-run$/.test(pathname)) {
         if (init?.method === "POST") {
           vmRun = { ...vmRun!, state: "ready", canRetryPlan: false };
           return json({ run: vmRun }, 202);
         }
         return json({ run: vmRun });
       }
-      if (pathname === `/api/local/tasks/${TASK.id}/vm-pmo-writeback-retry`) {
+      if (/^\/api\/local\/tasks\/[^/]+\/vm-pmo-writeback-retry$/.test(pathname)) {
         vmRun = { ...vmRun!, canRetryWriteback: false,
           writeback: { processing: { state: "pending", errorCode: null, attemptCount: 0 },
             completed: { state: "pending", errorCode: null, attemptCount: 0 } } };
         return json({ run: vmRun }, 202);
       }
-      if (pathname === `/api/tasks/${TASK.id}/comments`) return json({ comments: [] });
-      if (pathname === `/api/tasks/${TASK.id}/activities`) return json({ activities: [] });
-      if (pathname === `/api/tasks/${TASK.id}/attachments`) return json({ attachments: [] });
-      if (pathname === `/api/local/tasks/${TASK.id}/artifacts`) return json({ artifacts: [] });
-      if (pathname === `/api/local/tasks/${TASK.id}/upload`) return json({ uploads: [] });
+      if (/^\/api\/tasks\/[^/]+\/(comments|activities|attachments)$/.test(pathname)) {
+        return json({ [pathname.split("/").at(-1)!]: [] });
+      }
+      if (/^\/api\/local\/tasks\/[^/]+\/artifacts$/.test(pathname)) return json({ artifacts: [] });
+      if (/^\/api\/local\/tasks\/[^/]+\/upload$/.test(pathname)) return json({ uploads: [] });
       throw new Error(`Unexpected ${init?.method ?? "GET"} ${pathname}`);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -129,18 +138,19 @@ describe("TaskDetail Auto-Cut execution", () => {
     await waitFor(() => expect(runReads).toBe(2));
     expect(await screen.findByText("AUTOCUT_LARK_IDENTITY_UNAVAILABLE")).toBeTruthy();
     expect(screen.getByText("无法读取有效的飞书登录身份。")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "重试 Auto-Cut" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "按当前配置重新执行" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull();
   });
 
   it("passes the displayed single-run consent through the real detail retry handler and API", async () => {
     const blockedTask = { ...TASK, status: "blocked" as const, version: 2 };
     runs = [attempt({ state: "blocked", errorCode: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE" })];
     render(view(props(blockedTask)));
-    const retryButton = await screen.findByRole("button", { name: "重试 Auto-Cut" });
-    const retryRequests = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/autocut-retry"));
+    const retryButton = await screen.findByRole("button", { name: "按当前配置重新执行" });
+    const retryRequests = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/autocut-rerun-current"));
     expect(retryRequests()).toHaveLength(0);
     expect(document.getElementById(retryButton.getAttribute("aria-describedby")!)?.textContent)
-      .toMatch(/本次.*视频原音.*语音识别.*已配置的本机输出目录/);
+      .toMatch(/本次.*视频原音.*语音识别.*本机输出目录/);
 
     fireEvent.click(retryButton);
 
@@ -153,6 +163,44 @@ describe("TaskDetail Auto-Cut execution", () => {
     });
     expect(await screen.findByText("run-2")).toBeTruthy();
     await waitFor(() => expect(screen.queryByRole("button", { name: "重试 Auto-Cut" })).toBeNull());
+  });
+
+  it("reruns on the same card only after a click and refreshes both attempts", async () => {
+    runs = [attempt({ state: "blocked", errorCode: "docx_anchor_missing" })];
+    const detailProps = props({ ...TASK, status: "blocked", version: 2 });
+    render(view(detailProps));
+    const button = await screen.findByRole("button", { name: "按当前配置重新执行" });
+    expect(document.getElementById(button.getAttribute("aria-describedby")!)?.textContent)
+      .toMatch(/当前.*配置.*原任务.*视频原音.*语音识别.*本机输出目录/);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/autocut-rerun-current"))).toBe(false);
+    fireEvent.click(button);
+    expect(await screen.findByText("run-2")).toBeTruthy();
+    expect(detailProps.onOpenTask).not.toHaveBeenCalled();
+    const [, request] = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/autocut-rerun-current"))!;
+    expect(JSON.parse(request.body)).toEqual({ version: 2,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true } });
+    expect(screen.getByText("run-1")).toBeTruthy();
+    expect(screen.getByText("docx_anchor_missing")).toBeTruthy();
+  });
+
+  it("clears a pending rerun state when the detail switches to another card", async () => {
+    let releaseRerun!: (response: Response) => void;
+    rerunGate = new Promise<Response>(resolve => { releaseRerun = resolve; });
+    runs = [attempt({ state: "blocked", errorCode: "docx_anchor_missing" })];
+    const rendered = render(view(props({ ...TASK, status: "blocked", version: 2 })));
+    fireEvent.click(await screen.findByRole("button", { name: "按当前配置重新执行" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) =>
+      String(url).endsWith("/autocut-rerun-current"))).toBe(true));
+
+    const nextTask = { ...TASK, id: "task-2", identifier: "FEI-2", status: "blocked" as const,
+      feishuOrigin: { ...TASK.feishuOrigin!, recordId: "record-2", eventId: "event-2" } };
+    rendered.rerender(view(props(nextTask)));
+
+    expect(await screen.findByRole("button", { name: "按当前配置重新执行" })).toBeTruthy();
+    expect(screen.queryByText("重新执行中…")).toBeNull();
+    releaseRerun(json({ task: { ...TASK, status: "in_progress", version: 3 } }, 202));
+    await waitFor(() => expect(screen.getByRole("button", { name: "按当前配置重新执行" })).toBeTruthy());
+    expect(screen.queryByText("重新执行中…")).toBeNull();
   });
 
   it("requires per-retry ASR and local-plan consent before retrying the same VM run", async () => {

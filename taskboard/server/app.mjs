@@ -1776,6 +1776,8 @@ function parseFeishuTaskMetadata(description) {
       tableId: typeof metadata.tableId === "string" ? metadata.tableId.trim() : "",
       recordId: typeof metadata.recordId === "string" ? metadata.recordId.trim() : "",
       eventId: typeof metadata.eventId === "string" ? metadata.eventId.trim() : "",
+      ...(typeof metadata.rerunOfTaskId === "string" && metadata.rerunOfTaskId.trim()
+        ? { rerunOfTaskId: metadata.rerunOfTaskId.trim() } : {}),
       ...(typeof metadata.triggerField === "string" && metadata.triggerField.trim()
         ? { triggerField: metadata.triggerField.trim() } : {}),
       ...(typeof metadata.triggerFieldId === "string" && metadata.triggerFieldId.trim()
@@ -2920,7 +2922,7 @@ export function createTaskboardServer(options = {}) {
     const marker = parseFeishuTaskMetadata(task.description);
     if (!marker || !origin) return null;
     for (const key of [
-      "version", "source", "eventId", "baseToken", "tableId", "recordId",
+      "version", "source", "eventId", "rerunOfTaskId", "baseToken", "tableId", "recordId",
       "triggerField", "triggerFieldId", "triggerValue", "statusFieldId", "beforeOptionId",
       "afterOptionId", "stageId", "eventOccurredAt", "deliverySource", "mode", "executionMode",
       "subjectKey", "configVersion", "uploadMode", "packageAlias", "packageSource",
@@ -3041,7 +3043,40 @@ export function createTaskboardServer(options = {}) {
     return sameControlledContext(existing.controlledContext, expected.controlledContext);
   }
 
-  async function createCanonicalFeishuStageTask(registration, actor) {
+  function requireConfigRerunParent(taskId, version) {
+    const task = database.getTask(taskId);
+    if (!task) throw new ApiError(404, "TASK_NOT_FOUND", "The source task does not exist");
+    if (task.version !== version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+    const origin = requireTrustedFeishuTask(task, { requirePackage: true });
+    const snapshot = database.getFeishuTaskPackageSnapshot(task.id);
+    if (!isPhasedAutoCutOrigin(origin) || origin.deliverySource === "simulation"
+      || snapshot?.workflowTemplate?.id !== "document_draft_zip"
+      || task.status !== "blocked" || task.archivedAt !== null
+      || database.listFeishuAutoCutRuns(task.id).at(-1)?.state !== "blocked"
+      || database.getFeishuExecution(task.id)
+      || database.listTaskAiStarts().some(claim => claim.taskId === task.id)) {
+      throw new ApiError(409, "AUTOCUT_RERUN_NOT_ALLOWED", "Only a trusted, blocked production Auto-Cut task can use the current configuration");
+    }
+    return { task, origin, snapshot };
+  }
+
+  function requireCurrentConfigForRerun(parent, expectedConfigVersion = null) {
+    const subject = database.resolveFeishuSubjectVersionAt(parent.origin.subjectKey, Date.now());
+    if (!subject || (expectedConfigVersion !== null && subject.configVersion !== expectedConfigVersion)) {
+      throw new ApiError(409, "AUTOCUT_CURRENT_CONFIG_UNAVAILABLE", "The enabled configuration changed or is unavailable. Refresh and retry.");
+    }
+    if (subject.baseToken !== parent.origin.baseToken || subject.tableId !== parent.origin.tableId
+      || subject.workflowTemplate?.id === "vm_pmo_review_video"
+      || subject.packageRoute?.packageAlias !== parent.origin.packageAlias) {
+      throw new ApiError(409, "AUTOCUT_RERUN_BINDING_MISMATCH", "The current configuration must keep the source subject and Auto-Cut package");
+    }
+    if (subject.stages?.[parent.origin.stageId]?.enabled !== true) {
+      throw new ApiError(409, "STAGE_DISABLED", "The source task's stage is not enabled in the current configuration");
+    }
+    return subject;
+  }
+
+  async function createCanonicalFeishuStageTask(registration, actor, rerunParent = null) {
     const { event, binding, controlledContext } = registration;
     const separator = binding.subjectKey.indexOf(":");
     if (
@@ -3062,10 +3097,10 @@ export function createTaskboardServer(options = {}) {
       stageId: binding.stageId,
       eventId: event.eventId,
     };
-    database.assertFeishuEventNotDeleted(stageRegistrationOrigin(registration), { registration: true });
-    const existing = database.findFeishuTaskByEventId(event.eventId);
+    if (!rerunParent) database.assertFeishuEventNotDeleted(stageRegistrationOrigin(registration), { registration: true });
+    const existing = rerunParent ? null : database.findFeishuTaskByEventId(event.eventId);
     if (existing) {
-      const existingOrigin = database.getFeishuTaskOrigin(existing.id);
+      const existingOrigin = database.getFeishuTaskRegistrationOrigin(existing.id);
       if (!sameRegistrationEnvelope(existingOrigin, registration)) {
         throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
       }
@@ -3103,12 +3138,12 @@ export function createTaskboardServer(options = {}) {
     const stageStatusField = binding.stageId === "initial"
       ? subjectVersion.statusField
       : subjectVersion.reviewStatusField ?? subjectVersion.statusField;
-    if (
+    if (!rerunParent && (
       stageStatusField?.fieldId !== event.statusFieldId
       || stage.trigger?.fieldId !== event.statusFieldId
       || stage.trigger?.optionId !== event.afterOptionId
       || event.beforeOptionId === event.afterOptionId
-    ) {
+    )) {
       throw new ApiError(409, "FEISHU_STAGE_BINDING_MISMATCH", "The Feishu status edge does not match the configured stage");
     }
 
@@ -3163,6 +3198,7 @@ export function createTaskboardServer(options = {}) {
       version: 1,
       source: "feishu-base",
       eventId: event.eventId,
+      ...(rerunParent?.origin.rerunOfTaskId ? { rerunOfTaskId: rerunParent.origin.rerunOfTaskId } : {}),
       baseToken: event.baseToken,
       tableId: event.tableId,
       recordId: event.recordId,
@@ -3188,7 +3224,7 @@ export function createTaskboardServer(options = {}) {
       stageSnapshot,
       controlledContext: structuredClone(controlledContext),
     };
-    const eventRows = database.findFeishuTaskByRegistrationEvent(identity);
+    const eventRows = rerunParent ? [] : database.findFeishuTaskByRegistrationEvent(identity);
     if (eventRows.some((entry) => !sameStageRegistration(database.getFeishuTaskOrigin(entry.task.id), origin))) {
       throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different stage");
     }
@@ -3196,6 +3232,7 @@ export function createTaskboardServer(options = {}) {
       version: 1,
       source: "feishu-base",
       eventId: event.eventId,
+      ...(rerunParent?.origin.rerunOfTaskId ? { rerunOfTaskId: rerunParent.origin.rerunOfTaskId } : {}),
       baseToken: event.baseToken,
       tableId: event.tableId,
       recordId: event.recordId,
@@ -3243,6 +3280,17 @@ export function createTaskboardServer(options = {}) {
       feishuOrigin: origin,
       packageSnapshot,
     };
+    if (rerunParent) {
+      const task = database.prepareFeishuCurrentConfigRerun(rerunParent.task.id, rerunParent.task.version, taskInput, () => {
+        assertTaskStartAllowed();
+        const parent = requireConfigRerunParent(rerunParent.task.id, rerunParent.task.version);
+        if (!sameControlledContext(parent.origin, rerunParent.origin)) {
+          throw new ApiError(409, "AUTOCUT_RERUN_BINDING_MISMATCH", "The source task binding changed");
+        }
+        requireCurrentConfigForRerun(parent, binding.configVersion);
+      });
+      return { task, created: false };
+    }
     try {
       const task = database.createTask(taskInput);
       return { task, created: true };
@@ -3250,7 +3298,7 @@ export function createTaskboardServer(options = {}) {
       // A concurrent Bridge delivery may have won the unique event index.
       const winner = database.findFeishuTaskByEventId(event.eventId);
       if (winner) {
-        const winnerOrigin = database.getFeishuTaskOrigin(winner.id);
+        const winnerOrigin = database.getFeishuTaskRegistrationOrigin(winner.id);
         if (sameStageRegistration(winnerOrigin, origin)) return { task: winner, created: false };
         throw new ApiError(409, "FEISHU_EVENT_BINDING_CONFLICT", "This Feishu event is already bound to a different task or stage");
       }
@@ -4667,30 +4715,6 @@ export function createTaskboardServer(options = {}) {
     if (metadata.deliverySource === "simulation") {
       throw new ApiError(409, "SIMULATION_UPLOAD_FORBIDDEN", "Simulated tasks cannot publish ZIP artifacts");
     }
-    const snapshotSubjectKey = metadata.subjectKey ?? `${metadata.baseToken}:${metadata.tableId}`;
-    const snapshotTarget = Number.isSafeInteger(metadata.configVersion)
-      ? database.getFeishuSubjectUploadTargetByVersion(snapshotSubjectKey, metadata.configVersion)
-      : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
-    // A task created before upload was configured has an intentionally empty
-    // target in its snapshot. Let that task use the subject's current target;
-    // once a target was captured, keep the creation-time binding stable.
-    const stageTargetPath = isPhasedAutoCutOrigin(metadata)
-      && typeof metadata.stageSnapshot.artifactTargetPath === "string"
-      && metadata.stageSnapshot.artifactTargetPath.trim()
-      ? metadata.stageSnapshot.artifactTargetPath.trim()
-      : null;
-    const target = isPhasedAutoCutOrigin(metadata)
-      ? snapshotTarget && { ...snapshotTarget, targetPath: stageTargetPath }
-      : snapshotTarget?.targetPath
-        ? snapshotTarget
-        : database.getFeishuSubjectUploadTargetByOrigin(metadata.baseToken, metadata.tableId);
-    if (automaticOnly && (snapshotTarget?.enqueueMode ?? target?.enqueueMode) !== "automatic") return null;
-    if (!target) {
-      throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "This task is not linked to a configured subject");
-    }
-    if (!target.targetPath) {
-      throw new ApiError(409, "UPLOAD_TARGET_NOT_CONFIGURED", "Set an upload destination for this subject first");
-    }
     const workArtifact = database.getTaskArtifactForWork(artifact.id);
     if (!workArtifact || workArtifact.taskId !== task.id) {
       throw new ApiError(404, "ARTIFACT_NOT_FOUND", "The selected ZIP does not belong to this task");
@@ -4698,23 +4722,64 @@ export function createTaskboardServer(options = {}) {
     if (workArtifact.validationStatus !== "verified") {
       throw new ApiError(409, "ARTIFACT_NOT_VERIFIED", "Only verified ZIP artifacts can be uploaded");
     }
-    const deliveryConfigured = stageTargetPath && Number.isSafeInteger(metadata.configVersion)
-      && database.getFeishuSubjectVersion(snapshotSubjectKey, metadata.configVersion)?.delivery?.version === 1;
+    let uploadMetadata = metadata;
+    if (workArtifact.runId !== null) {
+      const run = database.getFeishuAutoCutRun(workArtifact.runId);
+      if (run) {
+        const frozen = database.getFeishuTaskConfigurationByVersion(task.id, run.configVersion);
+        if (!frozen
+          || frozen.metadata.subjectKey !== run.subjectKey
+          || frozen.metadata.stageId !== run.stageId
+          || frozen.metadata.eventId !== run.eventId
+          || frozen.metadata.packageAlias !== metadata.packageAlias) {
+          throw new ApiError(409, "ARTIFACT_RUN_CONFIGURATION_INVALID", "The ZIP run's frozen upload configuration is unavailable");
+        }
+        uploadMetadata = frozen.metadata;
+      } else if (isPhasedAutoCutOrigin(metadata)) {
+        throw new ApiError(409, "ARTIFACT_RUN_CONFIGURATION_INVALID", "The ZIP does not reference a registered Auto-Cut run");
+      }
+    }
+    const uploadSubjectKey = uploadMetadata.subjectKey ?? `${uploadMetadata.baseToken}:${uploadMetadata.tableId}`;
+    const snapshotTarget = Number.isSafeInteger(uploadMetadata.configVersion)
+      ? database.getFeishuSubjectUploadTargetByVersion(uploadSubjectKey, uploadMetadata.configVersion)
+      : database.getFeishuSubjectUploadTargetByOrigin(uploadMetadata.baseToken, uploadMetadata.tableId);
+    // A task created before upload was configured has an intentionally empty
+    // target in its snapshot. Let that task use the subject's current target;
+    // once a target was captured, keep the creation-time binding stable.
+    const stageTargetPath = isPhasedAutoCutOrigin(uploadMetadata)
+      && typeof uploadMetadata.stageSnapshot.artifactTargetPath === "string"
+      && uploadMetadata.stageSnapshot.artifactTargetPath.trim()
+      ? uploadMetadata.stageSnapshot.artifactTargetPath.trim()
+      : null;
+    const target = isPhasedAutoCutOrigin(uploadMetadata)
+      ? snapshotTarget && { ...snapshotTarget, targetPath: stageTargetPath }
+      : snapshotTarget?.targetPath
+        ? snapshotTarget
+        : database.getFeishuSubjectUploadTargetByOrigin(uploadMetadata.baseToken, uploadMetadata.tableId);
+    if (automaticOnly && (snapshotTarget?.enqueueMode ?? target?.enqueueMode) !== "automatic") return null;
+    if (!target) {
+      throw new ApiError(409, "TASK_UPLOAD_NOT_CONFIGURED", "This task is not linked to a configured subject");
+    }
+    if (!target.targetPath) {
+      throw new ApiError(409, "UPLOAD_TARGET_NOT_CONFIGURED", "Set an upload destination for this subject first");
+    }
+    const deliveryConfigured = stageTargetPath && Number.isSafeInteger(uploadMetadata.configVersion)
+      && database.getFeishuSubjectVersion(uploadSubjectKey, uploadMetadata.configVersion)?.delivery?.version === 1;
     let deliveryBinding = null;
     if (deliveryConfigured) {
       deliveryBinding = deliveryStore.getCourseBinding({
-        baseToken: metadata.baseToken,
-        tableId: metadata.tableId,
-        recordId: metadata.recordId,
+        baseToken: uploadMetadata.baseToken,
+        tableId: uploadMetadata.tableId,
+        recordId: uploadMetadata.recordId,
       });
-      if (!deliveryBinding || workArtifact.runId === null || typeof metadata.stageId !== "string") {
+      if (!deliveryBinding || workArtifact.runId === null || typeof uploadMetadata.stageId !== "string") {
         throw new ApiError(
           409,
           "ARTIFACT_DELIVERY_BINDING_INVALID",
           "The verified ZIP is not bound to one course delivery run",
         );
       }
-      if (deriveStageDestination(deliveryBinding, metadata.stageId) !== stageTargetPath) {
+      if (deriveStageDestination(deliveryBinding, uploadMetadata.stageId) !== stageTargetPath) {
         throw new ApiError(
           409,
           "ARTIFACT_DELIVERY_BINDING_INVALID",
@@ -4725,7 +4790,7 @@ export function createTaskboardServer(options = {}) {
     const upload = database.createArtifactUpload({
       taskId: task.id,
       artifactId: workArtifact.id,
-      subjectKey: target.subjectKey,
+      subjectKey: target.subjectKey ?? uploadSubjectKey,
       storageKey: workArtifact.storageKey,
       targetId: target.targetId,
       targetPath: target.targetPath,
@@ -5090,6 +5155,8 @@ export function createTaskboardServer(options = {}) {
     if (!metadata) return null;
     if (trigger === "automatic" && (
       Object.hasOwn(metadata, "deliverySource")
+      || metadata.rerunOfTaskId
+      || database.hasFeishuCurrentConfigRerun(task.id)
       || executionModeForMetadata(metadata) !== "automatic"
       || !isPhasedAutoCutOrigin(metadata)
     )) {
@@ -7009,8 +7076,8 @@ export function createTaskboardServer(options = {}) {
           const task = result.task;
           events.emit(result.created ? "task.created" : "task.updated", { task });
           if (automaticExecutionEnabled() && ["todo", "queued"].includes(task.status)) {
-            const metadata = trustedFeishuTaskOrigin(task, { requirePackage: true });
-            if (metadata && executionModeForMetadata(metadata) === "automatic") {
+            const metadata = currentExecutionMetadata(task, "automatic");
+            if (metadata) {
               assertTaskStartAllowed();
               await startTrackedTask(task.id, () => executionCoordinator.schedule(
                 task, metadata, "automatic", { actor: CODEX_AGENT_ACTOR },
@@ -7023,6 +7090,9 @@ export function createTaskboardServer(options = {}) {
         const metadata = parseFeishuTaskMetadata(input.description);
         if (!metadata || !metadata.baseToken || !metadata.tableId || !metadata.recordId || !metadata.eventId) {
           throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task description does not contain valid workflow metadata");
+        }
+        if (metadata.rerunOfTaskId) {
+          throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Configuration reruns can only be derived by Taskboard");
         }
         validateFeishuTaskRegistration(input, metadata);
         database.assertFeishuEventNotDeleted(metadata);
@@ -7462,6 +7532,44 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 202, {run});
       }
 
+      const autoCutRerunRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-rerun-current$/);
+      if (autoCutRerunRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/autocut-rerun-current");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(autoCutRerunRoute[1], "Task id");
+        const { version, autoCutRunConsent } = parseAutoCutRetry(await readJson(request));
+        if (!autoCutRunConsent) throw new ApiError(400, "INVALID_FIELD", "This execution requires explicit runConsent");
+        assertTaskStartAllowed();
+        const parent = requireConfigRerunParent(taskId, version);
+        const subject = requireCurrentConfigForRerun(parent);
+        const stage = subject.stages[parent.origin.stageId];
+        const actor = actorFromRequest(request);
+        let controlledContext;
+        try {
+          controlledContext = await readCurrentControlledContext({
+            bridgeUrl: resolved.feishuBridgeUrl, bridgeSecret: resolved.feishuBridgeSecret,
+            origin: { ...parent.origin, configVersion: subject.configVersion },
+            signal: taskStartAbortController.signal,
+          });
+        } catch (error) { throw blockedPreparationError(error); }
+        assertTaskStartAllowed();
+        requireCurrentConfigForRerun(requireConfigRerunParent(taskId, version), subject.configVersion);
+        const result = await createCanonicalFeishuStageTask({
+          event: { eventId: parent.origin.eventId, baseToken: parent.origin.baseToken,
+            tableId: parent.origin.tableId, recordId: parent.origin.recordId,
+            statusFieldId: stage.trigger.fieldId },
+          binding: { subjectKey: parent.origin.subjectKey, configVersion: subject.configVersion, stageId: parent.origin.stageId },
+          controlledContext,
+        }, actor, parent);
+        const metadata = requireTrustedFeishuTask(result.task, { requirePackage: true });
+        if (result.task.archivedAt !== null) throw new ApiError(409, "TASK_ARCHIVED", "The task was archived");
+        events.emit("task.updated", { task: result.task });
+        return sendJson(response, 202, await startTrackedTask(result.task.id, () => (
+          executionCoordinator.schedule(result.task, metadata, "retry", { actor, autoCutRunConsent })
+        )));
+      }
+
       const autoCutRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-retry$/);
       if (autoCutRetryRoute) {
         assertAiLoopbackRequest(request);
@@ -7474,6 +7582,9 @@ export function createTaskboardServer(options = {}) {
         const metadata = requireTrustedFeishuTask(task, { requirePackage: true });
         if (!isPhasedAutoCutOrigin(metadata)) {
           throw new ApiError(409, "AUTOCUT_RETRY_NOT_ALLOWED", "Only a blocked phased Auto-Cut task can be retried");
+        }
+        if ((metadata.rerunOfTaskId || database.hasFeishuCurrentConfigRerun(task.id)) && !autoCutRunConsent) {
+          throw new ApiError(400, "INVALID_FIELD", "A derived task retry requires explicit runConsent");
         }
         const ready = database.prepareFeishuAutoCutRetry(
           task.id,

@@ -33,7 +33,7 @@ import {
   resolveTaskboardUrl,
   resolvePersistedAttachmentUrl,
   retryTaskArtifactUpload,
-  retryTaskAutoCut,
+  rerunTaskAutoCutCurrent,
   retryTaskVmPmoPlan,
   retryTaskVmPmoWriteback,
   uploadAttachment,
@@ -512,6 +512,7 @@ export function TaskDetail({
   const [deleting, setDeleting] = useState(false);
   const titleRef = useRef<HTMLTextAreaElement>(null);
   const currentTaskIdRef = useRef(task.id);
+  const autoCutRerunRequestRef = useRef(0);
   const descriptionComposerRef = useRef<InlineMediaComposerHandle>(null);
   const descriptionScrollPositionRef = useRef<{ element: HTMLElement; top: number } | null>(null);
   const descriptionCaretRef = useRef<{ text: string; offset: number; occurrence: number } | null>(null);
@@ -584,6 +585,9 @@ export function TaskDetail({
       setDescriptionSegments(createInlineMediaSegments(task.description, referenceTasks));
     }
     if (taskChanged) {
+      autoCutRerunRequestRef.current += 1;
+      setRetryingAutoCut(false);
+      setAutoCutRunsError(null);
       setEditingDescription(false);
       setChangeStatusToTodo(false);
       setVmPmoRun(null);
@@ -1292,19 +1296,23 @@ export function TaskDetail({
     }
   }
 
-  async function retryAutoCut(taskId: string, version: number, runConsent: AutoCutRunConsent) {
+  async function rerunAutoCutCurrent(taskId: string, version: number, runConsent: AutoCutRunConsent) {
     if (!isPhasedAutoCutTask || retryingAutoCut || taskId !== currentTask.id) return;
+    const requestId = ++autoCutRerunRequestRef.current;
+    const isCurrentRequest = () => autoCutRerunRequestRef.current === requestId
+      && currentTaskIdRef.current === taskId;
     setRetryingAutoCut(true);
     setAutoCutRunsError(null);
     try {
-      const result = await retryTaskAutoCut(taskId, version, runConsent);
+      const result = await rerunTaskAutoCutCurrent(taskId, version, runConsent);
+      if (!isCurrentRequest()) return;
       setCurrentTask(result.task);
-      const runs = await getTaskAutoCutRuns(currentTask.id);
-      setAutoCutRuns(runs);
+      const runs = await getTaskAutoCutRuns(taskId);
+      if (isCurrentRequest()) setAutoCutRuns(runs);
     } catch (error) {
-      setAutoCutRunsError(messageFor(error));
+      if (isCurrentRequest()) setAutoCutRunsError(messageFor(error));
     } finally {
-      setRetryingAutoCut(false);
+      if (isCurrentRequest()) setRetryingAutoCut(false);
     }
   }
 
@@ -1850,6 +1858,15 @@ export function TaskDetail({
                     {typeof vmPmoRunError === "string" ? vmPmoRunError : text(vmPmoRunError[0], vmPmoRunError[1])}
                   </div>
                 )}
+                {isPhasedAutoCutTask && currentTask.feishuOrigin?.rerunOfTaskId && <p className="autocut-retry-consent">
+                  本任务由原失败任务按当前配置重新执行。
+                  <button type="button" className="button secondary" onClick={() => {
+                    const parentId = currentTask.feishuOrigin!.rerunOfTaskId!;
+                    const parent = referenceTasks.find(candidate => candidate.id === parentId);
+                    if (parent) onOpenTask(parent);
+                    else void getTask(parentId).then(onOpenTask).catch(error => setAutoCutRunsError(messageFor(error)));
+                  }}>查看原失败任务</button>
+                </p>}
                 {isPhasedAutoCutTask && (
                   autoCutRunsLoading
                     ? <div className="attachments-loading" aria-label={text("正在加载 Auto-Cut 运行", "Loading Auto-Cut runs")} aria-busy="true"><i /><i /></div>
@@ -1857,7 +1874,7 @@ export function TaskDetail({
                       task={currentTask}
                       attempts={autoCutRuns}
                       retrying={retryingAutoCut}
-                      onRetry={retryAutoCut}
+                      onRerunCurrent={currentTask.feishuOrigin?.deliverySource === "simulation" ? undefined : rerunAutoCutCurrent}
                       onOpenLog={onOpenAutoCutLog}
                       onCopy={onCopy}
                     />

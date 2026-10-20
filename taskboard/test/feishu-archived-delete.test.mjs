@@ -82,6 +82,30 @@ test("deletion failure rolls back the event reservation and all task changes", a
   } finally { db.close(); await rm(f.directory, { recursive: true, force: true }); }
 });
 
+test("deleted configuration reruns remain reserved after restart without deleting the real event", async () => {
+  const f = await fixture(); let db = f.database;
+  try {
+    const parent = db.createTask(input());
+    const derivedInput = input();
+    Object.assign(derivedInput.feishuOrigin, { rerunOfTaskId: parent.id, configVersion: 2 });
+    const derived = db.createTask(derivedInput);
+    let archived = db.archiveTask(derived.id, derived.version, null, null, actor);
+    db.database.exec("CREATE TRIGGER reject_test_delete BEFORE DELETE ON tasks BEGIN SELECT RAISE(ABORT,'fixture delete failure'); END;");
+    assert.throws(() => db.deleteArchivedTask(derived.id, archived.version), /fixture delete failure/);
+    assert.equal(db.findFeishuConfigRerun(parent.id, 2).id, derived.id);
+    db.database.exec("DROP TRIGGER reject_test_delete;");
+    db.deleteArchivedTask(derived.id, archived.version);
+    db.close(); db = new TaskboardDatabase(f.filename);
+    assert.equal(db.getTask(derived.id), null);
+    assert.equal(db.findFeishuTaskByEventId("delete-event").id, parent.id);
+    assert.doesNotThrow(() => db.assertFeishuEventNotDeleted(input().feishuOrigin));
+    assert.throws(() => db.findFeishuConfigRerun(parent.id, 2), { status: 410, code: "FEISHU_CONFIG_RERUN_DELETED" });
+    assert.throws(() => db.createTask(derivedInput), { status: 410, code: "FEISHU_CONFIG_RERUN_DELETED" });
+    derivedInput.feishuOrigin.configVersion = 3;
+    assert.ok(db.createTask(derivedInput).id);
+  } finally { db.close(); await rm(f.directory, { recursive: true, force: true }); }
+});
+
 test("invalid stored Feishu origin fails closed without deleting the event reservation", async () => {
   const f = await fixture(); const db = f.database;
   try {
