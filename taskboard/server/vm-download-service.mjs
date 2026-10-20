@@ -10,6 +10,7 @@ import { prepareVmSource } from "./vm-source-adapter.mjs";
 const TERMINAL = new Set(["ready", "rejected", "canceled", "needs_attention", "auth_required", "dead_letter"]);
 const MAX_QUEUE_CLEANUP_ITEMS = 1000;
 const DAY = 86400000;
+const PLUGIN_INPUT_OUTPUT_ROOT = "@taskboard-plugin-input";
 const fail = code => { throw new VmSourceError(code); };
 function object(value) { return value && typeof value === "object" && !Array.isArray(value); }
 function keys(value, allowed) { if (!object(value) || Object.keys(value).some(key => !allowed.includes(key))) fail("VM_DOWNLOAD_INPUT_INVALID"); }
@@ -34,18 +35,34 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
   let lastClient;
   let workerError = null;
   const session = injectedSession ?? createVmDownloadSession({ ...sessionOptions, now, onChange: () => { if (started) void wake(); } });
-  let settings = metadata.read("settings") ?? { outputRoot: defaultOutputRoot, department: "动画组", reason: "切片剪辑", notificationsEnabled: true };
+  const storedSettings = metadata.read("settings");
+  const storedSettingsVersion = metadata.read("settings-version");
+  const legacyDesktopDefault = storedSettingsVersion !== 1
+    && storedSettings?.outputRoot === path.join(os.homedir(), "Desktop");
+  let settings = storedSettings ?? { outputRoot: defaultOutputRoot, department: "动画组", reason: "切片剪辑", notificationsEnabled: true };
   function request(vmid, fields) {
     return validateVmApprovalRequest({ schema_version: 1, vmid, department: fields.department, reason: fields.reason,
       output_root: fields.outputRoot, allowed_origins: allowedOrigins, private_endpoints: privateEndpoints });
   }
   function validateSettings(value) {
     keys(value, ["outputRoot", "department", "reason", "notificationsEnabled"]);
-    request("000000000000000000000000", value);
+    if (typeof value.outputRoot !== "string") fail("VM_DOWNLOAD_INPUT_INVALID");
+    const outputRoot = value.outputRoot === PLUGIN_INPUT_OUTPUT_ROOT ? defaultOutputRoot : value.outputRoot;
+    request("000000000000000000000000", { ...value, outputRoot });
     if (typeof value.notificationsEnabled !== "boolean") fail("VM_DOWNLOAD_INPUT_INVALID");
-    return { outputRoot: path.resolve(value.outputRoot), department: value.department, reason: value.reason, notificationsEnabled: value.notificationsEnabled };
+    return { outputRoot: path.resolve(outputRoot), department: value.department, reason: value.reason, notificationsEnabled: value.notificationsEnabled };
   }
-  try { settings = validateSettings(settings); } catch { fail("VM_DOWNLOAD_STATE_INVALID"); }
+  function persistSettings(value) {
+    const outputRoot = path.relative(path.resolve(defaultOutputRoot), value.outputRoot) === ""
+      ? PLUGIN_INPUT_OUTPUT_ROOT : value.outputRoot;
+    metadata.write("settings", { ...value, outputRoot });
+    metadata.write("settings-version", 1);
+  }
+  try {
+    if (legacyDesktopDefault) settings.outputRoot = defaultOutputRoot;
+    settings = validateSettings(settings);
+    if (legacyDesktopDefault || storedSettings === null) persistSettings(settings);
+  } catch { fail("VM_DOWNLOAD_STATE_INVALID"); }
   let lastAccount = metadata.read("account");
   if (lastAccount !== null && !accountValid(lastAccount)) fail("VM_DOWNLOAD_STATE_INVALID");
   function publicJob(job) {
@@ -269,7 +286,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       return { removedCount: store.removeFromQueue(jobIds).length };
     },
     remove(id) { store.removeFromQueue([id]); return { removed: true }; },
-    updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); metadata.write("settings", settings); kick(); return { settings: structuredClone(settings) }; },
+    updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); persistSettings(settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },
     enqueue(input) { return enqueueRequests(input); },

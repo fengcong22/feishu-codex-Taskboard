@@ -25,6 +25,7 @@ async function fixture(t, options = {}) {
   let service;
   let db;
   let store;
+  let firstStart = true;
   const client = options.client ?? {};
   const session = {
     snapshot: () => ({ status, account: account ? { name: account.name, userId: account.user_id } : null, expiresAt, expirySource: expiresAt === null ? "unknown" : "token", lastCheckedAt: time, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false }),
@@ -37,6 +38,10 @@ async function fixture(t, options = {}) {
   function start(extra = {}) {
     db = new DatabaseSync(path.join(dir, "metadata.sqlite"));
     store = createVmApprovalStore({ file: path.join(dir, "queue.sqlite"), now: () => time });
+    const metadata = createVmDownloadMetadata({ database: db, now: () => time });
+    if (firstStart && options.savedSettings) metadata.write("settings", options.savedSettings);
+    if (firstStart && options.savedSettingsVersion !== undefined) metadata.write("settings-version", options.savedSettingsVersion);
+    firstStart = false;
     service = createVmDownloadService({ store, metadata: createVmDownloadMetadata({ database: db, now: () => time }),
       session, now: () => time, defaultOutputRoot: dir, notifier: { available: () => false }, ...options, ...extra });
     return service;
@@ -66,6 +71,46 @@ test("batch validates every input before enqueue; exact requests reuse persisten
   assert.equal(f.service.snapshot().jobs.length, 2);
   assert.equal(f.service.snapshot().settings.notificationsEnabled, false);
   assert.equal(f.service.enqueue(f.input()).jobs[0].id, jobs[0].id);
+});
+
+test("saved plugin input default follows the installation when its drive changes", async (t) => {
+  const initialInput = path.join(os.tmpdir(), "taskboard-install-a", "input");
+  const movedInput = path.join(os.tmpdir(), "taskboard-install-b", "input");
+  const f = await fixture(t, { defaultOutputRoot: initialInput });
+  const settings = { outputRoot: initialInput, department: "动画组", reason: "切片剪辑", notificationsEnabled: true };
+
+  assert.equal(f.service.snapshot().settings.outputRoot, initialInput);
+  f.service.updateSettings(settings);
+  await f.restart({ defaultOutputRoot: movedInput });
+
+  assert.equal(f.service.snapshot().settings.outputRoot, movedInput);
+});
+
+test("previous desktop default migrates to plugin input while custom directories remain unchanged", async (t) => {
+  const pluginInput = path.join(os.tmpdir(), "taskboard-install", "input");
+  const customDirectory = path.join(os.tmpdir(), "vm-custom-downloads");
+  const f = await fixture(t, { defaultOutputRoot: pluginInput, savedSettings: {
+    outputRoot: path.join(os.homedir(), "Desktop"), department: "动画组", reason: "切片剪辑", notificationsEnabled: true,
+  }, savedSettingsVersion: 0 });
+
+  assert.equal(f.service.snapshot().settings.outputRoot, pluginInput);
+  await f.restart({ defaultOutputRoot: path.join(os.tmpdir(), "taskboard-install-moved", "input") });
+  assert.equal(f.service.snapshot().settings.outputRoot, path.join(os.tmpdir(), "taskboard-install-moved", "input"));
+
+  f.service.updateSettings({ outputRoot: customDirectory, department: "动画组", reason: "切片剪辑", notificationsEnabled: true });
+  await f.restart({ defaultOutputRoot: path.join(os.tmpdir(), "taskboard-install-moved-again", "input") });
+  assert.equal(f.service.snapshot().settings.outputRoot, customDirectory);
+});
+
+test("a desktop directory saved as a custom path is not migrated on restart", async (t) => {
+  const desktop = path.join(os.homedir(), "Desktop");
+  const f = await fixture(t, { defaultOutputRoot: path.join(os.tmpdir(), "taskboard-install", "input"),
+    savedSettings: { outputRoot: desktop, department: "动画组", reason: "切片剪辑", notificationsEnabled: true },
+    savedSettingsVersion: 1 });
+
+  assert.equal(f.service.snapshot().settings.outputRoot, desktop);
+  await f.restart({ defaultOutputRoot: path.join(os.tmpdir(), "taskboard-install-moved", "input") });
+  assert.equal(f.service.snapshot().settings.outputRoot, desktop);
 });
 
 test("internal requestFor freezes the same server policy used by enqueue", async (t) => {

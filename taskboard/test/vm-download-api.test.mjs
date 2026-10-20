@@ -3,11 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createTaskboardServer } from "../server/index.mjs";
 import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 
 const route = "/api/local/vm-downloads";
+const taskboardPackageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 async function fixture(t) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "vm-api-"));
   let app;
@@ -33,6 +35,7 @@ test("local downloads API saves settings and persistent batch jobs without grant
   const f = await fixture(t);
   const initial = await call(f.baseUrl);
   assert.equal(initial.status, 200); assert.equal(initial.body.session.status, "disconnected");
+  assert.equal(initial.body.settings.outputRoot, path.join(taskboardPackageRoot, "input"));
   assert.deepEqual(initial.body.jobs, []);
   const fields = { department: "动画组", reason: "切片剪辑", outputRoot: f.directory };
   assert.equal((await call(f.baseUrl, "/settings", { method: "PUT", body: { ...fields, notificationsEnabled: false } })).status, 200);

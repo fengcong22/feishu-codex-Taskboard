@@ -2879,6 +2879,7 @@ export function createTaskboardServer(options = {}) {
       vmDownloads = createVmDownloadService({ store,
         metadata: createVmDownloadMetadata({ database: database.database }),
         notifier: createVmDownloadNotifier({ appId: config.appId, appSecret: config.appSecret }),
+        defaultOutputRoot: path.join(PROJECT_ROOT, "input"),
         privateEndpoints: config.privateEndpoints,
       });
       return vmDownloads;
