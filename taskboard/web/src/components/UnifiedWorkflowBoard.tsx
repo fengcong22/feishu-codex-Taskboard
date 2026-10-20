@@ -28,6 +28,7 @@ import type {
 import { useTaskboardI18n } from "../i18n";
 import { LinearIcon, type LinearIconName } from "./LinearIcon";
 import { TaskCard } from "./TaskCard";
+import { PackageWorkflowCardActions } from "./PackageWorkflowCardActions";
 // The drop helpers are runtime-independent so they can be shared with focused node tests.
 // @ts-expect-error The helper's structural contract is covered by node tests.
 import { canDropUnifiedWorkflowTask, hasUnifiedWorkflowDragType } from "../unifiedWorkflowDropGuard.mjs";
@@ -148,6 +149,8 @@ export interface UnifiedWorkflowBoardProps {
   onOpenTask: (task: Task, stage: UnifiedWorkflowStage) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete: (task: Task) => Promise<void>;
+  onArchiveTask: (task: Task) => void;
+  onDeleteTask: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -253,6 +256,8 @@ function UnifiedWorkflowColumn({
   onOpenTask,
   onUpdate,
   onComplete,
+  onArchiveTask,
+  onDeleteTask,
   onContextMenu,
   onDragStart,
   onDragEnd,
@@ -293,6 +298,8 @@ function UnifiedWorkflowColumn({
   onOpenTask: (task: Task, stage: UnifiedWorkflowStage) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete: (task: Task) => Promise<void>;
+  onArchiveTask: (task: Task) => void;
+  onDeleteTask: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -475,6 +482,15 @@ function UnifiedWorkflowColumn({
                 onEdit={(task) => onOpenTask(task, definition.id)}
                 onUpdate={onUpdate}
                 onComplete={!readOnly ? onComplete : undefined}
+                showWorkflowTimestamp
+                conversationPlacement="topline"
+                actions={definition.id === "uploaded" ? (
+                  <PackageWorkflowCardActions
+                    task={task}
+                    onArchiveTask={onArchiveTask}
+                    onDeleteTask={onDeleteTask}
+                  />
+                ) : null}
                 onContextMenu={onContextMenu}
                 onDragStart={onDragStart}
                 onDragEnd={onDragEnd}
@@ -520,6 +536,8 @@ export function UnifiedWorkflowBoard({
   onOpenTask,
   onUpdate,
   onComplete,
+  onArchiveTask,
+  onDeleteTask,
   onContextMenu,
   onDragStart,
   onDragEnd,
@@ -1139,6 +1157,8 @@ export function UnifiedWorkflowBoard({
               onOpenTask={onOpenTask}
               onUpdate={onUpdate}
               onComplete={onComplete}
+              onArchiveTask={onArchiveTask}
+              onDeleteTask={onDeleteTask}
               onContextMenu={onContextMenu}
               onDragStart={onDragStart}
               onDragEnd={onDragEnd}

@@ -53,6 +53,8 @@ interface TaskCardProps {
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onComplete?: (task: Task) => Promise<void>;
   actions?: ReactNode;
+  showWorkflowTimestamp?: boolean;
+  conversationPlacement?: "properties" | "topline";
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -99,6 +101,17 @@ function createdDate(value: string, locale: string, text: (chinese: string, engl
   const formatted = new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" })
     .format(new Date(value));
   return text(`${formatted}创建`, `Created ${formatted}`);
+}
+
+function workflowTimestamp(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}/${month}/${day} ${hours}:${minutes}`;
 }
 
 function elapsedTime(startedAt: string | null, now: number) {
@@ -206,10 +219,12 @@ function ProcessingStatusRow({
   presentation,
   now,
   onOpenConversation,
+  showConversationControls,
 }: {
   presentation: TaskCardPresentation;
   now: number;
   onOpenConversation: (conversation: TaskConversationItem) => void;
+  showConversationControls: boolean;
 }) {
   const { text } = useTaskboardI18n();
   const elapsed = elapsedTime(presentation.processing.startedAt, now);
@@ -235,7 +250,7 @@ function ProcessingStatusRow({
         {statusLabel}
       </span>
       <span className="task-processing-spacer" aria-hidden="true" />
-      {!running && localConversation && (
+      {showConversationControls && !running && localConversation && (
         <button
           className="task-processing-open"
           type="button"
@@ -249,7 +264,7 @@ function ProcessingStatusRow({
           <TaskboardIcon name="conversation" />
         </button>
       )}
-      {presentation.conversations.length > 0 && (
+      {showConversationControls && presentation.conversations.length > 0 && (
         <TaskConversationMenu
           conversations={presentation.conversations}
           onOpenConversation={onOpenConversation}
@@ -443,6 +458,8 @@ export function TaskCard({
   onUpdate,
   onComplete,
   actions,
+  showWorkflowTimestamp = false,
+  conversationPlacement = "properties",
   onContextMenu,
   onDragStart,
   onDragEnd,
@@ -465,6 +482,8 @@ export function TaskCard({
     || task.status === "done"
     || task.status === "canceled";
   const showsConversation = supportsConversation && presentation.conversations.length > 0;
+  const showsToplineConversation = showsConversation && conversationPlacement === "topline";
+  const showsPropertyConversation = showsConversation && !showsToplineConversation;
   const isFeishuTask = task.feishuOrigin?.source === "feishu-base";
   const visibleLabels = isFeishuTask
     ? task.labels.filter((label) => label !== "feishu")
@@ -479,7 +498,7 @@ export function TaskCard({
   );
   const hasProperties = showsPriority || visibleLabels.length > 0 || task.dueDate;
   const showsProperties = Boolean(projectName)
-    || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
+    || (!processingCard && (hasProperties || showsInlineParticipants || showsPropertyConversation));
   const propertyDisabled = savingProperty !== null;
 
   function updateProperty(changes: Partial<TaskDraft>, property: NonNullable<typeof savingProperty>) {
@@ -491,7 +510,7 @@ export function TaskCard({
 
   return (
     <article
-      className={`task-card task-card-${variant} status-${task.status}${actions ? " has-package-actions" : ""}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
+      className={`task-card task-card-${variant} status-${task.status}${actions ? " has-package-actions" : ""}${showsToplineConversation ? " has-topline-conversation" : ""}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
       style={{
         viewTransitionName: task.status === "in_review" ? `review-task-${task.id}` : "none",
         ...(dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : {}),
@@ -525,7 +544,7 @@ export function TaskCard({
         onClick={() => onEdit(task)}
       />
 
-      <div className="card-topline">
+      <div className={`card-topline${showsToplineConversation ? " has-topline-conversation" : ""}`}>
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
         </span>
@@ -550,6 +569,14 @@ export function TaskCard({
             <img src={completeIcon} alt="" aria-hidden="true" />
             <span>{text("完成", "Complete")}</span>
           </button>
+        )}
+        {showsToplineConversation && (
+          <span className="card-topline-conversation">
+            <TaskConversationMenu
+              conversations={presentation.conversations}
+              onOpenConversation={onOpenConversation}
+            />
+          </span>
         )}
         {variant === "sidebar" && (
           <span className="sidebar-card-creator">
@@ -627,8 +654,8 @@ export function TaskCard({
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
           )}
-          {!processingCard && showsConversation && <span className="card-properties-spacer" aria-hidden="true" />}
-          {!processingCard && showsConversation && (
+          {!processingCard && showsPropertyConversation && <span className="card-properties-spacer" aria-hidden="true" />}
+          {!processingCard && showsPropertyConversation && (
             <TaskConversationMenu
               conversations={presentation.conversations}
               onOpenConversation={onOpenConversation}
@@ -644,8 +671,16 @@ export function TaskCard({
             presentation={presentation}
             now={now}
             onOpenConversation={onOpenConversation}
+            showConversationControls={!showsToplineConversation}
           />
         </>
+      )}
+      {showWorkflowTimestamp && workflowTimestamp(task.createdAt) && (
+        <div className="task-card-workflow-footer">
+          <time className="task-card-workflow-time" dateTime={task.createdAt}>
+            {workflowTimestamp(task.createdAt)}
+          </time>
+        </div>
       )}
       {actions}
     </article>

@@ -3280,6 +3280,24 @@ kbd {
   min-width: 0;
 }
 
+.card-topline.has-topline-conversation {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.card-topline.has-topline-conversation .card-reference {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.card-topline-conversation {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: auto;
+}
+
 .card-reference {
   display: flex;
   align-items: center;
@@ -13993,6 +14011,9 @@ kbd {
 .package-workflow-card-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-secondary); cursor: pointer; }
 .package-workflow-card-actions button:hover { background: var(--surface-hover); color: var(--text-primary); }
 .package-workflow-card-actions button.is-danger:hover { color: var(--danger); }
+.task-card-workflow-footer { display: flex; align-items: center; min-width: 0; min-height: 25px; padding: 4px 4px 0; color: var(--text-tertiary); font-size: 11px; line-height: 16px; }
+.task-card.has-package-actions > .task-card-workflow-footer { padding-right: 76px; }
+.task-card-workflow-time { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 @media (hover: none), (pointer: coarse) {
   .task-card.has-package-actions > .package-workflow-card-actions { opacity: 1; visibility: visible; pointer-events: auto; }
 }

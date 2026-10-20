@@ -5299,6 +5299,8 @@ export function App() {
                 onOpenTask={(task, stage) => openTaskDetail(task, stage)}
                 onUpdate={updateTaskProperties}
                 onComplete={(task) => moveTask(task, "done")}
+                onArchiveTask={(task) => void archiveTask(task)}
+                onDeleteTask={requestArchivedTaskDelete}
                 onContextMenu={(task, position) => setContextMenu({ taskId: task.id, ...position })}
                 onDragStart={startTaskDrag}
                 onDragEnd={endTaskDrag}

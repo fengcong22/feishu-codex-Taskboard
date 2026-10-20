@@ -23,17 +23,20 @@ vi.mock("./TaskCard", () => ({
     onEdit,
     onComplete,
     actions,
+    showWorkflowTimestamp,
   }: {
     task: Task;
     onEdit: (t: Task) => void;
     onComplete?: unknown;
     actions?: import("react").ReactNode;
+    showWorkflowTimestamp?: boolean;
   }) => (
     <article className="task-card">
       <button onClick={() => onEdit(task)}>
         {task.title}
         {onComplete ? " manual acceptance" : ""}
       </button>
+      {showWorkflowTimestamp && <time>{task.createdAt}</time>}
       {actions}
     </article>
   ),
@@ -183,6 +186,12 @@ it("offers archive and delete for NAS-completed cards and forwards the exact tas
   expect(actions.onDeleteTask).not.toHaveBeenCalled();
   fireEvent.click(within(completed).getByRole("button", { name: "删除任务" }));
   expect(actions.onDeleteTask).toHaveBeenCalledExactlyOnceWith(tasks[0]);
+});
+
+it("marks VM package cards with their workflow arrival timestamp", async () => {
+  mount();
+  await screen.findByText("VM video");
+  expect(screen.getByText(tasks[0].createdAt)).toBeTruthy();
 });
 
 it("does not offer completed-card cleanup while NAS publication is pending", async () => {
