@@ -22,7 +22,6 @@ const currentSnapshot = {
     { id: "attention", vmid: "507f1f77bcf86cd799439011", status: "needs_attention", submission_attempts: 1, attempts: 0, next_attempt_at: null, created_at: 1, updated_at: 1, output_root: "E:\\Downloads", department: "动画组", reason: "课程制作" },
     { id: "pending", vmid: "507f1f77bcf86cd799439012", status: "waiting_approval", submission_attempts: 1, attempts: 0, next_attempt_at: null, created_at: 1, updated_at: 1, output_root: "E:\\Downloads", department: "动画组", reason: "课程制作" },
   ],
-  hiddenAttentionJobs: [],
   notifications: { available: false, enabled: true, errorCode: "VM_NOTIFY_NOT_CONFIGURED", lastSentAt: null },
   worker: { running: false, errorCode: null },
 };

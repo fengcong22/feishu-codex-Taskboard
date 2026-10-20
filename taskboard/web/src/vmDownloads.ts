@@ -60,7 +60,6 @@ export interface VmDownloadsSnapshot {
   session: VmDownloadSession;
   settings: VmDownloadSettings;
   jobs: VmDownloadJob[];
-  hiddenAttentionJobs: VmDownloadJob[];
   notifications: { available: boolean; enabled: boolean; errorCode: string | null; lastSentAt: number | null };
   worker?: { running: boolean; errorCode: string | null };
 }
@@ -93,7 +92,7 @@ export async function getVmDownloads(signal?: AbortSignal): Promise<VmDownloadsS
     || !record(value.settings) || !strings(value.settings, ["outputRoot", "department", "reason"])
     || typeof value.settings.notificationsEnabled !== "boolean"
     || !record(value.notifications) || typeof value.notifications.available !== "boolean" || typeof value.notifications.enabled !== "boolean"
-    || !Array.isArray(value.jobs) || !Array.isArray(value.hiddenAttentionJobs) || [...value.jobs, ...value.hiddenAttentionJobs].some((job) => !record(job)
+    || !Array.isArray(value.jobs) || value.jobs.some((job) => !record(job)
       || !strings(job, ["id", "vmid", "status", "output_root", "department", "reason"])
       || (job.application_id !== undefined && typeof job.application_id !== "string")
       || (job.instance_code !== undefined && typeof job.instance_code !== "string")
@@ -117,8 +116,8 @@ export async function loginVmDownloads(signal?: AbortSignal): Promise<{ loginUrl
 }
 export const logoutVmDownloads = (signal?: AbortSignal) => write("/logout", {}, "POST", signal);
 export const enqueueVmDownloads = (input: Omit<VmDownloadSettings, "notificationsEnabled"> & { vmids: string[] }, signal?: AbortSignal) => write<{ jobs: VmDownloadJob[] }>("/jobs", input, "POST", signal);
-export const cleanupVmDownloads = (jobIds: string[], signal?: AbortSignal) => write<{ clearedCount: number }>("/jobs/cleanup", { jobIds }, "POST", signal);
-export const restoreVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/restore`, {}, "POST", signal);
+export const removeVmDownloads = (jobIds: string[], signal?: AbortSignal) => write<{ removedCount: number }>("/jobs/cleanup", { jobIds }, "POST", signal);
+export const removeVmDownload = (id: string, signal?: AbortSignal) => write<{ removed: boolean }>(`/jobs/${encodeURIComponent(id)}/remove`, {}, "POST", signal);
 export const resumeVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/resume`, {}, "POST", signal);
 export const recoverVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/recover`, { confirmRepeatableResource: true }, "POST", signal);
 export const extendVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/extend`, {}, "POST", signal);

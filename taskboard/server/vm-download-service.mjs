@@ -211,7 +211,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     const jobs = requests.map(value => {
       let job = enqueueVmApproval(store, value, { now,
         ...(taskJobId ? { id: taskJobId, dedupeByRequest: false } : {}) });
-      if (job.queue_hidden_at !== undefined) job = store.restoreQueueItem(job.id);
+      if (job.queue_hidden_at !== undefined || job.queue_removed_at !== undefined) job = store.requeueItem(job.id);
       if (identity && !job.requester_id) bind(job.id, identity);
       return publicJob(store.get(job.id));
     });
@@ -258,8 +258,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       const summary = metadata.summary();
       const jobs = store.list();
       return { session: session.snapshot(), settings: structuredClone(settings), jobs: jobs
-        .filter(job => job.queue_hidden_at === undefined).map(publicJob),
-        hiddenAttentionJobs: jobs.filter(job => job.queue_hidden_at !== undefined && job.status === "needs_attention").map(publicJob),
+        .filter(job => job.queue_removed_at === undefined && (job.queue_hidden_at === undefined || job.status === "needs_attention")).map(publicJob),
         notifications: { ...summary, available: notifier.available() && Boolean(lastAccount) && !summary.errorCode, enabled: settings.notificationsEnabled,
           errorCode: !notifier.available() ? "VM_NOTIFY_NOT_CONFIGURED" : !lastAccount ? "VM_NOTIFY_RECIPIENT_UNAVAILABLE" : summary.errorCode },
         worker: { running: Boolean(running), errorCode: workerError } };
@@ -267,9 +266,9 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     cleanup(jobIds) {
       if (!Array.isArray(jobIds) || jobIds.length < 1 || jobIds.length > MAX_QUEUE_CLEANUP_ITEMS
         || jobIds.some(id => typeof id !== "string") || new Set(jobIds).size !== jobIds.length) fail("VM_DOWNLOAD_INPUT_INVALID");
-      return { clearedCount: store.hideFromQueue(jobIds).length };
+      return { removedCount: store.removeFromQueue(jobIds).length };
     },
-    restore(id) { return { job: publicJob(store.restoreQueueItem(id)) }; },
+    remove(id) { store.removeFromQueue([id]); return { removed: true }; },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); metadata.write("settings", settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },

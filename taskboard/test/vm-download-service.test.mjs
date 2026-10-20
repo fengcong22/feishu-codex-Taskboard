@@ -100,35 +100,43 @@ test("internal exact lookup reconciles a job without exposing its request policy
   assert.equal(f.service.lookupExact({ requestFingerprint: fingerprint, jobId: created.id }).id, created.id);
 });
 
-test("queue cleanup hides settled rows, keeps task lookup intact, and restores a reused request", async (t) => {
+test("queue deletion removes settled rows, keeps task lookup intact, and requeues a reused request", async (t) => {
   const f = await fixture(t);
   const ready = f.service.enqueue(f.input()).jobs[0];
   f.update(ready.id, (job) => { job.status = "ready"; });
-  assert.equal(f.service.cleanup([ready.id]).clearedCount, 1);
+  assert.equal(f.service.cleanup([ready.id]).removedCount, 1);
   assert.deepEqual(f.service.snapshot().jobs, []);
   assert.equal(f.service.lookupExact({ requestFingerprint: f.store.get(ready.id).request_fingerprint, jobId: ready.id }).status, "ready");
 
   const reused = f.service.enqueue(f.input()).jobs[0];
   assert.equal(reused.id, ready.id);
   assert.equal(f.service.snapshot().jobs.length, 1);
-  assert.equal(f.store.get(ready.id).queue_hidden_at, undefined);
-  assert.equal(f.service.cleanup([ready.id]).clearedCount, 1);
+  assert.equal(f.store.get(ready.id).queue_removed_at, undefined);
+  assert.equal(f.service.cleanup([ready.id]).removedCount, 1);
   assert.deepEqual(f.service.snapshot().jobs, []);
   assert.throws(() => f.service.cleanup([]), { code: "VM_DOWNLOAD_INPUT_INVALID" });
 });
 
-test("needs-attention rows can be hidden from the queue and restored without losing approval evidence", async (t) => {
+test("needs-attention rows can be removed from the queue without losing approval evidence", async (t) => {
   const f = await fixture(t);
   const attention = f.service.enqueue(f.input()).jobs[0];
-  f.update(attention.id, (job) => { job.status = "needs_attention"; job.last_error = "VM_API_TIMEOUT"; });
+  f.update(attention.id, (job) => {
+    job.status = "needs_attention";
+    job.last_error = "VM_API_TIMEOUT";
+    job.queue_hidden_at = 1;
+  });
 
-  assert.equal(f.service.cleanup([attention.id]).clearedCount, 1);
-  assert.deepEqual(f.service.snapshot().jobs, []);
-  assert.equal(f.service.snapshot().hiddenAttentionJobs[0].id, attention.id);
-  assert.equal(f.service.lookupTaskRun({ jobId: attention.id }).status, "needs_attention");
-  assert.equal(f.service.restore(attention.id).job.status, "needs_attention");
   assert.equal(f.service.snapshot().jobs[0].id, attention.id);
-  assert.deepEqual(f.service.snapshot().hiddenAttentionJobs, []);
+  assert.equal(f.service.snapshot().jobs.length, 1);
+  assert.equal(f.service.remove(attention.id).removed, true);
+  assert.deepEqual(f.service.snapshot().jobs, []);
+  assert.equal(f.service.lookupTaskRun({ jobId: attention.id }).status, "needs_attention");
+  assert.equal(f.store.get(attention.id).queue_removed_at > 0, true);
+
+  const reused = f.service.enqueue(f.input()).jobs[0];
+  assert.equal(reused.id, attention.id);
+  assert.equal(f.store.get(attention.id).queue_removed_at, undefined);
+  assert.equal(f.service.snapshot().jobs[0].id, attention.id);
 });
 
 test("private endpoint recovery applies the restarted service policy without submitting another application", async (t) => {

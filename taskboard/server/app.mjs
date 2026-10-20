@@ -6089,13 +6089,16 @@ export function createTaskboardServer(options = {}) {
               if (pathname.endsWith("/login")) return sendJson(response, 200, await downloads.beginLogin());
               return sendJson(response, 200, await downloads.logout());
             }
-            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|restore)$/u.exec(pathname);
+            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|remove)$/u.exec(pathname);
             if (action) {
               if (action[2] === "recover") {
                 assertAllowedKeys(input, new Set(["confirmRepeatableResource"]));
                 if (input.confirmRepeatableResource !== true) throw new ApiError(400, "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED", "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED");
               } else assertAllowedKeys(input, new Set());
-              return sendJson(response, 200, downloads[action[2]](action[1], input));
+              const result = action[2] === "remove"
+                ? downloads.remove(action[1])
+                : downloads[action[2]](action[1], input);
+              return sendJson(response, 200, result);
             }
             assertAllowedKeys(input, new Set());
           }

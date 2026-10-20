@@ -10,7 +10,8 @@ const SCHEMA_VERSION = 3;
 const MAX_JOB_BYTES = 1024 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const PRIVATE_KEY = /(?:token|secret|password|authorization|cookie|bearer|url|uri)$/iu;
-const QUEUE_CLEARABLE_STATUSES = new Set(["ready", "rejected", "canceled", "needs_attention"]);
+const QUEUE_REMOVABLE_STATUSES = new Set(["ready", "rejected", "canceled", "needs_attention"]);
+const LEGACY_QUEUE_HIDDEN_STATUSES = new Set([...QUEUE_REMOVABLE_STATUSES]);
 const MAX_QUEUE_CLEANUP_ITEMS = 1000;
 
 function fail(code) { throw new VmSourceError(code); }
@@ -36,7 +37,10 @@ function encodeJob(job) {
   if (job.last_error_detail !== undefined && (typeof job.last_error_detail !== "string"
     || !/^[A-Z][A-Z0-9_]{1,80}$/u.test(job.last_error_detail))) fail("VM_APPROVAL_STORE_INPUT_INVALID");
   if (job.queue_hidden_at !== undefined && (!Number.isSafeInteger(job.queue_hidden_at) || job.queue_hidden_at < 0
-    || !QUEUE_CLEARABLE_STATUSES.has(job.status))) {
+    || !LEGACY_QUEUE_HIDDEN_STATUSES.has(job.status))) {
+    fail("VM_APPROVAL_STORE_INPUT_INVALID");
+  }
+  if (job.queue_removed_at !== undefined && (!Number.isSafeInteger(job.queue_removed_at) || job.queue_removed_at < 0)) {
     fail("VM_APPROVAL_STORE_INPUT_INVALID");
   }
   const ancestors = new Set();
@@ -347,7 +351,7 @@ export function createVmApprovalStore({ file, now = Date.now } = {}) {
     },
     get(id) { return operation(() => decode(row(id))); },
     list() { return operation(() => database.prepare("SELECT * FROM vm_approval_jobs ORDER BY id").all().map(decode)); },
-    hideFromQueue(ids) {
+    removeFromQueue(ids) {
       if (!Array.isArray(ids) || ids.length < 1 || ids.length > MAX_QUEUE_CLEANUP_ITEMS
         || ids.some((id) => typeof id !== "string") || new Set(ids).size !== ids.length) fail("VM_APPROVAL_STORE_INPUT_INVALID");
       ids.forEach(identifier);
@@ -357,22 +361,23 @@ export function createVmApprovalStore({ file, now = Date.now } = {}) {
           const entry = database.prepare("SELECT * FROM vm_approval_jobs WHERE id = ?").get(id);
           const job = decode(entry);
           if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND");
-          if (!QUEUE_CLEARABLE_STATUSES.has(job.status)) fail("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
+          if (!QUEUE_REMOVABLE_STATUSES.has(job.status)) fail("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
           if (entry.lease_token !== null && entry.lease_expires_at > current) fail("VM_APPROVAL_JOB_BUSY");
           return job;
         });
         const update = database.prepare(`UPDATE vm_approval_jobs SET job_json = ?
           WHERE id = ? AND (lease_token IS NULL OR lease_expires_at <= ?)`);
         for (const job of jobs) {
-          if (job.queue_hidden_at === undefined) {
-            job.queue_hidden_at = current;
+          if (job.queue_removed_at === undefined) {
+            job.queue_removed_at = current;
+            delete job.queue_hidden_at;
             if (update.run(encodeJob(job), job.id, current).changes !== 1) fail("VM_APPROVAL_JOB_BUSY");
           }
         }
         return ids;
       });
     },
-    restoreQueueItem(id) {
+    requeueItem(id) {
       identifier(id);
       return transaction(() => {
         const entry = row(id);
@@ -380,9 +385,10 @@ export function createVmApprovalStore({ file, now = Date.now } = {}) {
         if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND");
         const current = timestamp();
         if (entry.lease_token !== null && entry.lease_expires_at > current) fail("VM_APPROVAL_JOB_BUSY");
-        if (!QUEUE_CLEARABLE_STATUSES.has(job.status)) fail("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
-        if (job.queue_hidden_at === undefined) return job;
+        if (!LEGACY_QUEUE_HIDDEN_STATUSES.has(job.status)) fail("VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
+        if (job.queue_hidden_at === undefined && job.queue_removed_at === undefined) return job;
         delete job.queue_hidden_at;
+        delete job.queue_removed_at;
         const updated = database.prepare(`UPDATE vm_approval_jobs SET job_json = ?
           WHERE id = ? AND (lease_token IS NULL OR lease_expires_at <= ?)`)
           .run(encodeJob(job), id, current);

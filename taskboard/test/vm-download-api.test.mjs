@@ -79,9 +79,14 @@ test("VM queue cleanup validates a bounded id list and rejects unsettled jobs", 
   assert.equal((await call(f.baseUrl)).body.jobs[0].id, id);
 });
 
-test("VM queue restore has a local route and rejects unknown queue evidence", async (t) => {
+test("VM queue removal has a local route and rejects unknown queue evidence", async (t) => {
   const f = await fixture(t);
-  const missing = await call(f.baseUrl, "/jobs/missing/restore", { method: "POST", body: {} });
+  const fields = { department: "动画组", reason: "切片剪辑", outputRoot: f.directory };
+  const queued = await call(f.baseUrl, "/jobs", { method: "POST", body: { ...fields, vmids: ["678465c3d94605d24bb9361a"] } });
+  const active = await call(f.baseUrl, `/jobs/${queued.body.jobs[0].id}/remove`, { method: "POST", body: {} });
+  assert.equal(active.status, 409);
+  assert.equal(active.body.error.code, "VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
+  const missing = await call(f.baseUrl, "/jobs/missing/remove", { method: "POST", body: {} });
   assert.equal(missing.status, 404);
   assert.equal(missing.body.error.code, "VM_APPROVAL_JOB_NOT_FOUND");
 });
