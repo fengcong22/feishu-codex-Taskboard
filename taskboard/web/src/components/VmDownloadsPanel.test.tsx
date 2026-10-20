@@ -17,6 +17,7 @@ function snapshot() {
     },
     settings: { outputRoot: "E:\\Downloads", department: "动画组", reason: "课程制作", notificationsEnabled: true },
     jobs: [] as ReturnType<typeof job>[],
+    hiddenAttentionJobs: [] as ReturnType<typeof job>[],
     notifications: { available: true, enabled: true, errorCode: null as string | null, lastSentAt: null },
     worker: { running: false, errorCode: null as string | null },
   };
@@ -79,8 +80,17 @@ beforeEach(() => {
     if (path === `${ROOT}/jobs`) { current.jobs = [job("queued-job", "queued")]; return response({ jobs: current.jobs }); }
     if (path === `${ROOT}/jobs/cleanup`) {
       const ids = writes.at(-1)!.body.jobIds as string[];
+      const hidden = current.jobs.filter((candidate) => ids.includes(candidate.id));
       current.jobs = current.jobs.filter((candidate) => !ids.includes(candidate.id));
+      current.hiddenAttentionJobs = [...current.hiddenAttentionJobs, ...hidden.filter((candidate) => candidate.status === "needs_attention")];
       return response({ clearedCount: ids.length });
+    }
+    if (path.endsWith("/restore")) {
+      const id = path.split("/").at(-2);
+      const restored = current.hiddenAttentionJobs.find((candidate) => candidate.id === id)!;
+      current.hiddenAttentionJobs = current.hiddenAttentionJobs.filter((candidate) => candidate.id !== id);
+      current.jobs.push(restored);
+      return response({ job: restored });
     }
     if (path.endsWith("/recover")) {
       const id = path.split("/").at(-2);
@@ -280,6 +290,23 @@ describe("VM downloads panel", () => {
     expect(screen.queryByText("已下载")).toBeNull();
   });
 
+  it("hides a needs-attention row from the active queue and lets the user restore it", async () => {
+    current.jobs = [job("attention-1", "needs_attention", "VM_API_TIMEOUT")];
+    mount();
+    await screen.findByText("VM_API_TIMEOUT");
+
+    fireEvent.click(screen.getByRole("button", { name: "隐藏此需处理项" }));
+    await screen.findByText("已隐藏的需处理项（1）");
+    expect(screen.queryByRole("button", { name: "隐藏此需处理项" })).toBeNull();
+    expect(screen.getByRole("button", { name: "恢复到下载队列" })).toBeTruthy();
+    expect(writes[0]).toMatchObject({ method: "POST", path: `${ROOT}/jobs/cleanup`, body: { jobIds: ["attention-1"] } });
+
+    fireEvent.click(screen.getByRole("button", { name: "恢复到下载队列" }));
+    expect(await screen.findByRole("button", { name: "隐藏此需处理项" })).toBeTruthy();
+    expect(screen.getByText("VM_API_TIMEOUT")).toBeTruthy();
+    expect(writes[1]).toMatchObject({ method: "POST", path: `${ROOT}/jobs/attention-1/restore`, body: {} });
+  });
+
   it("extends expired waits and retries failed work while auth jobs require reconnecting", async () => {
     current.jobs = [job("expired", "needs_attention", "VM_APPROVAL_WAIT_EXPIRED"),
       job("failed", "dead_letter", "VM_API_TIMEOUT", VM2),
@@ -387,11 +414,12 @@ describe("VM downloads panel", () => {
 
   it("polls for completed background login and stops requests after unmount", async () => {
     vi.useFakeTimers();
+    window.localStorage.setItem("taskboard.vm-status-refresh.v1", "15000");
     const view = mount();
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(screen.getByText("尚未连接")).toBeTruthy();
     current.session = { ...current.session, status: "connected", account: { name: "回调用户", userId: "fixture-user" } };
-    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
     expect(screen.getByText("回调用户")).toBeTruthy();
     view.unmount();
     const requestCount = fetchMock.mock.calls.length;

@@ -78,3 +78,10 @@ test("VM queue cleanup validates a bounded id list and rejects unsettled jobs", 
   assert.equal(active.body.error.code, "VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE");
   assert.equal((await call(f.baseUrl)).body.jobs[0].id, id);
 });
+
+test("VM queue restore has a local route and rejects unknown queue evidence", async (t) => {
+  const f = await fixture(t);
+  const missing = await call(f.baseUrl, "/jobs/missing/restore", { method: "POST", body: {} });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.error.code, "VM_APPROVAL_JOB_NOT_FOUND");
+});

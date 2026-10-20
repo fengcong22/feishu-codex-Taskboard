@@ -3,7 +3,8 @@ import { ApiError } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import {
   cleanupVmDownloads, enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads,
-  recoverVmDownload, resumeVmDownload, saveVmDownloadSettings,
+  getVmDownloadRefreshInterval, recoverVmDownload, restoreVmDownload, resumeVmDownload, saveVmDownloadSettings,
+  VM_DOWNLOAD_REFRESH_CHANGE_EVENT, VM_DOWNLOAD_REFRESH_INTERVAL_KEY,
   type VmDownloadJob, type VmDownloadSettings, type VmDownloadsSnapshot,
 } from "../vmDownloads";
 
@@ -35,6 +36,7 @@ export function VmDownloadsPanel() {
   const [vmidsText, setVmidsText] = useState("");
   const [manualOpen, setManualOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshInterval, setRefreshInterval] = useState(getVmDownloadRefreshInterval);
   const [busy, setBusy] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -121,21 +123,48 @@ export function VmDownloadsPanel() {
     });
   }
 
+  function hideNeedsAttention(jobId: string) {
+    void action(async (signal) => {
+      await cleanupVmDownloads([jobId], signal);
+      setNotice(text("已从队列隐藏该需处理项；审批记录和下载证据仍保留。", "Hidden from the queue. Approval history and download evidence remain available."));
+    });
+  }
+
+  function restoreNeedsAttention(jobId: string) {
+    void action(async (signal) => {
+      await restoreVmDownload(jobId, signal);
+      setNotice(text("已恢复到下载队列。", "Restored to the download queue."));
+    });
+  }
+
   useEffect(() => {
     mounted.current = true;
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5_000);
     const onFocus = () => void refresh();
     window.addEventListener("focus", onFocus);
     return () => {
       mounted.current = false;
       ++requestVersion.current;
-      window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
       reading.current?.abort(); reading.current = null;
       writing.current?.abort(); writing.current = null;
     };
   }, [refresh]);
+
+  useEffect(() => {
+    const updateInterval = () => setRefreshInterval(getVmDownloadRefreshInterval());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === VM_DOWNLOAD_REFRESH_INTERVAL_KEY) updateInterval();
+    };
+    window.addEventListener(VM_DOWNLOAD_REFRESH_CHANGE_EVENT, updateInterval);
+    window.addEventListener("storage", onStorage);
+    const timer = refreshInterval > 0 ? window.setInterval(() => void refresh(), refreshInterval) : null;
+    return () => {
+      window.removeEventListener(VM_DOWNLOAD_REFRESH_CHANGE_EVENT, updateInterval);
+      window.removeEventListener("storage", onStorage);
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [refresh, refreshInterval]);
 
   function edit<K extends keyof VmDownloadSettings>(field: K, value: VmDownloadSettings[K]) {
     dirty.current = true;
@@ -291,6 +320,17 @@ export function VmDownloadsPanel() {
         })}>{text("确认并用当前审批重试", "Confirm and retry with this approval")}</button>}
         {job.status === "dead_letter" && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => { await resumeVmDownload(job.id, signal); })}>{text("重试任务", "Retry job")}</button>}
       </div>}
+      {job.status === "needs_attention" && <div className="vm-downloads-actions">
+        <button className="button secondary" type="button" disabled={busy} onClick={() => hideNeedsAttention(job.id)}>{text("隐藏此需处理项", "Hide this item")}</button>
+      </div>}
+    </li>;
+  }
+
+  function renderHiddenAttentionJob(job: VmDownloadJob) {
+    return <li key={job.id} className="vm-downloads-job vm-downloads-hidden-job">
+      <div className="vm-downloads-job-heading"><code>{job.vmid}</code><span className="vm-downloads-badge vm-downloads-state-needs_attention">{text("需要处理", "Needs attention")}</span></div>
+      <p>{text("记录", "Record")}: <code>{job.id}</code>{job.error?.code && <> · <code>{safeCode(job.error.code) ?? "VM_ERROR"}</code></>}</p>
+      <button className="button secondary" type="button" disabled={busy} onClick={() => restoreNeedsAttention(job.id)}>{text("恢复到下载队列", "Restore to queue")}</button>
     </li>;
   }
 
@@ -360,6 +400,11 @@ export function VmDownloadsPanel() {
           </div>}
         </div>
         {snapshot.jobs.length ? <ul>{snapshot.jobs.map(renderJob)}</ul> : <p className="vm-downloads-help">{text("暂无下载任务。", "No download jobs yet.")}</p>}
+        {snapshot.hiddenAttentionJobs.length > 0 && <details className="vm-downloads-hidden">
+          <summary>{text(`已隐藏的需处理项（${snapshot.hiddenAttentionJobs.length}）`, `Hidden needs-attention items (${snapshot.hiddenAttentionJobs.length})`)}</summary>
+          <p className="vm-downloads-help">{text("隐藏仅影响队列显示，审批、申请和下载证据仍保留。", "Hiding changes only the queue view. Approval, request, and download evidence are retained.")}</p>
+          <ul>{snapshot.hiddenAttentionJobs.map(renderHiddenAttentionJob)}</ul>
+        </details>}
       </section>
     </>}
   </section>;

@@ -10,7 +10,7 @@ const SCHEMA_VERSION = 3;
 const MAX_JOB_BYTES = 1024 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const PRIVATE_KEY = /(?:token|secret|password|authorization|cookie|bearer|url|uri)$/iu;
-const QUEUE_CLEARABLE_STATUSES = new Set(["ready", "rejected", "canceled"]);
+const QUEUE_CLEARABLE_STATUSES = new Set(["ready", "rejected", "canceled", "needs_attention"]);
 const MAX_QUEUE_CLEANUP_ITEMS = 1000;
 
 function fail(code) { throw new VmSourceError(code); }

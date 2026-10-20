@@ -26,6 +26,7 @@ import { VmDownloadsPanel } from "./VmDownloadsPanel";
 
 type Props = {
   refreshKey?: number;
+  vmDownloadsRequest?: number;
   vmPmoInitialReady?: boolean;
   onPackageChange?: (packages: FeishuPackageSummary[]) => void;
   onError?: (message: string) => void;
@@ -146,7 +147,7 @@ function inspectionFailure(error: unknown): string {
   return error instanceof Error ? error.message : "工作区验证失败，请重试。";
 }
 
-export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false, onPackageChange, onError }: Props) {
+export function FeishuPackageManager({ refreshKey = 0, vmDownloadsRequest = 0, vmPmoInitialReady = false, onPackageChange, onError }: Props) {
   const [packages, setPackages] = useState<FeishuPackageSummary[]>([]);
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
   const [editorPanel, setEditorPanel] = useState<"package" | "vmDownloads">("package");
@@ -161,6 +162,7 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
   const [actionError, setActionError] = useState<string | null>(null);
   const inspectionRequest = useRef<AbortController | null>(null);
   const catalogRequest = useRef<AbortController | null>(null);
+  const handledVmDownloadsRequest = useRef(0);
   const zipDirectoryBeforeAutofill = useRef<string | null>(null);
   const [workspaceValidation, setWorkspaceValidation] = useState<{
     workspacePath: string;
@@ -269,6 +271,30 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
     void refresh();
     // refreshKey is incremented by local realtime package events.
   }, [refreshKey]);
+
+  useEffect(() => {
+    if (vmDownloadsRequest <= 0 || vmDownloadsRequest === handledVmDownloadsRequest.current || !catalogLoaded) return;
+    handledVmDownloadsRequest.current = vmDownloadsRequest;
+    setEditorPanel("vmDownloads");
+    const target = packages.find((item) => item.alias === "auto-cut-slicing");
+    resetInspection();
+    editorVersion.current += 1;
+    if (!target) {
+      setSelectedAlias(null);
+      setForm({ ...EMPTY_FORM });
+      setModels([]);
+      zipDirectoryBeforeAutofill.current = null;
+      setWorkspaceValidation(null);
+      setReferenceDrawer([]);
+      return;
+    }
+    setSelectedAlias(target.alias);
+    setForm(asForm(target));
+    zipDirectoryBeforeAutofill.current = target.zipSourceDirectory;
+    setModels([]);
+    setWorkspaceValidation(null);
+    setReferenceDrawer([]);
+  }, [vmDownloadsRequest, packages, catalogLoaded]);
 
   useLayoutEffect(() => {
     if (!loadError || loading || busy) return;
@@ -564,8 +590,11 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
       <div className="feishu-package-editor-header">
         <div>
           <h2>{editorPanel === "vmDownloads" ? "Auto-Cut-Slicing · VM 账号与队列" : selected ? `编辑 ${packageDisplayName(selected)}` : "新增 Auto-Cut 包"}</h2>
-          {selected && <small>状态：{STATE_LABELS[selected.state]} · 引用：{selected.referenceCount}</small>}
+          {selected && editorPanel === "package" && <small>状态：{STATE_LABELS[selected.state]} · 引用：{selected.referenceCount}</small>}
         </div>
+        {editorPanel === "vmDownloads" && <div className="feishu-package-actions">
+          <button type="button" onClick={() => setEditorPanel("package")}>返回包配置</button>
+        </div>}
         {editorPanel === "package" && <div className="feishu-package-actions">
           <button type="button" disabled={operationBusy || !canSave} onClick={() => void save()}>保存草稿</button>
           {selected && selected.state !== "enabled" && <button type="button" disabled={operationBusy || !canSave || (vmWorkflow && !vmPmoInitialReady)} title={vmWorkflow && !vmPmoInitialReady ? "本机初稿运行能力尚未就绪" : undefined} onClick={() => void runEditorAction("enable")}>启用</button>}
@@ -585,7 +614,7 @@ export function FeishuPackageManager({ refreshKey = 0, vmPmoInitialReady = false
         </li>)}</ul>
       </aside>}
       {actionError && <p className="feishu-package-load-error" role="alert">{actionError}</p>}
-      {editorPanel === "vmDownloads" && selected?.alias === "auto-cut-slicing"
+      {editorPanel === "vmDownloads" && (selected?.alias === "auto-cut-slicing" || vmDownloadsRequest > 0)
         ? <VmDownloadsPanel />
         : <>
       {vmWorkflow && <p role="status">{vmPmoInitialReady ? "初稿：审批下载 → 剪辑 → PMO 视频附件；审核修改复用上一轮成片，审核通过后自动归档。" : "VM 素材 → PMO 审核 → 视频附件。当前可保存草稿，本机初稿运行能力尚未就绪。"}</p>}

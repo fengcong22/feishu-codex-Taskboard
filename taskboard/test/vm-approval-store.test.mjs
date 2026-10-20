@@ -76,7 +76,7 @@ test("request deduplication can be scoped to a separate task run", async (t) => 
   assert.equal(store.enqueue(job("manual-replay")).id, first.id);
 });
 
-test("queue cleanup hides only settled jobs and preserves their approval and resource reservation records", async (t) => {
+test("queue cleanup hides settled or needs-attention jobs and preserves their approval and resource reservation records", async (t) => {
   let time = 5000;
   const f = await fixture(t);
   const store = f.open({ now: () => time });
@@ -103,6 +103,10 @@ test("queue cleanup hides only settled jobs and preserves their approval and res
   assert.equal(store.get("ready").status, "ready");
   assert.equal(store.get("ready").request.vmid, "video-1");
 
+  assert.deepEqual(store.hideFromQueue(["attention"]), ["attention"]);
+  assert.equal(store.get("attention").status, "needs_attention");
+  assert.equal(store.get("attention").queue_hidden_at, time);
+
   const contender = store.enqueue(job("contender", { request_fingerprint: "b".repeat(64), request: { vmid: "video-2" } }));
   const contenderLease = store.claim(contender.id);
   assert.deepEqual(store.reserveResource(contender.id, contenderLease.leaseToken, fingerprint), { job_id: "ready", owned: false });
@@ -112,6 +116,8 @@ test("queue cleanup hides only settled jobs and preserves their approval and res
   assert.equal(store.restoreQueueItem("ready").id, "ready");
   assert.equal(store.restoreQueueItem("ready").status, "ready");
   assert.equal(store.get("ready").queue_hidden_at, undefined);
+  assert.equal(store.restoreQueueItem("attention").status, "needs_attention");
+  assert.equal(store.get("attention").queue_hidden_at, undefined);
 });
 
 test("migrates the version-one unique request index without losing queued approvals", async (t) => {

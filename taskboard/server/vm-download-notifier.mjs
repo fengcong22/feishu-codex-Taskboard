@@ -3,8 +3,8 @@ import { createFeishuApiContext } from "../../src/feishu-api.mjs";
 import { VmSourceError } from "./vm-source-transfer.mjs";
 
 const MESSAGES = Object.freeze({
-  auth_required: "Shadow 登录已失效或本机服务已重启，下载队列已暂停。请在运行 Taskboard 的电脑上打开「Auto-Cut 包 → Auto-Cut-Slicing → VM 账号与队列」，点击“连接 Shadow 账号”或“重新连接账号”，在 Shadow 登录窗口完成授权，之后将继续原申请。当前还不支持手机直接为电脑完成 Shadow 授权。",
-  expiring: "Shadow 登录预计将在 30 分钟内到期。请在运行 Taskboard 的电脑上打开「Auto-Cut 包 → Auto-Cut-Slicing → VM 账号与队列」，点击“重新连接账号”，在 Shadow 登录窗口完成授权。队列和原审批会保留。",
+  auth_required: "Shadow 登录已失效或本机服务已重启，下载队列已暂停。请在运行 Taskboard 的电脑顶部栏打开“VM 状态菜单”，点击“连接 Shadow 账号”或“重新连接账号”，在 Shadow 登录窗口完成授权，之后将继续原申请。当前还不支持手机直接为电脑完成 Shadow 授权。",
+  expiring: "Shadow 登录预计将在 30 分钟内到期。请在运行 Taskboard 的电脑顶部栏打开“VM 状态菜单”，点击“重新连接账号”，在 Shadow 登录窗口完成授权。队列和原审批会保留。",
   approval_reminder: "下载申请已等待审批超过 24 小时。审批通过后会自动继续；等待满 7 天将暂停，可在 VM 下载面板延长等待。",
   rejected: "下载申请被驳回，已停止处理。请在 VM 下载面板查看原申请。",
   canceled: "下载申请已撤销，已停止处理。",

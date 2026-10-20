@@ -6089,7 +6089,7 @@ export function createTaskboardServer(options = {}) {
               if (pathname.endsWith("/login")) return sendJson(response, 200, await downloads.beginLogin());
               return sendJson(response, 200, await downloads.logout());
             }
-            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover)$/u.exec(pathname);
+            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|restore)$/u.exec(pathname);
             if (action) {
               if (action[2] === "recover") {
                 assertAllowedKeys(input, new Set(["confirmRepeatableResource"]));

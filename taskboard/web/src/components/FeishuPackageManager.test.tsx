@@ -91,6 +91,36 @@ it("places VM account and queue controls in the auto-cut-slicing package setting
   expect(screen.queryByRole("textbox", { name: "Codex 工作区路径" })).toBeNull();
 });
 
+it("selects Auto-Cut-Slicing and its VM queue tab when requested from the topbar", async () => {
+  const packageEntry = { ...historicalPackage, alias: "auto-cut-slicing", name: "Auto-Cut-Slicing",
+    model: null, reasoningEffort: null, zipSourceDirectory: null,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 } as const };
+  vi.mocked(listFeishuPackages).mockResolvedValue([historicalPackage, packageEntry]);
+  const view = render(<TaskboardLanguageProvider language="zh"><FeishuPackageManager /></TaskboardLanguageProvider>);
+
+  await screen.findByDisplayValue("historical prompt");
+  expect(screen.getAllByRole("button", { name: "编辑 Auto-Cut Lite" })[0].closest(".feishu-package-row")?.classList.contains("active")).toBe(true);
+
+  view.rerender(<TaskboardLanguageProvider language="zh"><FeishuPackageManager vmDownloadsRequest={1} /></TaskboardLanguageProvider>);
+
+  expect(await screen.findByRole("region", { name: "VM 账号与队列" })).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: "编辑 Auto-Cut-Slicing" })[0].closest(".feishu-package-row")?.classList.contains("active")).toBe(true);
+  expect(screen.getByRole("button", { name: "VM 账号与队列" }).getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByRole("button", { name: "返回包配置" })).toBeTruthy();
+});
+
+it("applies a pending topbar queue request after the package list loads", async () => {
+  const packageEntry = { ...historicalPackage, alias: "auto-cut-slicing", name: "Auto-Cut-Slicing",
+    model: null, reasoningEffort: null, zipSourceDirectory: null,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 } as const };
+  vi.mocked(listFeishuPackages).mockResolvedValue([historicalPackage, packageEntry]);
+  render(<TaskboardLanguageProvider language="zh"><FeishuPackageManager vmDownloadsRequest={1} /></TaskboardLanguageProvider>);
+
+  expect(await screen.findByRole("region", { name: "VM 账号与队列" })).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: "编辑 Auto-Cut-Slicing" })[0].closest(".feishu-package-row")?.classList.contains("active")).toBe(true);
+  expect(screen.getByRole("button", { name: "VM 账号与队列" }).getAttribute("aria-pressed")).toBe("true");
+});
+
 it("does not expose VM account and queue controls for other packages", async () => {
   vi.mocked(listFeishuPackages).mockResolvedValue([historicalPackage]);
   render(<FeishuPackageManager />);

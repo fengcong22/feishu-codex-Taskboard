@@ -117,6 +117,20 @@ test("queue cleanup hides settled rows, keeps task lookup intact, and restores a
   assert.throws(() => f.service.cleanup([]), { code: "VM_DOWNLOAD_INPUT_INVALID" });
 });
 
+test("needs-attention rows can be hidden from the queue and restored without losing approval evidence", async (t) => {
+  const f = await fixture(t);
+  const attention = f.service.enqueue(f.input()).jobs[0];
+  f.update(attention.id, (job) => { job.status = "needs_attention"; job.last_error = "VM_API_TIMEOUT"; });
+
+  assert.equal(f.service.cleanup([attention.id]).clearedCount, 1);
+  assert.deepEqual(f.service.snapshot().jobs, []);
+  assert.equal(f.service.snapshot().hiddenAttentionJobs[0].id, attention.id);
+  assert.equal(f.service.lookupTaskRun({ jobId: attention.id }).status, "needs_attention");
+  assert.equal(f.service.restore(attention.id).job.status, "needs_attention");
+  assert.equal(f.service.snapshot().jobs[0].id, attention.id);
+  assert.deepEqual(f.service.snapshot().hiddenAttentionJobs, []);
+});
+
 test("private endpoint recovery applies the restarted service policy without submitting another application", async (t) => {
   let application;
   let submitted = 0;
@@ -390,12 +404,12 @@ test("official SDK notification adapter uses verified email, safe text and stabl
   assert.equal(requests[0].data.uuid, "a".repeat(32));
   assert.doesNotMatch(requests[0].data.content, /http|token|fixture-secret/iu);
   const authText = JSON.parse(requests[0].data.content).text;
-  assert.match(authText, /Auto-Cut 包.*VM 账号与队列/u);
+  assert.match(authText, /Taskboard.*顶部栏.*VM 状态菜单/u);
   assert.match(authText, /重新连接账号/u);
   await notifier.send({ id: "b".repeat(32), recipient: identity.enterprise_email, kind: "expiring", vmid: null });
   const expiryText = JSON.parse(requests[1].data.content).text;
   assert.match(expiryText, /30 分钟/u);
-  assert.match(expiryText, /Taskboard.*VM 账号与队列/u);
+  assert.match(expiryText, /Taskboard.*顶部栏.*VM 状态菜单/u);
   assert.match(expiryText, /重新连接账号.*Shadow.*登录/u);
   assert.doesNotMatch(requests[1].data.content, /http|token|fixture-secret|127\.0\.0\.1/iu);
 });

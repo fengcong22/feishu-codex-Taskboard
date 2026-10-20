@@ -256,8 +256,10 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     },
     snapshot() {
       const summary = metadata.summary();
-      return { session: session.snapshot(), settings: structuredClone(settings), jobs: store.list()
+      const jobs = store.list();
+      return { session: session.snapshot(), settings: structuredClone(settings), jobs: jobs
         .filter(job => job.queue_hidden_at === undefined).map(publicJob),
+        hiddenAttentionJobs: jobs.filter(job => job.queue_hidden_at !== undefined && job.status === "needs_attention").map(publicJob),
         notifications: { ...summary, available: notifier.available() && Boolean(lastAccount) && !summary.errorCode, enabled: settings.notificationsEnabled,
           errorCode: !notifier.available() ? "VM_NOTIFY_NOT_CONFIGURED" : !lastAccount ? "VM_NOTIFY_RECIPIENT_UNAVAILABLE" : summary.errorCode },
         worker: { running: Boolean(running), errorCode: workerError } };
@@ -267,6 +269,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
         || jobIds.some(id => typeof id !== "string") || new Set(jobIds).size !== jobIds.length) fail("VM_DOWNLOAD_INPUT_INVALID");
       return { clearedCount: store.hideFromQueue(jobIds).length };
     },
+    restore(id) { return { job: publicJob(store.restoreQueueItem(id)) }; },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); metadata.write("settings", settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },

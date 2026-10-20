@@ -103,6 +103,7 @@ import { FeishuBaseNavigator } from "./components/FeishuBaseNavigator";
 import { useSidebarLayout } from "./components/useSidebarLayout";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { FeishuPackageManager } from "./components/FeishuPackageManager";
+import { VmStatusMenu } from "./components/VmStatusMenu";
 import { UnifiedWorkflowViewControls } from "./components/UnifiedWorkflowViewControls";
 import {
   addFeishuBaseFromUrl,
@@ -964,6 +965,7 @@ export function App() {
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [workflowRevision, setWorkflowRevision] = useState(0);
   const [autoCutPackagesRevision, setAutoCutPackagesRevision] = useState(0);
+  const [vmDownloadsRequest, setVmDownloadsRequest] = useState(0);
   const [workflowOptions, setWorkflowOptions] = useState<WorkflowOption[]>(DEFAULT_WORKFLOW_OPTIONS);
   const [feishuCatalog, setFeishuCatalog] = useState<import("./types").FeishuBaseCatalog[]>([]);
   const [selectedFeishuSubjectKey, setSelectedFeishuSubjectKey] = useState<string | null>(null);
@@ -3285,7 +3287,7 @@ export function App() {
 
 
   function selectBoardView(view: BoardView) {
-    if (view !== "workflow" && !confirmLeaveFeishuConfiguration()) return;
+    if (view !== "workflow" && !confirmLeaveFeishuConfiguration()) return false;
     endTaskDrag();
     closeContextMenu();
     setGanttViewMenuOpen(false);
@@ -3298,6 +3300,11 @@ export function App() {
     if (selectedProjectId) {
       taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${selectedProjectId}`, view);
     }
+    return true;
+  }
+
+  function openVmDownloads() {
+    if (selectBoardView("autocut_packages")) setVmDownloadsRequest((current) => current + 1);
   }
 
   function updateProjectBoardDisplaySettings(value: BoardDisplaySettings) {
@@ -4887,6 +4894,7 @@ export function App() {
           <div ref={dragRegionRef} className="workspace-drag-region" aria-hidden="true" />
 
           <div className="header-actions">
+            {localSettingsAvailable && <VmStatusMenu onOpenQueue={openVmDownloads} />}
             {localSettingsAvailable && (
               <button className="button secondary local-settings-entry" type="button" onClick={() => setLocalSettingsOpen(true)}>
                 <LinearIcon name="displayOptions" />
@@ -5144,6 +5152,7 @@ export function App() {
           <div className="autocut-package-view">
             <FeishuPackageManager
               refreshKey={autoCutPackagesRevision}
+              vmDownloadsRequest={vmDownloadsRequest}
               vmPmoInitialReady={taskboardMetadata?.capabilities?.vmPmoInitial === true}
               onError={(message) => setActionError(message)}
             />
