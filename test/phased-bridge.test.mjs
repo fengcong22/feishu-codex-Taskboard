@@ -289,6 +289,73 @@ test("controlled context strips Feishu's Base navigation hint from a trusted Wik
   assert.deepEqual(await readDocumentLinks(baseCellUrl), [wikiUrl]);
 });
 
+test("controlled context strips copy-link attribution from trusted Docx and Wiki cells", async () => {
+  const docxUrl = "https://guanghe.feishu.cn/docx/CopyLinkDocument";
+  const wikiUrl = "https://guanghe.feishu.cn/wiki/SharedWikiDocument";
+  assert.deepEqual(await readDocumentLinks([
+    { link: `${docxUrl}?from=from_copylink`, text: "示例课程" },
+    { type: "mention", mentionType: "Wiki", text: "示例知识库", link: `${wikiUrl}?from=from_share` },
+  ]), [docxUrl, wikiUrl]);
+});
+
+test("controlled context strips combined navigation and attribution hints in either order", async () => {
+  const docxUrl = "https://guanghe.feishu.cn/docx/CombinedHints";
+  for (const query of [
+    "from=from_copylink&pre_pathname=%2Fdrive%2Fhome%2Frecents%2F",
+    "pre_pathname=%2Fdrive%2Fhome%2Frecents%2F&from=from_copylink",
+  ]) {
+    assert.deepEqual(await readDocumentLinks(`${docxUrl}?${query}`), [docxUrl]);
+  }
+});
+
+test("controlled context deduplicates one document across plain and copied links", async () => {
+  const docxUrl = "https://guanghe.feishu.cn/docx/OneDocument";
+  assert.deepEqual(await readDocumentLinks([
+    `${docxUrl}?from=from_copylink`,
+    `${docxUrl}?pre_pathname=%2Fdrive%2Fhome%2F&from=from_copylink`,
+    docxUrl,
+  ]), [docxUrl]);
+});
+
+test("controlled context rejects unknown, empty or duplicate document-link query hints", async () => {
+  const docxUrl = "https://guanghe.feishu.cn/docx/InvalidHints";
+  assert.deepEqual(await readDocumentLinks([
+    `${docxUrl}?from=`,
+    `${docxUrl}?from`,
+    `${docxUrl}?from=from_copylink&from=from_share`,
+    `${docxUrl}?pre_pathname=`,
+    `${docxUrl}?pre_pathname=%2Fdrive%2F&pre_pathname=%2Fwiki%2F`,
+    `${docxUrl}?from=from_copylink&download=1`,
+    `${docxUrl}?from=from_copylink&redirect=https%3A%2F%2Fevil.example`,
+    `${docxUrl}?from=from_copylink#section`,
+    "https://guanghe.feishu.cn.evil.example/docx/WrongHost?from=from_copylink",
+    "https://user:secret@guanghe.feishu.cn/docx/Credentials?from=from_copylink",
+    "https://guanghe.feishu.cn/docx/Extra/../NormalizedAway?from=from_copylink",
+  ]), []);
+});
+
+test("controlled context rejects malformed document-link query segments and encodings", async (t) => {
+  const docxUrl = "https://guanghe.feishu.cn/docx/MalformedHints";
+  for (const query of [
+    "&from=from_copylink",
+    "from=from_copylink&",
+    "from=from_copylink&&pre_pathname=%2Fdrive",
+    "from=%",
+    "from=%2",
+    "from=%ZZ",
+    "from=%C3%28",
+    "from=%00",
+    "from=%0A",
+    "pre_pathname=%2Fdrive%0D",
+    "from=%7F",
+    "from=%C2%85",
+  ]) {
+    await t.test(query, async () => {
+      assert.deepEqual(await readDocumentLinks(`${docxUrl}?${query}`), []);
+    });
+  }
+});
+
 test("controlled context accepts only exact credential-free Feishu Docx or Wiki links", async () => {
   assert.deepEqual(await readDocumentLinks([
     "https://guanghe.feishu.cn/docx/DocxToken_1-2",

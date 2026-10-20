@@ -42,15 +42,20 @@ function collectDocumentLinks(value, result = []) {
       try {
         const url = new URL(trimmed);
         const host = url.hostname.toLowerCase();
-        const navigationHints = url.searchParams.getAll("pre_pathname");
+        const rawQuery = url.search.slice(1);
+        const navigationHints = [...url.searchParams];
         const hasNoQuery = url.search === "" && !trimmed.includes("?");
-        const hasOnlyNavigationHint = navigationHints.length === 1
-          && navigationHints[0] !== ""
-          && [...url.searchParams].length === 1;
+        // Feishu copy/open links may carry inert attribution/navigation hints.
+        // Strip only these known hints; the manifest still receives a bare URL.
+        const hasOnlyNavigationHints = navigationHints.length > 0
+          && rawQuery.split("&").every((segment) => segment !== "")
+          && !/[\u0000-\u001f\u007f-\u009f]/u.test(decodeURIComponent(rawQuery))
+          && navigationHints.every(([name, value]) => (name === "pre_pathname" || name === "from") && value !== "")
+          && new Set(navigationHints.map(([name]) => name)).size === navigationHints.length;
         if (url.toString() === trimmed && url.protocol === "https:"
           && (host === "feishu.cn" || host.endsWith(".feishu.cn"))
           && url.username === "" && url.password === ""
-          && (hasNoQuery || hasOnlyNavigationHint)
+          && (hasNoQuery || hasOnlyNavigationHints)
           && url.hash === "" && !trimmed.includes("#")
           && /^\/(?:docx|wiki)\/[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(url.pathname)) {
           url.search = "";
