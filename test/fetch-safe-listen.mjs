@@ -7,16 +7,16 @@ const FETCH_BLOCKED_PORTS = new Set([
   6679, 6697, 10080,
 ]);
 const FIRST_FETCH_SAFE_RANDOM_PORT = 10_081;
-const LAST_TCP_PORT = 65_535;
+const LAST_TEST_SERVER_PORT = 49_151;
 
-function listen(server, host) {
+function listen(server, host, port) {
   return new Promise((resolve, reject) => {
     const onError = (error) => {
       server.off("error", onError);
       reject(error);
     };
     server.once("error", onError);
-    server.listen(0, host, () => {
+    server.listen(port, host, () => {
       server.off("error", onError);
       resolve(server.address());
     });
@@ -39,11 +39,19 @@ function randomFetchSafePort(random) {
   if (!Number.isFinite(value) || value < 0 || value >= 1) {
     throw new TypeError("random must return a number in [0, 1)");
   }
-  return FIRST_FETCH_SAFE_RANDOM_PORT + Math.floor(value * (LAST_TCP_PORT - FIRST_FETCH_SAFE_RANDOM_PORT + 1));
+  return FIRST_FETCH_SAFE_RANDOM_PORT + Math.floor(value * (LAST_TEST_SERVER_PORT - FIRST_FETCH_SAFE_RANDOM_PORT + 1));
+}
+
+function canRetryListen(error) {
+  return error?.code === "EADDRINUSE" || error?.code === "EACCES";
 }
 
 /** Keep HTTP test fixtures reachable through Node's Fetch implementation. */
-export async function listenOnFetchSafePort(server, { host = "127.0.0.1", maxAttempts = 32 } = {}) {
+export async function listenOnFetchSafePort(server, {
+  host = "127.0.0.1",
+  maxAttempts = 32,
+  random = Math.random,
+} = {}) {
   if (!server || typeof server.listen !== "function" || typeof server.close !== "function") {
     throw new TypeError("server must be a Node HTTP server");
   }
@@ -52,9 +60,14 @@ export async function listenOnFetchSafePort(server, { host = "127.0.0.1", maxAtt
   }
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const address = await listen(server, host);
-    if (address && typeof address === "object" && isFetchSafePort(address.port)) return address;
-    await close(server);
+    const port = randomFetchSafePort(random);
+    try {
+      const address = await listen(server, host, port);
+      if (address && typeof address === "object" && isFetchSafePort(address.port)) return address;
+      await close(server);
+    } catch (error) {
+      if (!canRetryListen(error)) throw error;
+    }
   }
   throw new Error("Could not reserve a Fetch-safe loopback port");
 }
@@ -76,7 +89,7 @@ export async function listenTaskboardOnFetchSafePort(app, {
     try {
       return await app.listen({ host, port });
     } catch (error) {
-      if (error?.code !== "EADDRINUSE") throw error;
+      if (!canRetryListen(error)) throw error;
       lastError = error;
     }
   }

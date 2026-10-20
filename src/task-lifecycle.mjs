@@ -120,6 +120,7 @@ function trustedStageOrigin(task) {
 
 function matchesStageWaitingTask(task, scope) {
   if (!task || task.archivedAt !== null || task.status !== "todo") return false;
+  if (scope.packageAlias !== undefined && task.feishuOrigin?.packageAlias !== scope.packageAlias) return false;
   const origin = trustedStageOrigin(task);
   if (!origin) return false;
   const event = scope?.event ?? {};

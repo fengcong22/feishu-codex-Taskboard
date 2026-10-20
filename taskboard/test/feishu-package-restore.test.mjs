@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 import { createFeishuPackageStore } from "../server/feishu-package-config.mjs";
 
@@ -25,7 +26,7 @@ async function fixture(t) {
     await app.close();
     await rm(directory, { recursive: true, force: true });
   });
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = await listenTaskboardOnFetchSafePort(app);
   const request = async (route, method = "GET", body) => {
     const response = await fetch(`http://127.0.0.1:${address.port}${route}`, {
       method, headers: { "content-type": "application/json" },

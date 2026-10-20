@@ -21,7 +21,8 @@ const DELIVERY_STATES = new Set([
   "succeeded",
   "dead_letter",
 ]);
-const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting", "directory_operation"]);
+const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting", "final_archive", "directory_operation"]);
+const FINAL_ARCHIVE_STATES = new Set(["pending", "copying", "retry_wait", "published", "conflict", "dead_letter"]);
 const DECISION_SNAPSHOT_VERSION = 1;
 const LEGACY_DECISION_SNAPSHOT_ACTIONS = new Set(["create", "archive"]);
 const LEGACY_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
@@ -57,6 +58,7 @@ const PHASED_DECISION_SNAPSHOT_ACTIONS = new Set([
   "blocked",
   "ignored",
   "archive_waiting",
+  "final_archive",
   "directory_operation",
 ]);
 const PHASED_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
@@ -76,7 +78,7 @@ const PHASED_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
   "reasonCode",
   "controlledContext",
 ]);
-const PHASED_STAGE_IDS = new Set(["initial", "first_review", "final_review"]);
+const PHASED_STAGE_IDS = new Set(["initial", "review", "first_review", "final_review"]);
 const CONTROLLED_CONTEXT_FIELDS = new Set([
   "documentLinks",
   "namingDisplayValue",
@@ -109,6 +111,8 @@ const EVENT_SNAPSHOT_FIELDS = Object.freeze([
   "afterPresent",
   "beforeOptionId",
   "afterOptionId",
+  "beforeOptionIds",
+  "afterOptionIds",
   "eventOccurredAt",
   "eventOccurredAtPresent",
   "deliverySource",
@@ -464,7 +468,9 @@ function snapshotMatchesEvent(snapshot, event) {
     && tableId === event.tableId
     && (snapshot.event === null || snapshot.event.eventId === event.eventId)
     && (snapshot.beforeOptionId === null || snapshot.beforeOptionId === event.beforeOptionId)
-    && (snapshot.afterOptionId === null || snapshot.afterOptionId === event.afterOptionId);
+    && (snapshot.afterOptionId === null || snapshot.afterOptionId === event.afterOptionId)
+    && (!snapshot.event?.beforeOptionIds || JSON.stringify(snapshot.event.beforeOptionIds) === JSON.stringify(event.beforeOptionIds))
+    && (!snapshot.event?.afterOptionIds || JSON.stringify(snapshot.event.afterOptionIds) === JSON.stringify(event.afterOptionIds));
 }
 
 function assertClaimOptions({ ownerId, leaseMs }) {
@@ -603,9 +609,18 @@ function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {
     outcome.operationId = value.operationId.trim();
     outcome.configVersion = value.configVersion;
   }
+  if (value.kind === "final_archive") {
+    if (typeof value.archiveJobId !== "string" || value.archiveJobId.trim() === ""
+      || !FINAL_ARCHIVE_STATES.has(value.archiveState)
+      || !Number.isSafeInteger(value.configVersion) || value.configVersion < 1) return null;
+    outcome.archiveJobId = value.archiveJobId.trim();
+    outcome.archiveState = value.archiveState;
+    outcome.configVersion = value.configVersion;
+  }
   const noTaskOutcome = value.kind === "ignored"
     || value.kind === "archive_waiting"
     || value.kind === "blocked"
+    || value.kind === "final_archive"
     || value.kind === "directory_operation";
   if (!noTaskOutcome && !outcome.taskId && !outcome.taskIdentifier) return null;
   if (requireTaskIdentifier && !noTaskOutcome && (!outcome.taskId || !outcome.taskIdentifier)) return null;

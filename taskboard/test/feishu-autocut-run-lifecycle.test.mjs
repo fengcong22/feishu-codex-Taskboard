@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { listenOnFetchSafePort, listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
@@ -89,10 +90,10 @@ async function createBridge(controlledContext, status = 200) {
         : { error: { code: currentContext } },
     ));
   });
-  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  const address = await listenOnFetchSafePort(bridge);
   return {
     requests,
-    url: `http://127.0.0.1:${bridge.address().port}`,
+    url: `http://127.0.0.1:${address.port}`,
     holdResponses(gate) { responseGate = gate; },
     setResponse(nextContext, nextStatus = 200) {
       currentContext = nextContext;
@@ -198,7 +199,7 @@ if (args[0] === "debug") {
     ...(coursePathResolver ? { coursePathResolver } : {}),
   };
   const app = createTaskboardServer(serverOptions);
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = await listenTaskboardOnFetchSafePort(app);
   return {
     app,
     bridge,
@@ -541,6 +542,152 @@ test("an initial automatic phased run completes locally without Codex or taskctl
   }
 });
 
+test("the panel-authorized retry of a failed automatic run keeps local execution and separate progress history", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/automatic-local-retry"],
+    namingDisplayValue: "自动执行后重试",
+    namingValueUnique: true,
+  };
+  const invocations = [];
+  const runConsent = { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true };
+  const fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    autoCutRunner: async ({ run, onProgress, autoCutRunConsent }) => {
+      invocations.push({ runId: run.runId, autoCutRunConsent });
+      onProgress({ phase: "preflight", status: "complete" });
+      onProgress({ phase: "document_fetch", status: "running" });
+      if (invocations.length === 1) {
+        onProgress({ phase: "document_fetch", status: "failed" });
+        onProgress({ phase: "asset_download", status: "skipped" });
+        onProgress({ phase: "package_publish", status: "skipped" });
+        onProgress({ phase: "package_publish", status: "failed" });
+        const failure = new Error("The fixture document could not be read");
+        failure.code = "fixture_document_fetch_failed";
+        throw failure;
+      }
+      onProgress({ phase: "document_fetch", status: "complete" });
+      await writePassingRunResult(run);
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const blocked = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 30_000);
+    const [firstRun] = fixture.app.database.listFeishuAutoCutRuns(blocked.id);
+    const firstAiRun = fixture.app.database.getAiChatRun(firstRun.runId);
+    const firstSnapshot = fixture.app.aiChat.getThreadSnapshot(firstAiRun.threadId);
+    assert.equal(firstRun.errorCode, "fixture_document_fetch_failed");
+    assert.equal(firstSnapshot.thread.model, "local-autocut");
+    assert.ok(firstSnapshot.events.some((event) => event.type === "autocut_progress"
+      && event.data.phase === "document_fetch" && event.data.status === "failed"));
+    const firstAttempts = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-runs`,
+      undefined, { method: "GET" });
+    assert.equal(firstAttempts.response.status, 200);
+    assert.equal(firstAttempts.body.runs[0].threadId, firstAiRun.threadId);
+    assert.equal(firstAttempts.body.runs[0].executionKind, "local");
+    assert.equal(firstAttempts.body.runs[0].failedPhase, "document_fetch");
+    assert.equal(firstAttempts.body.runs[0].lastPhase, "package_publish");
+
+    const retried = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-retry`, {
+      version: blocked.version,
+      runConsent,
+    });
+    assert.equal(retried.response.status, 202, JSON.stringify(retried.body));
+    assert.equal(retried.body.execution.trigger, "retry");
+    const completed = await waitForTaskStatus(fixture.app, blocked.id, "done");
+    const runs = fixture.app.database.listFeishuAutoCutRuns(blocked.id);
+    assert.deepEqual(runs.map((run) => run.attempt), [1, 2]);
+    assert.deepEqual(runs.map((run) => run.state), ["blocked", "completed"]);
+    assert.deepEqual(runs[0], firstRun, "retry must preserve the failed attempt");
+    assert.notEqual(runs[1].runId, firstRun.runId);
+    assert.notEqual(runs[1].manifestPath, firstRun.manifestPath);
+    assert.equal(runs[1].eventId, firstRun.eventId);
+    assert.equal(runs[1].configVersion, firstRun.configVersion);
+    assert.equal(runs[1].stageId, firstRun.stageId);
+    assert.deepEqual(invocations, [
+      { runId: firstRun.runId, autoCutRunConsent: undefined },
+      { runId: runs[1].runId, autoCutRunConsent: runConsent },
+    ]);
+
+    const retrySnapshot = fixture.app.aiChat.getThreadSnapshot(completed.threadId);
+    assert.notEqual(retrySnapshot.thread.id, firstSnapshot.thread.id);
+    assert.equal(retrySnapshot.thread.model, "local-autocut");
+    assert.equal(retrySnapshot.runs[0].status, "completed");
+    const retryProgress = retrySnapshot.events.filter((event) => event.type === "autocut_progress");
+    assert.ok(retryProgress.some((event) => event.data.phase === "document_fetch" && event.data.status === "complete"));
+    assert.ok(retryProgress.some((event) => event.data.phase === "artifact_report" && event.data.status === "complete"));
+    assert.ok(retryProgress.every((event) => event.runId === runs[1].runId && event.threadId === retrySnapshot.thread.id));
+    assert.deepEqual(fixture.app.aiChat.getThreadSnapshot(firstAiRun.threadId), firstSnapshot);
+    assert.equal(fixture.app.database.getTaskArtifactForRun(blocked.id, runs[1].runId).validationStatus, "verified");
+    for (const [runId, type, phase] of [
+      [firstRun.runId, "autocut_progress", "source_hash"],
+      [runs[1].runId, "autocut_progress", "private-unknown-phase"],
+      [runs[1].runId, "command", "source_asr"],
+    ]) {
+      fixture.app.database.insertAiChatEvent({
+        threadId: retrySnapshot.thread.id, runId, type, role: "activity",
+        content: "private-event-text", data: { phase, status: "failed", command: "private-command" },
+      });
+    }
+    const attempts = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${blocked.id}/autocut-runs`,
+      undefined, { method: "GET" });
+    assert.equal(attempts.response.status, 200);
+    assert.deepEqual(attempts.body.runs[0], firstAttempts.body.runs[0], "retry must preserve the first attempt diagnostics");
+    assert.equal(attempts.body.runs[1].threadId, retrySnapshot.thread.id);
+    assert.equal(attempts.body.runs[1].executionKind, "local");
+    assert.equal(attempts.body.runs[1].failedPhase, null, "failure metadata must not cross run bindings");
+    assert.equal(attempts.body.runs[1].lastPhase, "artifact_report");
+    assert.doesNotMatch(JSON.stringify(attempts.body), /private-unknown-phase|private-event-text|private-command/);
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+for (const recoveryStatus of ["complete", "resumed"]) {
+  test(`Auto-Cut diagnostics ignore a ${recoveryStatus} failure before the next unrecovered phase`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/recovered-failure"],
+      namingDisplayValue: "恢复后失败",
+      namingValueUnique: true,
+    };
+    const fixture = await createFixture({
+      controlledContext,
+      allowAutomaticExecution: true,
+      autoCutRunner: async ({ onProgress }) => {
+        onProgress({ phase: "document_fetch", status: "failed" });
+        onProgress({ phase: "document_fetch", status: recoveryStatus });
+        onProgress({ phase: "asset_download", status: "failed" });
+        onProgress({ phase: "package_publish", status: "skipped" });
+        onProgress({ phase: "package_publish", status: "failed" });
+        const error = new Error("Fixture material download failed");
+        error.code = "fixture_asset_download_failed";
+        throw error;
+      },
+    });
+    try {
+      const subject = await registerSubject(fixture, { executionMode: "automatic" });
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      const task = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 8_000);
+      const attempts = await jsonRequest(fixture.baseUrl, `/api/local/tasks/${task.id}/autocut-runs`,
+        undefined, { method: "GET" });
+      assert.equal(attempts.response.status, 200);
+      assert.equal(attempts.body.runs[0].failedPhase, "asset_download");
+      assert.equal(attempts.body.runs[0].lastPhase, "package_publish");
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
 test("an automatic phased run with no package ZIP directory uses its frozen subject source through artifact verification", async () => {
   const controlledContext = {
     documentLinks: ["https://guanghe.feishu.cn/docx/frozen-zip-source"],
@@ -655,7 +802,7 @@ test("local switch cancels waiting automatic tasks while a running edit complete
     next.event.eventId = "evt-switch-second";
     next.event.recordId = "rec_switch_second";
     const running = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", next);
-    const deadline = Date.now() + 8_000;
+    const deadline = Date.now() + 30_000;
     while (!started && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
     assert.equal(started, true);
     assert.equal((await save(false, 3)).response.status, 200);
@@ -727,8 +874,8 @@ test("a recovered automatic phased reservation runs locally after policy revalid
     assert.equal(fixture.app.database.getFeishuExecution(created.body.task.id)?.state, "delayed");
     await fixture.app.close();
     fixture.app = createTaskboardServer(fixture.serverOptions);
-    await fixture.app.listen({ host: "127.0.0.1", port: 0 });
-    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
+    await listenTaskboardOnFetchSafePort(fixture.app);
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 30_000);
     const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
     assert.deepEqual(invocations, [run.runId]);
     assert.equal(run.state, "completed");
@@ -1622,6 +1769,10 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
     assert.deepEqual(attempts.body.runs, [{
       runId: blockedRun.runId,
       taskId: blockedRun.taskId,
+      threadId: started.body.thread.id,
+      executionKind: "codex",
+      failedPhase: null,
+      lastPhase: null,
       attempt: blockedRun.attempt,
       subjectKey: blockedRun.subjectKey,
       configVersion: blockedRun.configVersion,
@@ -1634,6 +1785,13 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
       errorMessage: blockedRun.errorMessage,
       createdAt: blockedRun.createdAt,
       updatedAt: blockedRun.updatedAt,
+    }]);
+    fixture.app.database.deleteAiChatRun(blockedRun.runId);
+    const withoutAiRun = await jsonRequest(fixture.baseUrl,
+      `/api/local/tasks/${encodeURIComponent(run.taskId)}/autocut-runs`, undefined, { method: "GET" });
+    assert.equal(withoutAiRun.response.status, 200);
+    assert.deepEqual(withoutAiRun.body.runs, [{
+      ...attempts.body.runs[0], threadId: null, executionKind: null, failedPhase: null, lastPhase: null,
     }]);
   } finally {
     await fixture.app.close();

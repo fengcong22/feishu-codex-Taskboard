@@ -2,6 +2,10 @@ import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { PackageConfigError } from "./feishu-package-config.mjs";
+import {
+  assertPackageWorkflowExecutable, normalizePackageWorkflowTemplate, packageWorkflowFromManifest,
+  PackageWorkflowError, workflowTemplatesEqual,
+} from "../shared/feishu-package-workflow.mjs";
 
 const RESERVED_ALIASES = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -39,7 +43,7 @@ async function readManifest(filename) {
   let source;
   try {
     const entry = await lstat(filename);
-    if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("unavailable");
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1) throw new Error("unavailable");
     source = await readFile(filename, "utf8");
   } catch (error) {
     if (error instanceof PackageConfigError) throw error;
@@ -196,8 +200,10 @@ export async function inspectAutoCutPackageWorkspace({ workspacePath, existingPa
   ]);
   const pluginName = requireManifestName(plugin.name);
   const pluginVersion = normalizeVersion(plugin.version);
-  const runtimeVersion = normalizeVersion(packageManifest.embedded_runtime?.version);
   const identity = collisionSafeIdentity(pluginName, existingPackages);
+  const workflowTemplate = packageWorkflowFromManifest(packageManifest.interface);
+  const runtimeVersion = workflowTemplate.id === "vm_pmo_review_video" && packageManifest.embedded_runtime === undefined
+    ? null : normalizeVersion(packageManifest.embedded_runtime?.version);
   const zipOutput = zipOutputDeclaration(packageManifest.interface, normalizedWorkspace);
 
   return {
@@ -206,6 +212,7 @@ export async function inspectAutoCutPackageWorkspace({ workspacePath, existingPa
     runtimeVersion,
     defaultPrompt: defaultPrompt(plugin.interface?.defaultPrompt),
     zipOutput,
+    workflowTemplate,
     ...identity,
   };
 }
@@ -216,6 +223,7 @@ export async function prepareAutoCutPackageOutputDirectory({ workspacePath } = {
   }
   const normalizedWorkspace = path.normalize(workspacePath.trim());
   const inspection = await inspectAutoCutPackageWorkspace({ workspacePath: normalizedWorkspace, existingPackages: [] });
+  assertPackageWorkflowExecutable(inspection.workflowTemplate);
   if (!inspection.zipOutput) {
     throw new PackageConfigError(
       "PACKAGE_ZIP_OUTPUT_UNDECLARED",
@@ -225,4 +233,35 @@ export async function prepareAutoCutPackageOutputDirectory({ workspacePath } = {
     );
   }
   return { zipOutput: await prepareDirectory({ workspacePath: normalizedWorkspace, zipOutput: inspection.zipOutput }) };
+}
+
+/** Resolve saved and current manifest identity without executing workspace code. */
+export async function resolvePackageWorkflowFromWorkspace(record = {}, { allowMissingLegacyManifest = false } = {}) {
+  const saved = normalizePackageWorkflowTemplate(record.workflowTemplate);
+  const savedDeclared = Object.hasOwn(record, "workflowTemplate");
+  if (!record.workspacePath) return { workflowTemplate: saved, declared: savedDeclared };
+  if (typeof record.workspacePath !== "string" || !path.isAbsolute(record.workspacePath)) {
+    throw new PackageConfigError("PACKAGE_WORKSPACE_UNAVAILABLE", "Package workspace is unavailable", undefined, 409);
+  }
+  const filename = path.join(record.workspacePath, "PACKAGE-MANIFEST.json");
+  try { await lstat(filename); }
+  catch (error) {
+    if (error?.code === "ENOENT" && (!savedDeclared || (allowMissingLegacyManifest && saved.id === "document_draft_zip"))) {
+      return { workflowTemplate: saved, declared: savedDeclared };
+    }
+    throw new PackageConfigError("PACKAGE_MANIFEST_UNAVAILABLE", "Package manifest is unavailable", undefined, 409);
+  }
+  const manifest = await readManifest(filename);
+  const actual = packageWorkflowFromManifest(manifest.interface);
+  if (savedDeclared && !workflowTemplatesEqual(saved, actual)) {
+    throw new PackageWorkflowError("PACKAGE_WORKFLOW_MISMATCH");
+  }
+  return { workflowTemplate: actual, declared: savedDeclared || Object.hasOwn(manifest.interface ?? {}, "workflowTemplate") };
+}
+
+/** Recheck immutable registry/snapshot identity and the current manifest before execution. */
+export async function assertExecutablePackageWorkflow(record = {}) {
+  assertPackageWorkflowExecutable(record.workflowTemplate);
+  const resolved = await resolvePackageWorkflowFromWorkspace(record, { allowMissingLegacyManifest: true });
+  return assertPackageWorkflowExecutable(resolved.workflowTemplate);
 }

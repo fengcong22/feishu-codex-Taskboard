@@ -24,6 +24,13 @@ function optionIdValue(value) {
   return null;
 }
 
+function optionIdsValue(value) {
+  const decoded = decodeJsonValue(value);
+  if (decoded === null || decoded === undefined || decoded === "") return [];
+  const values = Array.isArray(decoded) ? decoded : [decoded];
+  return [...new Set(values.map(optionIdValue).filter(Boolean))].sort();
+}
+
 function occurrenceTime(...values) {
   for (const value of values) {
     if (value === undefined || value === null || value === "") continue;
@@ -98,7 +105,7 @@ function fieldRawMap(entries) {
 }
 
 function statusFieldDefinition(table, fieldId) {
-  return [table.statusField, table.reviewStatusField].find((field) => (
+  return [table.statusField, table.reviewStatusField, ...(table.metadata?.fields ?? [])].find((field) => (
     field && (field.fieldId ?? field.field_id) === fieldId
   ));
 }
@@ -217,11 +224,13 @@ export function normalizeBitableRecordChanged(payload, table) {
     const changedIds = changedFieldIds(before, after);
     const statusFieldId = table.statusField?.fieldId ?? table.statusField?.field_id ?? table.triggerFieldId ?? "";
     const reviewStatusFieldId = table.reviewStatusField?.fieldId ?? table.reviewStatusField?.field_id;
+    const archiveStatusFieldId = table.vmWorkflow?.finalArchive?.enabled === true
+      ? table.vmWorkflow.finalArchive.statusFieldId : null;
     const finalDirectoryFieldId = table.delivery?.version === 1
       && table.delivery.finalDirectoryTrigger?.enabled === true
       ? table.delivery.finalDirectoryTrigger.fieldId
       : null;
-    const watchedFieldIds = [statusFieldId, reviewStatusFieldId, finalDirectoryFieldId]
+    const watchedFieldIds = [statusFieldId, reviewStatusFieldId, finalDirectoryFieldId, archiveStatusFieldId]
       .filter((fieldId, index, entries) => typeof fieldId === "string" && fieldId !== "" && entries.indexOf(fieldId) === index);
     const edgeFieldIds = watchedFieldIds.filter((fieldId) => changedIds.includes(fieldId));
     if (edgeFieldIds.length === 0) {
@@ -304,6 +313,8 @@ export function normalizeBitableRecordChanged(payload, table) {
         baseResult.afterPresent = afterRaw.has(edgeFieldId);
         baseResult.beforeOptionId = beforeOptionId;
         baseResult.afterOptionId = afterOptionId;
+        baseResult.beforeOptionIds = optionIdsValue(beforeRaw.get(edgeFieldId));
+        baseResult.afterOptionIds = optionIdsValue(afterRaw.get(edgeFieldId));
         baseResult.eventOccurredAtPresent = occurredAt !== null;
         baseResult.eventOccurredAt = occurredAt;
       }

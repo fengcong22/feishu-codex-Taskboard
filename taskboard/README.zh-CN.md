@@ -22,6 +22,8 @@ npm start
 
 打开 <http://127.0.0.1:47823>。SQLite 数据库存储在 `.data/taskboard.sqlite`。
 
+飞书 Bridge 接入的 `vm_pmo_review_video` 包包含独立的初稿与审核修改流程：初稿通过正常 VM 审批队列获取源视频，审核修改复用 Taskboard 已确认交付的上一轮 MP4。每轮通过 `plan/render` 生成唯一 MP4，上传并读回 PMO 附件后完成阶段。可选的最终归档 worker 会校验 SHA 并以无覆盖方式发布成片。启用要求本机 Python、包白名单、自动剪辑开关及完整学科配置；保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。
+
 如需在前端实时重载模式下开发：
 
 ```bash
@@ -211,7 +213,9 @@ Bridge 用下面的回环接口做生命周期同步：
 
 工作流面板支持“手动选择”（`manual_select`）和“Auto-Cut 上报”（`driver_report`）；“监控目录”（`watch_directory`）仍为预留值并保持禁用。使用 `driver_report` 时需要配置绝对的 ZIP 来源根目录。Auto-Cut 验收本次运行生成的准确 ZIP 后，执行 `taskctl artifact report --file <验收通过 ZIP 的绝对路径>`。该命令只读取并计算这个指定文件的 SHA-256，再通过 Taskboard 为本次运行注入的专属能力上报准确路径和哈希。
 
-只有通过 `POST /api/local/tasks/:id/autocut-retry` 发起、同时携带两个字面量 `true` 授权项，并且属于服务端登记的已阻塞 phased Auto-Cut 任务，Taskboard 才直接启动本机已登记的 Auto-Cut runtime；该路径不会再启动新的 Codex turn。初次执行和未携带授权的重试继续使用原有 Codex 路径；普通任务、复制标记、legacy 或未登记任务不能取得本地执行资格。授权只绑定随后创建的这一个 run；run 创建前若服务重启，必须重新授权。
+任务详情中的“重试 Auto-Cut”按钮旁会显示本次视频原音语音识别及已配置本机输出目录的授权范围。点击后通过 `POST /api/local/tasks/:id/autocut-retry` 发起，同时携带两个字面量 `true` 授权项；服务端核对已阻塞 phased Auto-Cut 任务的可信登记后，直接启动本机已登记的 runtime，继续显示结构化阶段进度并保留旧 attempt。打开页面不会发送授权或启动任务。初次自动执行在满足独立自动执行门禁后也使用本机 runner；手动启动和其他 API 调用方未携带授权的重试继续使用原有 Codex 路径。普通任务、复制标记、legacy 或未登记任务不能取得本地执行资格。授权只绑定随后创建的这一个 run，不持久化或继承；run 创建前若服务重启，必须重新授权。
+
+受阻后，在任务详情的 **Auto-Cut 运行 → 受阻诊断与检查建议** 查看中文原因、记录的失败阶段、检查位置和重试建议。最新一轮默认展开，历史轮次可单独展开；**查看本次日志** 打开对应轮次的面板对话，**复制排查信息** 仅复制任务/运行标识与固定诊断文案，不复制运行时原始错误文本。错误记录不足时明确显示原因未确定，不把检查建议当成已确认根因。阶段来自同一 run 的安全进度事件：优先最早仍未恢复的失败阶段，避免下游跳过或收尾失败掩盖起点；只有最后记录阶段时不宣称其就是失败位置。任务版本更新会刷新诊断，无附件产生的失败同样可见。
 
 Taskboard 向本机 runtime 传入该 run 独占的素材 manifest、manifest 哈希、结果回执路径和预期 ZIP 路径。runtime 结束后，Taskboard 只对这个预期 ZIP 计算 SHA-256，并通过同一个 task/run 限定的 `artifact-report` 接口登记；接收端继续核对任务来源、不可变配置、run、回执、ZIP 与哈希，不扫描目录、不选择“最新 ZIP”、不根据文件名猜归属。
 

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { types as utilTypes } from "node:util";
 
 import {
   ARTIFACT_UPLOAD_LEASE_DURATION_MS,
@@ -14,6 +15,7 @@ import { UNIFIED_WORKFLOW_STAGES } from "../shared/unified-workflow-stages.mjs";
 import { originFingerprint, registrationFingerprint } from "./feishu-deleted-event.mjs";
 import { CONTROLLED_CONTEXT_FIELDS, normalizeOptionalCourseName } from "./feishu-controlled-context.mjs";
 import { feishuTaskDisplayTitle } from "./feishu-task-title.mjs";
+import { normalizePackageWorkflowTemplate, workflowTemplatesEqual } from "../shared/feishu-package-workflow.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -473,7 +475,7 @@ function normalizeFeishuTaskOrigin(value) {
   if (origin.uploadMode !== undefined && !["manual", "automatic"].includes(origin.uploadMode)) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin uploadMode is invalid");
   }
-  if (origin.stageId !== undefined && !["initial", "first_review", "final_review"].includes(origin.stageId)) {
+  if (origin.stageId !== undefined && !["initial", "review", "first_review", "final_review"].includes(origin.stageId)) {
     throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin stageId is invalid");
   }
   if (origin.controlledContext !== undefined) {
@@ -510,6 +512,11 @@ function normalizeFeishuPackageSnapshot(value) {
     workspacePath: value.workspacePath === null || value.workspacePath === undefined ? null : typeof value.workspacePath === "string" ? value.workspacePath.trim() : value.workspacePath,
     prompt: value.prompt === null || value.prompt === undefined ? null : typeof value.prompt === "string" ? value.prompt.trim() : value.prompt,
   };
+  try {
+    snapshot.workflowTemplate = normalizePackageWorkflowTemplate(value.workflowTemplate);
+  } catch {
+    throw new ApiError(409, "INVALID_PACKAGE_SNAPSHOT", "Package snapshot workflow is invalid");
+  }
   for (const key of ["workspacePath", "prompt"]) {
     if (snapshot[key] !== null && (typeof value[key] !== "string" || value[key].includes("\0") || snapshot[key] === "")) {
       throw new ApiError(400, "INVALID_PACKAGE_SNAPSHOT", `Package snapshot '${key}' is invalid`);
@@ -4060,6 +4067,7 @@ export class TaskboardDatabase {
         task.feishuPackageSnapshot = {
           zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
           ...(packageSnapshot.zipOutputMode ? { zipOutputMode: packageSnapshot.zipOutputMode } : {}),
+          ...(packageSnapshot.workflowTemplate ? { workflowTemplate: packageSnapshot.workflowTemplate } : {}),
         };
       }
       return task;
@@ -4087,6 +4095,7 @@ export class TaskboardDatabase {
       enriched.feishuPackageSnapshot = {
         zipSourceDirectory: packageSnapshot.zipSourceDirectory ?? null,
         ...(packageSnapshot.zipOutputMode ? { zipOutputMode: packageSnapshot.zipOutputMode } : {}),
+        ...(packageSnapshot.workflowTemplate ? { workflowTemplate: packageSnapshot.workflowTemplate } : {}),
       };
     }
     return enriched;
@@ -4156,7 +4165,11 @@ export class TaskboardDatabase {
     };
   }
 
-  createTask(input) {
+  createTask(input, onCreatedInTransaction = null) {
+    if (onCreatedInTransaction !== null && (typeof onCreatedInTransaction !== "function"
+      || utilTypes.isAsyncFunction(onCreatedInTransaction))) {
+      throw new ApiError(500, "FEISHU_TRANSACTION_CALLBACK_INVALID", "Task transaction callback must be synchronous");
+    }
     if (input.status === "queued" && !input.feishuOrigin) {
       throw new ApiError(409, "QUEUED_STATUS_RESERVED", "Queued status is reserved for server-managed executions");
     }
@@ -4292,6 +4305,15 @@ export class TaskboardDatabase {
             (task_id, package_alias, package_revision, snapshot_json, created_at)
           VALUES (?, ?, ?, ?, ?)
         `).run(id, snapshot.packageAlias, snapshot.packageRevision, JSON.stringify(snapshot), timestamp);
+      }
+      if (onCreatedInTransaction !== null) {
+        const result = onCreatedInTransaction({ taskId: id, database: this });
+        if (result !== null && result !== undefined && typeof result.then === "function") {
+          // Consume rejected promises before rolling back so an accidental async
+          // callback cannot escape as an unhandled rejection after the request.
+          Promise.resolve(result).catch(() => {});
+          throw new ApiError(500, "FEISHU_TRANSACTION_CALLBACK_INVALID", "Task transaction callback must be synchronous");
+        }
       }
       this.database.exec("COMMIT");
       return this.getTask(id);
@@ -4464,14 +4486,14 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  createFeishuTask(input, packageSnapshot = undefined) {
+  createFeishuTask(input, packageSnapshot = undefined, onCreatedInTransaction = null) {
     if (!input || typeof input !== "object" || !input.feishuOrigin) {
       throw new ApiError(400, "INVALID_FEISHU_ORIGIN", "Feishu task origin is required");
     }
     if (packageSnapshot === undefined && input.feishuOrigin.packageAlias) {
       throw new ApiError(409, "PACKAGE_SNAPSHOT_REQUIRED", "A trusted Auto-Cut package snapshot is required");
     }
-    return this.createTask({ ...input, packageSnapshot });
+    return this.createTask({ ...input, packageSnapshot }, onCreatedInTransaction);
   }
 
   getFeishuTaskOrigin(taskId) {
@@ -4522,7 +4544,7 @@ export class TaskboardDatabase {
     try {
       return structuredClone(normalizeFeishuPackageSnapshot(JSON.parse(row.snapshot_json)));
     } catch {
-      return null;
+      throw new ApiError(409, "INVALID_PACKAGE_SNAPSHOT", "The saved package snapshot is invalid");
     }
   }
 
@@ -5064,6 +5086,13 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_PACKAGE_REFRESH_BLOCKED", "Only waiting or queued tasks can refresh their package configuration");
     }
     const snapshot = normalizeFeishuPackageSnapshot(packageSnapshot);
+    const previousSnapshot = this.getFeishuTaskPackageSnapshot(taskId);
+    if (previousSnapshot && (
+      previousSnapshot.packageAlias !== snapshot.packageAlias
+      || !workflowTemplatesEqual(previousSnapshot.workflowTemplate, snapshot.workflowTemplate)
+    )) {
+      throw new ApiError(409, "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "A task cannot switch to a different package workflow");
+    }
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {

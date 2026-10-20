@@ -63,6 +63,7 @@ export interface TaskboardMetadata {
 export interface TaskboardCapabilities {
   localAiChat: boolean;
   automaticExecution?: boolean;
+  vmPmoInitial?: boolean;
 }
 
 export interface AutomaticExecutionSettings {
@@ -398,6 +399,74 @@ export interface Project {
 
 export type FeishuPackageState = "draft" | "enabled" | "disabled";
 
+export interface FeishuPackageWorkflowTemplate {
+  id: "document_draft_zip" | "vm_pmo_review_video";
+  version: 1;
+}
+
+export interface FeishuVmPmoWritebackTarget {
+  fieldId: string | null;
+  optionId: string | null;
+}
+
+export type FeishuVmPmoStageId = "initial" | "review";
+
+export interface FeishuVmPmoStageConfig {
+  enabled: boolean;
+  statusFieldId: string | null;
+  triggerOptionId: string | null;
+  /** Null means no instruction binding for this stage. */
+  instructionFieldId: string | null;
+  writeback?: {
+    processing: FeishuVmPmoWritebackTarget;
+    completed: FeishuVmPmoWritebackTarget;
+  };
+}
+
+export interface FeishuVmPmoFinalArchiveConfig {
+  enabled: boolean;
+  statusFieldId: string | null;
+  triggerOptionId: string | null;
+  pathSource: "manual" | "pmo_field";
+  directoryPath: string | null;
+  pathFieldId: string | null;
+}
+
+export interface FeishuVmPmoWorkflowConfig {
+  fields: {
+    vmidFieldId: string | null;
+    outputAttachmentFieldId: string | null;
+    /** Common video name for all outputs; absent in older draft responses. */
+    namingFieldId?: string | null;
+  };
+  approval: { department: string; reason: string };
+  stages: {
+    initial: FeishuVmPmoStageConfig;
+    review: FeishuVmPmoStageConfig & { instructionAttachmentsFieldId: string | null };
+  };
+  /** Missing in older drafts; displayed as a disabled archive until edited. */
+  finalArchive?: FeishuVmPmoFinalArchiveConfig;
+}
+
+export type FeishuZipWorkflowConfig = Pick<FeishuSubjectConfig,
+  "trigger" | "title" | "execution" | "packageRoute" | "upload" | "statusField"
+  | "reviewStatusField" | "documentField" | "namingField" | "stages" | "delivery">;
+
+export interface FeishuPackageWorkflowDraft<Config = FeishuVmPmoWorkflowConfig> {
+  subjectKey: string;
+  packageAlias: string;
+  workflowTemplate: FeishuPackageWorkflowTemplate;
+  revision: number;
+  config: Config;
+  /** Present only when a saved VM draft was read in its legacy three-stage shape. */
+  legacyReviewStage?: "first_review" | "final_review";
+  /** Legacy independent name fields disagreed; select a common name and save. */
+  legacyNamingConflict?: boolean;
+  /** The legacy archive hierarchy needs an explicit directory choice before saving. */
+  legacyArchivePathNeedsReview?: boolean;
+  updatedAt: string | null;
+}
+
 export interface FeishuPackageZipOutput {
   relativeDirectory: string;
   directory: string;
@@ -411,6 +480,7 @@ export interface FeishuPackageWorkspaceInspection {
   alias: string;
   projectId: string;
   zipOutput?: FeishuPackageZipOutput | null;
+  workflowTemplate?: FeishuPackageWorkflowTemplate;
 }
 
 export interface AutoCutPackageDraft {
@@ -425,6 +495,7 @@ export interface AutoCutPackageDraft {
   zipOutputMode?: "package_default" | "custom";
   maxConcurrent: number;
   resourceGroups: string[];
+  workflowTemplate?: FeishuPackageWorkflowTemplate;
 }
 
 export interface FeishuPackage extends AutoCutPackageDraft {
@@ -522,8 +593,17 @@ export interface FeishuDeliveryConfig {
   finalDirectoryTrigger: { enabled: boolean; fieldId: string | null; optionId: string | null };
 }
 
+export interface AutoCutRunConsent {
+  allowVideoAudioAsr: true;
+  allowConfiguredLocalOutput: true;
+}
+
 export interface FeishuAutoCutRun {
   runId: string;
+  threadId?: string | null;
+  executionKind?: "local" | "codex" | null;
+  failedPhase?: string | null;
+  lastPhase?: string | null;
   taskId: string;
   attempt: number;
   subjectKey: string;
@@ -538,7 +618,76 @@ export interface FeishuAutoCutRun {
   updatedAt: string;
 }
 
+export interface VmPmoRunSummary {
+  runId: string;
+  taskId: string;
+  state: "waiting_materials" | "ready" | "preparing" | "prepared" | "planning" | "planned"
+    | "rendering" | "rendered" | "delivery_pending" | "delivery_confirmed"
+    | "completed" | "blocked" | "needs_attention";
+  errorCode: string | null;
+  approvalStatus: string;
+  planAttempt: number;
+  retryLimit: number;
+  retryHistory: Array<{ planAttempt: number; errorCode: string; failedAt: string }>;
+  canRetryPlan: boolean;
+  canRetryWriteback?: boolean;
+  writeback?: {
+    processing: { state: string; errorCode: string | null; attemptCount: number } | null;
+    completed: { state: string; errorCode: string | null; attemptCount: number } | null;
+  };
+  updatedAt: string;
+}
+
+export type PackageBoardStage = UnifiedWorkflowStage | "materials" | "editing" | "feishu_delivery"
+  | "awaiting_feishu_review" | "nas_upload" | "completed" | "needs_attention";
+
+export interface PackageBoardView {
+  id: string;
+  name: string;
+  stageIds: PackageBoardStage[];
+  isSystem: boolean;
+}
+
+export interface PackageBoardDisplay {
+  stageId: PackageBoardStage;
+  zhName: string | null;
+  enName: string | null;
+  zhDescription: string | null;
+  enDescription: string | null;
+}
+
+export interface PackageBoardSettings {
+  subjectKey: string;
+  packageAlias: string;
+  workflowTemplate: FeishuPackageWorkflowTemplate;
+  revision: number;
+  views: PackageBoardView[];
+  activeViewId: string;
+  defaultViewId: string;
+  stageDisplays: PackageBoardDisplay[];
+}
+
+export interface PackageBoardEvidence extends Pick<VmPmoRunSummary,"taskId" | "errorCode" | "writeback" | "updatedAt"> {
+  runId: string | null;
+  state: VmPmoRunSummary["state"] | "todo";
+  approvalStatus: string | null;
+  parentTaskId?: string | null;
+  waitingForSlot?: boolean;
+  parentRunId?: string | null;
+  latestDelivered?: boolean;
+  runnerStartedAt?: string | null;
+  completedAt?: string | null;
+  archive?: {id?: string; state: string; errorCode: string | null; sourceRunId: string; sourceTaskId?: string; updatedAt?: string} | null;
+}
+
+export interface PackageBoardResponse {
+  settings: PackageBoardSettings;
+  status: {subjectKey: string; packageAlias: string; tasks: PackageBoardEvidence[]};
+}
+
 export interface FeishuSubjectConfig {
+  workflowTemplate?: FeishuPackageWorkflowTemplate;
+  vmWorkflow?: FeishuVmPmoWorkflowConfig;
   subjectKey: string;
   baseToken: string;
   baseName: string;
@@ -550,6 +699,9 @@ export interface FeishuSubjectConfig {
   configVersion: number;
   /** Server-owned active version; a newer draft may coexist with it. */
   readonly activeConfigVersion?: number | null;
+  readonly activePackageAlias?: string | null;
+  /** Last saved package draft to reopen; independent of the active route. */
+  readonly preferredPackageAlias?: string | null;
   statusField?: { fieldId: string; fieldName: string; type?: string; options?: FeishuFieldOption[] };
   reviewStatusField?: { fieldId: string; fieldName: string; type?: string; options?: FeishuFieldOption[] };
   documentField?: { fieldId: string; fieldName: string; kind?: string };
@@ -559,7 +711,7 @@ export interface FeishuSubjectConfig {
   trigger?: { fieldId: string; fieldName: string; startValue: string; optionId: string | null };
   title?: { fieldId: string | null; fieldName: string | null };
   execution?: { mode: "manual" | "automatic"; concurrencyGroup: string; maxConcurrent: number; resourceGroups: string[] };
-  packageRoute?: { routeMode: "fixed"; packageAlias: string; subjectCodeFieldId: string | null; branchMap: Record<string, string> | null };
+  packageRoute?: { routeMode: "fixed"; packageAlias: string | null; subjectCodeFieldId: string | null; branchMap: Record<string, string> | null };
   upload?: { enqueueMode: "manual" | "automatic"; artifactSourceMode: string; artifactSourcePath: string | null; targetId: string | null; targetPath: string | null; uploadConcurrency: number };
   metadata?: { fields?: FeishuFieldMetadata[] };
   createdAt: string;
@@ -598,6 +750,38 @@ export interface FeishuWorkflowShareResult {
   diagnostics: FeishuWorkflowShareDiagnostic[];
   diagnosticsOk?: boolean;
   dryRun: boolean;
+}
+
+export interface FeishuSubjectWorkflowShareConfiguration {
+  kind: "feishu-subject-workflow";
+  schemaVersion: 1;
+  source: { subjectKey: string; baseName: string; tableName: string; metadata?: FeishuSubjectConfig["metadata"] };
+  packageAlias: string;
+  workflowTemplate: FeishuPackageWorkflowTemplate;
+  config: FeishuZipWorkflowConfig | FeishuVmPmoWorkflowConfig;
+}
+
+export interface FeishuSubjectWorkflowShareInput {
+  configuration: FeishuSubjectWorkflowShareConfiguration | FeishuWorkflowShareConfiguration;
+  sourceSubjectKey?: string;
+  targetSubjectKey: string;
+  expectedVersion: number;
+  expectedRevision?: number;
+  dryRun: boolean;
+}
+
+export interface FeishuSubjectWorkflowShareResult {
+  configuration: FeishuSubjectWorkflowShareConfiguration;
+  source: { subjectKey: string; baseName: string; tableName: string };
+  target: { subjectKey: string; baseName: string; tableName: string };
+  packageAlias: string;
+  workflowTemplate: FeishuPackageWorkflowTemplate;
+  expectedVersion: number;
+  expectedRevision: number;
+  diagnostics: FeishuWorkflowShareDiagnostic[];
+  diagnosticsOk?: boolean;
+  dryRun: boolean;
+  catalog?: FeishuBaseCatalog[];
 }
 
 export type UnifiedWorkflowStage =
@@ -869,6 +1053,7 @@ export interface FeishuTaskOrigin {
 export interface FeishuTaskPackageSnapshot {
   zipSourceDirectory: string | null;
   zipOutputMode?: "package_default" | "custom";
+  workflowTemplate?: FeishuPackageWorkflowTemplate;
 }
 
 export interface ArtifactUpload {

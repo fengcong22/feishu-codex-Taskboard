@@ -65,11 +65,17 @@ if (args[0] === "debug") {
   });
   const address = await app.listen({ host, port: 0 });
   const workflowStore = createFeishuWorkflowStore({ database: app.database });
-  const subject = subjectPackage ? (await workflowStore.upsertBasePreview({
+  let subject = subjectPackage ? (await workflowStore.upsertBasePreview({
     baseToken: "bas_ai_subject",
     baseName: "Example Base",
     tables: [{ tableId: "tbl_ai_subject", tableName: "Example subject", fields: [] }],
   })).subjects[0] : null;
+  if (subject) {
+    subject = await workflowStore.saveSubjectDraft(subject.subjectKey, {
+      expectedVersion: subject.configVersion,
+      packageRoute: { ...subject.packageRoute, packageAlias: "Auto-cut-A" },
+    });
+  }
   return {
     app,
     subject,
@@ -618,6 +624,42 @@ test("AI SSE is live-only and thread snapshots remain the durable source", async
     assert.match(streamed, /event: ai\.(event|run)/);
     controller.abort();
   } finally {
+    await fixture.close();
+  }
+});
+
+test("AI updates reach the shared event stream as content-free thread hints", async () => {
+  const fixture = await createServerFixture();
+  const controller = new AbortController();
+  try {
+    const created = await request(fixture.baseUrl, "/api/local/ai/threads", {
+      method: "POST",
+      body: { projectId: "local" },
+    });
+    const threadId = created.body.thread.id;
+    const response = await fetch(`${fixture.baseUrl}/api/events`, { signal: controller.signal });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    let streamed = "";
+    const turn = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
+      method: "POST",
+      body: { message: "private user content" },
+    });
+    assert.equal(turn.response.status, 202);
+    while (!streamed.includes("event: ai.thread.updated")) {
+      const { done, value } = await reader.read();
+      assert.equal(done, false);
+      streamed += new TextDecoder().decode(value);
+    }
+    const frame = streamed.match(/event: ai\.thread\.updated\ndata: ([^\n]+)\n\n/u);
+    assert.ok(frame);
+    const payload = JSON.parse(frame[1]);
+    assert.equal(payload.threadId, threadId);
+    assert.ok(["ai.event", "ai.run"].includes(payload.hintType));
+    assert.deepEqual(Object.keys(payload).sort(), ["at", "hintType", "threadId", "type"]);
+    assert.equal(streamed.includes("private user content"), false);
+  } finally {
+    controller.abort();
     await fixture.close();
   }
 });

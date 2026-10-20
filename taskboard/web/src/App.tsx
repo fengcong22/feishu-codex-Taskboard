@@ -45,12 +45,12 @@ import {
   moveTask as moveTaskRequest,
   publishHostRuntime,
   removeTaskRelation,
-  resolveTaskboardUrl,
   resolveTaskboardWebSocketUrl,
   restoreTask as restoreTaskRequest,
   retryTaskArtifactUpload,
   setApiText,
   setCurrentUserActor,
+  subscribeLocalEvents,
   setProjectArchived,
   startTaskWithCodex,
   syncJiraConnection,
@@ -70,6 +70,7 @@ import {
   UnifiedWorkflowBoard,
   type UnifiedWorkflowStage,
 } from "./components/UnifiedWorkflowBoard";
+import { PackageWorkflowWorkspace, type PackageBoardScope } from "./components/PackageWorkflowWorkspace";
 import { IssueListView } from "./components/IssueListView";
 import {
   BoardCardDisplayMenu,
@@ -99,6 +100,7 @@ import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
 import { FeishuBaseNavigator } from "./components/FeishuBaseNavigator";
+import { useSidebarLayout } from "./components/useSidebarLayout";
 import { FeishuWorkflowPanel } from "./components/FeishuWorkflowPanel";
 import { FeishuPackageManager } from "./components/FeishuPackageManager";
 import { UnifiedWorkflowViewControls } from "./components/UnifiedWorkflowViewControls";
@@ -209,7 +211,12 @@ type DetailSourceScroll =
   }
   | { projectId: string; view: "list" | "completed_editing"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
-type ActionError = string | readonly [string, string];
+type ActionError = string | readonly [string, string] | {
+  source: "feishu-workflow";
+  scope: string;
+  context: string;
+  message: string;
+};
 const SHOW_WORKFLOW_BOARD_ENTRY = true;
 const GANTT_ZOOM_OPTIONS: GanttZoom[] = ["day", "week", "month"];
 
@@ -696,7 +703,6 @@ function LocalRealtimeSync({
   onAutomaticExecutionChanged,
 }: LocalRealtimeSyncProps) {
   useEffect(() => {
-    const source = new EventSource(resolveTaskboardUrl("/api/events"));
     let refreshTimer: number | undefined;
     let refreshProjectsPending = false;
     let refreshTasksPending = false;
@@ -795,28 +801,29 @@ function LocalRealtimeSync({
       }
     };
 
-    EVENT_NAMES.forEach((name) => source.addEventListener(name, handleEvent));
-    source.onopen = () => {
-      setConnection("live");
-      void refreshProjectBoardDisplaySettings();
-      scheduleRefresh({ projects: true, tasks: Boolean(selectedProjectId) });
-      void getBoardStageLabels().then(setBoardStageLabels).catch(() => {});
-      if (selectedProjectId && selectedProjectId !== ALL_PROJECTS_ID) {
-        void refreshArtifactUploads(selectedProjectId, { quiet: true });
-        void refreshWorkflowOptions(selectedProjectId);
-        setReadmeRevision((current) => current + 1);
-      }
-      if (detailTaskId) {
-        setCommentsRevision((current) => current + 1);
-        setAttachmentsRevision((current) => current + 1);
-      }
-    };
-    source.onerror = () => setConnection("reconnecting");
+    const unsubscribeEvents = subscribeLocalEvents(EVENT_NAMES, {
+      onEvent: handleEvent,
+      onOpen: () => {
+        setConnection("live");
+        void refreshProjectBoardDisplaySettings();
+        scheduleRefresh({ projects: true, tasks: Boolean(selectedProjectId) });
+        void getBoardStageLabels().then(setBoardStageLabels).catch(() => {});
+        if (selectedProjectId && selectedProjectId !== ALL_PROJECTS_ID) {
+          void refreshArtifactUploads(selectedProjectId, { quiet: true });
+          void refreshWorkflowOptions(selectedProjectId);
+          setReadmeRevision((current) => current + 1);
+        }
+        if (detailTaskId) {
+          setCommentsRevision((current) => current + 1);
+          setAttachmentsRevision((current) => current + 1);
+        }
+      },
+      onError: () => setConnection("reconnecting"),
+    });
 
     return () => {
       window.clearTimeout(refreshTimer);
-      EVENT_NAMES.forEach((name) => source.removeEventListener(name, handleEvent));
-      source.close();
+      unsubscribeEvents();
     };
   }, [
     detailTaskId,
@@ -842,6 +849,7 @@ export function App() {
   const query = useMemo(() => new URL(document.baseURI).searchParams, []);
   const host = query.get("host");
   const embedded = host === "codex" || host === "workbuddy" || host === "deepseek-harness";
+  const sidebarLayout = useSidebarLayout(!embedded);
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [boardStageLabels, setBoardStageLabels] = useState<import("./types").BoardStageLabels | null>(null);
@@ -913,7 +921,9 @@ export function App() {
     ? null
     : typeof actionError === "string"
       ? actionError
-      : text(actionError[0], actionError[1]);
+      : "source" in actionError
+        ? actionError.message
+        : text(actionError[0], actionError[1]);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState(readTaskFilters);
@@ -959,7 +969,21 @@ export function App() {
   const [selectedFeishuSubjectKey, setSelectedFeishuSubjectKey] = useState<string | null>(null);
   const [feishuConfigurationBaseToken, setFeishuConfigurationBaseToken] = useState<string | null>(null);
   const [feishuConfigurationOpen, setFeishuConfigurationOpen] = useState(false);
+  const feishuConfigurationKey = feishuConfigurationOpen
+    ? JSON.stringify([feishuConfigurationBaseToken, selectedFeishuSubjectKey]) : null;
+  const feishuConfigurationSessionRef = useRef({ key: feishuConfigurationKey, generation: 0 });
+  if (feishuConfigurationSessionRef.current.key !== feishuConfigurationKey) {
+    feishuConfigurationSessionRef.current = {
+      key: feishuConfigurationKey, generation: feishuConfigurationSessionRef.current.generation + 1,
+    };
+  }
+  const feishuConfigurationErrorScope = feishuConfigurationKey === null ? null
+    : JSON.stringify([feishuConfigurationKey, feishuConfigurationSessionRef.current.generation]);
+  const feishuConfigurationErrorScopeRef = useRef(feishuConfigurationErrorScope);
+  feishuConfigurationErrorScopeRef.current = feishuConfigurationErrorScope;
+  const feishuConfigurationDirtyRef = useRef(false);
   const [unifiedViewsState, setUnifiedViewsState] = useState<UnifiedWorkflowViewsState | null>(null);
+  const [packageBoardScope, setPackageBoardScope] = useState<PackageBoardScope | null>(null);
   const unifiedViewsStateRef = useRef(unifiedViewsState);
   unifiedViewsStateRef.current = unifiedViewsState;
   const [unifiedStageDisplays, setUnifiedStageDisplays] = useState<StageDisplayOverride[]>([]);
@@ -1170,6 +1194,8 @@ export function App() {
       || task.feishuOrigin.subjectKey === selectedFeishuWorkflowSubjectKey
     ));
   }, [selectedFeishuWorkflowSubjectKey, selectedProjectId, tasks]);
+  const packageWorkflowEnabled = Boolean(selectedFeishuSubject?.packageRoute?.packageAlias
+    || unifiedWorkflowTasks.some(task => task.feishuOrigin?.packageAlias));
   const selectedCodexProjectIdentity = useMemo(
     () => selectedProject ? codexProjectContextForTaskProject(selectedProject.id) : null,
     [deviceWorkspacePaths, hostContext, projectCodexIdentities, projects, selectedProject?.id],
@@ -1906,6 +1932,10 @@ export function App() {
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
+      if ((routeProjectId !== selectedProjectId || routeIssueIdentifier) && !confirmLeaveFeishuConfiguration()) {
+        window.history.replaceState(null, "", buildIssueUrl(window.location.href, selectedProjectId, null));
+        return;
+      }
       if (
         routeIssueIdentifier
         && (boardView === "list" || boardView === "completed_editing")
@@ -1947,7 +1977,7 @@ export function App() {
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [artifactUploadItems, beginProjectRequestContext, boardView, selectedProjectId]);
+  }, [artifactUploadItems, beginProjectRequestContext, boardView, selectedProjectId, feishuConfigurationOpen]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -2196,6 +2226,7 @@ export function App() {
         && current.manageTaskboardSkillPath === metadata.manageTaskboardSkillPath
         && current.localCapabilities?.available === metadata.localCapabilities?.available
         && current.capabilities?.automaticExecution === metadata.capabilities?.automaticExecution
+        && current.capabilities?.vmPmoInitial === metadata.capabilities?.vmPmoInitial
           ? current
           : metadata
       ));
@@ -3105,11 +3136,13 @@ export function App() {
     for (const task of filteredTasks) {
       if (!scopedTaskIds.has(task.id)) continue;
       if (!isFeishuWorkflowTask(task)) continue;
+      if (packageWorkflowEnabled && (packageBoardScope?.subjectKey !== selectedFeishuWorkflowSubjectKey
+        || task.feishuOrigin?.packageAlias !== packageBoardScope.packageAlias)) continue;
       if (!["backlog", "canceled"].includes(task.status)) continue;
       grouped[task.status].push(task);
     }
     return grouped;
-  }, [filteredTasks, unifiedWorkflowTasks]);
+  }, [filteredTasks, unifiedWorkflowTasks, packageWorkflowEnabled, packageBoardScope, selectedFeishuWorkflowSubjectKey]);
 
   const unifiedOrdinaryTasks = useMemo(() => {
     const scopedTaskIds = new Set(unifiedWorkflowTasks.map((task) => task.id));
@@ -3124,8 +3157,9 @@ export function App() {
     return scoped.filter((task) => (
       !task.feishuOrigin?.subjectKey
       || task.feishuOrigin.subjectKey === selectedFeishuWorkflowSubjectKey
-    ));
-  }, [filteredArchivedTasks, selectedFeishuWorkflowSubjectKey, selectedProjectId]);
+    ) && (!packageWorkflowEnabled || packageBoardScope?.subjectKey !== selectedFeishuWorkflowSubjectKey
+      || task.feishuOrigin?.packageAlias === packageBoardScope.packageAlias));
+  }, [filteredArchivedTasks, selectedFeishuWorkflowSubjectKey, selectedProjectId, packageWorkflowEnabled, packageBoardScope]);
 
   const completedEditingTasks = useMemo(() => filteredTasks.filter(
     (task) => task.status === "done" && isFeishuWorkflowTask(task),
@@ -3251,11 +3285,15 @@ export function App() {
 
 
   function selectBoardView(view: BoardView) {
+    if (view !== "workflow" && !confirmLeaveFeishuConfiguration()) return;
     endTaskDrag();
     closeContextMenu();
     setGanttViewMenuOpen(false);
     if (view === "autocut_packages") closeTaskDetail();
-    if (view !== "workflow") setFeishuConfigurationOpen(false);
+    if (view !== "workflow") {
+      if (feishuConfigurationOpen) clearClosedFeishuConfigurationError();
+      setFeishuConfigurationOpen(false);
+    }
     setBoardView(view);
     if (selectedProjectId) {
       taskboardStorage.setItem(`${PROJECT_VIEW_KEY_PREFIX}${selectedProjectId}`, view);
@@ -3601,7 +3639,9 @@ export function App() {
       const activeView = viewsState?.subjectKey === subjectKey
         ? viewsState.views.find((view) => view.id === viewsState.activeViewId)
         : undefined;
-      const visibleStageIds = activeView?.stageIds ?? [];
+      const packageScope = packageBoardScope?.subjectKey === subjectKey ? packageBoardScope : null;
+      if (packageScope && task.feishuOrigin?.packageAlias !== packageScope.packageAlias) return;
+      const visibleStageIds = packageScope?.stageIds ?? activeView?.stageIds ?? [];
       if (!canDropUnifiedWorkflowTask({
         projectId,
         subjectKey,
@@ -3727,8 +3767,7 @@ export function App() {
     setFeishuConfigurationBaseToken(base?.baseToken ?? null);
     closeTaskDetail();
     if (subject) {
-      changeProject(subject.projectId, "workflow", subject.subjectKey);
-      setFeishuConfigurationOpen(true);
+      changeProject(subject.projectId, "workflow", subject.subjectKey, true);
     } else {
       setSelectedFeishuSubjectKey(null);
       selectBoardView("workflow");
@@ -4009,13 +4048,14 @@ export function App() {
     window.location.assign(`codex://threads/${encodeURIComponent(threadId.trim())}`);
   }
 
+  function openLocalAiThread(threadId: string) {
+    aiOpenThreadRequestSequenceRef.current += 1;
+    setAiOpenThreadRequest({ threadId, requestId: aiOpenThreadRequestSequenceRef.current });
+  }
+
   function openTaskConversation(conversation: TaskConversationItem) {
     if (conversation.kind === "local-ai" && conversation.aiThreadId) {
-      aiOpenThreadRequestSequenceRef.current += 1;
-      setAiOpenThreadRequest({
-        threadId: conversation.aiThreadId!,
-        requestId: aiOpenThreadRequestSequenceRef.current,
-      });
+      openLocalAiThread(conversation.aiThreadId);
       return;
     }
     if (conversation.threadBinding) {
@@ -4180,7 +4220,25 @@ export function App() {
     });
   }
 
-  function changeProject(projectId: string, preferredView?: BoardView, subjectKey?: string | null) {
+  function confirmLeaveFeishuConfiguration() {
+    if (!feishuConfigurationOpen || !feishuConfigurationDirtyRef.current) return true;
+    if (!window.confirm("流程配置有尚未保存的修改。离开将丢弃这些修改，是否继续？")) return false;
+    feishuConfigurationDirtyRef.current = false;
+    return true;
+  }
+
+  function clearClosedFeishuConfigurationError() {
+    const closedScope = feishuConfigurationErrorScope;
+    feishuConfigurationErrorScopeRef.current = null;
+    setActionError((current) => closedScope !== null && current !== null
+      && typeof current === "object" && "source" in current
+      && current.source === "feishu-workflow" && current.scope === closedScope
+      ? null : current);
+  }
+
+  function changeProject(projectId: string, preferredView?: BoardView, subjectKey?: string | null, keepConfiguration = false) {
+    if (!keepConfiguration && !confirmLeaveFeishuConfiguration()) return false;
+    const closingConfiguration = feishuConfigurationOpen && !keepConfiguration;
     const subject = feishuCatalog.flatMap((base) => base.subjects).find((candidate) => candidate.projectId === projectId);
     const nextSubjectKey = subjectKey === undefined ? subject?.subjectKey ?? null : subjectKey;
     const scopeChanged = projectId !== selectedProjectIdRef.current
@@ -4194,7 +4252,8 @@ export function App() {
     setProjectContextMenu(null);
     setProjectMenuOpen(false);
     detailSourceProjectIdRef.current = null;
-    setFeishuConfigurationOpen(false);
+    if (closingConfiguration) clearClosedFeishuConfigurationError();
+    setFeishuConfigurationOpen(keepConfiguration);
     setDetailTaskIdentifier(null);
     if (projectId === ALL_PROJECTS_ID) {
       setBoardView("issues");
@@ -4214,11 +4273,12 @@ export function App() {
     setSelectedProjectId(projectId);
     setSearch("");
     setFilters(EMPTY_TASK_FILTERS);
-    setActionError(null);
+    if (!closingConfiguration) setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
     const url = buildIssueUrl(window.location.href, projectId, null);
     window.history.replaceState(null, "", url);
+    return true;
   }
 
   async function selectProject(choice: ProjectChoice) {
@@ -4565,11 +4625,11 @@ export function App() {
   }
   const appShellStyle = embedded
     ? { "--codex-titlebar-left-inset": `${hostContext?.titlebarLeftInset ?? 0}px` } as CSSProperties
-    : undefined;
+    : sidebarLayout.style;
 
   return (
     <TaskboardLanguageProvider language={language} stageLabels={boardStageLabels}>
-      <div className={`app-shell${embedded ? " embedded" : ""}`} style={appShellStyle}>
+      <div className={`app-shell${embedded ? " embedded" : ""}${sidebarLayout.dragging ? " is-resizing-sidebar" : ""}`} style={appShellStyle}>
       {taskboardMetadata && taskboardMetadata.mode !== "cloud" && (
         <LocalRealtimeSync
           selectedProjectId={taskScopeProjectId}
@@ -4589,7 +4649,7 @@ export function App() {
         />
       )}
       {!embedded && (
-        <aside className="taskboard-sidebar" aria-label={text("任务面板导航", "Taskboard navigation")}>
+        <aside id="taskboard-navigation" className="taskboard-sidebar" aria-label={text("任务面板导航", "Taskboard navigation")}>
           <div className="brand-row">
             <span className="brand-mark" aria-hidden="true"><LinearIcon name="project" /></span>
             <span>{text("任务面板", "Taskboard")}</span>
@@ -4621,8 +4681,7 @@ export function App() {
                 .flatMap((base) => base.subjects)
                 .find((item) => item.subjectKey === subjectKey);
               if (!subject) return;
-              setSelectedFeishuSubjectKey(subjectKey);
-              changeProject(subject.projectId, "issues");
+              changeProject(subject.projectId, "issues", subjectKey);
             }}
             onOpenConfiguration={openFeishuConfiguration}
             onToggleSubjectDisplay={async (subject, displayEnabled) => {
@@ -4664,6 +4723,13 @@ export function App() {
           </div>
         </aside>
       )}
+      {sidebarLayout.resizable && <div
+        className="taskboard-sidebar-resizer"
+        aria-controls="taskboard-navigation"
+        aria-label={text("调整左侧栏宽度", "Resize navigation sidebar")}
+        title={text("左右拖动调整宽度；方向键微调，Home / End 调至最窄 / 最宽", "Drag to resize; arrow keys adjust, Home / End select minimum / maximum width")}
+        {...sidebarLayout.splitterProps}
+      />}
       <main className="workspace">
         <header className="workspace-header">
           <div className="workspace-title">
@@ -4929,7 +4995,7 @@ export function App() {
               </button>
             )}
           </div>
-          {boardView === "issues" && isSelectedFeishuProject && selectedFeishuWorkflowSubjectKey && (
+          {boardView === "issues" && isSelectedFeishuProject && selectedFeishuWorkflowSubjectKey && !packageWorkflowEnabled && (
             <div className="unified-workflow-toolbar-controls">
               {unifiedViewsState && unifiedViewsState.subjectKey === selectedFeishuWorkflowSubjectKey ? (
                 <UnifiedWorkflowViewControls
@@ -5078,6 +5144,7 @@ export function App() {
           <div className="autocut-package-view">
             <FeishuPackageManager
               refreshKey={autoCutPackagesRevision}
+              vmPmoInitialReady={taskboardMetadata?.capabilities?.vmPmoInitial === true}
               onError={(message) => setActionError(message)}
             />
           </div>
@@ -5105,6 +5172,7 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenLegacyLocalThread={openLegacyLocalThread}
+            onOpenAutoCutLog={openLocalAiThread}
             onOpenInThread={openTaskInThread}
             onStartCodex={startCodexForTask}
             onCopy={(text, message) => void copyText(text, message)}
@@ -5179,19 +5247,42 @@ export function App() {
             className={`issue-board-layout unified-workflow-layout${otherTasksVisible ? " has-other-tasks" : ""}`}
           >
             <div className="unified-workflow-main">
-              <UnifiedWorkflowBoard
-                key={selectedProjectId}
+              <PackageWorkflowWorkspace
+                enabled={packageWorkflowEnabled}
                 projectId={selectedProjectId}
                 subjectKey={selectedFeishuWorkflowSubjectKey ?? ""}
-                viewId={unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
+                activePackageAlias={selectedFeishuSubject?.packageRoute?.packageAlias}
+                tasks={unifiedWorkflowTasks}
+                historicalTasks={archivedTasks.filter(task => task.projectId === selectedProjectId)}
+                refreshKey={autoCutPackagesRevision}
+                search={search}
+                filters={filters}
+                presentations={taskPresentations}
+                now={processingNow}
+                availableLabels={availableLabels}
+                currentUser={currentUser}
+                showCover={boardDisplaySettings.cover}
+                showBody={boardDisplaySettings.body}
+                onOpenTask={openTaskDetail}
+                onUpdate={updateTaskProperties}
+                onCreateLabel={persistProjectLabel}
+                onOpenConversation={openTaskConversation}
+                onScopeChange={setPackageBoardScope}
+                renderZipBoard={({tasks: packageTasks, settings, packageAlias}) => (
+              <UnifiedWorkflowBoard
+                key={`${selectedProjectId}:${packageAlias ?? "legacy"}`}
+                projectId={selectedProjectId}
+                subjectKey={selectedFeishuWorkflowSubjectKey ?? ""}
+                viewId={settings ? `${packageAlias}:${settings.activeViewId}` : unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
                   ? unifiedViewsState.activeViewId
                   : "all"}
-                stageIds={unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
+                stageIds={settings ? settings.views.find(view => view.id === settings.activeViewId)?.stageIds as UnifiedWorkflowStage[] : unifiedViewsState?.subjectKey === selectedFeishuWorkflowSubjectKey
                   ? unifiedViewsState.views.find((view) => view.id === unifiedViewsState.activeViewId)?.stageIds
                   : undefined}
-                stageDisplays={unifiedStageDisplays}
+                stageDisplays={settings ? settings.stageDisplays.map(display => ({...display,
+                  stageId: display.stageId as UnifiedWorkflowStage,subjectKey: settings.subjectKey,revision: settings.revision,updatedAt: ""})) : unifiedStageDisplays}
                 searchScope={unifiedSearchScope}
-                tasks={unifiedWorkflowTasks}
+                tasks={packageTasks}
                 uploadItems={artifactUploadItems}
                 artifactSummaries={taskArtifactSummaries}
                 presentations={taskPresentations}
@@ -5228,6 +5319,8 @@ export function App() {
                   boardColumnScrollRefs.current[status] = element;
                 }}
                 onBoardScrollRef={unifiedWorkflowScrollRef}
+              />
+                )}
               />
             </div>
             {otherTasksMounted && (
@@ -5322,12 +5415,12 @@ export function App() {
               configurationBaseToken={feishuConfigurationBaseToken}
               selectedSubjectKey={selectedFeishuSubjectKey}
               allowAutomaticExecution={taskboardMetadata?.capabilities?.automaticExecution}
+              vmPmoInitialReady={taskboardMetadata?.capabilities?.vmPmoInitial === true}
               onOpenLocalSettings={localSettingsAvailable ? () => setLocalSettingsOpen(true) : undefined}
               onSelectSubject={(subjectKey, openProject = true) => {
                 const subject = feishuCatalog.flatMap((base) => base.subjects).find((item) => item.subjectKey === subjectKey);
                 if (!subject) return;
-                changeProject(subject.projectId, openProject ? "issues" : "workflow", subjectKey);
-                setFeishuConfigurationOpen(!openProject);
+                changeProject(subject.projectId, openProject ? "issues" : "workflow", subjectKey, !openProject);
               }}
               onAddBase={async (url) => {
                 const next = await addFeishuBaseAndRefreshProjects(url);
@@ -5335,8 +5428,7 @@ export function App() {
                 const nextSubjectKey = next.subjects[0]?.subjectKey ?? null;
                 const nextSubject = next.subjects[0];
                 if (nextSubject) {
-                  changeProject(nextSubject.projectId, "workflow", nextSubject.subjectKey);
-                  setFeishuConfigurationOpen(true);
+                  changeProject(nextSubject.projectId, "workflow", nextSubject.subjectKey, true);
                 } else {
                   beginProjectRequestContext(selectedProjectIdRef.current, nextSubjectKey);
                   setSelectedFeishuSubjectKey(nextSubjectKey);
@@ -5346,7 +5438,21 @@ export function App() {
               }}
               onCatalogChange={setFeishuCatalog}
               onSubjectChange={updateFeishuSubject}
-              onError={(message) => setActionError(message)}
+              onDirtyChange={(dirty) => { feishuConfigurationDirtyRef.current = dirty; }}
+              onError={(message, context) => {
+                if (feishuConfigurationErrorScope === null
+                  || feishuConfigurationErrorScopeRef.current !== feishuConfigurationErrorScope) return;
+                setActionError({ source: "feishu-workflow", scope: feishuConfigurationErrorScope,
+                  context: context ?? feishuConfigurationErrorScope, message });
+              }}
+              onErrorClear={(message, context) => {
+                if (feishuConfigurationErrorScope === null
+                  || feishuConfigurationErrorScopeRef.current !== feishuConfigurationErrorScope) return;
+                setActionError((current) => current !== null && typeof current === "object" && "source" in current
+                  && current.source === "feishu-workflow" && current.scope === feishuConfigurationErrorScope
+                  && current.context === (context ?? feishuConfigurationErrorScope) && current.message === message
+                  ? null : current);
+              }}
             />
           </div>
         ) : boardView === "workflow" && !isSelectedFeishuProject ? (

@@ -1,6 +1,8 @@
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, lstat, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { packageWorkflowFromManifest, workflowTemplatesEqual, PackageWorkflowError } from "../shared/feishu-package-workflow.mjs";
+import { assertExecutablePackageWorkflow, resolvePackageWorkflowFromWorkspace } from "./feishu-package-identity.mjs";
 
 const REGISTRY_VERSION = 1;
 const STATES = new Set(["draft", "enabled", "disabled"]);
@@ -128,6 +130,7 @@ function assertDraftFields(value) {
 
 function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false, requireState = false } = {}) {
   const entry = plainObject(raw, `packages.${aliasKey}`);
+  const workflowTemplate = packageWorkflowFromManifest(entry);
   const alias = packageAlias(entry.alias ?? aliasKey);
   const name = requireText(entry.name ?? entry.projectName ?? alias, `packages.${alias}.name`);
   const projectId = requireText(entry.projectId ?? alias, `packages.${alias}.projectId`);
@@ -182,6 +185,7 @@ function normalizeRecord(aliasKey, raw, { now = nowIso, legacy = false, requireS
     updatedAt,
   };
   if (zipOutputMode !== undefined) record.zipOutputMode = zipOutputMode;
+  if (Object.hasOwn(entry, "workflowTemplate")) record.workflowTemplate = workflowTemplate;
   return record;
 }
 
@@ -288,9 +292,22 @@ export function createFeishuPackageStore({
   listReferences = async () => [],
   modelCatalog = null,
   getModelCatalog = null,
+  validateVmPackage = null,
 } = {}) {
   let inline = packages === undefined ? null : normalizeFeishuPackages(packages, { now });
   let mutationQueue = mutationQueueFor(filename);
+
+  async function assertRegistryExecutable(record) {
+    if (record.workflowTemplate?.id !== "vm_pmo_review_video") return assertExecutablePackageWorkflow(record);
+    // This callback belongs to the local host, never to a cell, request body or package manifest.
+    const actual = await resolvePackageWorkflowFromWorkspace(record);
+    if (!workflowTemplatesEqual(actual.workflowTemplate, record.workflowTemplate)) {
+      throw new PackageWorkflowError("PACKAGE_WORKFLOW_MISMATCH");
+    }
+    if (typeof validateVmPackage !== "function" || await validateVmPackage(clone(record)) !== true) {
+      throw new PackageWorkflowError("PACKAGE_WORKFLOW_NOT_READY");
+    }
+  }
 
   async function readCatalog() {
     if (inline !== null) return clone(inline);
@@ -395,6 +412,15 @@ export function createFeishuPackageStore({
     }
     const base = existing ?? { alias: aliasFromChanges, name: aliasFromChanges, projectId: aliasFromChanges, state: "draft" };
     const record = normalizeRecord(aliasFromChanges, { ...base, ...changes, alias: aliasFromChanges }, { now, legacy: false });
+    if (existing && !workflowTemplatesEqual(existing.workflowTemplate, record.workflowTemplate)) {
+      throw new PackageConfigError("PACKAGE_IDENTITY_IMMUTABLE", "Package workflow identity cannot be changed; register a new alias", undefined, 409);
+    }
+    const workflow = await resolvePackageWorkflowFromWorkspace(record);
+    if (existing && !workflowTemplatesEqual(existing.workflowTemplate, workflow.workflowTemplate)) {
+      throw new PackageConfigError("PACKAGE_IDENTITY_IMMUTABLE", "Package workflow identity cannot be changed; register a new alias", undefined, 409);
+    }
+    if (workflow.declared) record.workflowTemplate = workflow.workflowTemplate;
+    if (record.state === "enabled") await assertRegistryExecutable(record);
     if (record.zipOutputMode === "custom") {
       record.zipSourceDirectory = await validateCustomZipOutputDirectory(record.zipSourceDirectory);
     }
@@ -415,6 +441,7 @@ export function createFeishuPackageStore({
     if (!currentValue.record) throw new PackageConfigError("PACKAGE_NOT_FOUND", `Package '${alias}' does not exist`, undefined, 404);
     assertRevision(currentValue.record, expectedRevision);
     const record = clone(currentValue.record);
+    await assertRegistryExecutable(record);
     await assertDirectory(record.workspacePath, "PACKAGE_ENABLE_INVALID", "workspacePath");
     if (!record.prompt) throw new PackageConfigError("PACKAGE_ENABLE_INVALID", "prompt is required before enabling");
     if (!Number.isSafeInteger(record.maxConcurrent) || record.maxConcurrent <= 0) throw new PackageConfigError("PACKAGE_ENABLE_INVALID", "maxConcurrent must be a positive integer");
@@ -423,10 +450,10 @@ export function createFeishuPackageStore({
     } else if (record.zipSourceDirectory) {
       await assertDirectory(record.zipSourceDirectory, "PACKAGE_ENABLE_INVALID", "zipSourceDirectory");
     }
-    const catalog = options.modelCatalog ?? (typeof options.getModelCatalog === "function"
+    const catalog = record.workflowTemplate?.id === "vm_pmo_review_video" ? null : options.modelCatalog ?? (typeof options.getModelCatalog === "function"
       ? await options.getModelCatalog(record.workspacePath)
       : typeof getModelCatalog === "function" ? await getModelCatalog(record.workspacePath) : modelCatalog);
-    validateModel(record, catalog);
+    if (record.workflowTemplate?.id !== "vm_pmo_review_video") validateModel(record, catalog);
     record.state = "enabled";
     record.revision += 1;
     record.updatedAt = now();
@@ -472,6 +499,7 @@ export function createFeishuPackageStore({
       if (record.state !== "enabled") {
         throw new PackageConfigError("PACKAGE_DISABLED", "原 Auto-Cut 包尚未启用，无法恢复任务；请先启用原包");
       }
+      await assertExecutablePackageWorkflow(record);
       return operation(clone(record));
     });
   }

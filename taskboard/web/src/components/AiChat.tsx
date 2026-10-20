@@ -2063,7 +2063,6 @@ export function AiChat({
       onOpenThreadRequestHandled(openThreadRequest.requestId);
       return;
     }
-    if (!threads.some((thread) => thread.id === openThreadRequest.threadId)) return;
     handledOpenThreadRequestRef.current = openThreadRequest.requestId;
     const selectedChanged = selectedThreadRef.current !== openThreadRequest.threadId;
     const leavingDraft = draftOrigin !== null;

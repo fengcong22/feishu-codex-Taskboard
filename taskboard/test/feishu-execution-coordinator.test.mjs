@@ -76,6 +76,7 @@ function createFixture({
   startError = null,
   beforeStart = null,
   packageStore: packageStoreOverride = null,
+  validatePackageWorkflow = null,
 } = {}) {
   const clock = createClock();
   const tasks = new Map();
@@ -215,6 +216,7 @@ function createFixture({
   const coordinatorOptions = {
     database,
     packageStore,
+    validatePackageWorkflow,
     scheduler,
     now: clock.now,
     timers: clock,
@@ -278,6 +280,47 @@ function createFixture({
     get requestCount() { return requestCount; },
   };
 }
+
+test("VM workflows cannot request an editing slot or fall back to a legacy start", async () => {
+  for (const source of ["registry", "snapshot"]) {
+    const fixture = createFixture({ packages: { example: { state: "enabled", maxConcurrent: 1 } } });
+    const vm = { id: "vm_pmo_review_video", version: 1 };
+    fixture.tasks.set("vm-task", task("vm-task", "example"));
+    if (source === "registry") fixture.packages.example.workflowTemplate = vm;
+    else fixture.packageSnapshots.set("vm-task", { packageRevision: 1, workflowTemplate: vm });
+    await assert.rejects(fixture.coordinator.schedule(fixture.tasks.get("vm-task"), metadata("example")), {
+      code: "PACKAGE_WORKFLOW_NOT_READY",
+    });
+    assert.equal(fixture.requestCount, 0);
+    assert.equal(fixture.starts.length, 0);
+    assert.equal(fixture.database.getTask("vm-task").status, "todo");
+    assert.equal(fixture.database.getFeishuExecution("vm-task"), null);
+    await fixture.clock.advance(30_000);
+    assert.equal(fixture.requestCount, 0);
+    await fixture.coordinator.close();
+  }
+});
+
+test("archiving during asynchronous workflow verification prevents editing reservation", async () => {
+  let releaseCheck;
+  let entered;
+  const enteredCheck = new Promise((resolve) => { entered = resolve; });
+  const check = new Promise((resolve) => { releaseCheck = resolve; });
+  const fixture = createFixture({
+    packages: { example: { state: "enabled" } },
+    validatePackageWorkflow: async () => { entered(); await check; },
+  });
+  fixture.tasks.set("archive-task", task("archive-task", "example"));
+  const scheduled = fixture.coordinator.schedule(fixture.tasks.get("archive-task"), metadata("example"));
+  await enteredCheck;
+  fixture.tasks.get("archive-task").archivedAt = new Date().toISOString();
+  releaseCheck();
+  await scheduled;
+  assert.equal(fixture.requestCount, 0);
+  assert.equal(fixture.starts.length, 0);
+  assert.equal(fixture.database.getFeishuExecution("archive-task"), null);
+  await fixture.coordinator.close();
+});
 
 test("automatic registration persists a five-second deadline", async () => {
   const fixture = createFixture({ packages: { "Auto-cut-copyA": { maxConcurrent: 1 } } });

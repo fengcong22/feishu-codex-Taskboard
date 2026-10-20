@@ -163,6 +163,16 @@ function metadataFieldForId(table, fieldId) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+function persistedNamingDescriptor(naming) {
+  if (typeof naming?.fieldId !== "string" || naming.fieldId.trim() === "") return null;
+  const kind = typeof naming.kind === "string"
+    ? naming.kind.replace(/[^A-Za-z]/gu, "").toLowerCase()
+    : "";
+  if (kind === "text") return { ...naming, type: 1, uiType: "Text" };
+  if (kind === "formula") return { ...naming, type: 20, uiType: "Formula" };
+  return null;
+}
+
 function descriptorForCourseNaming(table) {
   const courseNaming = table?.delivery?.courseNaming;
   if (courseNaming?.mode === "field") {
@@ -176,12 +186,7 @@ function descriptorForCourseNaming(table) {
     // and its persisted kind proves it is a plain text/formula value.
     const naming = table?.namingField;
     if (naming?.fieldId !== courseNaming.fieldId) return null;
-    const kind = typeof naming.kind === "string"
-      ? naming.kind.replace(/[^A-Za-z]/gu, "").toLowerCase()
-      : "";
-    if (kind === "text") return { ...naming, type: 1, uiType: "Text" };
-    if (kind === "formula") return { ...naming, type: 20, uiType: "Formula" };
-    return null;
+    return persistedNamingDescriptor(naming);
   }
   const configured = table?.namingField ?? {
     fieldId: table?.namingFieldId,
@@ -189,7 +194,7 @@ function descriptorForCourseNaming(table) {
   };
   const configuredId = configured?.fieldId ?? configured?.field_id;
   return metadataFieldForId(table, configuredId)
-    ?? (metadataType(configured) === null ? null : configured);
+    ?? (metadataType(configured) === null ? persistedNamingDescriptor(configured) : configured);
 }
 
 function uniqueProof(result, expectedRecordId) {

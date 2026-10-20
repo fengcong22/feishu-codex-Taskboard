@@ -121,7 +121,7 @@ test("realtime recovery refreshes global stage labels after missed updates", asy
   const app = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
   assert.match(
     app,
-    /source\.onopen = \(\) => \{[\s\S]*?getBoardStageLabels\(\)\.then\(setBoardStageLabels\)/,
+    /subscribeLocalEvents\(EVENT_NAMES, \{[\s\S]*?onOpen: \(\) => \{[\s\S]*?getBoardStageLabels\(\)\.then\(setBoardStageLabels\)/,
   );
   assert.match(
     app,

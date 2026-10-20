@@ -15,6 +15,7 @@ import {
   activeTables as getActiveTables,
   portableSubject,
   subjectKey,
+  validateSubjectConfig,
   validateWorkflowConfig,
 } from "./workflow-config.mjs";
 import {
@@ -130,8 +131,11 @@ function subjectWithoutRuntime(subject, { forceDraft = false } = {}) {
   delete result.activeSnapshot;
   delete result.courseNamingField;
   if (forceDraft) result.lifecycle = "draft";
-  result.upload.artifactSourcePath = null;
-  result.upload.targetPath = null;
+  if (result.upload) {
+    result.upload.artifactSourcePath = null;
+    result.upload.targetPath = null;
+  }
+  if (result.vmWorkflow) result.vmWorkflow.finalArchive.directoryPath = null;
   if (result.delivery) result.delivery.rootPath = null;
   return result;
 }
@@ -193,11 +197,16 @@ function mergeImported(current, imported) {
         // Paths are machine-local bindings.  A share file intentionally has
         // nulls here; retain an existing local binding when importing into the
         // same machine instead of silently unbinding it.
-        if (nextSubject.upload.artifactSourcePath === null) {
-          nextSubject.upload.artifactSourcePath = currentSubject.upload.artifactSourcePath ?? null;
+        if (nextSubject.upload) {
+          if (nextSubject.upload.artifactSourcePath === null) {
+            nextSubject.upload.artifactSourcePath = currentSubject.upload?.artifactSourcePath ?? null;
+          }
+          if (nextSubject.upload.targetPath === null) {
+            nextSubject.upload.targetPath = currentSubject.upload?.targetPath ?? null;
+          }
         }
-        if (nextSubject.upload.targetPath === null) {
-          nextSubject.upload.targetPath = currentSubject.upload.targetPath ?? null;
+        if (nextSubject.vmWorkflow?.finalArchive?.directoryPath === null && currentSubject.vmWorkflow?.finalArchive?.directoryPath) {
+          nextSubject.vmWorkflow.finalArchive.directoryPath = currentSubject.vmWorkflow.finalArchive.directoryPath;
         }
         if (nextSubject.delivery?.rootPath === null && currentSubject.delivery?.rootPath) {
           nextSubject.delivery.rootPath = currentSubject.delivery.rootPath;
@@ -258,6 +267,14 @@ async function remoteMetadataDiagnostics(configuration, metadataReader) {
   const diagnostics = [];
   for (const base of configuration.bases) {
     const basePath = baseDiagnosticPath(base);
+    for (const subject of base.subjects) {
+      if (subject.workflowTemplate !== undefined || subject.vmWorkflow !== undefined) {
+        diagnostics.push(diagnostic(
+          "VM_METADATA_RECHECK_REQUIRED", "error", subjectDiagnosticPath(subject),
+          "Refresh VM field metadata and enable this package workflow locally before receiving events",
+        ));
+      }
+    }
     if (!metadataReader || typeof metadataReader.preview !== "function") {
       diagnostics.push(diagnostic(
         "FEISHU_METADATA_UNAVAILABLE",
@@ -306,6 +323,7 @@ async function remoteMetadataDiagnostics(configuration, metadataReader) {
     }
     const seen = new Set();
     for (const subject of base.subjects) {
+      if (subject.workflowTemplate !== undefined || subject.vmWorkflow !== undefined) continue;
       const issues = subject?.statusField && subject?.stages
         ? comparePhasedSubjectMetadata(subject, preview)
         : compareSubjectMetadata(subject, preview);
@@ -362,7 +380,7 @@ function localBindingDiagnostics(configuration, current, packages) {
       const local = currentSubjects.get(subject.subjectKey);
       const sourcePath = local?.upload?.artifactSourcePath ?? null;
       const targetPath = local?.upload?.targetPath ?? null;
-      if (["watch_directory", "driver_report"].includes(subject.upload.artifactSourceMode) && !sourcePath) {
+      if (["watch_directory", "driver_report"].includes(subject.upload?.artifactSourceMode) && !sourcePath) {
         diagnostics.push(diagnostic(
           "ARTIFACT_SOURCE_PATH_UNBOUND",
           "warning",
@@ -370,7 +388,7 @@ function localBindingDiagnostics(configuration, current, packages) {
           "Bind a ZIP artifact source path on this machine before artifact discovery can run",
         ));
       }
-      if (subject.upload.targetId && !targetPath) {
+      if (subject.upload?.targetId && !targetPath) {
         diagnostics.push(diagnostic(
           "UPLOAD_TARGET_PATH_UNBOUND",
           "warning",
@@ -622,7 +640,33 @@ export function createWorkflowConfigStore({
     if (input.subjectKey !== undefined && input.subjectKey !== key) {
       throw new Error("workflow subject identity does not match subjectKey");
     }
-    const current = currentSubject ? clone(currentSubject) : {};
+    const vm = input.workflowTemplate !== undefined || input.vmWorkflow !== undefined;
+    const current = currentSubject && !currentSubject.vmWorkflow ? clone(currentSubject) : {};
+    if (vm) {
+      return validateSubjectConfig({
+        subjectKey: key,
+        baseToken,
+        tableId,
+        baseName: input.baseName ?? currentSubject?.baseName,
+        tableName: input.tableName ?? currentSubject?.tableName,
+        displayEnabled: input.displayEnabled ?? currentSubject?.displayEnabled ?? true,
+        lifecycle,
+        configVersion,
+        createdAt: input.createdAt ?? currentSubject?.createdAt ?? nowValue(now),
+        updatedAt: nowValue(now),
+        workflowTemplate: input.workflowTemplate,
+        vmWorkflow: input.vmWorkflow && {
+          ...clone(input.vmWorkflow),
+          finalArchive: input.vmWorkflow.finalArchive && {
+            ...clone(input.vmWorkflow.finalArchive), directoryPath: null,
+          },
+        },
+        title: input.title,
+        statusField: input.statusField,
+        execution: input.execution,
+        packageRoute: input.packageRoute,
+      });
+    }
     const next = {
       ...current,
       subjectKey: key,
@@ -633,7 +677,7 @@ export function createWorkflowConfigStore({
       displayEnabled: input.displayEnabled ?? current.displayEnabled ?? true,
       lifecycle,
       configVersion,
-      createdAt: input.createdAt ?? current.createdAt ?? nowValue(now),
+      createdAt: input.createdAt ?? currentSubject?.createdAt ?? nowValue(now),
       updatedAt: nowValue(now),
       trigger: input.trigger ?? current.trigger,
       title: input.title ?? current.title ?? { fieldId: null, fieldName: null },

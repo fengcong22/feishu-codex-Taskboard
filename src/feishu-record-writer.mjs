@@ -40,11 +40,21 @@ function identifier(value, name) {
 function frozenIntent(value) {
   const input = exactKeys(value, new Set(["target", "operation"]), "writeback intent");
   const target = exactKeys(input.target, new Set(["baseToken", "tableId", "recordId"]), "writeback target");
-  const operation = exactKeys(input.operation, new Set(["type", "fieldId", "optionId", "value"]), "writeback operation");
+  const operation = exactKeys(input.operation, new Set(["type", "fieldId", "optionId", "value", "guard"]), "writeback operation");
   const type = identifier(operation.type, "operation.type");
   if (type === "single_select") {
-    if (Object.keys(operation).some((key) => !["type", "fieldId", "optionId"].includes(key))) {
+    if (Object.keys(operation).some((key) => !["type", "fieldId", "optionId", "guard"].includes(key))) {
       fail("WRITEBACK_INTENT_INVALID", "single-select operation is invalid");
+    }
+    let guard;
+    if (Object.hasOwn(operation, "guard")) {
+      const value = exactKeys(operation.guard, new Set(["fieldId", "optionIds"]), "writeback guard");
+      if (!Array.isArray(value.optionIds) || value.optionIds.length < 1 || value.optionIds.length > 16) {
+        fail("WRITEBACK_INTENT_INVALID", "writeback guard is invalid");
+      }
+      const optionIds = value.optionIds.map((entry) => identifier(entry, "guard.optionIds"));
+      if (new Set(optionIds).size !== optionIds.length) fail("WRITEBACK_INTENT_INVALID", "writeback guard is invalid");
+      guard = { fieldId: identifier(value.fieldId, "guard.fieldId"), optionIds };
     }
     return {
       target: {
@@ -56,6 +66,7 @@ function frozenIntent(value) {
         type,
         fieldId: identifier(operation.fieldId, "operation.fieldId"),
         optionId: identifier(operation.optionId, "operation.optionId"),
+        ...(guard ? { guard } : {}),
       },
     };
   }
@@ -206,6 +217,24 @@ function validateOperationField(field, operation) {
   return null;
 }
 
+function validateStatusGuard(fields, recordFields, guard) {
+  if (!guard) return;
+  const field = targetField(fields, { fieldId: guard.fieldId });
+  if (field.type !== 3 || (field.uiType !== null && field.uiType !== "SingleSelect")) {
+    fail("FIELD_NOT_WRITABLE", "The configured status field is no longer a single-select field", 409);
+  }
+  const options = guard.optionIds.map((optionId) => {
+    const matches = field.options.filter((entry) => entry.id === optionId);
+    if (matches.length !== 1) fail("FIELD_OPTION_CHANGED", "The configured status option no longer exists", 409);
+    return matches[0];
+  });
+  const current = optionValue(rawRecordValue(recordFields, field));
+  const matches = field.options.filter((entry) => entry.id === current || entry.name === current);
+  if (matches.length !== 1 || !options.some((entry) => entry.id === matches[0].id)) {
+    fail("WRITEBACK_REFERENCE_INVALID", "The PMO record has advanced beyond this stage writeback", 409);
+  }
+}
+
 /**
  * Applies a writeback intent obtained from a trusted local resolver. This
  * module deliberately accepts no client-provided Base, record, or field data.
@@ -240,6 +269,7 @@ export function createFeishuRecordWriter({ client } = {}) {
     }
     const recordFields = plainObject(current.record?.fields);
     if (!recordFields) fail("FEISHU_WRITEBACK_FAILED", "Feishu writeback request failed", 502);
+    validateStatusGuard(fields, recordFields, intent.operation.guard);
     const currentValue = rawRecordValue(recordFields, field);
     const alreadyApplied = intent.operation.type === "single_select"
       ? [intent.operation.optionId, option.name].includes(optionValue(currentValue))

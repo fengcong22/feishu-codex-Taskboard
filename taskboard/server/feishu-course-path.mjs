@@ -3,6 +3,7 @@ import { win32 as path } from "node:path";
 const MAX_WINDOWS_PATH_LENGTH = 259;
 const INVALID_WINDOWS_NAME = /[<>:"/\\|?*\u0000-\u001f\u007f]/u;
 const RESERVED_WINDOWS_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
+const RESERVED_WINDOWS_DIRECTORY = /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³]) *(?:\..*)?$/iu;
 
 export const DELIVERY_STAGE_DIRECTORIES = Object.freeze({
   initial: "01初稿",
@@ -73,6 +74,26 @@ function normalizeAbsoluteRoot(rootPath) {
     throw fail("ROOT_PATH_INVALID", "rootPath is invalid");
   }
   return result;
+}
+
+/** Validate a locally configured root syntactically without probing the NAS. */
+export function normalizeCourseRootPath(rootPath) {
+  const raw = text(rootPath, "ROOT_PATH_INVALID", "rootPath").replaceAll("/", "\\");
+  let segments;
+  if (raw.startsWith("\\\\")) {
+    const unc = splitUncRoot(raw);
+    if (!unc || [unc.server, unc.share].some((part) => hasUnsafePathSegment(part)
+      || INVALID_WINDOWS_NAME.test(part))) {
+      throw fail("ROOT_PATH_INVALID", "rootPath must be a complete UNC share path without a device prefix");
+    }
+    segments = unc.rest;
+  } else {
+    segments = raw.slice(3).split("\\");
+  }
+  if (segments.some((segment) => RESERVED_WINDOWS_DIRECTORY.test(segment))) {
+    throw fail("ROOT_PATH_INVALID", "rootPath cannot contain a Windows device name");
+  }
+  return normalizeAbsoluteRoot(rootPath);
 }
 
 function normalizeUncRoot(value, code = "NETWORK_ROOT_UNRESOLVED") {

@@ -159,6 +159,7 @@ for (const fieldsAvailable of [true, false]) {
       assert.equal(subject.lifecycle, "draft");
       assert.equal(subject.displayEnabled, false);
       assert.equal(subject.upload.enqueueMode, "manual");
+      assert.equal(subject.packageRoute.packageAlias, null);
       assert.equal(syncCalls, 0);
     } finally {
       database.close();
@@ -166,6 +167,88 @@ for (const fieldsAvailable of [true, false]) {
     }
   });
 }
+
+test("unselected packages remain empty through draft save, share import and local lifecycle cleanup", async () => {
+  const checkedAliases = [];
+  const synced = [];
+  const { directory, database, store } = await fixture({
+    packageAliases: async () => ["Auto-cut-lite"],
+    validatePackageWorkflow: async (alias) => { checkedAliases.push(alias); },
+    syncSubject: async (subject) => { synced.push(subject); },
+  });
+  try {
+    const subject = (await store.upsertBasePreview(phasedPreview())).subjects[0];
+    assert.equal(subject.packageRoute.packageAlias, null);
+    const saved = await store.saveSubjectDraft(subject.subjectKey, { expectedVersion: subject.configVersion });
+    assert.equal(saved.packageRoute.packageAlias, null);
+    await assert.rejects(() => store.enableSubject(saved.subjectKey, saved.configVersion), (error) => error.code === "PACKAGE_ALIAS_REQUIRED");
+    const shared = await store.exportShareable();
+    delete shared.bases[0].subjects[0].packageRoute;
+    const imported = await store.importShareable(shared);
+    const pending = imported.catalog[0].subjects[0];
+    assert.equal(pending.packageRoute.packageAlias, null);
+    const disabled = await store.disableSubject(pending.subjectKey, pending.configVersion);
+    assert.equal(disabled.packageRoute.packageAlias, null);
+    await store.removeSubject(disabled.subjectKey);
+    assert.deepEqual(checkedAliases, []);
+    assert.deepEqual(synced, []);
+    assert.equal(database.database.prepare("SELECT COUNT(*) AS count FROM feishu_package_workflow_drafts").get().count, 0);
+  } finally { database.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("clearing an editable package keeps active history and uses its bound route when disabling", async () => {
+  const synced = [];
+  const { directory, database, store } = await fixture({ syncSubject: async (subject) => { synced.push(structuredClone(subject)); } });
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const active = await store.enableSubject(draft.subjectKey, draft.configVersion);
+    const activeBefore = database.database.prepare("SELECT * FROM feishu_subject_versions WHERE subject_key=? AND lifecycle='enabled'").get(active.subjectKey);
+    const cleared = await store.saveSubjectDraft(active.subjectKey, { expectedVersion: active.configVersion,
+      packageRoute: { routeMode: "fixed", packageAlias: "", subjectCodeFieldId: null, branchMap: null },
+    });
+    assert.equal(cleared.packageRoute.packageAlias, null);
+    assert.equal(cleared.activePackageAlias, "Auto-cut-A");
+    assert.deepEqual(database.database.prepare("SELECT * FROM feishu_subject_versions WHERE subject_key=? AND lifecycle='enabled'").get(active.subjectKey), activeBefore);
+    await assert.rejects(() => store.enableSubject(cleared.subjectKey, cleared.configVersion), (error) => error.code === "PACKAGE_ALIAS_REQUIRED");
+    const disabled = await store.disableSubject(cleared.subjectKey, cleared.configVersion);
+    assert.equal(disabled.packageRoute.packageAlias, null);
+    assert.equal(synced.at(-1).packageRoute.packageAlias, "Auto-cut-A");
+    assert.equal(synced.at(-1).lifecycle, "disabled");
+    assert.equal((await store.getSubject(cleared.subjectKey)).activeConfigVersion, null);
+  } finally { database.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("unbound lifecycle cleanup fails closed when history cannot prove the subject was local only", async () => {
+  const { directory, database, store } = await fixture({ syncSubject: async () => { throw new Error("must not sync an unknown route"); } });
+  try {
+    const subject = (await store.upsertBasePreview(phasedPreview())).subjects[0];
+    database.database.prepare("DELETE FROM feishu_subject_versions WHERE subject_key=?").run(subject.subjectKey);
+    const before = database.database.prepare("SELECT * FROM feishu_subjects WHERE subject_key=?").get(subject.subjectKey);
+    await assert.rejects(() => store.removeSubject(subject.subjectKey), (error) => error.code === "WORKFLOW_HISTORY_INVALID");
+    await assert.rejects(() => store.disableSubject(subject.subjectKey, subject.configVersion), (error) => error.code === "WORKFLOW_HISTORY_INVALID");
+    assert.deepEqual(database.database.prepare("SELECT * FROM feishu_subjects WHERE subject_key=?").get(subject.subjectKey), before);
+  } finally { database.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("cleared package cannot remove or disable a previously enabled workflow with missing active history", async () => {
+  const synced = [];
+  const { directory, database, store } = await fixture({ syncSubject: async (subject) => { synced.push(subject.lifecycle); } });
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const active = await store.enableSubject(draft.subjectKey, draft.configVersion);
+    const cleared = await store.saveSubjectDraft(active.subjectKey, { expectedVersion: active.configVersion,
+      packageRoute: { routeMode: "fixed", packageAlias: null, subjectCodeFieldId: null, branchMap: null },
+    });
+    database.database.prepare("DELETE FROM feishu_subject_versions WHERE subject_key=? AND lifecycle='enabled'").run(cleared.subjectKey);
+    const before = database.database.prepare("SELECT * FROM feishu_subjects WHERE subject_key=?").get(cleared.subjectKey);
+    await assert.rejects(() => store.removeSubject(cleared.subjectKey), (error) => error.code === "WORKFLOW_HISTORY_INVALID");
+    await assert.rejects(() => store.disableSubject(cleared.subjectKey, cleared.configVersion), (error) => error.code === "WORKFLOW_HISTORY_INVALID");
+    assert.deepEqual(database.database.prepare("SELECT * FROM feishu_subjects WHERE subject_key=?").get(cleared.subjectKey), before);
+    assert.deepEqual(synced, ["enabled"]);
+  } finally { database.close(); await rm(directory, { recursive: true, force: true }); }
+});
 
 for (const mode of ["manual", "automatic"]) {
   test(`metadata refresh and restoration preserve an existing ${mode} subject's execution settings`, async () => {
@@ -323,6 +406,22 @@ test("new tables receive complete phased defaults with independent field and opt
   }
 });
 
+test("new phased tables leave naming unbound when the positional candidate is single-select", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const metadata = phasedPreview();
+    metadata.tables[0].fields = metadata.tables[0].fields.map((field) => (
+      field.fieldId === "fld_name" ? { ...field, type: 3, uiType: "SingleSelect" } : field
+    ));
+    const subject = (await store.upsertBasePreview(metadata)).subjects[0];
+    assert.equal(subject.namingField.fieldId, "pending_naming_field");
+    assert.equal(subject.lifecycle, "draft");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("status-only table keeps missing document and naming bindings pending and cannot be enabled", async () => {
   let syncCalls = 0;
   const { directory, database, store } = await fixture({
@@ -330,7 +429,7 @@ test("status-only table keeps missing document and naming bindings pending and c
   });
   try {
     const catalog = await store.upsertBasePreview(preview());
-    const subject = catalog.subjects[0];
+    const subject = await store.saveSubjectDraft(catalog.subjects[0].subjectKey, { packageRoute: subjectPatch().packageRoute });
 
     assert.deepEqual(subject.statusField, { fieldId: "fld_status", fieldName: "待制作" });
     assert.deepEqual(subject.documentField, { fieldId: "pending_document_field", fieldName: "待配置" });
@@ -358,6 +457,7 @@ test("course delivery settings remain repairable in a draft and block activation
     const subject = catalog.subjects[0];
     const draft = await store.saveSubjectDraft(subject.subjectKey, {
       expectedVersion: subject.configVersion,
+      packageRoute: subjectPatch().packageRoute,
       upload: { ...subject.upload, enabled: true },
       delivery: {
         version: 1,
@@ -396,6 +496,7 @@ test("a complete course delivery activates automatic upload without legacy per-s
     const subject = catalog.subjects[0];
     const draft = await store.saveSubjectDraft(subject.subjectKey, {
       expectedVersion: subject.configVersion,
+      packageRoute: subjectPatch().packageRoute,
       upload: {
         ...subject.upload,
         enabled: true,
@@ -641,6 +742,7 @@ test("legacy migration keeps its uniquely matched trigger field and non-first op
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_legacy_status",
         fieldName: "实际流程状态",
@@ -697,6 +799,7 @@ test("legacy migration preserves snake_case trigger bindings", async () => {
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         field_id: "legacy-snake_status",
         field_name: "旧状态",
@@ -749,6 +852,7 @@ test("legacy migration refreshes the label of a uniquely matched option before r
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "renamed-option_status",
         fieldName: "旧状态名称",
@@ -800,6 +904,7 @@ test("legacy migration resolves a missing option id by one unique start value", 
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "legacy-value_status",
         fieldName: "旧值触发流程状态",
@@ -848,6 +953,7 @@ test("legacy migration keeps an ambiguous start value repairable instead of gues
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "legacy-ambiguous_status",
         fieldName: "旧歧义触发流程状态",
@@ -893,6 +999,7 @@ test("legacy migration clears a missing trigger field instead of selecting anoth
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_removed_status",
         fieldName: "已删除流程状态",
@@ -948,6 +1055,7 @@ test("refreshing a disabled legacy subject preserves disabled lifecycle while ad
     const key = initial.subjects[0].subjectKey;
     const legacy = {
       ...initial.subjects[0],
+      packageRoute: subjectPatch().packageRoute,
       lifecycle: "disabled",
       trigger: { fieldId: "legacy_status", fieldName: "旧状态", startValue: "旧值", optionId: "legacy_draft" },
     };
@@ -1701,6 +1809,7 @@ test("repairing missing stages preserves a non-first top-level trigger as the in
     const subject = initial.subjects[0];
     const partial = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_status",
         fieldName: "流程状态",
@@ -1846,6 +1955,7 @@ test("repairing a missing status field stays pending when persisted trigger fiel
     const subject = initial.subjects[0];
     const partial = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_live_status",
         fieldName: "当前流程状态",
@@ -1916,6 +2026,7 @@ test("repairing an initial stage without a usable trigger preserves the top-leve
     const subject = initial.subjects[0];
     const partial = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_status",
         fieldName: "流程状态",
@@ -1978,6 +2089,7 @@ test("repairing a stale initial trigger does not reroute a valid top-level trigg
     const subject = initial.subjects[0];
     const stale = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_live_status",
         fieldName: "流程状态",
@@ -2048,6 +2160,7 @@ test("repairing stale top-level and initial triggers stays blocked instead of ch
     const subject = initial.subjects[0];
     const stale = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       trigger: {
         fieldId: "fld_removed_status",
         fieldName: "已删除流程状态",
@@ -2100,9 +2213,12 @@ test("enabling a phased draft with pending bindings fails before Bridge synchron
     const subject = catalog.subjects[0];
     const pending = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       documentField: { fieldId: "pending_document_field", fieldName: "待配置" },
     };
     delete pending.activeConfigVersion;
+    delete pending.activePackageAlias;
+    delete pending.preferredPackageAlias;
     database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
       .run(JSON.stringify(pending), subject.subjectKey);
 
@@ -2132,6 +2248,7 @@ test("legacy share import projects the retained local upload target onto enabled
     const targetPath = "D:\\local\\legacy-upload";
     const legacy = {
       ...subject,
+      packageRoute: subjectPatch().packageRoute,
       upload: {
         ...subject.upload,
         enqueueMode: "automatic",
@@ -2232,6 +2349,185 @@ function phasedPatch() {
     },
   };
 }
+
+test("phased naming fields can be repaired in drafts but must be text or formula to enable", async () => {
+  const syncCalls = [];
+  const { directory, database, store } = await fixture({
+    syncSubject: async (subject) => { syncCalls.push(subject); },
+  });
+  try {
+    const metadata = phasedPreview();
+    metadata.tables[0].fields = metadata.tables[0].fields.map((field) => (
+      field.fieldId === "fld_name"
+        ? { ...field, type: 3, uiType: "SingleSelect" }
+        : field
+    ));
+    await store.upsertBasePreview(metadata);
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    assert.equal(draft.namingField.fieldId, "fld_name");
+    await assert.rejects(
+      () => store.enableSubject(draft.subjectKey, draft.configVersion),
+      (error) => error.code === "FIELD_TYPE_INVALID" && error.status === 409,
+    );
+    assert.equal((await store.getSubject(draft.subjectKey)).configVersion, draft.configVersion);
+    assert.deepEqual(syncCalls, []);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import ignores unavailable packages on skipped active subjects", async () => {
+  const checkedAliases = [];
+  const { directory, database, store } = await fixture({
+    validatePackageWorkflow: async (alias) => {
+      checkedAliases.push(alias);
+      if (alias === "Missing-package") throw new Error("Unavailable package");
+    },
+    packageAliases: async () => ["Auto-cut-A"],
+  });
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const active = await store.enableSubject(draft.subjectKey, draft.configVersion);
+    const shared = await store.exportShareable();
+    const base = shared.bases[0];
+    const skipped = base.subjects[0];
+    skipped.packageRoute.packageAlias = "Missing-package";
+    const added = structuredClone(skipped);
+    added.subjectKey = `${base.baseToken}:tbl_new`;
+    added.tableId = "tbl_new";
+    added.tableName = "新学科";
+    added.projectId = subjectProjectId(added.subjectKey);
+    added.packageRoute.packageAlias = "Auto-cut-A";
+    base.subjects.push(added);
+
+    checkedAliases.length = 0;
+    const preview = await store.importShareable(shared, { dryRun: true });
+    assert.ok(preview.diagnostics.some((entry) => entry.code === "ENABLED_SUBJECT_SKIPPED"));
+    assert.deepEqual(checkedAliases, ["Auto-cut-A"]);
+
+    checkedAliases.length = 0;
+    const imported = await store.importShareable(shared);
+    assert.deepEqual(checkedAliases, ["Auto-cut-A"]);
+    assert.equal(imported.catalog[0].subjects.find((subject) => subject.subjectKey === active.subjectKey).configVersion, active.configVersion);
+    assert.equal(imported.catalog[0].subjects.find((subject) => subject.subjectKey === added.subjectKey).lifecycle, "draft");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import preserves a removed subject even if legacy history retains an active version", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    const draft = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const active = await store.enableSubject(draft.subjectKey, draft.configVersion);
+    const shared = await store.exportShareable();
+    database.database.prepare("UPDATE feishu_subjects SET removed_at = ? WHERE subject_key = ?")
+      .run("2026-10-14T00:00:00.000Z", active.subjectKey);
+    const before = database.database.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(active.subjectKey);
+
+    const preview = await store.importShareable(shared, { dryRun: true });
+    assert.equal(preview.diagnostics.some((entry) => entry.code === "ENABLED_SUBJECT_SKIPPED"), false);
+    assert.ok(preview.diagnostics.some((entry) => entry.code === "REMOVED_SUBJECT_SKIPPED"));
+    const imported = await store.importShareable(shared);
+    assert.equal(imported.catalog[0].subjects.some((subject) => subject.subjectKey === active.subjectKey), false);
+    assert.deepEqual(database.database.prepare("SELECT * FROM feishu_subjects WHERE subject_key = ?").get(active.subjectKey), before);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy share import never restores a removed Base or validates its unavailable packages", async () => {
+  const checkedAliases = [];
+  const { directory, database, store } = await fixture({
+    validatePackageWorkflow: async (alias) => { checkedAliases.push(alias); },
+  });
+  try {
+    await store.upsertBasePreview(phasedPreview());
+    await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const shared = await store.exportShareable();
+    await store.removeBase("bas_demo");
+    const snapshot = () => JSON.stringify([
+      database.database.prepare("SELECT * FROM feishu_bases").all(),
+      database.database.prepare("SELECT * FROM feishu_subjects").all(),
+      database.database.prepare("SELECT * FROM feishu_subject_versions").all(),
+      database.database.prepare("SELECT * FROM projects").all(),
+      database.database.prepare("SELECT * FROM feishu_package_workflow_drafts").all(),
+    ]);
+    const before = snapshot();
+    checkedAliases.length = 0;
+    for (const dryRun of [true, false]) {
+      const result = await store.importShareable(shared, { dryRun });
+      assert.ok(result.diagnostics.some((entry) => entry.code === "REMOVED_BASE_SKIPPED"));
+      assert.equal(snapshot(), before);
+    }
+    assert.deepEqual(checkedAliases, []);
+    assert.deepEqual(await store.listCatalog(), []);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("share import previews stale phased and delivery field bindings against local metadata", async () => {
+  const { directory, database, store } = await fixture();
+  try {
+    const metadata = phasedPreview();
+    metadata.tables[0].fields.push({
+      fieldId: "fld_review", fieldName: "审核状态", type: 3, uiType: "SingleSelect",
+      options: [{ id: "opt_review", name: "待审核" }],
+    });
+    await store.upsertBasePreview(metadata);
+    await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
+    const shared = await store.exportShareable();
+    const subject = shared.bases[0].subjects[0];
+    subject.reviewStatusField = { fieldId: "fld_review", fieldName: "审核状态" };
+    subject.delivery = {
+      version: 1,
+      rootPath: null,
+      courseNaming: { mode: "field", fieldId: "fld_document" },
+      coursePathWriteback: { enabled: true, fieldId: "fld_name" },
+      writeback: {
+        initial: { onProcessing: [{ fieldId: "fld_audio", optionId: "opt_ready" }], onUploaded: [] },
+        first_review: { onProcessing: [], onUploaded: [] },
+        final_review: { onProcessing: [], onUploaded: [] },
+      },
+      finalDirectoryTrigger: { enabled: true, fieldId: "fld_audio", optionId: "opt_ready" },
+    };
+    const changedLocalFields = metadata.tables[0].fields
+      .filter((field) => !["fld_review", "fld_document"].includes(field.fieldId))
+      .map((field) => (
+        field.fieldId === "fld_status" ? { ...field, type: 1, uiType: "Text" }
+          : field.fieldId === "fld_name" ? { ...field, type: 3, uiType: "SingleSelect" }
+            : field
+      ));
+    database.database.prepare("UPDATE feishu_subjects SET metadata_json = ? WHERE subject_key = ?")
+      .run(JSON.stringify({ fields: changedLocalFields }), subject.subjectKey);
+
+    const preview = await store.importShareable(shared, { dryRun: true });
+    const subjectPath = "bases.bas_demo.subjects.tbl_math";
+    const bindings = preview.diagnostics
+      .filter((entry) => entry.path?.startsWith(subjectPath) && entry.path?.endsWith(".fieldId"))
+      .map((entry) => [entry.code, entry.path.slice(subjectPath.length + 1)]);
+    assert.deepEqual(bindings, [
+      ["FIELD_TYPE_INVALID", "statusField.fieldId"],
+      ["FIELD_NOT_FOUND", "reviewStatusField.fieldId"],
+      ["FIELD_NOT_FOUND", "documentField.fieldId"],
+      ["FIELD_TYPE_INVALID", "namingField.fieldId"],
+      ["WRITEBACK_FIELD_NOT_FOUND", "delivery.courseNaming.fieldId"],
+      ["WRITEBACK_FIELD_TYPE_INVALID", "delivery.coursePathWriteback.fieldId"],
+      ["WRITEBACK_FIELD_TYPE_INVALID", "delivery.writeback.initial.onProcessing[0].fieldId"],
+      ["WRITEBACK_FIELD_TYPE_INVALID", "delivery.finalDirectoryTrigger.fieldId"],
+    ]);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 function twoFieldStoreFixture() {
   const metadata = phasedPreview();
@@ -2374,6 +2670,7 @@ test("two trigger fields survive repair of incomplete stage settings", async () 
     const draft = await store.saveSubjectDraft("bas_demo:tbl_math", patch);
     const incomplete = structuredClone(draft);
     delete incomplete.activeConfigVersion;
+    delete incomplete.activePackageAlias;
     delete incomplete.stages.final_review.reviewSource;
     database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
       .run(JSON.stringify(incomplete), draft.subjectKey);
@@ -2438,6 +2735,8 @@ test("legacy automatic upload still requires and uses its common destination", a
     const catalog = await store.upsertBasePreview(preview());
     const legacy = { ...catalog.subjects[0], ...subjectPatch() };
     delete legacy.activeConfigVersion;
+    delete legacy.activePackageAlias;
+    delete legacy.preferredPackageAlias;
     for (const field of ["statusField", "documentField", "namingField", "stages"]) delete legacy[field];
     legacy.upload.enqueueMode = "automatic";
     const persist = () => database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
@@ -3153,6 +3452,8 @@ test("metadata refresh clears an independently renamed top-level trigger option"
     const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
     const persisted = structuredClone(saved);
     delete persisted.activeConfigVersion;
+    delete persisted.activePackageAlias;
+    delete persisted.preferredPackageAlias;
     persisted.trigger = {
       fieldId: "fld_alternate",
       fieldName: "备用状态",
@@ -3366,6 +3667,8 @@ test("metadata refresh clears an independently stale legacy trigger", async () =
     const saved = await store.saveSubjectDraft("bas_demo:tbl_math", phasedPatch());
     const stale = structuredClone(saved);
     delete stale.activeConfigVersion;
+    delete stale.activePackageAlias;
+    delete stale.preferredPackageAlias;
     stale.trigger = { fieldId: "fld_status", fieldName: "旧状态", startValue: "旧值", optionId: "opt_ready" };
     database.database.prepare("UPDATE feishu_subjects SET config_json = ? WHERE subject_key = ?")
       .run(JSON.stringify(stale), stale.subjectKey);
@@ -3552,7 +3855,7 @@ test("draft mutations keep the previous enabled version routable until an explic
 });
 
 
-test("known empty or malformed metadata blocks phased draft saves", async () => {
+test("empty metadata permits pending draft saves while malformed selected metadata remains blocked", async () => {
   const { directory, database, store } = await fixture();
   try {
     const original = phasedPreview();
@@ -3561,7 +3864,7 @@ test("known empty or malformed metadata blocks phased draft saves", async () => 
     for (const [metadataRefreshedAt, fields] of [
       [1710000007000, []],
       [1710000008000, [
-        { fieldId: "fld_status", fieldName: "流程", type: 3, uiType: "SingleSelect" },
+        { fieldId: "fld_status", fieldName: "待制作", type: 3, uiType: "SingleSelect" },
         { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text", options: [] },
         { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text", options: [] },
       ]],
@@ -3571,10 +3874,17 @@ test("known empty or malformed metadata blocks phased draft saves", async () => 
         metadataRefreshedAt,
         tables: [{ ...original.tables[0], fields }],
       });
-      await assert.rejects(
-        () => store.saveSubjectDraft(refreshed.subjects[0].subjectKey, { expectedVersion: refreshed.subjects[0].configVersion }),
-        (error) => ["FIELD_NOT_FOUND", "TRIGGER_OPTION_NOT_FOUND"].includes(error.code) && [400, 409].includes(error.status),
-      );
+      if (fields.length === 0) {
+        const pending = await store.saveSubjectDraft(refreshed.subjects[0].subjectKey, { expectedVersion: refreshed.subjects[0].configVersion });
+        assert.equal(pending.documentField.fieldId, "pending_document_field");
+        await assert.rejects(() => store.enableSubject(pending.subjectKey, pending.configVersion));
+      } else {
+        const pending = await store.saveSubjectDraft(refreshed.subjects[0].subjectKey, { expectedVersion: refreshed.subjects[0].configVersion });
+        await assert.rejects(
+          () => store.saveSubjectDraft(pending.subjectKey, { ...phasedPatch(), expectedVersion: pending.configVersion }),
+          (error) => ["FIELD_NOT_FOUND", "TRIGGER_OPTION_NOT_FOUND"].includes(error.code) && [400, 409].includes(error.status),
+        );
+      }
     }
     assert.equal((await store.getSubject(saved.subjectKey)).lifecycle, "draft");
   } finally {
@@ -4042,12 +4352,10 @@ test("clears a removed phased attachment binding into a repairable draft", async
     assert.equal(stale.lifecycle, "draft");
     assert.equal(stale.stages.initial.audio.source.fieldId, "pending_attachment_field");
 
+    const pendingDraft = await store.saveSubjectDraft(stale.subjectKey, { expectedVersion: stale.configVersion });
+    assert.equal(pendingDraft.stages.initial.audio.source.fieldId, "pending_attachment_field");
     await assert.rejects(
-      () => store.saveSubjectDraft(stale.subjectKey, { expectedVersion: stale.configVersion }),
-      (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
-    );
-    await assert.rejects(
-      () => store.enableSubject(stale.subjectKey, stale.configVersion),
+      () => store.enableSubject(stale.subjectKey, pendingDraft.configVersion),
       (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
     );
 
@@ -4063,12 +4371,15 @@ test("clears a removed phased attachment binding into a repairable draft", async
     });
     const wrongType = changedType.subjects[0];
     assert.equal(wrongType.stages.initial.audio.source.fieldId, "pending_attachment_field");
+    const retainedPending = await store.saveSubjectDraft(wrongType.subjectKey, { expectedVersion: wrongType.configVersion });
     await assert.rejects(
-      () => store.saveSubjectDraft(wrongType.subjectKey, { expectedVersion: wrongType.configVersion }),
-      (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
+      () => store.saveSubjectDraft(wrongType.subjectKey, { expectedVersion: retainedPending.configVersion,
+        stages: { initial: { audio: { mode: "replace_original", source: { kind: "base_attachment", fieldId: "fld_audio" }, durationToleranceSeconds: 3 } } },
+      }),
+      (error) => error.code === "FIELD_TYPE_INVALID" && error.status === 409,
     );
     await assert.rejects(
-      () => store.enableSubject(wrongType.subjectKey, wrongType.configVersion),
+      () => store.enableSubject(wrongType.subjectKey, retainedPending.configVersion),
       (error) => error.code === "FIELD_NOT_FOUND" && error.status === 409,
     );
   } finally {

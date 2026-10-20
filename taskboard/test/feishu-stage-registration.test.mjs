@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { access, mkdtemp, mkdir, rm } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -8,11 +8,35 @@ import { test } from "node:test";
 import { createTaskboardServer } from "../server/index.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
 import { createBridge } from "../../src/bridge.mjs";
+import { createFeishuControlledContextReader } from "../../src/feishu-record-reader.mjs";
 import { JsonStateStore } from "../../src/state-store.mjs";
 import { TaskboardClient } from "../../src/taskboard-client.mjs";
+import { validateSubjectConfig } from "../../src/workflow-config.mjs";
 
 const SECRET = "fixture-stage-registration-secret";
 const SUBJECT_KEY = "bas_stage:tbl_math";
+
+// Test listeners use OS-assigned ports, including ports blocked by Fetch.
+async function localRequest(url, { method = "GET", headers, body, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const requestHeaders = { ...headers };
+    if (body !== undefined) requestHeaders["content-length"] = Buffer.byteLength(body);
+    const outgoing = httpRequest(url, { method, headers: requestHeaders, signal, agent: false }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.once("error", reject);
+      response.once("end", () => {
+        const content = Buffer.concat(chunks);
+        resolve(new Response(content.length ? content : null, {
+          status: response.statusCode,
+          headers: response.headers,
+        }));
+      });
+    });
+    outgoing.once("error", reject);
+    outgoing.end(body);
+  });
+}
 
 function stage(stageId, optionId, value) {
   return {
@@ -68,7 +92,7 @@ async function fixture({
 }
 
 async function request(baseUrl, pathname, body, headers = {}) {
-  const response = await fetch(`${baseUrl}${pathname}`, {
+  const response = await localRequest(`${baseUrl}${pathname}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -82,7 +106,10 @@ async function request(baseUrl, pathname, body, headers = {}) {
   return { response, body: text ? JSON.parse(text) : undefined };
 }
 
-async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery = undefined, splitFields = false } = {}) {
+async function enableSubject(fixtureData, {
+  subjectResourceGroups = [], delivery = undefined, splitFields = false, namingType = 1,
+  namingUiType = namingType === 20 ? "Formula" : "Text",
+} = {}) {
   const catalog = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog", {
     baseToken: "bas_stage",
     baseName: "阶段 Base",
@@ -103,7 +130,7 @@ async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery
           ],
         },
         { fieldId: "fld_document", fieldName: "素材文档", type: 1, uiType: "Text" },
-        { fieldId: "fld_name", fieldName: "命名", type: 1, uiType: "Text" },
+        { fieldId: "fld_name", fieldName: "命名", type: namingType, uiType: namingUiType },
         {
           fieldId: "fld_review",
           fieldName: "审核进度",
@@ -135,7 +162,7 @@ async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery
     // The request helper defaults to POST; use a direct PATCH below.
   });
   assert.equal(draft.response.status, 405);
-  const patchResponse = await fetch(`${fixtureData.baseUrl}${route}`, {
+  const patchResponse = await localRequest(`${fixtureData.baseUrl}${route}`, {
     method: "PATCH",
     headers: {
       "content-type": "application/json",
@@ -176,7 +203,7 @@ async function enableSubject(fixtureData, { subjectResourceGroups = [], delivery
   });
   const patched = await patchResponse.json();
   assert.equal(patchResponse.status, 200, JSON.stringify(patched));
-  const enable = await fetch(`${fixtureData.baseUrl}${route}/enable`, {
+  const enable = await localRequest(`${fixtureData.baseUrl}${route}/enable`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -226,7 +253,7 @@ test("archived stage tasks can be deleted without recreating or executing delete
     assert.equal(created.response.status, 201);
     const task = created.body.task;
     const archived = await request(f.baseUrl, `/api/tasks/${task.id}/archive`, { version: task.version });
-    const deleted = await fetch(`${f.baseUrl}/api/tasks/${task.id}`, {
+    const deleted = await localRequest(`${f.baseUrl}/api/tasks/${task.id}`, {
       method: "DELETE", headers: { "content-type": "application/json", "x-taskboard-client": "web" },
       body: JSON.stringify({ version: archived.body.task.version }),
     });
@@ -249,7 +276,7 @@ test("archived stage tasks can be deleted without recreating or executing delete
       },
       workflowStore: { resolveSubjectVersionAt: async () => bridgeSubject },
       readControlledContext: async () => payload.controlledContext,
-      taskboard: new TaskboardClient(f.baseUrl, { bridgeSecret: SECRET }),
+      taskboard: new TaskboardClient(f.baseUrl, { bridgeSecret: SECRET, fetchImplementation: localRequest }),
     };
     const event = {
       ...payload.event, fieldId: "fld_status", fieldName: "流程", beforePresent: true, afterPresent: true,
@@ -560,9 +587,9 @@ test("new stage tasks freeze resource groups from their Auto-Cut package", async
     );
     assert.deepEqual(created.body.task.feishuOrigin.resourceGroups, ["剪映主机", "音频工作站"]);
 
-    const packageBeforeChange = await fetch(`${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite`)
+    const packageBeforeChange = await localRequest(`${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite`)
       .then((response) => response.json());
-    const changedPackage = await fetch(`${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite`, {
+    const changedPackage = await localRequest(`${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -635,7 +662,7 @@ test("long naming snapshots produce editable new and historical task titles", as
       .run("数学 · rec_1 · _初稿", task.id);
     const projected = f.app.database.getTask(task.id);
     assert.equal(projected.title, task.title);
-    const response = await fetch(`${f.baseUrl}/api/tasks/${task.id}`, {
+    const response = await localRequest(`${f.baseUrl}/api/tasks/${task.id}`, {
       method: "PATCH", headers: { "content-type": "application/json" },
       body: JSON.stringify({ version: projected.version, title: projected.title, priority: "high" }),
     });
@@ -664,7 +691,7 @@ test("historical generated task titles display stored names without rewriting id
     const title = "数学 · 课程001 · _初稿";
     assert.equal(database.getTask(id).title, title);
     assert.equal(database.listTasks({}).find((task) => task.id === id).title, title);
-    const detail = await fetch(`${fixtureData.baseUrl}/api/tasks/${id}`);
+    const detail = await localRequest(`${fixtureData.baseUrl}/api/tasks/${id}`);
     assert.equal(detail.status, 200);
     assert.equal((await detail.json()).task.title, title);
     const replay = await request(fixtureData.baseUrl, "/api/local/feishu/tasks", payload);
@@ -794,11 +821,11 @@ test("canonical replay heals a task committed before its automatic reservation",
     assert.equal(fixtureData.app.database.getFeishuExecution(committed.id), null);
 
     fixtureData.app.database.createFeishuExecution = createExecution;
-    const packageCatalog = await fetch(`${fixtureData.baseUrl}/api/local/autocut/packages`).then(
+    const packageCatalog = await localRequest(`${fixtureData.baseUrl}/api/local/autocut/packages`).then(
       (response) => response.json(),
     );
     const packageRecord = packageCatalog.packages.find((entry) => entry.alias === "Auto-cut-lite");
-    const disabled = await fetch(
+    const disabled = await localRequest(
       `${fixtureData.baseUrl}/api/local/autocut/packages/Auto-cut-lite/disable`,
       {
         method: "POST",
@@ -987,6 +1014,50 @@ test("workflow synchronization carries course-name and separate review field des
     });
     assert.equal(synchronized?.subject.reviewStatusField?.fieldId, "fld_review");
     assert.equal(synchronized?.subject.reviewStatusField?.fieldName, "审核进度");
+  } finally {
+    await fixtureData.app.close();
+    await new Promise((resolve) => bridge.close(resolve));
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+});
+
+test("workflow synchronization preserves a reused formula course-name type", async () => {
+  let synchronized = null;
+  const bridge = createServer(async (incoming, response) => {
+    let body = "";
+    for await (const chunk of incoming) body += chunk;
+    synchronized = JSON.parse(body);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ subject: synchronized.subject }));
+  });
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  const fixtureData = await fixture({
+    feishuBridgeUrl: `http://127.0.0.1:${bridge.address().port}`,
+    feishuWorkflowSync: null,
+  });
+  try {
+    await enableSubject(fixtureData, {
+      namingType: 20,
+      namingUiType: null,
+      delivery: {
+        version: 1,
+        rootPath: "D:\\课程交付",
+        courseNaming: { mode: "reuse_artifact_naming", fieldId: null },
+        coursePathWriteback: { enabled: false, fieldId: null },
+        writeback: {},
+        finalDirectoryTrigger: { enabled: false, fieldId: null, optionId: null },
+      },
+    });
+    const subject = validateSubjectConfig(synchronized.subject);
+    const reader = createFeishuControlledContextReader({
+      client: { bitable: { v1: { appTableRecord: { get: async () => ({
+        code: 0,
+        data: { record: { fields: { fld_name: "#ERROR!" } } },
+      }) } } } },
+    });
+    const context = await reader.read(subject, { recordId: "rec_formula" });
+    assert.equal(context.courseName, "");
+    assert.equal(subject.namingField.kind, "formula");
   } finally {
     await fixtureData.app.close();
     await new Promise((resolve) => bridge.close(resolve));

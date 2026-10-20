@@ -4,11 +4,13 @@ import path from "node:path";
 import { ApiError } from "./database.mjs";
 import { PackageConfigError, validateCustomZipOutputDirectory } from "./feishu-package-config.mjs";
 import { inspectAutoCutPackageWorkspace, prepareAutoCutPackageOutputDirectory } from "./feishu-package-identity.mjs";
+import { PackageWorkflowError } from "../shared/feishu-package-workflow.mjs";
 
 const PACKAGE_ROOT = "/api/local/autocut/packages";
 const PACKAGE_FIELDS = new Set([
   "alias", "name", "projectName", "projectId", "workspacePath", "model", "reasoningEffort",
   "prompt", "zipSourceDirectory", "zipOutputMode", "maxConcurrent", "resourceGroups",
+  "workflowTemplate",
 ]);
 const PACKAGE_MUTATION_FIELDS = new Set([
   ...PACKAGE_FIELDS, "revision", "expectedRevision",
@@ -47,7 +49,7 @@ function decodeAlias(value) {
 
 function toApiError(error) {
   if (error instanceof ApiError) return error;
-  if (error instanceof PackageConfigError) {
+  if (error instanceof PackageConfigError || error instanceof PackageWorkflowError) {
     return new ApiError(error.status ?? 409, error.code, error.message, error.details);
   }
   return new ApiError(500, "PACKAGE_REGISTRY_FAILED", "Unable to update the Auto-Cut package registry");

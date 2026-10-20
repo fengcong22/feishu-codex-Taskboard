@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -98,7 +98,7 @@ test("rejects unsafe enabled package bindings and duplicate project ids", () => 
 });
 
 test("loadPackageRegistry fails closed for missing and malformed files", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "feishu-package-registry-"));
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "feishu-package-registry-")));
   const filename = path.join(directory, "packages.json");
   try {
     await assert.rejects(
@@ -114,4 +114,67 @@ test("loadPackageRegistry fails closed for missing and malformed files", async (
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+const vmTemplate = { id: "vm_pmo_review_video", version: 1 };
+
+async function vmRegistryFixture(t, declaration = vmTemplate) {
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "feishu-vm-registry-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const workspacePath = path.join(directory, "package");
+  await mkdir(workspacePath);
+  const manifestPath = path.join(workspacePath, "PACKAGE-MANIFEST.json");
+  await writeFile(manifestPath, JSON.stringify({ interface: { workflowTemplate: vmTemplate } }));
+  const entry = trustedPackage({ workspacePath });
+  if (declaration !== undefined) entry.workflowTemplate = declaration;
+  const registryPath = path.join(directory, "packages.json");
+  await writeFile(registryPath, JSON.stringify({ version: 1, packages: { "auto-cut-slicing": entry } }));
+  return { directory, workspacePath, manifestPath, registryPath, entry };
+}
+
+test("VM registry acceptance requires explicit host opt-in and a matching live manifest", async t => {
+  const { registryPath } = await vmRegistryFixture(t);
+  await assert.rejects(() => loadPackageRegistry(registryPath), { code: "PACKAGE_WORKFLOW_NOT_READY" });
+  const packages = await loadPackageRegistry(registryPath, { allowVmInitial: true });
+  assert.deepEqual(packages["auto-cut-slicing"].workflowTemplate, vmTemplate);
+});
+
+test("registry data cannot opt in to VM execution", () => {
+  for (const option of [undefined, { allowVmInitial: "true" }, { allowVmInitial: 1 }]) {
+    assert.throws(() => normalizePackageRegistry({ version: 1, allowVmInitial: true,
+      packages: { "auto-cut-slicing": trustedPackage({ workflowTemplate: vmTemplate, allowVmInitial: true }) },
+    }, option), { code: "PACKAGE_WORKFLOW_NOT_READY" });
+  }
+});
+
+test("host VM opt-in cannot infer VM identity from an undeclared registry", async t => {
+  const { registryPath, entry } = await vmRegistryFixture(t);
+  delete entry.workflowTemplate;
+  await writeFile(registryPath, JSON.stringify({ version: 1, packages: { "auto-cut-slicing": entry } }));
+  await assert.rejects(() => loadPackageRegistry(registryPath, { allowVmInitial: true }),
+    { code: "PACKAGE_WORKFLOW_NOT_READY" });
+});
+
+test("host VM opt-in rejects missing, malformed and changed manifests", async t => {
+  const { registryPath, manifestPath } = await vmRegistryFixture(t);
+  for (const [content, code] of [["{bad-json", "PACKAGE_MANIFEST_INVALID"],
+    [JSON.stringify({ interface: { workflowTemplate: { id: "document_draft_zip", version: 1 } } }), "PACKAGE_WORKFLOW_MISMATCH"],
+    [JSON.stringify({ interface: { workflowTemplate: vmTemplate, artifactKind: "zip" } }), "PACKAGE_WORKFLOW_UNSUPPORTED"]]) {
+    await writeFile(manifestPath, content);
+    await assert.rejects(() => loadPackageRegistry(registryPath, { allowVmInitial: true }), { code });
+  }
+  await rm(manifestPath);
+  await assert.rejects(() => loadPackageRegistry(registryPath, { allowVmInitial: true }),
+    { code: "PACKAGE_MANIFEST_UNAVAILABLE" });
+});
+
+test("host VM opt-in rejects a linked package workspace", async t => {
+  const { directory, workspacePath, registryPath, entry } = await vmRegistryFixture(t);
+  const linked = path.join(directory, "linked-package");
+  await symlink(workspacePath, linked, process.platform === "win32" ? "junction" : "dir");
+  await writeFile(registryPath, JSON.stringify({ version: 1, packages: {
+    "auto-cut-slicing": { ...entry, workspacePath: linked },
+  } }));
+  await assert.rejects(() => loadPackageRegistry(registryPath, { allowVmInitial: true }),
+    { code: "PACKAGE_WORKSPACE_UNAVAILABLE" });
 });

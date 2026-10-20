@@ -1065,6 +1065,7 @@ test("workflow API saves incomplete delivery drafts and reports activation requi
       body: {
         expectedVersion: subject.configVersion,
         upload: { ...subject.upload, enabled: true },
+        packageRoute: { routeMode: "fixed", packageAlias: "Auto-cut-A", subjectCodeFieldId: null, branchMap: null },
         delivery: {
           version: 1,
           rootPath: null,
@@ -1859,7 +1860,7 @@ test("workflow PATCH applies snake_case phased aliases and rejects shadow aliase
   }
 });
 
-test("share import sends a Bridge-compatible DTO through the real Bridge validator", async () => {
+test("share import sends only package-bound subjects through the real Bridge validator", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-feishu-share-real-bridge-"));
   const metadataFields = [
     {
@@ -1927,6 +1928,12 @@ test("share import sends a Bridge-compatible DTO through the real Bridge validat
       }),
     },
   });
+  const unboundSubject = structuredClone(configuration.bases[0].subjects[0]);
+  unboundSubject.subjectKey = "bas_real_share:tbl_unbound";
+  unboundSubject.tableId = "tbl_unbound";
+  unboundSubject.tableName = "尚未选包";
+  unboundSubject.packageRoute.packageAlias = null;
+  configuration.bases[0].subjects.push(unboundSubject);
   let bridgeConfiguration = null;
   const bridge = createBridgeServer({
     host: "127.0.0.1",
@@ -1961,6 +1968,9 @@ test("share import sends a Bridge-compatible DTO through the real Bridge validat
 
     assert.equal(result.response.status, 200);
     assert.equal(result.body.diagnosticsOk, true);
+    assert.equal(bridgeConfiguration.bases[0].subjects.length, 1);
+    assert.equal(result.body.configuration.bases[0].subjects.length, 2);
+    assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_REQUIRED" && entry.path.includes("tbl_unbound")));
     const [bridgeSubject] = bridgeConfiguration.bases[0].subjects;
     assert.equal(Object.hasOwn(bridgeSubject, "projectId"), false);
     assert.equal(Object.hasOwn(bridgeSubject, "metadata"), false);
@@ -2274,7 +2284,9 @@ test("committed share import returns diagnostics recomputed at commit time", asy
     feishuPackageStore: {
       async read() {
         packageReads += 1;
-        return packageReads === 1 ? packageConfig : {};
+        // Preview checks both workflow compatibility and alias diagnostics;
+        // the package disappears before the commit performs those reads again.
+        return packageReads <= 2 ? packageConfig : {};
       },
     },
     feishuWorkflowShareImport: async (configuration) => ({ configuration, diagnostics: [] }),
@@ -2309,7 +2321,7 @@ test("committed share import returns diagnostics recomputed at commit time", asy
       body: { configuration, dryRun: false },
     });
     assert.equal(result.response.status, 200);
-    assert.equal(packageReads, 2);
+    assert.equal(packageReads, 4);
     assert.ok(result.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE"));
     assert.equal(result.body.diagnosticsOk, false);
     assert.equal((await request(baseUrl, "/api/local/feishu/workflow/catalog")).body.catalog[0].subjects[0].lifecycle, "draft");

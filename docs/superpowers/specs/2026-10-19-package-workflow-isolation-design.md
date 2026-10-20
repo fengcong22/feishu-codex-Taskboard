@@ -1,0 +1,13 @@
+# Package workflow isolation and automatic VM review loop
+
+Approved in chat on 2026-10-19. Each package owns its task board, configuration and delivered-video lineage. Shared scheduling, credentials and the local automatic-execution switch remain shared infrastructure.
+
+The VM workflow is initial approval/download → queue → actual render starts and processing writeback → verified MP4 delivery/readback → configured review-ready writeback → wait for Feishu review. Entering the configured review option freezes new instructions and the preceding confirmed MP4, creates one new round, and repeats without downloading VM material. Entering the configured final-archive option freezes the approved confirmed MP4 and NAS destination; successful publication and hash verification complete the business workflow. No local acceptance click is required. ZIP completion/publication rules remain independent.
+
+Taskboard displays separate package boards. The VM board uses todo, materials, queued, editing, Feishu delivery, awaiting Feishu review, NAS publication, completed, and needs attention. Status is derived from trusted task/run/delivery/archive evidence, never from descriptions or attachment ordering. A round may complete before its business workflow completes. Historical task/run snapshots remain immutable. Package switching selects a board only and never changes active execution configuration.
+
+Views and stage labels are scoped by subject and package. Existing subject views remain compatible with legacy boards; the VM board owns its own layout and display preferences. Review ancestry and archive source must match subject, record, output attachment field, package alias and workflow template. A repeated event is idempotent; a subsequent real review edge creates the next round. Same-field stage and archive triggers must dispatch independently. Stale review/approval events must not replace newer work. Archive retries must not silently select a newer video. Same-name different-content NAS files remain conflicts.
+
+Normal automation requires the existing explicit local switch, automatic snapshot and enabled allowlisted package. Approval waiting does not consume an editing slot. Network errors use bounded retries; ambiguous editing evidence and unsafe publication remain visible failures. Existing approval, provenance, loopback and credential boundaries remain intact.
+
+Validation uses offline fixtures for initial delivery, two successive review rounds, archive publication, mixed package history, shared-field routing, duplicate and delayed events, package isolation, and unchanged ZIP behavior. Live Feishu or NAS writes are not needed for development verification.

@@ -41,12 +41,20 @@ import type {
   FeishuSubjectConfig,
   FeishuWorkflowShareConfiguration,
   FeishuWorkflowShareResult,
+  FeishuSubjectWorkflowShareConfiguration,
+  FeishuSubjectWorkflowShareInput,
+  FeishuSubjectWorkflowShareResult,
   AutoCutPackageDraft,
   FeishuPackage,
   FeishuPackageSummary,
   FeishuPackageZipOutput,
   FeishuPackageWorkspaceInspection,
+  FeishuPackageWorkflowDraft,
+  FeishuVmPmoWorkflowConfig,
+  FeishuZipWorkflowConfig,
   FeishuAutoCutRun,
+  VmPmoRunSummary,
+  AutoCutRunConsent,
   CreateUnifiedWorkflowViewInput,
   StageDisplayOverride,
   UnifiedWorkflowStage,
@@ -63,6 +71,68 @@ const DEFAULT_USER_ACTOR: ActorIdentity = {
 
 let currentUserActor = DEFAULT_USER_ACTOR;
 let apiText = (_chinese: string, english: string) => english;
+
+type LocalEventSubscription = {
+  eventNames: Set<string>;
+  onEvent: (event: MessageEvent<string>) => void;
+  onOpen?: () => void;
+  onError?: () => void;
+};
+
+let localEventSource: EventSource | null = null;
+const localEventSubscriptions = new Set<LocalEventSubscription>();
+const localEventDispatchers = new Map<string, EventListener>();
+
+function openLocalEventSource() {
+  if (localEventSource) return localEventSource;
+  const source = new EventSource(resolveTaskboardUrl("/api/events"));
+  localEventSource = source;
+  source.addEventListener("open", () => {
+    for (const subscription of localEventSubscriptions) subscription.onOpen?.();
+  });
+  source.addEventListener("error", () => {
+    for (const subscription of localEventSubscriptions) subscription.onError?.();
+  });
+  return source;
+}
+
+export function subscribeLocalEvents(
+  eventNames: readonly string[],
+  callbacks: Omit<LocalEventSubscription, "eventNames">,
+): () => void {
+  if (eventNames.length === 0) return () => {};
+  const source = openLocalEventSource();
+  const subscription: LocalEventSubscription = {
+    ...callbacks,
+    eventNames: new Set(eventNames),
+  };
+  localEventSubscriptions.add(subscription);
+  for (const name of subscription.eventNames) {
+    if (localEventDispatchers.has(name)) continue;
+    const dispatcher: EventListener = (event) => {
+      for (const subscriber of localEventSubscriptions) {
+        if (subscriber.eventNames.has(name)) subscriber.onEvent(event as MessageEvent<string>);
+      }
+    };
+    localEventDispatchers.set(name, dispatcher);
+    source.addEventListener(name, dispatcher);
+  }
+
+  return () => {
+    if (!localEventSubscriptions.delete(subscription)) return;
+    for (const name of subscription.eventNames) {
+      if ([...localEventSubscriptions].some((subscriber) => subscriber.eventNames.has(name))) continue;
+      const dispatcher = localEventDispatchers.get(name);
+      if (dispatcher) source.removeEventListener(name, dispatcher);
+      localEventDispatchers.delete(name);
+    }
+    if (localEventSubscriptions.size === 0 && localEventSource === source) {
+      source.close();
+      localEventSource = null;
+      localEventDispatchers.clear();
+    }
+  };
+}
 
 export function setCurrentUserActor(actor?: ActorIdentity) {
   currentUserActor = actor?.type === "user" ? actor : DEFAULT_USER_ACTOR;
@@ -242,6 +312,13 @@ export async function getAutomaticExecutionSettings(signal?: AbortSignal): Promi
     "/api/local/settings/automatic-execution", { signal },
   );
   return data.setting;
+}
+
+/** Local VM requests share actor headers, base-path handling and bounded cancellation. */
+export function requestVmDownloads<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return requestPackageBounded<T>(`/api/local/vm-downloads${path}`, init, () => new ApiError(0, {
+    error: { code: "VM_DOWNLOAD_REQUEST_TIMEOUT" },
+  }));
 }
 
 export async function updateAutomaticExecutionSettings(input: {
@@ -553,13 +630,19 @@ export function subscribeAiChatThread(
   onHint: (type: "ai.event" | "ai.run") => void,
   onError?: () => void,
 ): () => void {
-  const source = new EventSource(
-    resolveTaskboardUrl(`/api/local/ai/threads/${encodeURIComponent(threadId)}/events`),
-  );
-  source.addEventListener("ai.event", () => onHint("ai.event"));
-  source.addEventListener("ai.run", () => onHint("ai.run"));
-  if (onError) source.addEventListener("error", onError);
-  return () => source.close();
+  return subscribeLocalEvents(["ai.thread.updated"], {
+    onEvent: (event) => {
+      let payload: { threadId?: string; hintType?: string };
+      try {
+        payload = JSON.parse(event.data) as { threadId?: string; hintType?: string };
+      } catch {
+        return;
+      }
+      if (payload.threadId !== threadId) return;
+      if (payload.hintType === "ai.event" || payload.hintType === "ai.run") onHint(payload.hintType);
+    },
+    ...(onError ? { onError } : {}),
+  });
 }
 
 export async function listDeviceWorkspaces(signal?: AbortSignal): Promise<Record<string, string>> {
@@ -811,6 +894,23 @@ export async function getFeishuPackage(alias: string): Promise<FeishuPackage> {
   return data.package;
 }
 
+export function getFeishuPackageWorkflowDraft<Config = FeishuVmPmoWorkflowConfig>(subjectKey: string, alias: string, signal?: AbortSignal): Promise<FeishuPackageWorkflowDraft<Config>> {
+  return request<FeishuPackageWorkflowDraft<Config>>(`/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/${encodeURIComponent(alias)}`, { signal });
+}
+
+export function saveFeishuPackageWorkflowDraft<Config extends FeishuVmPmoWorkflowConfig | FeishuZipWorkflowConfig>(subjectKey: string, alias: string, expectedRevision: number, config: Config): Promise<FeishuPackageWorkflowDraft<Config>> {
+  return request<FeishuPackageWorkflowDraft<Config>>(`/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/${encodeURIComponent(alias)}`, {
+    method: "PUT", body: JSON.stringify({ expectedRevision, config }),
+  });
+}
+
+export async function enableFeishuPackageWorkflowDraft(subjectKey: string, alias: string, expectedRevision: number, expectedVersion: number): Promise<FeishuSubjectConfig> {
+  const result = await request<{ subject: FeishuSubjectConfig }>(`/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/${encodeURIComponent(alias)}/enable`, {
+    method: "POST", body: JSON.stringify({ expectedRevision, expectedVersion }),
+  });
+  return result.subject;
+}
+
 export async function saveFeishuPackageDraft(
   alias: string | null,
   patch: AutoCutPackageDraft & { expectedRevision?: number },
@@ -964,6 +1064,20 @@ export async function importFeishuWorkflowShare(
   return request<FeishuWorkflowShareResult>("/api/local/feishu/workflow/share/import", {
     method: "POST",
     body: JSON.stringify({ configuration, dryRun }),
+  });
+}
+
+export async function exportFeishuSubjectWorkflowShare(subjectKey: string, packageAlias: string): Promise<FeishuSubjectWorkflowShareConfiguration> {
+  const query = new URLSearchParams({ subjectKey, packageAlias });
+  const data = await request<{ configuration: FeishuSubjectWorkflowShareConfiguration }>(
+    `/api/local/feishu/workflow/subject-share/export?${query}`,
+  );
+  return data.configuration;
+}
+
+export function importFeishuSubjectWorkflowShare(input: FeishuSubjectWorkflowShareInput): Promise<FeishuSubjectWorkflowShareResult> {
+  return request<FeishuSubjectWorkflowShareResult>("/api/local/feishu/workflow/subject-share/import", {
+    method: "POST", body: JSON.stringify(input),
   });
 }
 
@@ -1364,15 +1478,59 @@ export async function getTaskAutoCutRuns(
   return data.runs;
 }
 
+export function getPackageWorkflowBoard(subjectKey: string, packageAlias: string, signal?: AbortSignal): Promise<import("./types").PackageBoardResponse> {
+  return request(`/api/local/feishu/package-board?${new URLSearchParams({subjectKey,packageAlias})}`, {signal});
+}
+
+export function savePackageWorkflowBoard(settings: import("./types").PackageBoardSettings): Promise<{settings: import("./types").PackageBoardSettings}> {
+  const {subjectKey,packageAlias,revision,views,activeViewId,defaultViewId,stageDisplays}=settings;
+  return request("/api/local/feishu/package-board", {method:"PATCH",body:JSON.stringify({subjectKey,packageAlias,revision,views,activeViewId,defaultViewId,stageDisplays})});
+}
+
+export async function getTaskVmPmoRun(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<VmPmoRunSummary | null> {
+  const data = await request<{ run: VmPmoRunSummary | null }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-run`,
+    { signal },
+  );
+  return data.run;
+}
+
+export async function retryTaskVmPmoPlan(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-run`,
+    { method: "POST", body: JSON.stringify({ version,
+      runConsent: { allowVideoAudioAsr: true, allowConfiguredLocalOutput: true } }) },
+  );
+  return data.run;
+}
+
+export async function retryTaskVmPmoWriteback(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-writeback-retry`,
+    { method: "POST", body: JSON.stringify({ version }) },
+  );
+  return data.run;
+}
+
 export async function retryTaskAutoCut(
   taskId: string,
   version: number,
+  runConsent: AutoCutRunConsent,
 ): Promise<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }> {
   return request<{ task: Task; execution?: unknown; run?: FeishuAutoCutRun }>(
     `/api/local/tasks/${encodeURIComponent(taskId)}/autocut-retry`,
     {
       method: "POST",
-      body: JSON.stringify({ version }),
+      body: JSON.stringify({ version, runConsent }),
     },
   );
 }

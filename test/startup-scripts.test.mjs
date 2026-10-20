@@ -1638,6 +1638,48 @@ test("local check keeps the Node validation import quoted for Windows PowerShell
   assert.doesNotMatch(source, /from "\.\/src\/config\.mjs"/);
 });
 
+test("local check accepts only a validated enabled VM initial package", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-check-vm-package-"));
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const source = await readFile(new URL("../scripts/check-local.ps1", import.meta.url), "utf8");
+  const validationCode = source.match(/\$validationCode = @'\r?\n([\s\S]*?)\r?\n'@/)?.[1];
+  assert.ok(validationCode, "local check validation code is missing");
+  const configPath = join(directory, "bridge.json");
+  const registryPath = join(directory, "packages.json");
+  const workspacePath = join(directory, "vm-package");
+  const manifestPath = join(workspacePath, "PACKAGE-MANIFEST.json");
+  const template = { id: "vm_pmo_review_video", version: 1 };
+  const validate = () => spawnSync(process.execPath,
+    ["--input-type=module", "-e", validationCode, configPath, registryPath],
+    { cwd: root, encoding: "utf8" });
+  try {
+    await mkdir(workspacePath);
+    await writeFile(configPath, JSON.stringify({
+      host: "127.0.0.1", port: 47824, taskboardUrl: "http://127.0.0.1:47823",
+      stateFile: join(directory, "state.json"), tables: [],
+    }));
+    await writeFile(registryPath, JSON.stringify({ version: 1, packages: {
+      vm: { state: "enabled", projectId: "vm", workspacePath,
+        prompt: "VM initial test", workflowTemplate: template },
+    } }));
+    await writeFile(manifestPath, JSON.stringify({ interface: { workflowTemplate: template } }));
+    const valid = validate();
+    assert.ifError(valid.error);
+    assert.equal(valid.status, 0, valid.stderr);
+    assert.deepEqual(JSON.parse(valid.stdout), { tables: 0, packages: 1 });
+
+    await writeFile(manifestPath, JSON.stringify({ interface: {
+      workflowTemplate: { id: "document_draft_zip", version: 1 },
+    } }));
+    const mismatched = validate();
+    assert.ifError(mismatched.error);
+    assert.notEqual(mismatched.status, 0, "changed VM manifest must fail validation");
+    assert.match(mismatched.stderr, /PACKAGE_WORKFLOW_MISMATCH/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("stop script stops only validated PIDs from runtime files", async () => {
   const [source, helper] = await Promise.all([
     readFile(files.stop, "utf8"),

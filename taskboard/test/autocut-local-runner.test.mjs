@@ -6,6 +6,9 @@ import { test } from "node:test";
 
 import { runLocalAutoCut } from "../server/autocut-local-runner.mjs";
 
+// Bound Windows directory-lock cleanup without retrying runtime operations.
+const FIXTURE_CLEANUP_OPTIONS = { recursive: true, force: true, maxRetries: 5, retryDelay: 100 };
+
 async function waitForJson(filename, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -138,7 +141,7 @@ process.stdout.write("fixture complete");
     });
   } finally {
     await rm(capturePath, { force: true });
-    await rm(current.root, { recursive: true, force: true });
+    await rm(current.root, FIXTURE_CLEANUP_OPTIONS);
   }
 });
 
@@ -170,7 +173,7 @@ for (const scenario of ["missing-cli", "denied-auth", "invalid-readiness", "whoa
       }), (error) => error.code === code && !error.message.includes("must-stay-private"));
       await assert.rejects(readFile(capture), { code: "ENOENT" });
     } finally {
-      await rm(current.root, { recursive: true, force: true });
+      await rm(current.root, FIXTURE_CLEANUP_OPTIONS);
     }
   });
 }
@@ -188,7 +191,7 @@ test("uses the configured Lark entrypoint with no taskctl or lark-cli on PATH an
     });
     assert.equal(result.exitCode, 0);
     assert.equal(await readFile(readinessPath, "utf8"), readiness);
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 test("bounds a runtime stuck in preflight and suppresses raw runtime errors", async () => {
@@ -199,7 +202,7 @@ test("bounds a runtime stuck in preflight and suppresses raw runtime errors", as
       environment: { ...process.env, LOCALAPPDATA: current.localAppData },
       preflightTimeoutMs: 500,
     }), { code: "AUTOCUT_PREFLIGHT_TIMEOUT" });
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 test("runtime failure does not expose arbitrary stdout or stderr", async () => {
@@ -209,7 +212,7 @@ test("runtime failure does not expose arbitrary stdout or stderr", async () => {
       run: current.run, packageConfig: current.packageConfig,
       environment: { ...process.env, LOCALAPPDATA: current.localAppData },
     }), (error) => error.code === "autocut_process_failed" && !error.message.includes("must-stay-private"));
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 test("stops a stuck post-preflight run at its overall deadline", async () => {
@@ -220,7 +223,7 @@ test("stops a stuck post-preflight run at its overall deadline", async () => {
       environment: { ...process.env, LOCALAPPDATA: current.localAppData },
       preflightTimeoutMs: 2_000, runTimeoutMs: 3_000,
     }), { code: "AUTOCUT_RUN_TIMEOUT" });
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 test("rejects a read-only readiness file before editing on Windows", { skip: process.platform !== "win32" }, async () => {
@@ -238,7 +241,7 @@ test("rejects a read-only readiness file before editing on Windows", { skip: pro
     assert.equal(await readFile(readinessPath, "utf8"), '{"status":"existing"}');
   } finally {
     await chmod(readinessPath, 0o666);
-    await rm(current.root, { recursive: true, force: true });
+    await rm(current.root, FIXTURE_CLEANUP_OPTIONS);
   }
 });
 
@@ -252,7 +255,7 @@ test("rejects non-user authentication and malformed whoami output without exposi
         environment: { ...process.env, LOCALAPPDATA: current.localAppData },
       }), { code: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE" });
     }
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 for (const scenario of ["js-entrypoint", "native-exe-with-old-cmd", "different-adjacent-node"]) {
@@ -277,7 +280,7 @@ for (const scenario of ["js-entrypoint", "native-exe-with-old-cmd", "different-a
         },
       }), { code: "AUTOCUT_LARK_CLI_UNAVAILABLE" });
       await assert.rejects(readFile(capture), { code: "ENOENT" });
-    } finally { await rm(current.root, { recursive: true, force: true }); }
+    } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
   });
 }
 
@@ -309,7 +312,7 @@ setInterval(() => {}, 1_000);
   } finally {
     controller.abort();
     await rm(readyPath, { force: true });
-    await rm(current.root, { recursive: true, force: true });
+    await rm(current.root, FIXTURE_CLEANUP_OPTIONS);
   }
 });
 
@@ -327,7 +330,7 @@ test("reports an unavailable local runner when its installed script is missing",
         && error?.message === "Auto-Cut local runner is unavailable",
     );
   } finally {
-    await rm(current.root, { recursive: true, force: true });
+    await rm(current.root, FIXTURE_CLEANUP_OPTIONS);
   }
 });
 
@@ -384,7 +387,7 @@ next();
       { phase: "environment_check", status: "complete" },
       ...expected,
     ]);
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 for (const failure of ["throw", "reject"]) {
@@ -408,7 +411,7 @@ for (const failure of ["throw", "reject"]) {
         { phase: "environment_check", status: "complete" },
         { phase: "preflight", status: "complete" },
       ]);
-    } finally { await rm(current.root, { recursive: true, force: true }); }
+    } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
   });
 }
 
@@ -423,7 +426,7 @@ test("an environment failure never publishes environment completion", async () =
       onProgress: (event) => events.push(event),
     }), { code: "AUTOCUT_LARK_IDENTITY_UNAVAILABLE" });
     assert.deepEqual(events, [{ phase: "environment_check", status: "running" }]);
-  } finally { await rm(current.root, { recursive: true, force: true }); }
+  } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
 });
 
 for (const status of ["completed", "resumed"]) {
@@ -445,6 +448,6 @@ setTimeout(() => {}, 900);
       assert.deepEqual(events.at(-1), {
         phase: "preflight", status: status === "completed" ? "complete" : status,
       });
-    } finally { await rm(current.root, { recursive: true, force: true }); }
+    } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
   });
 }

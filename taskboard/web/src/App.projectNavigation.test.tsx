@@ -9,6 +9,12 @@ import { startAutomaticExecutionTestServer } from "../test/automatic-execution-s
 import type { FeishuBaseCatalog, FeishuSubjectConfig, Project, Task } from "./types";
 
 const realFetch = globalThis.fetch;
+type RecoverableWorkflowPanelProps = FeishuWorkflowPanelProps & {
+  onError?: (message: string, context?: string) => void;
+  onErrorClear?: (message?: string, context?: string) => void;
+};
+let workflowPanelCallbacks: RecoverableWorkflowPanelProps;
+let packageManagerCallbacks: { onError?: (message: string) => void };
 
 vi.mock("./api", async (importOriginal) => ({
   ...await importOriginal<typeof import("./api")>(),
@@ -49,23 +55,38 @@ vi.mock("./storage", () => ({
 // The destination page is unrelated to project selection; navigation, App state,
 // UnifiedWorkflowBoard and TaskCard remain real throughout these regressions.
 vi.mock("./components/FeishuPackageManager", () => ({
-  FeishuPackageManager: () => <div role="region" aria-label="Package manager" />,
+  FeishuPackageManager: (props: { onError?: (message: string) => void }) => {
+    packageManagerCallbacks = props;
+    return <div role="region" aria-label="Package manager" />;
+  },
 }));
 
 vi.mock("./components/FeishuWorkflowPanel", () => ({
-  FeishuWorkflowPanel: ({ selectedSubjectKey, onSelectSubject, onOpenLocalSettings, allowAutomaticExecution }: FeishuWorkflowPanelProps) => (
+  FeishuWorkflowPanel: (props: RecoverableWorkflowPanelProps) => {
+    workflowPanelCallbacks = props;
+    const { selectedSubjectKey, onSelectSubject, onOpenLocalSettings, allowAutomaticExecution, onDirtyChange } = props;
+    return (
     <div role="region" aria-label="Subject configuration">
       <button type="button" onClick={() => onSelectSubject(selectedSubjectKey!, true)}>
         Return to subject board
       </button>
-      <button type="button" onClick={onOpenLocalSettings}>Manage local automatic editing</button>
+      <button type="button" onClick={onOpenLocalSettings}>Open local settings</button>
+      <button type="button" onClick={() => onDirtyChange?.(true)}>Edit configuration draft</button>
+      <button type="button" onClick={() => onSelectSubject("second", false)}>Configure second subject</button>
+      <span>Editing subject: {selectedSubjectKey}</span>
       <span>Machine automatic editing: {String(allowAutomaticExecution)}</span>
     </div>
-  ),
+    );
+  },
 }));
 
 vi.mock("./components/UnifiedWorkflowStageSettings", () => ({
   UnifiedWorkflowStageSettings: () => <div role="region" aria-label="Stage display settings" />,
+}));
+
+// Detail content is passive here; App still owns opening, Escape and URL state.
+vi.mock("./components/TaskDetail", () => ({
+  TaskDetail: ({ task }: { task: Task }) => <section aria-label={`${task.identifier} issue details`} />,
 }));
 
 const NOW = "2026-09-15T03:00:00.000Z";
@@ -189,6 +210,12 @@ async function renderFirstSubject() {
   await act(async () => {});
 }
 
+function sidebarPointer(target: Element | Window, type: string, clientX: number, pointerId = 1) {
+  const event = new MouseEvent(type, { bubbles: true, clientX, button: 0 });
+  Object.defineProperties(event, { pointerId: { value: pointerId }, isPrimary: { value: true } });
+  fireEvent(target, event);
+}
+
 describe("App project navigation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -257,6 +284,68 @@ describe("App project navigation", () => {
     vi.unstubAllGlobals();
   });
 
+  it("resizes the navigation sidebar by dragging its edge and restores the width after reload", async () => {
+    vi.stubGlobal("innerWidth", 1280);
+    const first = render(<App />);
+    await waitFor(() => expect(subjectButton(FIRST_SUBJECT)).toBeTruthy());
+    const handle = screen.getByRole("separator", { name: "Resize navigation sidebar" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("220");
+    Object.assign(handle, {
+      setPointerCapture: vi.fn(), hasPointerCapture: () => true, releasePointerCapture: vi.fn(),
+    });
+    sidebarPointer(handle, "pointerdown", 220);
+    sidebarPointer(window, "pointermove", 340);
+    expect(handle.getAttribute("aria-valuenow")).toBe("340");
+    expect((document.querySelector(".app-shell") as HTMLElement).style.getPropertyValue("--taskboard-sidebar-width")).toBe("340px");
+    expect(window.localStorage.getItem("taskboard.sidebar-layout.v1")).toBeNull();
+    sidebarPointer(window, "pointerup", 340);
+    first.unmount();
+    render(<App />);
+    await waitFor(() => expect(subjectButton(FIRST_SUBJECT)).toBeTruthy());
+    expect(screen.getByRole("separator", { name: "Resize navigation sidebar" }).getAttribute("aria-valuenow")).toBe("340");
+  });
+
+  it("cancels an unfinished sidebar drag without saving a different width", async () => {
+    vi.stubGlobal("innerWidth", 1280);
+    await renderFirstSubject();
+    fireEvent.click(await screen.findByRole("button", { name: `Open ${FIRST_TASK.identifier}: ${FIRST_TASK.title}` }));
+    expect(screen.getByRole("region", { name: `${FIRST_TASK.identifier} issue details` })).toBeTruthy();
+    const handle = screen.getByRole("separator", { name: "Resize navigation sidebar" });
+    Object.assign(handle, {
+      setPointerCapture: vi.fn(), hasPointerCapture: () => true, releasePointerCapture: vi.fn(),
+    });
+    sidebarPointer(handle, "pointerdown", 220);
+    sidebarPointer(window, "pointermove", 400);
+    fireEvent.keyDown(handle, { key: "Escape" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("220");
+    expect(screen.getByRole("region", { name: `${FIRST_TASK.identifier} issue details` })).toBeTruthy();
+    expect(window.localStorage.getItem("taskboard.sidebar-layout.v1")).toBeNull();
+    sidebarPointer(window, "pointerup", 400);
+    expect(handle.getAttribute("aria-valuenow")).toBe("220");
+  });
+
+  it("bounds sidebar keyboard resizing and restores the preference after a narrow viewport", async () => {
+    vi.stubGlobal("innerWidth", 1280);
+    await renderFirstSubject();
+    const handle = screen.getByRole("separator", { name: "Resize navigation sidebar" });
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("236");
+    fireEvent.keyDown(handle, { key: "End" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("480");
+    vi.stubGlobal("innerWidth", 900);
+    fireEvent(window, new Event("resize"));
+    expect(handle.getAttribute("aria-valuenow")).toBe("460");
+    vi.stubGlobal("innerWidth", 720);
+    fireEvent(window, new Event("resize"));
+    expect(screen.queryByRole("separator", { name: "Resize navigation sidebar" })).toBeNull();
+    vi.stubGlobal("innerWidth", 1280);
+    fireEvent(window, new Event("resize"));
+    const restored = screen.getByRole("separator", { name: "Resize navigation sidebar" });
+    expect(restored.getAttribute("aria-valuenow")).toBe("480");
+    fireEvent.keyDown(restored, { key: "Home" });
+    expect(restored.getAttribute("aria-valuenow")).toBe("200");
+  });
+
   it("keeps task cards when returning from Auto-Cut packages to the same sidebar subject", async () => {
     await renderFirstSubject();
     expect(await screen.findByText(FIRST_TASK.title)).toBeTruthy();
@@ -277,12 +366,12 @@ describe("App project navigation", () => {
     await renderFirstSubject();
     fireEvent.click(screen.getByRole("button", { name: "Local settings" }));
     const dialog = screen.getByRole("dialog", { name: "Local settings" });
-    const toggle = await within(dialog).findByRole("switch", { name: "Allow automatic editing on this device" });
+    const toggle = await within(dialog).findByRole("switch", { name: "Automatic execution" });
     await waitFor(() => expect((toggle as HTMLInputElement).disabled).toBe(false));
     expect((toggle as HTMLInputElement).checked).toBe(false);
-    expect(within(dialog).getByText(/all subjects on this device/)).toBeTruthy();
-    expect(within(dialog).getByText(/Running tasks will continue/)).toBeTruthy();
-    expect(within(dialog).getByText(/historical tasks/)).toBeTruthy();
+    expect(within(dialog).queryByText(/all subjects on this device/)).toBeNull();
+    expect(within(dialog).queryByText(/Running tasks will continue/)).toBeNull();
+    expect(within(dialog).queryByText(/historical tasks/)).toBeNull();
     fireEvent.click(toggle);
     expect(api.updateAutomaticExecutionSettings).toHaveBeenCalledWith({ enabled: true, expectedVersion: 1 });
     expect((toggle as HTMLInputElement).checked).toBe(false);
@@ -293,7 +382,7 @@ describe("App project navigation", () => {
     openFirstSubjectConfiguration();
     expect(screen.getByText("Machine automatic editing: true")).toBeTruthy();
     vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 3 });
-    fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open local settings" }));
     await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
     expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(false);
   });
@@ -314,7 +403,7 @@ describe("App project navigation", () => {
     await waitFor(() => expect((screen.getByRole("switch") as HTMLInputElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     openFirstSubjectConfiguration();
-    fireEvent.click(screen.getByRole("button", { name: "Manage local automatic editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open local settings" }));
     expect(await screen.findByRole("dialog", { name: "Local settings" })).toBeTruthy();
     await act(async () => {});
   });
@@ -421,7 +510,7 @@ describe("App project navigation", () => {
     rerender(view("zh"));
     vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
     await act(async () => pending.resolve({ enabled: true, version: 2 }));
-    expect((screen.getByRole("switch", { name: "允许本机自动剪辑" }) as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByRole("switch", { name: "自动执行" }) as HTMLInputElement).disabled).toBe(false);
     expect((screen.getByRole("switch") as HTMLInputElement).checked).toBe(true);
   });
 
@@ -459,6 +548,91 @@ describe("App project navigation", () => {
     expect(screen.queryByRole("region", { name: "Subject configuration" })).toBeNull();
   });
 
+  it("clears a recovered workflow error from the global banner", async () => {
+    await renderFirstSubject();
+    openFirstSubjectConfiguration();
+    act(() => workflowPanelCallbacks.onError?.("Workflow draft needs repair", "profile-a"));
+    expect(screen.getByRole("alert").textContent).toContain("Workflow draft needs repair");
+    act(() => workflowPanelCallbacks.onErrorClear?.("Workflow draft needs repair", "profile-a"));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("clears the closed configuration error when switching to another board view", async () => {
+    await renderFirstSubject();
+    openFirstSubjectConfiguration();
+    const previousCallbacks = workflowPanelCallbacks;
+    act(() => previousCallbacks.onError?.("Closed configuration error", "profile-a"));
+    expect(screen.getByRole("alert").textContent).toContain("Closed configuration error");
+
+    fireEvent.click(screen.getByRole("button", { name: "List" }));
+    expect(screen.queryByRole("region", { name: "Subject configuration" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    act(() => previousCallbacks.onError?.("Late configuration error", "profile-a"));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("preserves an unrelated error when closing the same subject configuration", async () => {
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Auto-Cut packages" }));
+    const reportUnrelatedError = packageManagerCallbacks.onError;
+    fireEvent.click(subjectButton(FIRST_SUBJECT));
+    openFirstSubjectConfiguration();
+    act(() => workflowPanelCallbacks.onError?.("Configuration error", "profile-a"));
+    act(() => reportUnrelatedError?.("Unrelated package error"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Return to subject board" }));
+    expect(screen.queryByRole("region", { name: "Subject configuration" })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain("Unrelated package error");
+  });
+
+  it("keeps a newer profile error when an earlier profile recovers", async () => {
+    await renderFirstSubject();
+    openFirstSubjectConfiguration();
+    act(() => workflowPanelCallbacks.onError?.("Workflow draft needs repair", "profile-a"));
+    act(() => workflowPanelCallbacks.onError?.("Workflow draft needs repair", "profile-b"));
+    act(() => workflowPanelCallbacks.onErrorClear?.("Workflow draft needs repair", "profile-a"));
+    expect(screen.getByRole("alert").textContent).toContain("Workflow draft needs repair");
+  });
+
+  it("ignores recovery and error callbacks from a previously selected subject", async () => {
+    await renderFirstSubject();
+    openFirstSubjectConfiguration();
+    const previousCallbacks = workflowPanelCallbacks;
+    fireEvent.click(screen.getByRole("button", { name: "Configure second subject" }));
+    expect(screen.getByText("Editing subject: second")).toBeTruthy();
+    act(() => workflowPanelCallbacks.onError?.("Current workflow error", "profile-current"));
+    act(() => previousCallbacks.onError?.("Stale workflow error", "profile-old"));
+    act(() => previousCallbacks.onErrorClear?.("Current workflow error", "profile-current"));
+    expect(screen.getByRole("alert").textContent).toContain("Current workflow error");
+    expect(screen.queryByText("Stale workflow error")).toBeNull();
+  });
+
+  it("ignores callbacks from a closed configuration after reopening the same subject", async () => {
+    await renderFirstSubject();
+    openFirstSubjectConfiguration();
+    const previousCallbacks = workflowPanelCallbacks;
+    fireEvent.click(screen.getByRole("button", { name: "Return to subject board" }));
+    openFirstSubjectConfiguration();
+    act(() => workflowPanelCallbacks.onError?.("Workflow draft needs repair", "profile-a"));
+    act(() => previousCallbacks.onErrorClear?.("Workflow draft needs repair", "profile-a"));
+    expect(screen.getByRole("alert").textContent).toContain("Workflow draft needs repair");
+    act(() => previousCallbacks.onError?.("Stale workflow error", "profile-a"));
+    expect(screen.getByRole("alert").textContent).toContain("Workflow draft needs repair");
+    expect(screen.queryByText("Stale workflow error")).toBeNull();
+  });
+
+  it("preserves an unrelated action error with identical text when the workflow recovers", async () => {
+    await renderFirstSubject();
+    fireEvent.click(screen.getByRole("button", { name: "Auto-Cut packages" }));
+    const reportUnrelatedError = packageManagerCallbacks.onError;
+    fireEvent.click(subjectButton(FIRST_SUBJECT));
+    openFirstSubjectConfiguration();
+    act(() => workflowPanelCallbacks.onError?.("Shared error text", "profile-a"));
+    act(() => reportUnrelatedError?.("Shared error text"));
+    act(() => workflowPanelCallbacks.onErrorClear?.("Shared error text", "profile-a"));
+    expect(screen.getByRole("alert").textContent).toContain("Shared error text");
+  });
+
   it("does not mount stage name and description editing in subject configuration", async () => {
     await renderFirstSubject();
 
@@ -467,6 +641,43 @@ describe("App project navigation", () => {
     await waitFor(() => expect(api.getUnifiedWorkflowStageDisplays).toHaveBeenCalled());
     await act(async () => {});
     await waitFor(() => expect(screen.queryByRole("region", { name: "Stage display settings" })).toBeNull());
+  });
+
+  it("retains configuration navigation and confirms before leaving unsaved drafts", async () => {
+    await renderFirstSubject();
+    openFirstSubjectConfiguration();
+    fireEvent.click(screen.getByRole("button", { name: "Edit configuration draft" }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    fireEvent.click(screen.getByRole("button", { name: "Configure second subject" }));
+    expect(screen.getByText("Editing subject: second")).toBeTruthy();
+    expect(confirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Return to subject board" }));
+    expect(confirm).toHaveBeenCalled();
+    expect(screen.getByRole("region", { name: "Subject configuration" })).toBeTruthy();
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "Return to subject board" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Subject configuration" })).toBeNull());
+    confirm.mockRestore();
+  });
+  it("keeps the editing subject when cancelling a sidebar navigation", async () => {
+    await renderFirstSubject(); openFirstSubjectConfiguration();
+    fireEvent.click(screen.getByRole("button", { name: "Edit configuration draft" }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    fireEvent.click(subjectButton(SECOND_SUBJECT));
+    expect(confirm).toHaveBeenCalled();
+    expect(screen.getByText("Editing subject: first")).toBeTruthy();
+    confirm.mockRestore();
+  });
+  it("warns before browser history navigation discards configuration drafts", async () => {
+    await renderFirstSubject(); openFirstSubjectConfiguration();
+    fireEvent.click(screen.getByRole("button", { name: "Edit configuration draft" }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    window.history.pushState(null, "", `/?project=${SECOND_SUBJECT.projectId}`);
+    fireEvent(window, new PopStateEvent("popstate"));
+    expect(confirm).toHaveBeenCalled();
+    expect(screen.getByText("Editing subject: first")).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("project")).toBe(FIRST_SUBJECT.projectId);
+    confirm.mockRestore();
   });
 
   it.each(["packages", "configuration", "current subject"])(

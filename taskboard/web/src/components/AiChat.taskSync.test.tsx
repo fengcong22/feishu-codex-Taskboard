@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   getCatalog: vi.fn(),
   createThread: vi.fn(),
   startTurn: vi.fn(),
+  startComposerTurn: vi.fn(),
 }));
 
 vi.mock("../api", async (importOriginal) => ({
@@ -24,6 +25,7 @@ vi.mock("../api", async (importOriginal) => ({
   getAiChatCatalog: api.getCatalog,
   createAiChatThread: api.createThread,
   startAiChatTurn: api.startTurn,
+  startAiChatComposerTurn: api.startComposerTurn,
 }));
 
 const STARTED_AT = "2026-09-15T03:00:00.000Z";
@@ -66,6 +68,16 @@ const TASK: Task = {
   version: 1,
   createdAt: STARTED_AT,
   updatedAt: STARTED_AT,
+};
+
+const VM_TASK: Task = {
+  ...TASK,
+  id: "vm-task-1",
+  identifier: "VM-1",
+  feishuPackageSnapshot: {
+    zipSourceDirectory: null,
+    workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
+  },
 };
 
 function thread(id = TASK_THREAD_ID, overrides: Partial<AiChatThread> = {}): AiChatThread {
@@ -119,15 +131,19 @@ const subscribers = new Map<string, Set<Hint>>();
 const snapshots = new Map<string, AiChatThreadSnapshot>();
 
 function Harness({
+  task = TASK,
   taskThreadIds = EMPTY_IDS,
   now = NOW,
   available = true,
   observeThreads,
+  logThreadId,
 }: {
+  task?: Task;
   taskThreadIds?: string[];
   now?: number;
   available?: boolean;
   observeThreads?: (threads: AiChatThread[]) => void;
+  logThreadId?: string;
 }) {
   const [threads, setThreads] = useState<AiChatThread[]>([]);
   const [openThreadRequest, setOpenThreadRequest] = useState<AiChatOpenThreadRequest | null>(null);
@@ -139,7 +155,7 @@ function Harness({
     <>
       <AiChat
         available={available}
-        projectId={TASK.projectId}
+        projectId={task.projectId}
         issueId={null}
         codexProjectIdentity={null}
         taskThreadIds={taskThreadIds}
@@ -147,9 +163,13 @@ function Harness({
         openThreadRequest={openThreadRequest}
         onOpenThreadRequestHandled={() => setOpenThreadRequest(null)}
       />
+      {logThreadId && <button
+        type="button"
+        onClick={() => setOpenThreadRequest({ threadId: logThreadId, requestId: 1 })}
+      >Open run log</button>}
       <TaskCard
-        task={TASK}
-        presentation={taskCardPresentation(TASK, threads, false)}
+        task={task}
+        presentation={taskCardPresentation(task, threads, false)}
         now={now}
         isDragging={false}
         dragShift={0}
@@ -220,6 +240,79 @@ describe("AiChat task execution synchronization", () => {
     vi.useRealTimers();
   });
 
+  it("loads an explicitly requested failed local run absent from the cached thread list", async () => {
+    const local = thread("failed-local-run", { model: "local-autocut", codexThreadId: null, title: "Failed edit" });
+    snapshots.set(local.id, {
+      thread: local,
+      runs: [{ id: "failed-run", threadId: local.id, status: "failed" }],
+      events: [{
+        id: "phase-1", runId: "failed-run", type: "autocut_progress", role: "activity",
+        content: "读取文档 · 失败", data: { phase: "document_fetch", status: "failed" },
+      }],
+    });
+    render(<Harness logThreadId={local.id} />);
+    await settle();
+    expect(api.getThread).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open run log" }));
+    await settle();
+
+    const panel = screen.getByRole("region", { name: "Auto-Cut execution" });
+    expect(within(panel).getByText("Failed edit")).toBeTruthy();
+    expect(within(panel).getByText("Auto-Cut failed")).toBeTruthy();
+    expect(within(panel).getByRole("list", { name: "Auto-Cut progress" }).textContent).toContain("读取文档 · 失败");
+    expect(within(panel).queryByRole("textbox", { name: "Message to Codex" })).toBeNull();
+    expect(api.getThread).toHaveBeenCalledWith(local.id);
+    expect(api.createThread).not.toHaveBeenCalled();
+    expect(api.startTurn).not.toHaveBeenCalled();
+    expect(api.startComposerTurn).not.toHaveBeenCalled();
+  });
+
+  it("shows the lookup error for an explicitly requested missing thread", async () => {
+    api.getThread.mockRejectedValue(new Error("The requested conversation was not found"));
+    render(<Harness logThreadId="missing-run-thread" />);
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open run log" }));
+    await settle();
+
+    expect(screen.getByRole("alert").textContent).toContain("The requested conversation was not found");
+    expect(api.getThread).toHaveBeenCalledWith("missing-run-thread");
+    expect(api.createThread).not.toHaveBeenCalled();
+    expect(api.startTurn).not.toHaveBeenCalled();
+    expect(api.startComposerTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["empty", "unrelated"] as const)(
+    "keeps an explicitly requested uncached run selected when a delayed %s list arrives",
+    async (listKind) => {
+      const initial = deferred<AiChatThread[]>();
+      api.listThreads.mockReturnValueOnce(initial.promise);
+      const local = thread("historical-local-run", { model: "local-autocut", codexThreadId: null, title: "Historical edit" });
+      snapshots.set(local.id, {
+        thread: local, events: [], runs: [{ id: "historical-run", threadId: local.id, status: "failed" }],
+      });
+      const unrelated = thread("personal-thread");
+      snapshots.set(unrelated.id, snapshot(unrelated));
+      render(<Harness logThreadId={local.id} />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Open run log" }));
+      await settle();
+      expect(screen.getByText("Historical edit")).toBeTruthy();
+
+      await act(async () => initial.resolve(listKind === "empty" ? [] : [unrelated]));
+
+      const panel = screen.getByRole("region", { name: "Auto-Cut execution" });
+      expect(within(panel).getByText("Historical edit")).toBeTruthy();
+      expect(within(panel).getByText("Auto-Cut failed")).toBeTruthy();
+      expect(taskboardStorage.getItem("taskboard.aiChat.lastThreadId")).toBe(local.id);
+      expect(api.getThread).not.toHaveBeenCalledWith(unrelated.id);
+      expect(api.createThread).not.toHaveBeenCalled();
+      expect(api.startTurn).not.toHaveBeenCalled();
+      expect(api.startComposerTurn).not.toHaveBeenCalled();
+    },
+  );
+
   it("discovers a task thread created after its binding arrives without remounting or opening chat", async () => {
     const view = render(<Harness />);
     await settle();
@@ -246,6 +339,15 @@ describe("AiChat task execution synchronization", () => {
     const callsAfterDiscovery = api.listThreads.mock.calls.length;
     await advance(6_000);
     expect(api.listThreads).toHaveBeenCalledTimes(callsAfterDiscovery);
+  });
+
+  it("shows elapsed VM editing time without waiting for a Codex conversation", async () => {
+    render(<Harness task={VM_TASK} />);
+    await settle();
+
+    expect(screen.getByText("VM editing · 5s")).toBeTruthy();
+    expect(screen.queryByText("Waiting for Codex...")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Codex AI chat" })).toBeNull();
   });
 
   it("subscribes to an initially idle task thread and renders its later running snapshot", async () => {

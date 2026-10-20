@@ -242,8 +242,9 @@ kbd {
 }
 
 .app-shell {
+  position: relative;
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: var(--taskboard-sidebar-width, 220px) minmax(0, 1fr);
   width: 100%;
   height: 100vh;
   overflow: hidden;
@@ -258,11 +259,43 @@ kbd {
   z-index: 2;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   height: 100vh;
   padding: 10px 8px 8px;
   overflow: auto;
   background: var(--sidebar-bg);
   border-right: var(--border-hairline) solid var(--border);
+}
+
+.taskboard-sidebar-resizer {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--taskboard-sidebar-width, 220px) - 4px);
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.taskboard-sidebar-resizer::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  content: "";
+}
+
+.taskboard-sidebar-resizer:hover::after,
+.taskboard-sidebar-resizer:focus-visible::after,
+.app-shell.is-resizing-sidebar .taskboard-sidebar-resizer::after {
+  background: var(--accent);
+}
+
+.app-shell.is-resizing-sidebar,
+.app-shell.is-resizing-sidebar * {
+  cursor: col-resize !important;
 }
 
 .brand-row {
@@ -404,6 +437,10 @@ kbd {
 .feishu-package-actions button:disabled,
 .feishu-package-row button:disabled { cursor: not-allowed; opacity: .48; }
 .feishu-package-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.feishu-package-editor-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+.feishu-package-editor-tabs button { padding: 6px 10px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); color: var(--text-secondary); cursor: pointer; }
+.feishu-package-editor-tabs button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--text-primary); }
+.feishu-package-editor-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .feishu-package-actions .danger { color: var(--danger); }
 .feishu-package-table-header,
 .feishu-package-row { display: grid; grid-template-columns: minmax(90px, 1.35fr) 42px minmax(76px, 1fr) 30px 30px 76px; align-items: center; gap: 8px; }
@@ -6378,6 +6415,56 @@ kbd {
 .local-settings-help p { margin-top: 9px; line-height: 1.7; }
 .local-settings-dialog .local-settings-status { margin-top: 14px; }
 
+.vm-downloads-panel { margin-top: 20px; color: var(--text-primary); }
+.vm-downloads-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.vm-downloads-heading h3 { margin: 0; font-size: 15px; }
+.vm-downloads-heading > .button { flex: 0 0 auto; }
+.vm-downloads-panel p { margin: 7px 0 0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.vm-downloads-heading p, .vm-downloads-panel .vm-downloads-help { color: var(--text-secondary); }
+.vm-downloads-session { margin-top: 16px; padding: 14px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); }
+.vm-downloads-session-heading { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; }
+.vm-downloads-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.vm-downloads-login a { color: var(--accent); text-decoration: underline; }
+.vm-downloads-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; min-width: 0; padding: 0; margin: 20px 0 0; border: 0; }
+.vm-downloads-form legend { padding: 0; margin-bottom: 12px; font-size: 13px; font-weight: 600; }
+.vm-downloads-form label { display: grid; gap: 6px; min-width: 0; color: var(--text-secondary); font-size: 12px; }
+.vm-downloads-wide { grid-column: 1 / -1; }
+.vm-downloads-form input:not([type="checkbox"]), .vm-downloads-form textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text-primary); font: inherit; }
+.vm-downloads-form textarea { min-height: 76px; resize: vertical; font-family: ui-monospace, monospace; }
+.vm-downloads-form input:focus-visible, .vm-downloads-form textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.vm-downloads-form .vm-downloads-checkbox { display: flex; align-items: center; gap: 8px; }
+.vm-downloads-checkbox input { margin: 0; accent-color: var(--accent); }
+.vm-downloads-form .vm-downloads-help, .vm-downloads-form .vm-downloads-actions { margin-top: 0; }
+.vm-downloads-panel .vm-downloads-error, .vm-downloads-panel .vm-downloads-job-error { color: var(--danger); }
+.vm-downloads-auth-alert { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; padding: 12px; border: 1px solid var(--danger); border-left-width: 4px; border-radius: 6px; background: var(--surface-raised); }
+.vm-downloads-auth-alert strong { color: var(--danger); font-size: 13px; }
+.vm-downloads-auth-alert p { margin-top: 4px; color: var(--text-secondary); }
+@media (max-width: 560px) { .vm-downloads-auth-alert { align-items: stretch; flex-direction: column; } }
+.vm-downloads-queue { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border-strong); }
+.vm-downloads-queue-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.vm-downloads-queue h4 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; }
+.vm-downloads-queue h4 span { color: var(--text-secondary); font-weight: 400; }
+.vm-downloads-queue-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.vm-downloads-select-all, .vm-downloads-job-select { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 12px; }
+.vm-downloads-select-all input, .vm-downloads-job-select input { margin: 0; accent-color: var(--accent); }
+.vm-downloads-queue ul { display: grid; gap: 10px; padding: 0; margin: 12px 0 0; list-style: none; }
+.vm-downloads-job { min-width: 0; padding: 12px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); }
+.vm-downloads-job-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; }
+.vm-downloads-job-select { margin-right: auto; }
+.vm-downloads-job code { overflow-wrap: anywhere; }
+.vm-downloads-badge { padding: 3px 7px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-size: 11px; white-space: nowrap; }
+.vm-downloads-state-rejected, .vm-downloads-state-canceled, .vm-downloads-state-dead_letter, .vm-downloads-state-needs_attention, .vm-downloads-state-auth_required { color: var(--danger); background: var(--surface-raised); }
+.vm-downloads-job dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 10px 0 0; font-size: 11px; line-height: 1.6; }
+.vm-downloads-job dt { color: var(--text-secondary); }
+.vm-downloads-job dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .vm-downloads-heading { flex-direction: column; gap: 10px; }
+  .vm-downloads-form { grid-template-columns: minmax(0, 1fr); }
+  .vm-downloads-job dl { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .vm-downloads-job dd { margin-bottom: 5px; }
+  .vm-downloads-actions .button { flex: 1 1 auto; }
+}
+
 .delete-dialog .jira-http-warning {
   margin-top: 7px;
   color: var(--warning-text, #9a6700);
@@ -9686,6 +9773,7 @@ kbd {
 }
 
 @media (max-width: 840px) {
+  .taskboard-sidebar-resizer { display: none; }
   .workflow-board {
     --workflow-library-width: 184px;
   }
@@ -13578,6 +13666,7 @@ kbd {
 .autocut-run-summary-heading button { display: inline-flex; align-items: center; gap: 5px; }
 .autocut-run-summary-heading button svg { width: 13px; height: 13px; }
 .autocut-run-retrying { color: var(--accent); font-size: 9px; }
+.autocut-retry-consent { margin: 8px 0; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
 .autocut-run-list { display: grid; gap: 6px; margin: 9px 0 0; padding: 0; list-style: none; }
 .autocut-run-row { min-width: 0; padding: 8px 9px; border: var(--border-hairline) solid var(--border); border-radius: 5px; background: var(--surface-muted); }
 .autocut-run-row-main, .autocut-run-row-meta { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
@@ -13589,6 +13678,27 @@ kbd {
 .autocut-run-row-meta code { color: var(--text-secondary); }
 .autocut-run-error { display: flex; min-width: 0; flex-wrap: wrap; gap: 6px; margin-top: 7px; color: var(--danger); font-size: 9px; }
 .autocut-run-error span { overflow-wrap: anywhere; }
+.autocut-run-error { font-size: 12px; line-height: 1.5; }
+.autocut-diagnostic { margin-top: 8px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.autocut-diagnostic summary { cursor: pointer; color: var(--text-primary); font-weight: 600; }
+.autocut-diagnostic p { margin: 8px 0; }
+.autocut-diagnostic-context { color: var(--text-tertiary); }
+.autocut-diagnostic h3 { margin: 8px 0 4px; font-size: 12px; }
+.autocut-diagnostic ul { margin: 0; padding-left: 20px; }
+.autocut-diagnostic-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.autocut-diagnostic-actions .button { min-height: 28px; font-size: 11px; }
+
+.vm-pmo-run-summary { display: grid; gap: 8px; margin: 0 0 14px; padding: 10px; border: var(--border-hairline) solid var(--border); border-radius: 5px; background: var(--surface-muted); }
+.vm-pmo-run-heading, .vm-pmo-run-meta { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.vm-pmo-run-heading strong { font-size: 12px; font-weight: 600; }
+.vm-pmo-run-state, .vm-pmo-run-meta { color: var(--text-tertiary); font-size: 10px; }
+.vm-pmo-run-state.is-blocked, .vm-pmo-run-error-code { color: var(--danger); }
+.vm-pmo-run-meta code, .vm-pmo-retry-history code { overflow-wrap: anywhere; }
+.vm-pmo-retry-history { display: grid; gap: 4px; margin: 0; padding-left: 18px; color: var(--text-secondary); font-size: 10px; }
+.vm-pmo-retry-consent { display: grid; gap: 8px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.vm-pmo-retry-consent label { display: flex; align-items: flex-start; gap: 7px; }
+.vm-pmo-retry-consent input { flex: 0 0 auto; margin: 2px 0 0; }
+.vm-pmo-retry-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 
 @media (max-width: 1000px) {
   .feishu-workflow-panel {
@@ -13702,6 +13812,70 @@ kbd {
 .unified-workflow-main > .unified-workflow-board {
   width: 100%;
 }
+
+.package-workflow-workspace {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  position: relative;
+}
+.package-workflow-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.package-workflow-toolbar label { display: flex; align-items: center; gap: 6px; }
+.package-workflow-toolbar select, .package-workflow-settings input:not([type="checkbox"]), .package-workflow-settings select {
+  background: var(--bg);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 7px;
+  max-width: 260px;
+}
+.package-workflow-toolbar button, .package-workflow-history button, .package-workflow-error button {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 8px;
+  background: var(--bg);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.package-workflow-automatic-note { color: var(--text-tertiary); }
+.package-workflow-settings {
+  position: absolute;
+  z-index: 20;
+  top: 48px;
+  left: 10px;
+  width: min(520px, calc(100% - 20px));
+  max-height: calc(100% - 60px);
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  box-shadow: 0 8px 24px #0003;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.package-workflow-settings-heading { display: flex; justify-content: space-between; width: 100%; align-items: center; }
+.package-workflow-stage-settings { display: grid; gap: 8px; width: 100%; }
+.package-workflow-stage-settings > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.package-workflow-stage-settings > div > input { min-width: 0; width: 45%; }
+.package-workflow-error { padding: 10px; color: var(--text-primary); }
+.package-workflow-error button { margin-left: 8px; }
+.package-workflow-card-evidence { display: flex; flex-direction: column; gap: 4px; padding: 4px 8px 8px; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.package-workflow-history { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 10px; max-height: 140px; overflow: auto; }
+.package-workflow-workspace .unified-workflow-column-header h2 { margin: 0; font-size: 12px; }
 
 .unified-workflow-board {
   display: flex;
@@ -14709,17 +14883,20 @@ kbd {
 }
 
 .feishu-configuration-stack .feishu-subject-settings {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: max-content max-content minmax(0, 1fr) max-content;
-  gap: 16px;
-  padding: 26px clamp(20px, 3vw, 36px) 0;
-  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 12px;
+  padding: 18px clamp(20px, 3vw, 36px) 0;
+  overflow-x: hidden;
+  overflow-y: hidden;
   background: var(--feishu-config-bg);
+  overscroll-behavior: contain;
 }
 
-.feishu-configuration-stack .feishu-subject-settings:has(.feishu-field-refresh-feedback) {
-  grid-template-rows: max-content max-content max-content minmax(0, 1fr) max-content;
+/* Optional profile summaries and feedback must not change which child scrolls. */
+.feishu-configuration-stack .feishu-subject-settings > * {
+  flex: 0 0 auto;
 }
 
 .feishu-configuration-stack .feishu-subject-settings-header {
@@ -14818,6 +14995,51 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
   font-weight: 600;
 }
 
+.feishu-configuration-stack .feishu-package-context {
+  padding: 8px 12px 12px;
+}
+
+.feishu-configuration-stack .feishu-package-context-grid {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(0, 1.4fr);
+  align-items: center;
+  gap: 8px 18px;
+  min-width: 0;
+}
+
+.feishu-configuration-stack .feishu-package-context-grid > label {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.feishu-configuration-stack .feishu-package-context-grid select {
+  width: 100%;
+  min-width: 0;
+}
+
+.feishu-configuration-stack .feishu-package-status {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.feishu-configuration-stack .feishu-package-status p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.feishu-configuration-stack .feishu-package-dirty-hint {
+  display: block;
+  margin-top: 8px;
+  color: var(--feishu-config-warning);
+  font-size: 11px;
+}
+
 .feishu-configuration-stack .feishu-config-subsection {
   min-width: 0;
   margin: 0;
@@ -14868,6 +15090,70 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
   color: var(--text-secondary);
   font-size: 11px;
   line-height: 1.6;
+}
+
+.feishu-configuration-stack .feishu-execution-settings {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px 2px 10px;
+  border-bottom: 1px solid var(--feishu-config-line);
+}
+
+.feishu-configuration-stack .feishu-execution-mode-row,
+.feishu-configuration-stack .feishu-execution-policy-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.feishu-configuration-stack .feishu-execution-mode-row > span {
+  min-width: 74px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.feishu-configuration-stack .feishu-execution-mode-control {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--feishu-config-line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.feishu-configuration-stack .feishu-execution-mode-control > button {
+  min-width: 58px;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.feishu-configuration-stack .feishu-execution-mode-control > button.is-active {
+  border-color: var(--feishu-config-line);
+  background: var(--feishu-config-accent-soft);
+  color: var(--feishu-config-accent);
+}
+
+.feishu-configuration-stack .feishu-execution-mode-control > button:focus-visible {
+  outline: 2px solid var(--feishu-config-accent);
+  outline-offset: 2px;
+}
+
+.feishu-configuration-stack .feishu-execution-policy-row {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.feishu-configuration-stack .feishu-execution-policy-row > .button {
+  margin-left: auto;
 }
 
 .feishu-configuration-stack .feishu-phased-settings {
@@ -15077,6 +15363,7 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
 
 .feishu-configuration-stack .feishu-subject-actions {
   position: static;
+  flex: 0 0 auto;
   min-width: 0;
   flex-wrap: nowrap;
   overflow-x: auto;
@@ -15089,6 +15376,14 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
 
 .feishu-configuration-stack .feishu-subject-actions > .button {
   flex: 0 0 auto;
+}
+
+.feishu-configuration-stack .feishu-subject-actions > .feishu-subject-action-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  align-self: center;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {
@@ -15117,8 +15412,17 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
   }
 
   .feishu-configuration-stack .feishu-subject-actions {
+    flex-wrap: wrap;
     margin: 0 -14px;
     padding: 12px 14px 16px;
+  }
+
+  .feishu-configuration-stack .feishu-subject-actions > .feishu-subject-action-note {
+    flex-basis: 100%;
+  }
+
+  .feishu-configuration-stack .feishu-subject-actions > .feishu-subject-action-note + .button {
+    margin-left: auto;
   }
 }
 
@@ -15183,6 +15487,7 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
 
 .feishu-configuration-stack .feishu-settings-tabpanel {
   display: grid;
+  flex: 1 1 auto;
   align-content: start;
   width: min(100%, 1040px);
   min-width: 0;
@@ -15193,6 +15498,76 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+}
+
+.feishu-package-route,
+.feishu-package-route .feishu-settings-grid,
+.feishu-vm-pmo-editor,
+.feishu-vm-pmo-editor > *,
+.feishu-vm-pmo-editor .feishu-settings-grid > * {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.feishu-vm-pmo-editor p {
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+}
+.feishu-vm-pmo-editor h4 {
+  margin: 0 0 8px;
+}
+.feishu-vm-pmo-editor .feishu-vm-stage-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.feishu-vm-pmo-editor .feishu-vm-stage-toggle input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex-shrink: 0;
+}
+.feishu-vm-pmo-editor fieldset > section + section {
+  margin-top: 20px;
+}
+
+.feishu-configuration-stack .feishu-vm-pmo-editor {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.feishu-configuration-stack .feishu-vm-pmo-editor > * {
+  flex: 0 0 auto;
+}
+
+.feishu-configuration-stack .feishu-vm-pmo-summary {
+  display: flex;
+  align-items: center;
+  gap: 4px 14px;
+  flex-wrap: wrap;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.feishu-configuration-stack .feishu-vm-pmo-editor > .feishu-settings-tabpanel {
+  flex: 1 1 auto;
+}
+
+.feishu-configuration-stack .feishu-vm-pmo-editor .feishu-vm-pmo-actions {
+  position: static;
+  margin: 0;
+  padding: 12px 2px 16px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.feishu-vm-pmo-editor > .feishu-config-card > small {
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 /* Use the available panel width, including beside the standalone app sidebar. */
@@ -15211,6 +15586,25 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
 
 .feishu-configuration-stack .feishu-workflow-panel.is-stacked .feishu-workflow-splitter {
   display: none;
+}
+
+@media (max-width: 760px) {
+  .feishu-configuration-stack .feishu-workflow-panel.is-stacked {
+    grid-template-rows: max-content minmax(64px, 96px) minmax(0, 1fr);
+  }
+
+  .feishu-configuration-stack .feishu-workflow-panel.is-stacked .feishu-workflow-catalog {
+    padding: 8px 14px;
+  }
+
+  .feishu-configuration-stack .feishu-subject-settings {
+    gap: 8px;
+    padding-top: 10px;
+  }
+
+  .feishu-configuration-stack .feishu-vm-pmo-editor {
+    gap: 8px;
+  }
 }
 
 .feishu-configuration-stack .feishu-settings-grid,
@@ -15283,6 +15677,10 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
 }
 
 @container (max-width: 460px) {
+  .feishu-configuration-stack .feishu-package-context-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .feishu-configuration-stack .feishu-delivery-assignment {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -15746,4 +16144,33 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
   height: 5px;
   border-radius: 50%;
   background: var(--success);
+}
+
+@media (max-height: 650px) {
+  .feishu-configuration-stack .feishu-workflow-panel.is-stacked {
+    grid-template-rows: max-content minmax(48px, 64px) minmax(0, 1fr);
+  }
+
+  .feishu-configuration-stack .feishu-subject-settings {
+    gap: 4px;
+    padding-top: 6px;
+    overflow-y: auto;
+  }
+
+  .feishu-configuration-stack .feishu-vm-pmo-editor {
+    flex: 0 0 auto;
+    height: 260px;
+    overflow: visible;
+  }
+
+  .feishu-configuration-stack .feishu-settings-tabpanel {
+    min-height: 120px;
+  }
+
+  .feishu-configuration-stack .feishu-subject-actions,
+  .feishu-configuration-stack .feishu-vm-pmo-editor .feishu-vm-pmo-actions {
+    position: sticky;
+    bottom: 4px;
+    z-index: 1;
+  }
 }

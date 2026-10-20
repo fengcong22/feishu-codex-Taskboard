@@ -27,6 +27,11 @@ import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
 import { createFeishuPackageStore, PackageConfigError } from "./feishu-package-config.mjs";
 import { createFeishuPackageApi } from "./feishu-package-api.mjs";
+import { assertExecutablePackageWorkflow } from "./feishu-package-identity.mjs";
+import { PackageWorkflowError, normalizePackageWorkflowTemplate, workflowTemplatesEqual } from "../shared/feishu-package-workflow.mjs";
+import { createFeishuPackageWorkflowDrafts } from "./feishu-package-workflow-drafts.mjs";
+import { createPackageBoardSettings } from "./package-board-settings.mjs";
+import { createFeishuSubjectShareApi } from "./feishu-subject-share.mjs";
 import {
   CloudProxyError,
   createCloudProxy,
@@ -44,6 +49,7 @@ import { createFeishuWorkflowApi } from "./feishu-workflow-api.mjs";
 import { createResourceScheduler } from "./resource-scheduler.mjs";
 import { createFeishuExecutionCoordinator } from "./feishu-execution-coordinator.mjs";
 import { runLocalAutoCut } from "./autocut-local-runner.mjs";
+import { normalizeAutoCutProgress } from "./autocut-progress.mjs";
 import { ArtifactServiceError, createArtifactService } from "./artifact-service.mjs";
 import { createArtifactUploadWorker } from "./upload-worker.mjs";
 import { createFeishuWritebackWorker } from "./feishu-writeback-worker.mjs";
@@ -59,6 +65,13 @@ import {
 import { prepareFeishuRunInputs, resolveFeishuPackageSourceDirectory } from "./feishu-run-inputs.mjs";
 import { canonicalJson } from "./feishu-source-manifest.mjs";
 import { stageRegistrationOrigin } from "./feishu-deleted-event.mjs";
+import { createVmApprovalStore } from "./vm-approval-store.mjs";
+import { createVmDownloadService } from "./vm-download-service.mjs";
+import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-download-notifier.mjs";
+import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
+import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
+import { createFeishuVmMp4Adapter } from "./vm-mp4-feishu-adapter.mjs";
+import { createFeishuApiContext } from "../../src/feishu-api.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -281,6 +294,22 @@ function courseNamingFieldForBridge(subject) {
     type: field.type,
     uiType: field.uiType,
   };
+}
+
+function namingFieldForBridge(subject) {
+  if (!subject?.namingField) return null;
+  const matches = (subject?.metadata?.fields ?? []).filter(
+    (field) => field?.fieldId === subject.namingField.fieldId,
+  );
+  const field = matches.length === 1 ? matches[0] : null;
+  const type = typeof field?.type === "string" && /^\d+$/u.test(field.type.trim())
+    ? Number(field.type) : field?.type;
+  const uiType = typeof field?.uiType === "string"
+    ? field.uiType.replace(/[\s_-]/gu, "").toLowerCase() : null;
+  const kind = type === 1 && (uiType === null || uiType === "text") ? "text"
+    : type === 20 && (uiType === null || uiType === "formula") ? "formula"
+      : "unknown";
+  return { ...structuredClone(subject.namingField), kind };
 }
 
 function bridgeShareInspectionConfiguration(configuration, sourceConfiguration = null) {
@@ -858,6 +887,26 @@ function parseAutoCutRetry(value) {
       allowConfiguredLocalOutput: true,
     }),
   };
+}
+
+function parseVmPmoRetry(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version", "runConsent"]));
+  const version = parseVersion(value.version);
+  assertPlainObject(value.runConsent);
+  assertAllowedKeys(value.runConsent, new Set(["allowVideoAudioAsr", "allowConfiguredLocalOutput"]));
+  for (const key of ["allowVideoAudioAsr", "allowConfiguredLocalOutput"]) {
+    if (value.runConsent[key] !== true) {
+      throw new ApiError(400, "INVALID_FIELD", `'runConsent.${key}' must be true`);
+    }
+  }
+  return { version, runConsent: {allowVideoAudioAsr:true,allowConfiguredLocalOutput:true} };
+}
+
+function parseVmPmoWritebackRetry(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["version"]));
+  return {version: parseVersion(value.version)};
 }
 
 function parseWorkflowVersion(value) {
@@ -2772,6 +2821,69 @@ export function createTaskboardServer(options = {}) {
   }));
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  let vmDownloads;
+  let vmDownloadsClosing = false;
+  let vmRuntime;
+  let vmAdapter;
+  function vmLocalConfig() {
+    return resolveVmDownloadConfig({ dataDirectory: resolved.dataDirectory, environment: serviceEnvironment,
+      statePath: options.vmApprovalStatePath,
+      envFile: options.vmDownloadEnvFile ?? (options.processEnv ? undefined : path.join(PROJECT_ROOT, "..", ".env.local")) });
+  }
+  async function getVmAdapter() {
+    if (typeof options.getVmAdapter === "function") return options.getVmAdapter();
+    if (!vmAdapter) {
+      const config = vmLocalConfig();
+      const context = await createFeishuApiContext({appId: config.appId, appSecret: config.appSecret});
+      vmAdapter = createFeishuVmMp4Adapter({client: context.client});
+    }
+    return vmAdapter;
+  }
+  function getVmRuntime() {
+    if (vmRuntime) return vmRuntime;
+    let config = {};
+    try { config = vmLocalConfig(); } catch { /* Missing local configuration remains unavailable. */ }
+    vmRuntime = options.vmPmoRuntime ?? createVmPmoRuntime({
+      database,
+      getPackage: alias => feishuPackages.get(alias),
+      getActiveSubject: (key, occurredAt) => database.resolveFeishuSubjectVersionAt(key, occurredAt ?? Date.now()),
+      getSubjectVersion: (key, version) => database.getFeishuSubjectVersion(key, version),
+      getDownloads: getVmDownloads,
+      getAdapter: getVmAdapter,
+      getPolicy: () => database.getAutomaticExecutionSetting(automaticExecutionDefault),
+      scheduler: resourceScheduler,
+      dispatchWriteback: dispatchFeishuWritebackClaim,
+      onTaskUpdated: task => events.emit("task.updated", {task}),
+      runRoot: options.vmPmoRunRoot ?? config.vmPmoRunRoot ?? path.join(resolved.dataDirectory, "vm-pmo-runs"),
+      pythonPath: options.vmPmoPythonPath ?? config.vmPmoPythonPath ?? null,
+      coursePathResolver,
+    });
+    return vmRuntime;
+  }
+  async function vmPmoAvailable() {
+    try { return (await getVmRuntime().ready()).available === true; } catch { return false; }
+  }
+  function getVmDownloads() {
+    if (vmDownloadsClosing) throw new ApiError(503, "VM_DOWNLOAD_CLOSED", "VM download service is closing");
+    if (vmDownloads) return vmDownloads;
+    let store;
+    try {
+      const config = resolveVmDownloadConfig({ dataDirectory: resolved.dataDirectory, environment: serviceEnvironment,
+        statePath: options.vmApprovalStatePath,
+        envFile: options.vmDownloadEnvFile ?? (options.processEnv ? undefined : path.join(PROJECT_ROOT, "..", ".env.local")) });
+      store = createVmApprovalStore({ file: config.statePath });
+      vmDownloads = createVmDownloadService({ store,
+        metadata: createVmDownloadMetadata({ database: database.database }),
+        notifier: createVmDownloadNotifier({ appId: config.appId, appSecret: config.appSecret }),
+        privateEndpoints: config.privateEndpoints,
+      });
+      return vmDownloads;
+    } catch (error) {
+      store?.close();
+      const code = ["VM_DOWNLOAD_CONFIG_INVALID", "VM_DOWNLOAD_STATE_AMBIGUOUS"].includes(error?.code) ? error.code : "VM_DOWNLOAD_UNAVAILABLE";
+      throw new ApiError(503, code, "VM download service configuration or local state is unavailable");
+    }
+  }
   const deliveryStore = options.feishuDeliveryStore ?? createFeishuDeliveryStore({ database });
   const coursePathResolver = options.coursePathResolver ?? createWindowsCoursePathResolver();
   const directoryOperationStore = options.feishuDirectoryOperationStore
@@ -2790,6 +2902,7 @@ export function createTaskboardServer(options = {}) {
     listReferences: typeof options.listFeishuPackageReferences === "function"
       ? options.listFeishuPackageReferences
       : (alias) => database.listPackageReferences(alias),
+    validateVmPackage: record => getVmRuntime().validateVmPackage(record),
   });
   const feishuPackageApi = createFeishuPackageApi({
     store: feishuPackages,
@@ -2867,6 +2980,7 @@ export function createTaskboardServer(options = {}) {
     return {
       packageAlias: packageRecord.alias ?? packageAlias,
       packageRevision: packageRecord.revision ?? 1,
+      workflowTemplate: normalizePackageWorkflowTemplate(packageRecord.workflowTemplate),
       name: packageRecord.name ?? packageRecord.projectName ?? packageRecord.alias ?? packageAlias,
       projectId: packageRecord.projectId ?? null,
       workspacePath: packageRecord.workspacePath,
@@ -2969,6 +3083,17 @@ export function createTaskboardServer(options = {}) {
     if (subjectVersion.baseToken !== event.baseToken || subjectVersion.tableId !== event.tableId) {
       throw new ApiError(409, "FEISHU_SUBJECT_IDENTITY_REQUIRED", "Stage registration subject identity is invalid");
     }
+    const packageAlias = subjectVersion.packageRoute?.packageAlias;
+    const packageRecord = typeof feishuPackages.get === "function"
+      ? await feishuPackages.get(packageAlias)
+      : (await feishuPackages.read())[packageAlias] ?? null;
+    if (!packageRecord) {
+      throw new ApiError(409, "UNKNOWN_PACKAGE_ALIAS", "The configured Auto-Cut package is not available");
+    }
+    if (packageRecord.state && packageRecord.state !== "enabled") {
+      throw new ApiError(409, "PACKAGE_DISABLED", "The configured Auto-Cut package is disabled");
+    }
+    await assertExecutablePackageWorkflow(packageRecord);
     const stage = subjectVersion.stages?.[binding.stageId];
     if (!stage || stage.enabled !== true) {
       throw new ApiError(409, "STAGE_DISABLED", "The referenced Auto-Cut stage is disabled");
@@ -3026,16 +3151,6 @@ export function createTaskboardServer(options = {}) {
       };
     }
 
-    const packageAlias = subjectVersion.packageRoute?.packageAlias;
-    const packageRecord = typeof feishuPackages.get === "function"
-      ? await feishuPackages.get(packageAlias)
-      : (await feishuPackages.read())[packageAlias] ?? null;
-    if (!packageRecord) {
-      throw new ApiError(409, "UNKNOWN_PACKAGE_ALIAS", "The configured Auto-Cut package is not available");
-    }
-    if (packageRecord.state && packageRecord.state !== "enabled") {
-      throw new ApiError(409, "PACKAGE_DISABLED", "The configured Auto-Cut package is disabled");
-    }
     const packageSnapshot = packageSnapshotFromRecord(packageRecord, packageAlias);
     const executionMode = event.deliverySource === "simulation"
       ? "manual"
@@ -3297,8 +3412,20 @@ export function createTaskboardServer(options = {}) {
     if (bridgeUrl.protocol !== "http:" || bridgeUrl.hostname !== "127.0.0.1") {
       throw new ApiError(503, "FEISHU_BRIDGE_UNAVAILABLE", "Feishu Bridge is unavailable");
     }
-    const courseNamingField = courseNamingFieldForBridge(subject);
-    const safeSubject = {
+    const isVm = subject.workflowTemplate?.id === "vm_pmo_review_video";
+    const courseNamingField = isVm ? null : courseNamingFieldForBridge(subject);
+    const safeSubject = isVm ? {
+      subjectKey: subject.subjectKey, baseToken: subject.baseToken, baseName: subject.baseName,
+      tableId: subject.tableId, tableName: subject.tableName, displayEnabled: subject.displayEnabled,
+      lifecycle, configVersion: subject.configVersion,
+      createdAt: subject.createdAt, updatedAt: subject.updatedAt,
+      workflowTemplate: structuredClone(subject.workflowTemplate),
+      vmWorkflow: { ...structuredClone(subject.vmWorkflow),
+        finalArchive: { ...structuredClone(subject.vmWorkflow.finalArchive), directoryPath: null } },
+      title: structuredClone(subject.title),
+      statusField: structuredClone(subject.statusField), execution: structuredClone(subject.execution),
+      packageRoute: structuredClone(subject.packageRoute),
+    } : {
       subjectKey: subject.subjectKey,
       baseToken: subject.baseToken,
       baseName: subject.baseName,
@@ -3310,7 +3437,7 @@ export function createTaskboardServer(options = {}) {
       ...(subject.statusField ? { statusField: structuredClone(subject.statusField) } : {}),
       ...(subject.reviewStatusField !== undefined ? { reviewStatusField: structuredClone(subject.reviewStatusField) } : {}),
       ...(subject.documentField ? { documentField: structuredClone(subject.documentField) } : {}),
-      ...(subject.namingField ? { namingField: structuredClone(subject.namingField) } : {}),
+      ...(subject.namingField ? { namingField: namingFieldForBridge(subject) } : {}),
       ...(courseNamingField ? { courseNamingField } : {}),
       ...(subject.stages ? {
         stages: safeBridgeStages(subject.stages),
@@ -3434,12 +3561,28 @@ export function createTaskboardServer(options = {}) {
   }
   const feishuWorkflowStore = createFeishuWorkflowStore({
     database,
+    validateVmWorkflowActivation: input => getVmRuntime().validateActivation(input),
+    validatePackageWorkflow: async (alias) => {
+      const record = typeof feishuPackages.get === "function"
+        ? await feishuPackages.get(alias) : (await feishuPackages.read())[alias];
+      if (record) await assertExecutablePackageWorkflow(record);
+    },
     packageAliases: async () => (typeof feishuPackages.list === "function"
       ? (await feishuPackages.list()).filter((record) => record.state === "enabled").map((record) => record.alias)
       : Object.keys(await feishuPackages.read()).filter((alias) => alias)),
     syncSubject: typeof options.feishuWorkflowSync === "function"
       ? options.feishuWorkflowSync
       : syncFeishuSubjectToBridge,
+  });
+  const feishuPackageWorkflowDrafts = createFeishuPackageWorkflowDrafts({
+    database, packageStore: feishuPackages, workflowStore: feishuWorkflowStore,
+  });
+  const packageBoardSettings = createPackageBoardSettings({
+    database, packageStore: feishuPackages,
+    getPackageBoard: scope => getVmRuntime().getPackageBoard(scope),
+  });
+  const feishuSubjectShareApi = createFeishuSubjectShareApi({
+    database, packageStore: feishuPackages, workflowStore: feishuWorkflowStore,
   });
   const feishuWorkflowApi = createFeishuWorkflowApi({
     database,
@@ -3962,6 +4105,11 @@ export function createTaskboardServer(options = {}) {
     resolveContext: resolveAiChatContext,
     remoteAppServerFactory: options.remoteAppServerFactory,
   });
+  const unsubscribeAiChatHints = aiChat.subscribeHints(({ threadId, type }) => {
+    if (type === "ai.event" || type === "ai.run") {
+      events.emit("ai.thread.updated", { threadId, hintType: type });
+    }
+  });
   function executionModeForMetadata(metadata) {
     return metadata?.executionMode === "automatic" || metadata?.mode === "automatic"
       ? "automatic"
@@ -4107,9 +4255,27 @@ export function createTaskboardServer(options = {}) {
   }
 
   function publicAutoCutRun(run) {
+    const aiRun = database.getAiChatRun(run.runId);
+    const threadId = aiRun?.threadId ?? null;
+    const thread = threadId ? database.getAiChatThread(threadId) : null;
+    let lastPhase = null;
+    const phaseStates = new Map();
+    for (const event of thread ? database.listAiChatEvents(threadId) : []) {
+      if (event.runId !== run.runId || event.type !== "autocut_progress") continue;
+      const progress = normalizeAutoCutProgress(event.data);
+      if (!progress) continue;
+      phaseStates.set(progress.phase, progress.status);
+      lastPhase = progress.phase;
+    }
+    // A later wrapper failure must not hide the first phase that never recovered.
+    const failedPhase = [...phaseStates].find(([, status]) => status === "failed")?.[0] ?? null;
     return {
       runId: run.runId,
       taskId: run.taskId,
+      threadId,
+      executionKind: thread ? (thread.model === "local-autocut" ? "local" : "codex") : null,
+      failedPhase,
+      lastPhase,
       attempt: run.attempt,
       subjectKey: run.subjectKey,
       configVersion: run.configVersion,
@@ -5516,6 +5682,9 @@ export function createTaskboardServer(options = {}) {
       throw new ApiError(409, "PACKAGE_DISABLED", "Auto-Cut package is disabled and cannot start");
     }
     const storedSnapshot = database.getFeishuTaskPackageSnapshot(task.id);
+    if (storedSnapshot && !workflowTemplatesEqual(storedSnapshot.workflowTemplate, livePackage.workflowTemplate)) {
+      throw new ApiError(409, "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "The saved task workflow differs from the current package");
+    }
     const packageConfig = storedSnapshot
       ? {
           ...livePackage,
@@ -5524,6 +5693,7 @@ export function createTaskboardServer(options = {}) {
           state: livePackage.state,
         }
       : livePackage;
+    await assertExecutablePackageWorkflow(packageConfig);
     // A Feishu subject project identifies the Base/table queue.  The trusted
     // package alias identifies the Auto-Cut workspace and may be shared by
     // multiple subject projects; never require the two identities to match.
@@ -5555,6 +5725,10 @@ export function createTaskboardServer(options = {}) {
     if (latestPackage.state && latestPackage.state !== "enabled") {
       throw new ApiError(409, "PACKAGE_DISABLED", "Auto-Cut package is disabled and cannot start");
     }
+    if (!workflowTemplatesEqual(packageConfig.workflowTemplate, latestPackage.workflowTemplate)) {
+      throw new ApiError(409, "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "The package workflow changed during startup");
+    }
+    await assertExecutablePackageWorkflow(latestPackage);
     const finalContext = requireCurrentExecutionContext(task.id, trigger);
     assertStartAllowed();
     if (finalContext.metadata.packageAlias !== metadata.packageAlias) {
@@ -5616,6 +5790,13 @@ export function createTaskboardServer(options = {}) {
     packageStore: feishuPackages,
     scheduler: resourceScheduler,
     allowAutomaticExecution: automaticExecutionEnabled,
+    validatePackageWorkflow: async (record, snapshot) => {
+      if (snapshot && !workflowTemplatesEqual(snapshot.workflowTemplate, record.workflowTemplate)) {
+        throw new ApiError(409, "TASK_PACKAGE_WORKFLOW_IMMUTABLE", "The saved task workflow differs from the current package");
+      }
+      await assertExecutablePackageWorkflow(record);
+      if (snapshot) await assertExecutablePackageWorkflow(snapshot);
+    },
     resolveCurrentMetadata: (task, { trigger } = {}) => currentExecutionMetadata(task, trigger),
     onTaskUpdated: (task) => events.emit("task.updated", { task }),
     startClaimedTask: (
@@ -5818,7 +5999,7 @@ export function createTaskboardServer(options = {}) {
       }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
-      if (pathname.startsWith("/api/local/feishu/workflow/")) {
+      if (pathname.startsWith("/api/local/feishu/workflow/") && !pathname.startsWith("/api/local/feishu/workflow/subject-share/")) {
         assertLoopbackRequest(request);
         const result = await feishuWorkflowApi.handle({
           method: request.method,
@@ -5849,6 +6030,84 @@ export function createTaskboardServer(options = {}) {
       } else if (pathname.startsWith("/api/local/")) {
         assertLoopbackRequest(request);
       }
+      if (pathname === "/api/local/feishu/package-board") {
+        const result = await packageBoardSettings.handle({
+          method: request.method, pathname, query: url.searchParams,
+          body: request.method === "PATCH" ? await readJson(request) : null,
+        });
+        return sendJson(response, result.status, result.body);
+      }
+      if (/^\/api\/local\/feishu\/subjects\/[^/]+\/package-workflow-drafts\/[^/]+(?:\/enable)?$/u.test(pathname)) {
+        assertNoQuery(url.searchParams, pathname);
+        const result = await feishuPackageWorkflowDrafts.handle({
+          method: request.method, pathname,
+          body: request.method === "GET" ? null : await readJson(request),
+        });
+        if (result) return sendJson(response, result.status, result.body);
+      }
+      if (pathname.startsWith("/api/local/feishu/workflow/subject-share/")) {
+        const result = await feishuSubjectShareApi.handle({
+          method: request.method, pathname, query: url.searchParams,
+          body: request.method === "GET" ? null : await readJson(request),
+        });
+        if (result) return sendJson(response, result.status, result.body);
+      }
+      if (pathname === "/api/local/vm-downloads" || pathname.startsWith("/api/local/vm-downloads/")) {
+        assertNoQuery(url.searchParams, pathname);
+        const host = parseRequestHost(request.headers.host);
+        if (!isLoopbackHostname(host.hostname)) throw new ApiError(403, "INVALID_HOST", "VM downloads require a loopback Host");
+        const origin = request.headers.origin;
+        if (origin && origin !== "app://-") {
+          let originUrl;
+          try { originUrl = new URL(origin); } catch {}
+          if (!originUrl || !["http:", "https:"].includes(originUrl.protocol) || !isLoopbackHostname(originUrl.hostname)) {
+            throw new ApiError(403, "INVALID_ORIGIN", "VM downloads require a loopback Origin");
+          }
+        }
+        if (origin === "app://-" && !resolved.instanceToken) throw new ApiError(403, "INVALID_ORIGIN", "VM downloads require a verified launcher");
+        let input;
+        if (request.method !== "GET") {
+          if (request.headers["x-taskboard-client"] !== "web") throw new ApiError(403, "LOCAL_SETTINGS_CLIENT_REQUIRED", "VM downloads require an explicit web request");
+          if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") throw new ApiError(415, "JSON_REQUIRED", "VM downloads require JSON");
+          input = await readJson(request);
+          assertPlainObject(input);
+        }
+        try {
+          const downloads = getVmDownloads();
+          if (pathname === "/api/local/vm-downloads" && request.method === "GET") return sendJson(response, 200, downloads.snapshot());
+          if (pathname === "/api/local/vm-downloads/settings" && request.method === "PUT") return sendJson(response, 200, downloads.updateSettings(input));
+          if (pathname === "/api/local/vm-downloads/jobs" && request.method === "POST") return sendJson(response, 201, downloads.enqueue(input));
+          if (pathname === "/api/local/vm-downloads/jobs/cleanup" && request.method === "POST") {
+            assertAllowedKeys(input, new Set(["jobIds"]));
+            return sendJson(response, 200, downloads.cleanup(input.jobIds));
+          }
+          if (request.method === "POST") {
+            if (["/api/local/vm-downloads/login", "/api/local/vm-downloads/logout"].includes(pathname)) {
+              assertAllowedKeys(input, new Set());
+              if (pathname.endsWith("/login")) return sendJson(response, 200, await downloads.beginLogin());
+              return sendJson(response, 200, await downloads.logout());
+            }
+            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover)$/u.exec(pathname);
+            if (action) {
+              if (action[2] === "recover") {
+                assertAllowedKeys(input, new Set(["confirmRepeatableResource"]));
+                if (input.confirmRepeatableResource !== true) throw new ApiError(400, "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED", "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED");
+              } else assertAllowedKeys(input, new Set());
+              return sendJson(response, 200, downloads[action[2]](action[1], input));
+            }
+            assertAllowedKeys(input, new Set());
+          }
+          throw new ApiError(404, "NOT_FOUND", "VM download route not found");
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          const code = /^VM_[A-Z0-9_]{1,100}$/u.test(error?.code) ? error.code : "VM_DOWNLOAD_FAILED";
+          const status = code === "VM_APPROVAL_JOB_NOT_FOUND" ? 404
+              : ["VM_AUTH_REQUIRED", "VM_APPLICANT_CHANGED", "VM_APPROVAL_JOB_BUSY", "VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE", "VM_APPROVAL_NOT_RESUMABLE", "VM_APPROVAL_NOT_EXTENDABLE",
+              "VM_DOWNLOAD_RECOVERY_NOT_ALLOWED", "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT", "VM_DOWNLOAD_RECOVERY_PATH_INVALID", "VM_RESOURCE_ALREADY_CLAIMED"].includes(code) ? 409
+              : ["VM_DOWNLOAD_INPUT_INVALID", "VM_DOWNLOAD_BATCH_INVALID", "VM_APPROVAL_REQUEST_INVALID", "VM_APPROVAL_STORE_INPUT_INVALID"].includes(code) ? 400 : 503;
+          throw new ApiError(status, code, code);
+        }
+      }
       if (pathname === "/api/local/settings/automatic-execution") {
         assertNoQuery(url.searchParams, pathname);
         const host = parseRequestHost(request.headers.host);
@@ -5877,7 +6136,10 @@ export function createTaskboardServer(options = {}) {
           assertPlainObject(input);
           assertAllowedKeys(input, new Set(["enabled", "expectedVersion"]));
           const setting = database.saveAutomaticExecutionSetting(input.expectedVersion, input.enabled, automaticExecutionDefault);
-          if (!setting.enabled) executionCoordinator.cancelPendingAutomatic();
+          if (!setting.enabled) {
+            executionCoordinator.cancelPendingAutomatic();
+            await vmRuntime?.cancelPendingAutomatic?.();
+          }
           events.emit("automatic-execution.updated", { setting });
           return sendJson(response, 200, { setting });
         }
@@ -6209,6 +6471,7 @@ export function createTaskboardServer(options = {}) {
             localAiChat: !configuredTrustedRequest
               && isLoopbackAddress(request.socket.remoteAddress),
             automaticExecution: automaticExecutionEnabled(),
+            vmPmoInitial: !configuredTrustedRequest && await vmPmoAvailable(),
           },
           ...(capabilityCloudConfig?.remoteUrl
             ? {
@@ -6661,7 +6924,9 @@ export function createTaskboardServer(options = {}) {
         if (typeof deliveryStore.resolveWritebackIntentForBridge !== "function") {
           throw new ApiError(503, "WRITEBACK_UNAVAILABLE", "The local writeback resolver is unavailable");
         }
-        const intent = deliveryStore.resolveWritebackIntentForBridge(claim);
+        const intent = claim.operationId.startsWith("vm-")
+          ? await getVmRuntime().resolveWriteback(claim)
+          : await deliveryStore.resolveWritebackIntentForBridge(claim);
         const target = intent?.target;
         const operation = intent?.operation;
         if (!target || typeof target !== "object" || Array.isArray(target)
@@ -6669,7 +6934,8 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(502, "WRITEBACK_RESOLUTION_INVALID", "The local writeback resolver returned an invalid intent");
         }
         const safeOperation = operation.type === "single_select"
-          ? { type: operation.type, fieldId: operation.fieldId, optionId: operation.optionId }
+          ? { type: operation.type, fieldId: operation.fieldId, optionId: operation.optionId,
+            ...(operation.guard ? { guard: operation.guard } : {}) }
           : operation.type === "text"
             ? { type: operation.type, fieldId: operation.fieldId, value: operation.value }
             : null;
@@ -6693,6 +6959,24 @@ export function createTaskboardServer(options = {}) {
           parseFeishuDirectoryOperationBody(await readJson(request)),
         );
         return sendJson(response, result.created ? 201 : 200, { operation: result.operation });
+      }
+
+      if (pathname === "/api/local/feishu/vm/tasks") {
+        assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
+        assertNoQuery(url.searchParams, "POST /api/local/feishu/vm/tasks");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertTaskStartAllowed();
+        const result = await getVmRuntime().register(await readJson(request), actorFromRequest(request));
+        events.emit(result.created ? "task.created" : "task.updated", {task: result.task});
+        return sendJson(response, result.created ? 201 : 200, {task: result.task});
+      }
+
+      if (pathname === "/api/local/feishu/vm/final-archive") {
+        assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
+        assertNoQuery(url.searchParams, "POST /api/local/feishu/vm/final-archive");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const result = await getVmRuntime().enqueueFinalArchive(await readJson(request));
+        return sendJson(response, result.created ? 201 : 200, {job: result.job});
       }
 
       if (pathname === "/api/local/feishu/tasks" && request.method === "POST") {
@@ -6741,20 +7025,10 @@ export function createTaskboardServer(options = {}) {
               `Package '${metadata.packageAlias}' is not configured on this Taskboard`,
             );
           }
-          if (packageRecord) packageSnapshot = {
-            packageAlias: packageRecord.alias ?? metadata.packageAlias,
-            packageRevision: packageRecord.revision ?? 1,
-            name: packageRecord.name ?? packageRecord.projectName ?? packageRecord.alias ?? metadata.packageAlias,
-            projectId: packageRecord.projectId ?? null,
-            workspacePath: packageRecord.workspacePath,
-            model: packageRecord.model ?? null,
-            reasoningEffort: packageRecord.reasoningEffort ?? null,
-            prompt: packageRecord.prompt,
-            zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
-            ...(packageRecord.zipOutputMode ? { zipOutputMode: packageRecord.zipOutputMode } : {}),
-            maxConcurrent: packageRecord.maxConcurrent,
-            resourceGroups: packageRecord.resourceGroups,
-          };
+          if (packageRecord) {
+            await assertExecutablePackageWorkflow(packageRecord);
+            packageSnapshot = packageSnapshotFromRecord(packageRecord, metadata.packageAlias);
+          }
         }
         const create = packageSnapshot || !metadata.packageAlias
           ? database.createFeishuTask
@@ -7125,6 +7399,54 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 201, { attachment });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const vmPmoRunRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-run$/);
+      if (vmPmoRunRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "/api/local/tasks/:id/vm-pmo-run");
+        const taskId = decodeRouteSegment(vmPmoRunRoute[1], "Task id");
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (request.method === "GET") {
+          const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+          if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+            || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+            || snapshot.workflowTemplate.version !== 1) return sendJson(response, 200, {run:null});
+          return sendJson(response, 200, {run:await getVmRuntime().getTaskRun(taskId)});
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["GET", "POST"]);
+        const body = parseVmPmoRetry(await readJson(request));
+        if (body.version !== task.version) {
+          throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        }
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1) {
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        }
+        const run = await getVmRuntime().retryPlanning(taskId, body);
+        return sendJson(response, 202, {run});
+      }
+
+      const vmPmoWritebackRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-writeback-retry$/);
+      if (vmPmoWritebackRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-writeback-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoWritebackRetryRoute[1], "Task id");
+        const body = parseVmPmoWritebackRetry(await readJson(request));
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        const run = await getVmRuntime().retryWriteback(taskId, body);
+        return sendJson(response, 202, {run});
       }
 
       const autoCutRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/autocut-retry$/);
@@ -7597,20 +7919,8 @@ export function createTaskboardServer(options = {}) {
         if (packageRecord.state && packageRecord.state !== "enabled") {
           throw new ApiError(409, "PACKAGE_DISABLED", "Enable the Auto-Cut package before refreshing this task");
         }
-        const snapshot = {
-          packageAlias: packageRecord.alias ?? origin.packageAlias,
-          packageRevision: packageRecord.revision,
-          name: packageRecord.name ?? packageRecord.projectName ?? origin.packageAlias,
-          projectId: packageRecord.projectId ?? null,
-          workspacePath: packageRecord.workspacePath,
-          model: packageRecord.model ?? null,
-          reasoningEffort: packageRecord.reasoningEffort ?? null,
-          prompt: packageRecord.prompt,
-          zipSourceDirectory: packageRecord.zipSourceDirectory ?? packageRecord.artifactSourcePath ?? null,
-          ...(packageRecord.zipOutputMode ? { zipOutputMode: packageRecord.zipOutputMode } : {}),
-          maxConcurrent: packageRecord.maxConcurrent,
-          resourceGroups: packageRecord.resourceGroups,
-        };
+        await assertExecutablePackageWorkflow(packageRecord);
+        const snapshot = packageSnapshotFromRecord(packageRecord, origin.packageAlias);
         const refreshed = database.refreshFeishuTaskPackageSnapshot(
           task.id,
           version,
@@ -7880,7 +8190,7 @@ export function createTaskboardServer(options = {}) {
         response.destroy(error);
         return;
       }
-      if (error instanceof ApiError) {
+      if (error instanceof ApiError || error instanceof PackageWorkflowError || error instanceof PackageConfigError) {
         const payload = { error: { code: error.code, message: error.message } };
         if (error.details !== undefined) payload.error.details = error.details;
         sendJson(response, error.status, payload);
@@ -8055,10 +8365,17 @@ export function createTaskboardServer(options = {}) {
       reconcilePublishedDeliveryWritebacks();
       startUploadWorker();
       startWritebackWorker();
+      try { getVmDownloads().start(); } catch { /* Fail closed for downloads while keeping other local tools available. */ }
+      const runtime = getVmRuntime();
+      if (await vmPmoAvailable()) await runtime.start();
+      else await runtime.startFinalArchive();
       return address;
     },
     async close() {
       closing = true;
+      await vmRuntime?.close();
+      vmDownloadsClosing = true;
+      const vmDownloadsClosed = vmDownloads?.close();
       taskStartAbortController.abort();
       cancelQueuedTaskStarts();
       for (const { localSocket, remoteSocket } of cloudRealtimeSockets) {
@@ -8068,6 +8385,7 @@ export function createTaskboardServer(options = {}) {
       cloudRealtimeSockets.clear();
       cloudRealtimeServer.close();
       events.close();
+      unsubscribeAiChatHints();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await executionCoordinator.close();
@@ -8087,6 +8405,7 @@ export function createTaskboardServer(options = {}) {
       await projectSummary.close();
       await serverClosed;
       listening = false;
+      await vmDownloadsClosed;
       database.close();
     },
   };

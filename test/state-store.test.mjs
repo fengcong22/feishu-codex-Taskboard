@@ -995,6 +995,38 @@ test("completes a claimed event without changing its captured event", async () =
   assert.deepEqual(result.event, captured);
 });
 
+test("completes and reloads a final archive outcome without a task identifier", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const claim = await store.claimEvent(event("evt_final_archive"), {
+    ownerId: "archive-worker", now: 0, leaseMs: 100,
+  });
+  const result = await store.complete("evt_final_archive", {
+    ownerId: "archive-worker",
+    token: claim.record.lease.token,
+    decision: "final_archive",
+    outcome: {
+      kind: "final_archive",
+      archiveJobId: "archive_job_1",
+      archiveState: "pending",
+      subjectKey: "bas_demo:tbl_demo",
+      configVersion: 3,
+    },
+    requireTaskIdentifier: false,
+    now: 1,
+  });
+
+  assert.equal(result.deliveryState, "succeeded");
+  assert.deepEqual(result.outcome, {
+    kind: "final_archive",
+    archiveJobId: "archive_job_1",
+    archiveState: "pending",
+    subjectKey: "bas_demo:tbl_demo",
+    configVersion: 3,
+  });
+  assert.deepEqual(await (new JsonStateStore(filename)).get("evt_final_archive"), result);
+});
+
 test("complete rejects malformed outcomes without recording success", async () => {
   const store = new JsonStateStore(await stateFilename());
   const claim = await store.claimEvent(event(), { ownerId: "one", now: 0, leaseMs: 100 });

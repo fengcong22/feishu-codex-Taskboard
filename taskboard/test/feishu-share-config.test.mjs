@@ -271,6 +271,28 @@ test("share import rejects a primitive upload object as a controlled client erro
   }
 });
 
+test("legacy share inspection keeps unbound package drafts local and still inspects unavailable named packages", async () => {
+  const inspected = [];
+  const f = await fixture({ feishuWorkflowShareImport: async (configuration) => { inspected.push(configuration); return { diagnostics: [] }; } });
+  try {
+    await request(f.baseUrl, "/api/local/feishu/workflow/catalog", { method: "POST", body: {
+      baseToken: "bas_unbound", baseName: "未配置", tables: [{ tableId: "tbl_new", tableName: "新学科", fields: phasedMetadata().fields }],
+    } });
+    const exported = await request(f.baseUrl, "/api/local/feishu/workflow/share/export");
+    const configuration = exported.body.configuration;
+    const unbound = await request(f.baseUrl, "/api/local/feishu/workflow/share/import", { method: "POST", body: { configuration, dryRun: true } });
+    assert.equal(unbound.response.status, 200, JSON.stringify(unbound.body));
+    assert.equal(inspected.length, 0);
+    assert.equal(unbound.body.configuration.bases[0].subjects[0].packageRoute.packageAlias, null);
+    assert.ok(unbound.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_REQUIRED"));
+    configuration.bases[0].subjects[0].packageRoute.packageAlias = "missing-package";
+    const missing = await request(f.baseUrl, "/api/local/feishu/workflow/share/import", { method: "POST", body: { configuration, dryRun: true } });
+    assert.equal(missing.response.status, 200, JSON.stringify(missing.body));
+    assert.equal(inspected.length, 1);
+    assert.equal(inspected[0].bases[0].subjects[0].packageRoute.packageAlias, "missing-package");
+  } finally { await f.app.close(); await rm(f.directory, { recursive: true, force: true }); }
+});
+
 test("share inspection never forwards a legacy snake-case stage destination to Bridge", async () => {
   let inspectedConfiguration = null;
   const fixtureData = await fixture({
@@ -324,6 +346,127 @@ test("workflow share import dry-run returns diagnostics without mutating the cat
     await rm(fixtureData.directory, { recursive: true, force: true });
   }
 });
+
+async function assertShareImportSkipsActiveSubject(editAfterEnable) {
+  const fixtureData = await fixture({
+    feishuWorkflowShareImport: async (configuration) => ({
+      configuration,
+      diagnostics: [
+        {
+          code: "FIELD_TYPE_INVALID",
+          severity: "error",
+          path: "bases.bas_keep_enabled.subjects.tbl_chinese.namingField.fieldId",
+          message: "Skipped subject has an invalid field",
+        },
+        {
+          code: "FIELD_TYPE_INVALID",
+          severity: "error",
+          path: "bases.bas_keep_enabled.subjects.tbl_new_subject.namingField.fieldId",
+          message: "Imported subject has an invalid field",
+        },
+      ],
+    }),
+  });
+  try {
+    const subjectKey = await seedSubject(fixtureData.baseUrl, "bas_keep_enabled", phasedMetadata().fields);
+    const named = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+      { method: "PATCH", body: { namingField: { fieldId: "fld_name", fieldName: "命名" } } },
+    );
+    assert.equal(named.response.status, 200, JSON.stringify(named.body));
+    const beforeEnable = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+    );
+    const enabled = await request(
+      fixtureData.baseUrl,
+      `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}/enable`,
+      { method: "POST", body: { expectedVersion: beforeEnable.body.subject.configVersion } },
+    );
+    assert.equal(enabled.response.status, 200, JSON.stringify(enabled.body));
+    let original = enabled.body.subject;
+    if (editAfterEnable) {
+      const edited = await request(
+        fixtureData.baseUrl,
+        `/api/local/feishu/workflow/subjects/${encodeURIComponent(subjectKey)}`,
+        {
+          method: "PATCH",
+          body: {
+            expectedVersion: original.configVersion,
+            execution: { ...original.execution, concurrencyGroup: "draft-edit" },
+          },
+        },
+      );
+      assert.equal(edited.response.status, 200, JSON.stringify(edited.body));
+      original = edited.body.subject;
+      assert.equal(original.lifecycle, "draft");
+      assert.equal(original.activeConfigVersion, enabled.body.subject.configVersion);
+    }
+    const profilePath = `/api/local/feishu/subjects/${encodeURIComponent(subjectKey)}/package-workflow-drafts/Auto-cut-A`;
+    const originalProfile = await request(fixtureData.baseUrl, profilePath);
+    assert.equal(originalProfile.response.status, 200, JSON.stringify(originalProfile.body));
+    const exported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/export");
+    const configuration = structuredClone(exported.body.configuration);
+    const base = configuration.bases[0];
+    base.subjects[0].displayEnabled = false;
+    const added = structuredClone(base.subjects[0]);
+    added.subjectKey = `${base.baseToken}:tbl_new_subject`;
+    added.tableId = "tbl_new_subject";
+    added.tableName = "新增草稿学科";
+    added.projectId = subjectProjectId(added.subjectKey);
+    added.packageRoute.packageAlias = "Missing-package";
+    base.subjects.push(added);
+
+    const preview = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: true },
+    });
+    assert.equal(preview.response.status, 200, JSON.stringify(preview.body));
+    assert.ok(preview.body.diagnostics.some((entry) => (
+      entry.code === "ENABLED_SUBJECT_SKIPPED"
+      && entry.path === `bases.${base.baseToken}.subjects.${original.tableId}`
+    )));
+    assert.ok(preview.body.diagnostics.some((entry) => entry.code === "PACKAGE_ALIAS_UNAVAILABLE"));
+    assert.equal(preview.body.diagnostics.some((entry) => (
+      entry.path === `bases.${base.baseToken}.subjects.${original.tableId}.namingField.fieldId`
+    )), false);
+    assert.ok(preview.body.diagnostics.some((entry) => (
+      entry.path === `bases.${base.baseToken}.subjects.${added.tableId}.namingField.fieldId`
+    )));
+
+    const imported = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/share/import", {
+      method: "POST",
+      body: { configuration, dryRun: false },
+    });
+    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
+    assert.ok(imported.body.diagnostics.some((entry) => entry.code === "ENABLED_SUBJECT_SKIPPED"));
+    assert.equal(imported.body.diagnostics.some((entry) => (
+      entry.path === `bases.${base.baseToken}.subjects.${original.tableId}.namingField.fieldId`
+    )), false);
+    const catalog = await request(fixtureData.baseUrl, "/api/local/feishu/workflow/catalog");
+    const subjects = catalog.body.catalog.flatMap((entry) => entry.subjects);
+    const kept = subjects.find((subject) => subject.subjectKey === subjectKey);
+    const newDraft = subjects.find((subject) => subject.subjectKey === added.subjectKey);
+    assert.equal(kept.lifecycle, original.lifecycle);
+    assert.equal(kept.configVersion, original.configVersion);
+    assert.equal(kept.displayEnabled, original.displayEnabled);
+    assert.deepEqual(kept, original);
+    const currentProfile = await request(fixtureData.baseUrl, profilePath);
+    assert.deepEqual(currentProfile.body, originalProfile.body);
+    assert.equal(newDraft.lifecycle, "draft");
+    assert.equal(newDraft.packageRoute.packageAlias, "Missing-package");
+  } finally {
+    await fixtureData.app.close();
+    await rm(fixtureData.directory, { recursive: true, force: true });
+  }
+}
+
+for (const editAfterEnable of [false, true]) {
+  test(`share import skips a subject with an active version after a draft edit: ${editAfterEnable}`, () => (
+    assertShareImportSkipsActiveSubject(editAfterEnable)
+  ));
+}
 
 test("automatic phased share configuration imports as a draft without local stage targets", async () => {
   const fixtureData = await fixture();

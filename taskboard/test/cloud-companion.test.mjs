@@ -635,6 +635,7 @@ test("configured server proxies business APIs without touching local rows and ad
     dataDirectory: directory,
     cloudConfigPath: configPath,
     allowAutomaticExecution: false,
+    processEnv: {},
     remoteFetch: async (url, init) => {
       upstreamCalls.push({ url: url.toString(), init });
       return jsonResponse({ tasks: [{ id: "REMOTE-1", projectId: "portfolio" }] });
@@ -646,7 +647,7 @@ test("configured server proxies business APIs without touching local rows and ad
   try {
     const metadata = await fetch(`${baseUrl}/api/meta`).then((response) => response.json());
     assert.deepEqual(metadata, {
-      capabilities: { localAiChat: true, automaticExecution: false },
+      capabilities: { localAiChat: true, automaticExecution: false, vmPmoInitial: false },
       mode: "cloud",
       realtime: {
         transport: "websocket",

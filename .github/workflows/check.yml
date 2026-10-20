@@ -20,6 +20,32 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             taskboard/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install media test dependencies
+        shell: pwsh
+        run: |
+          $ffmpegVersion = '9.0.2'
+          $archivePath = Join-Path $env:RUNNER_TEMP "ffmpeg-$ffmpegVersion-essentials_build.zip"
+          $extractPath = Join-Path $env:RUNNER_TEMP "ffmpeg-$ffmpegVersion"
+          $archiveUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$ffmpegVersion/ffmpeg-$ffmpegVersion-essentials_build.zip"
+          $expectedSha256 = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
+          Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath
+          $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) { throw 'FFmpeg archive checksum mismatch.' }
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $extractPath -Force
+          $ffmpegExe = Get-ChildItem -LiteralPath $extractPath -Filter ffmpeg.exe -File -Recurse | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem -LiteralPath $extractPath -Filter ffprobe.exe -File -Recurse | Select-Object -First 1
+          if (-not $ffmpegExe -or -not $ffprobeExe) { throw 'FFmpeg archive is missing ffmpeg.exe or ffprobe.exe.' }
+          $ffmpegBin = $ffmpegExe.DirectoryName
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $ffmpegBin
+          $env:PATH = "$ffmpegBin;$env:PATH"
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python --version
       - name: Install Bridge dependencies
         run: npm ci
       - name: Install Taskboard dependencies

@@ -1,0 +1,5 @@
+{
+  "name": "vm-pmo-review-video-preview",
+  "version": "0.1.0",
+  "description": "VM / PMO 审核成片配置预览示例；不包含执行器。"
+}

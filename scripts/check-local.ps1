@@ -52,7 +52,7 @@ $validationCode = @'
 import { loadConfig } from './src/config.mjs';
 import { loadPackageRegistry } from './src/package-config.mjs';
 const config = await loadConfig(process.argv[1]);
-const packages = await loadPackageRegistry(process.argv[2]);
+const packages = await loadPackageRegistry(process.argv[2], { allowVmInitial: true });
 console.log(JSON.stringify({ tables: config.tables.length, packages: Object.keys(packages).length }));
 '@
 $configSummaryOutput = $null
@@ -64,7 +64,7 @@ try {
   Pop-Location
 }
 if ($configExitCode -ne 0) {
-  throw 'Local config failed validation. Check config/bridge.local.json.'
+  throw 'Local config or package registry failed validation. Check config/bridge.local.json and the configured package registry.'
 }
 try {
   $configSummary = ($configSummaryOutput -join "`n") | ConvertFrom-Json

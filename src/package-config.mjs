@@ -1,5 +1,7 @@
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
+import { assertPackageWorkflowExecutable, packageWorkflowFromManifest } from "../taskboard/shared/feishu-package-workflow.mjs";
+import { assertExecutablePackageWorkflow, resolvePackageWorkflowFromWorkspace } from "../taskboard/server/feishu-package-identity.mjs";
 
 const REGISTRY_VERSION = 1;
 const PACKAGE_STATES = new Set(["draft", "enabled", "disabled"]);
@@ -80,7 +82,7 @@ function registrySource(value) {
  * Return only enabled, server-trusted package bindings. Draft and disabled
  * records remain owned by Taskboard and cannot make Bridge accept events.
  */
-export function normalizePackageRegistry(value) {
+export function normalizePackageRegistry(value, { allowVmInitial = false } = {}) {
   const { source, versioned } = registrySource(value);
   const packages = {};
   const projectIds = new Set();
@@ -95,6 +97,10 @@ export function normalizePackageRegistry(value) {
       throw packageError("PACKAGE_REGISTRY_INVALID", `packages.${key}.state is invalid`, 503);
     }
     if (state !== "enabled") continue;
+    const declaredTemplate = packageWorkflowFromManifest(entry);
+    const workflowTemplate = allowVmInitial === true && Object.hasOwn(entry, "workflowTemplate")
+      && declaredTemplate.id === "vm_pmo_review_video"
+      ? declaredTemplate : assertPackageWorkflowExecutable(declaredTemplate);
     const alias = packageAlias(entry.alias ?? key, `packages.${key}.alias`);
     if (aliases.has(alias)) {
       throw packageError("PACKAGE_REGISTRY_INVALID", `duplicate package alias: ${alias}`, 503);
@@ -111,12 +117,13 @@ export function normalizePackageRegistry(value) {
       workspacePath: absolutePath(entry.workspacePath, `packages.${alias}.workspacePath`),
       prompt: requiredString(entry.prompt, `packages.${alias}.prompt`),
       resourceGroups: resourceGroups(entry.resourceGroups, `packages.${alias}.resourceGroups`),
+      ...(Object.hasOwn(entry, "workflowTemplate") ? { workflowTemplate } : {}),
     };
   }
   return packages;
 }
 
-export async function loadPackageRegistry(filename) {
+export async function loadPackageRegistry(filename, { allowVmInitial = false } = {}) {
   if (typeof filename !== "string" || filename.trim() === "" || !path.isAbsolute(filename)) {
     throw packageError("PACKAGE_REGISTRY_PATH_INVALID", "Package registry path must be absolute", 503);
   }
@@ -142,7 +149,23 @@ export async function loadPackageRegistry(filename) {
     }
     throw packageError("PACKAGE_REGISTRY_UNAVAILABLE", "Package registry is unavailable", 503);
   }
-  return normalizePackageRegistry(parsed);
+  const packages = normalizePackageRegistry(parsed, { allowVmInitial });
+  await Promise.all(Object.values(packages).map(async record => {
+    if (allowVmInitial !== true || record.workflowTemplate?.id !== "vm_pmo_review_video") {
+      return assertExecutablePackageWorkflow(record);
+    }
+    // The host opt-in applies only to an explicitly saved VM identity. A
+    // linked workspace or changed/missing manifest cannot supply that trust.
+    try {
+      const info = await lstat(record.workspacePath);
+      if (!info.isDirectory() || info.isSymbolicLink()
+        || await realpath(record.workspacePath) !== record.workspacePath) throw new Error("unsafe workspace");
+    } catch {
+      throw packageError("PACKAGE_WORKSPACE_UNAVAILABLE", "Package workspace is unavailable", 409);
+    }
+    return resolvePackageWorkflowFromWorkspace(record);
+  }));
+  return packages;
 }
 
 export const PACKAGE_REGISTRY_VERSION = REGISTRY_VERSION;

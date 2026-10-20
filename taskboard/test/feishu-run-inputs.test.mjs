@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -69,6 +69,20 @@ test("writes one immutable manifest and naming input under the run root", async 
   } finally {
     await rm(fixtureData.dataDirectory, { recursive: true, force: true });
     await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("a VM snapshot cannot create ZIP run directories or manifests", async () => {
+  const data = await fixture();
+  try {
+    await assert.rejects(prepareFeishuRunInputs(input(data, {
+      packageSnapshot: { zipSourceDirectory: data.packageRoot, workflowTemplate: { id: "vm_pmo_review_video", version: 1 } },
+    })), { code: "PACKAGE_WORKFLOW_NOT_READY" });
+    assert.deepEqual(await readdir(data.dataDirectory), []);
+    assert.deepEqual(await readdir(data.packageRoot), []);
+  } finally {
+    await rm(data.dataDirectory, { recursive: true, force: true });
+    await rm(data.packageRoot, { recursive: true, force: true });
   }
 });
 

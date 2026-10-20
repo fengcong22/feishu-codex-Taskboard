@@ -10,6 +10,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { createTaskboardServer, resolveServerOptions } from "../server/index.mjs";
 import { scanDevelopmentContexts } from "../server/app.mjs";
+import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 
 const runningApps = [];
 
@@ -21,11 +22,11 @@ afterEach(async () => {
   }
 });
 
-async function startServer(configure, listenOptions = {}) {
+async function startServer(configure) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-test-"));
   const options = configure ? await configure(directory) : {};
   const app = createTaskboardServer({ dataDirectory: directory, ...options });
-  const address = await app.listen({ port: 0, ...listenOptions });
+  const address = await listenTaskboardOnFetchSafePort(app);
   runningApps.push({ app, directory });
   return `http://127.0.0.1:${address.port}`;
 }
@@ -103,7 +104,7 @@ test("health and the default local project are available", async () => {
   let skillPath;
   const baseUrl = await startServer(async (directory) => {
     skillPath = path.join(directory, "skills", "manage-taskboard", "SKILL.md");
-    return { skillPath, allowAutomaticExecution: false };
+    return { skillPath, allowAutomaticExecution: false, processEnv: {} };
   });
 
   const health = await request(baseUrl, "/health");
@@ -114,7 +115,7 @@ test("health and the default local project are available", async () => {
   assert.equal(metadata.response.status, 200);
   assert.deepEqual(metadata.body, {
     manageTaskboardSkillPath: skillPath,
-    capabilities: { localAiChat: true, automaticExecution: false },
+    capabilities: { localAiChat: true, automaticExecution: false, vmPmoInitial: false },
   });
 
   const result = await request(baseUrl, "/api/projects");
@@ -626,7 +627,7 @@ test("trusted HTTPS origins do not inherit device-local capabilities from tunnel
   const metadata = await request(baseUrl, "/api/meta", trustedRequest);
   assert.equal(metadata.response.status, 200);
   assert.deepEqual(metadata.body, {
-    capabilities: { localAiChat: false, automaticExecution: false },
+    capabilities: { localAiChat: false, automaticExecution: false, vmPmoInitial: false },
     mode: "cloud",
     realtime: {
       transport: "websocket",
@@ -660,7 +661,7 @@ test("trusted HTTPS origins do not inherit device-local capabilities from tunnel
   assert.equal(localMetadata.response.status, 200);
   assert.deepEqual(localMetadata.body, {
     manageTaskboardSkillPath: skillPath,
-    capabilities: { localAiChat: true, automaticExecution: false },
+    capabilities: { localAiChat: true, automaticExecution: false, vmPmoInitial: false },
     mode: "cloud",
     realtime: {
       transport: "websocket",

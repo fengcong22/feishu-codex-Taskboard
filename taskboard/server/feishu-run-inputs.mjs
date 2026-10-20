@@ -1,5 +1,6 @@
 import { mkdir, realpath, stat, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
+import { assertPackageWorkflowExecutable } from "../shared/feishu-package-workflow.mjs";
 
 import {
   createSourceManifest,
@@ -97,6 +98,7 @@ function packageZipFilename(artifactName) {
 }
 
 export function resolveFeishuPackageSourceDirectory(packageSnapshot, subjectVersion) {
+  assertPackageWorkflowExecutable(packageSnapshot?.workflowTemplate);
   const packageSource = packageSnapshot?.zipSourceDirectory ?? packageSnapshot?.artifactSourcePath;
   // ZIP source is optional in a package registry. The task's immutable local
   // subject version also binds an approved driver source; upload destinations
@@ -125,6 +127,7 @@ export async function prepareFeishuRunInputs({
   packageSnapshot,
   controlledContext,
 }) {
+  assertPackageWorkflowExecutable(packageSnapshot?.workflowTemplate);
   const root = path.resolve(text(dataDirectory, "dataDirectory"));
   const taskId = identifier(task?.id ?? origin?.taskId, "task.id");
   const runId = identifier(run?.runId ?? run?.id, "run.id");

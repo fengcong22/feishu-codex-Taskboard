@@ -251,3 +251,53 @@ test("uses the matching configured name field for legacy synchronized course nam
 
   assert.equal(result.courseName, "课程兼容001");
 });
+
+test("reuses a text or formula naming field when the active snapshot has no metadata fields", async () => {
+  for (const [kind, value] of [
+    ["text", [{ type: "text", text: "课程文本001" }]],
+    ["formula", "课程公式001"],
+  ]) {
+    const reader = createFeishuControlledContextReader({
+      client: {
+        bitable: { v1: { appTableRecord: { get: async () => ({
+          code: 0,
+          data: { record: { fields: { fld_course_name: value } } },
+        }) } } },
+      },
+    });
+
+    const result = await reader.read({
+      baseToken: "bas_demo",
+      tableId: "tbl_demo",
+      namingField: { fieldId: "fld_course_name", fieldName: "课程名称", kind },
+      metadata: { fields: [] },
+      delivery: { courseNaming: { mode: "reuse_artifact_naming", fieldId: null } },
+    }, { recordId: "rec_demo" });
+
+    assert.equal(result.courseName, kind === "text" ? "课程文本001" : "课程公式001");
+  }
+});
+
+test("does not reuse an untyped naming field or override conflicting metadata", async () => {
+  const reader = createFeishuControlledContextReader({
+    client: {
+      bitable: { v1: { appTableRecord: { get: async () => ({
+        code: 0,
+        data: { record: { fields: { fld_course_name: "课程001" } } },
+      }) } } },
+    },
+  });
+  const baseTable = {
+    baseToken: "bas_demo",
+    tableId: "tbl_demo",
+    namingField: { fieldId: "fld_course_name", fieldName: "课程名称" },
+    delivery: { courseNaming: { mode: "reuse_artifact_naming", fieldId: null } },
+  };
+
+  assert.equal((await reader.read(baseTable, { recordId: "rec_demo" })).courseName, "");
+  assert.equal((await reader.read({
+    ...baseTable,
+    namingField: { ...baseTable.namingField, kind: "text" },
+    metadata: { fields: [{ fieldId: "fld_course_name", type: 15, uiType: "Url" }] },
+  }, { recordId: "rec_demo" })).courseName, "");
+});

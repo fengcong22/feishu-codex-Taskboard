@@ -150,34 +150,53 @@ test("aborted catalog requests preserve AbortError instead of reporting a servic
   }
 });
 
-test("thread event subscription listens only for public snapshot hints and closes cleanly", () => {
+test("thread subscriptions share the page event stream and filter lightweight snapshot hints", () => {
   const PreviousEventSource = globalThis.EventSource;
-  const listeners = new Map();
-  let openedUrl = "";
-  let closed = false;
+  const sources = [];
   globalThis.EventSource = class {
     constructor(url) {
-      openedUrl = url;
+      this.url = url;
+      this.listeners = new Map();
+      this.closed = false;
+      sources.push(this);
     }
 
     addEventListener(type, listener) {
-      listeners.set(type, listener);
+      const listeners = this.listeners.get(type) ?? new Set();
+      listeners.add(listener);
+      this.listeners.set(type, listeners);
     }
 
-    close() {
-      closed = true;
+    removeEventListener(type, listener) {
+      this.listeners.get(type)?.delete(listener);
     }
+
+    dispatch(type, data) {
+      const event = new MessageEvent(type, { data: JSON.stringify(data) });
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
+
+    close() { this.closed = true; }
   };
 
   try {
-    const hints = [];
-    const unsubscribe = subscribeAiChatThread("thread / 1", (type) => hints.push(type));
-    assert.equal(openedUrl, `${taskboardBase}api/local/ai/threads/thread%20%2F%201/events`);
-    listeners.get("ai.event")();
-    listeners.get("ai.run")();
-    assert.deepEqual(hints, ["ai.event", "ai.run"]);
-    unsubscribe();
-    assert.equal(closed, true);
+    const firstHints = [];
+    const secondHints = [];
+    const unsubscribeFirst = subscribeAiChatThread("thread-1", (type) => firstHints.push(type));
+    const unsubscribeSecond = subscribeAiChatThread("thread-2", (type) => secondHints.push(type));
+    assert.equal(sources.length, 1);
+    assert.equal(sources[0].url, `${taskboardBase}api/events`);
+
+    sources[0].dispatch("ai.thread.updated", { threadId: "thread-2", hintType: "ai.run" });
+    sources[0].dispatch("ai.thread.updated", { threadId: "thread-1", hintType: "ai.event" });
+    sources[0].dispatch("ai.thread.updated", { threadId: "thread-1", hintType: "private.event" });
+    assert.deepEqual(firstHints, ["ai.event"]);
+    assert.deepEqual(secondHints, ["ai.run"]);
+
+    unsubscribeFirst();
+    assert.equal(sources[0].closed, false);
+    unsubscribeSecond();
+    assert.equal(sources[0].closed, true);
   } finally {
     globalThis.EventSource = PreviousEventSource;
   }

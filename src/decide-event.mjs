@@ -1,4 +1,21 @@
 import { subjectKey as makeSubjectKey } from "./workflow-config.mjs";
+import { packageWorkflowFromManifest } from "../taskboard/shared/feishu-package-workflow.mjs";
+
+/** ZIP routes never become VM routes by changing a trusted package binding. */
+export function zipPackageWorkflowErrorCode(packageConfig) {
+  if (!packageConfig) return null;
+  try {
+    return packageWorkflowFromManifest(packageConfig).id === "document_draft_zip"
+      ? null : "PACKAGE_WORKFLOW_MISMATCH";
+  } catch {
+    return "PACKAGE_WORKFLOW_UNSUPPORTED";
+  }
+}
+
+function incompatibleWorkflowDecision(decision, packageConfig) {
+  const reasonCode = zipPackageWorkflowErrorCode(packageConfig);
+  return reasonCode ? { ...decision, kind: "blocked", reason: "incompatible_package_workflow", reasonCode } : decision;
+}
 
 function displayValue(value) {
   if (value === null || value === undefined) return "";
@@ -204,7 +221,7 @@ function finalDirectoryDecision(subject, event) {
   return null;
 }
 
-function modernDecision(subject, event) {
+function modernDecision(subject, event, externalPackages = null) {
   if (!subject || !event || typeof event !== "object") {
     return { kind: "ignored", reason: "invalid_event" };
   }
@@ -280,7 +297,7 @@ function modernDecision(subject, event) {
     return { kind: "ignored", reason: "new_value_not_trigger", subject, table: subjectTable(subject), event };
   }
   const packageAlias = subject.packageRoute?.packageAlias ?? subject.defaultPackageAlias ?? null;
-  const packageMap = subject.packages ?? subject.packageCatalog ?? null;
+  const packageMap = externalPackages ?? subject.packages ?? subject.packageCatalog ?? null;
   const packageConfig = packageMap && Object.hasOwn(packageMap, packageAlias)
     ? packageMap[packageAlias]
     : subject.packageConfig;
@@ -361,7 +378,15 @@ export function decideRecordChange(config, event) {
     (!candidate.baseToken || candidate.baseToken === event?.baseToken)
     && (!candidate.tableId || candidate.tableId === event?.tableId)
   ));
-  if (subject) return modernDecision(subject, event);
+  if (subject) {
+    const packages = config?.packages ?? subject.packages ?? subject.packageCatalog ?? null;
+    const decision = modernDecision(subject, event, packages);
+    if (!["register", "archive_waiting", "directory_operation"].includes(decision.kind)) return decision;
+    const alias = subject.packageRoute?.packageAlias ?? subject.defaultPackageAlias;
+    const packageConfig = packages && Object.hasOwn(packages, alias)
+      ? packages[alias] : subject.packageConfig;
+    return incompatibleWorkflowDecision(decision, packageConfig);
+  }
   const table = configuredTables(config).find((candidate) => (
     candidate.tableId === event.tableId
     && (!candidate.baseToken || candidate.baseToken === event.baseToken)
@@ -423,7 +448,7 @@ export function decideRecordChange(config, event) {
       event,
     };
   }
-  return {
+  return incompatibleWorkflowDecision({
     kind: "ready",
     table,
     ...tableSnapshot(table),
@@ -431,5 +456,5 @@ export function decideRecordChange(config, event) {
     packageConfig,
     packageSource: packageFromField === undefined ? "table-default" : "record-field",
     event,
-  };
+  }, packageConfig);
 }
