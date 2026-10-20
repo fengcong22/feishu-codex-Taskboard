@@ -21,12 +21,13 @@ async function fixture(t, options = {}) {
   let time = 1000000000;
   let account = identity;
   let status = "connected";
+  let expiresAt = null;
   let service;
   let db;
   let store;
   const client = options.client ?? {};
   const session = {
-    snapshot: () => ({ status, account: account ? { name: account.name, userId: account.user_id } : null, expiresAt: null, expirySource: "unknown", lastCheckedAt: time, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false }),
+    snapshot: () => ({ status, account: account ? { name: account.name, userId: account.user_id } : null, expiresAt, expirySource: expiresAt === null ? "unknown" : "token", lastCheckedAt: time, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false }),
     identity: () => account,
     client: () => status === "connected" ? client : null,
     check: async () => {}, beginLogin: async () => ({ loginUrl: "https://shadow.yangcong345.com/fixture", session: session.snapshot() }),
@@ -44,6 +45,7 @@ async function fixture(t, options = {}) {
   t.after(async () => { await service.close(); db.close(); await rm(dir, { recursive: true, force: true }); });
   return { dir, get service() { return service; }, get store() { return store; }, session,
     advance: (ms) => { time += ms; }, account: (value) => { account = value; }, status: (value) => { status = value; },
+    expiresIn: (ms) => { expiresAt = ms === null ? null : time + ms; },
     async restart(extra) { await service.close(); db.close(); return start(extra); },
     input: (vmids = [vmid]) => ({ vmids, department: "动画组", reason: "切片剪辑", outputRoot: dir }),
     update(id, mutate) { const claim = store.claim(id); const job = claim.job; mutate(job); return store.save(id, claim.leaseToken, job); },
@@ -301,6 +303,84 @@ test("notifications deduplicate durably, retry failures and never overwrite acti
   assert.equal(f.store.get(job.id).status, "waiting_approval");
 });
 
+test("expiry reminders start thirty minutes before expiry and remain deduplicated across restart", async (t) => {
+  const sent = [];
+  const notifier = { available: () => true, send: async value => { sent.push(value); } };
+  const f = await fixture(t, { notifier, processJob: async (store, id) => store.get(id) });
+  const job = f.service.enqueue(f.input()).jobs[0];
+  f.expiresIn(30 * 60_000 + 1);
+  await f.service.wake();
+  assert.equal(sent.length, 0);
+  f.advance(1);
+  await f.service.wake();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, "expiring");
+  assert.equal(sent[0].recipient, identity.enterprise_email);
+  assert.equal(sent[0].vmid, null);
+  f.advance(15 * 60_000);
+  await f.service.wake();
+  await f.restart({ notifier });
+  await f.service.wake();
+  assert.equal(sent.length, 1);
+  assert.equal(f.store.get(job.id).status, "queued");
+
+  // A rotated credential with a new expiry gets its own reminder.
+  f.expiresIn(31 * 60_000);
+  await f.service.wake();
+  assert.equal(sent.length, 1);
+  f.advance(60_000);
+  await f.service.wake();
+  assert.equal(sent.length, 2);
+  assert.notEqual(sent[0].id, sent[1].id);
+});
+
+test("expiry reminders require a future known expiry, a connected account and active work", async (t) => {
+  for (const scenario of ["unknown", "expired", "expires_now", "disconnected", "idle", "settled", "disabled"]) {
+    await t.test(scenario, async (t) => {
+      const sent = [];
+      const f = await fixture(t, { notifier: { available: () => true, send: async value => { sent.push(value); } },
+        processJob: async (store, id) => store.get(id) });
+      const job = scenario === "idle" ? null : f.service.enqueue(f.input()).jobs[0];
+      f.expiresIn(scenario === "unknown" ? null : scenario === "expired" ? -1 : scenario === "expires_now" ? 0 : 10 * 60_000);
+      if (scenario === "disconnected") f.status("disconnected");
+      if (scenario === "settled") f.update(job.id, value => { value.status = "ready"; });
+      if (scenario === "disabled") f.service.updateSettings({ ...f.service.snapshot().settings, notificationsEnabled: false });
+      await f.service.wake();
+      assert.equal(sent.filter(value => value.kind === "expiring").length, 0);
+    });
+  }
+});
+
+test("pending expiry reminders are discarded when their session or active work is no longer current", async (t) => {
+  for (const scenario of ["expired", "rotated", "settled", "disconnected"]) {
+    await t.test(scenario, async (t) => {
+      let attempts = 0;
+      const sent = [];
+      const notifier = { available: () => true, send: async value => {
+        attempts++;
+        if (attempts === 1) throw new Error("temporary notification failure");
+        sent.push(value);
+      } };
+      const f = await fixture(t, { notifier, processJob: async (store, id) => store.get(id) });
+      const job = f.service.enqueue(f.input()).jobs[0];
+      f.expiresIn(scenario === "expired" ? 30_000 : 10 * 60_000);
+      await f.service.wake();
+      assert.equal(attempts, 1);
+      if (scenario === "rotated") f.expiresIn(60 * 60_000);
+      if (scenario === "settled") f.update(job.id, value => { value.status = "ready"; });
+      if (scenario === "disconnected") f.status("disconnected");
+      f.advance(60_000);
+      await f.restart({ notifier });
+      await f.service.wake();
+      assert.equal(sent.filter(value => value.kind === "expiring").length, 0);
+      assert.equal(f.service.snapshot().notifications.errorCode, null);
+      f.advance(5 * 60_000);
+      await f.service.wake();
+      assert.equal(sent.filter(value => value.kind === "expiring").length, 0);
+    });
+  }
+});
+
 test("official SDK notification adapter uses verified email, safe text and stable idempotency ID", async () => {
   const requests = [];
   const notifier = createVmDownloadNotifier({ appId: "fixture", appSecret: "fixture-secret", createContext: async () => ({ client: { im: { message: { create: async value => { requests.push(value); return { code: 0, data: { message_id: "message" } }; } } } } }) });
@@ -309,4 +389,13 @@ test("official SDK notification adapter uses verified email, safe text and stabl
   assert.equal(requests[0].data.receive_id, identity.enterprise_email);
   assert.equal(requests[0].data.uuid, "a".repeat(32));
   assert.doesNotMatch(requests[0].data.content, /http|token|fixture-secret/iu);
+  const authText = JSON.parse(requests[0].data.content).text;
+  assert.match(authText, /Auto-Cut 包.*VM 账号与队列/u);
+  assert.match(authText, /重新连接账号/u);
+  await notifier.send({ id: "b".repeat(32), recipient: identity.enterprise_email, kind: "expiring", vmid: null });
+  const expiryText = JSON.parse(requests[1].data.content).text;
+  assert.match(expiryText, /30 分钟/u);
+  assert.match(expiryText, /Taskboard.*VM 账号与队列/u);
+  assert.match(expiryText, /重新连接账号.*Shadow.*登录/u);
+  assert.doesNotMatch(requests[1].data.content, /http|token|fixture-secret|127\.0\.0\.1/iu);
 });

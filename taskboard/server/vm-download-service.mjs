@@ -92,15 +92,27 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       lastClient = client;
     }
   }
+  function hasActiveWork(jobs) {
+    return jobs.some(job => job.requester_id === lastAccount?.userId
+      && (!TERMINAL.has(job.status) || job.status === "auth_required"));
+  }
+  function queueExpiryReminder(jobs) {
+    if (!settings.notificationsEnabled || !lastAccount) return null;
+    const state = session.snapshot();
+    const remainingMs = state.expiresAt === null ? 0 : state.expiresAt - now();
+    if (hasActiveWork(jobs) && state.status === "connected" && state.expirySource === "token"
+      && remainingMs > 0 && remainingMs <= 30 * 60000) {
+      return metadata.enqueue({ key: `expiry:${lastAccount.userId}:${state.expiresAt}`,
+        kind: "expiring", recipient: lastAccount.email });
+    }
+    return null;
+  }
   function queueNotifications(jobs) {
     if (!settings.notificationsEnabled || !lastAccount) return;
     const state = session.snapshot();
-    const active = jobs.filter(job => job.requester_id === lastAccount.userId && (!TERMINAL.has(job.status) || job.status === "auth_required"));
     const enqueue = (key, kind, vmid) => metadata.enqueue({ key, kind, vmid, recipient: lastAccount.email });
-    if (active.length && ["disconnected", "auth_required"].includes(state.status)) enqueue(`auth:${lastAccount.epoch}`, "auth_required");
-    if (active.length && state.status === "connected" && state.expiresAt !== null && state.expiresAt - now() <= 15 * 60000) {
-      enqueue(`expiry:${lastAccount.userId}:${state.expiresAt}`, "expiring");
-    }
+    if (hasActiveWork(jobs) && ["disconnected", "auth_required"].includes(state.status)) enqueue(`auth:${lastAccount.epoch}`, "auth_required");
+    queueExpiryReminder(jobs);
     for (const job of jobs) {
       if (job.requester_id !== lastAccount.userId) continue;
       if (job.status === "waiting_approval" && Number.isSafeInteger(job.approval_wait_started_at) && now() - job.approval_wait_started_at >= DAY) {
@@ -118,6 +130,10 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     for (let count = 0; count < 10 && !closed && settings.notificationsEnabled; count++) {
       const item = metadata.claim();
       if (!item) break;
+      if (item.kind === "expiring" && item.id !== queueExpiryReminder(store.list())) {
+        metadata.dismiss(item);
+        continue;
+      }
       let success = false;
       try { await notifier.send({ id: item.id, recipient: item.recipient, kind: item.kind, vmid: item.vmid }); success = true; }
       catch { /* Persist only a known error, never an SDK response or request. */ }
