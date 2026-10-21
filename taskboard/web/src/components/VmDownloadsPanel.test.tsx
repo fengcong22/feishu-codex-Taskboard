@@ -3,12 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskboardLanguageProvider } from "../i18n";
 import { VmDownloadsPanel } from "./VmDownloadsPanel";
 import { LocalSettingsDialog } from "./LocalSettingsDialog";
+import type { VmDownloadsSnapshot } from "../vmDownloads";
 
 const VM1 = "507f1f77bcf86cd799439011";
 const VM2 = "507f1f77bcf86cd799439012";
 const ROOT = "/api/local/vm-downloads";
 
-function snapshot() {
+function snapshot(): VmDownloadsSnapshot {
   return {
     session: {
       status: "disconnected", account: null as { name: string; userId: string } | null,
@@ -17,7 +18,7 @@ function snapshot() {
     },
     settings: { outputRoot: "E:\\Downloads", department: "动画组", reason: "课程制作", notificationsEnabled: true },
     jobs: [] as ReturnType<typeof job>[],
-    notifications: { available: true, enabled: true, errorCode: null as string | null, lastSentAt: null },
+    notifications: { available: true, enabled: true, errorCode: null as string | null, lastSentAt: null, pendingCount: 0, failedCount: 0 },
     worker: { running: false, errorCode: null as string | null },
   };
 }
@@ -158,15 +159,39 @@ describe("VM downloads panel", () => {
 
   it("uses token expiry metadata only when the server actually supplies it", async () => {
     current.session = { ...current.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" }, expiresAt: 1_792_600_000_000, expirySource: "token" };
-    mount(); await screen.findByText("测试用户");
+    mount(); await screen.findByText(/测试用户/);
     expect(screen.getByText(/凭据提示到期时间/)).toBeTruthy();
     expect(screen.queryByText(/有效期未知/)).toBeNull();
+  });
+
+  it("shows previous account verification and notification health while manual requests stay collapsed", async () => {
+    current.session = { ...current.session, status: "unavailable", account: { name: "测试用户", userId: "fixture-user" },
+      expiresAt: 1_792_600_000_000, expirySource: "token", lastCheckedAt: 1_792_500_000_000,
+      errorCode: "VM_API_TRANSPORT_FAILED" };
+    current.notifications = { available: true, enabled: true, errorCode: "VM_NOTIFY_SEND_FAILED",
+      lastSentAt: 1_792_400_000_000, pendingCount: 1, failedCount: 3 };
+    mount();
+
+    await screen.findByText("暂时无法验证账号");
+    expect(screen.getByText("上次验证账号: 测试用户")).toBeTruthy();
+    expect(screen.getByText(/上次凭据提示到期时间/)).toBeTruthy();
+    expect(screen.getByText(/VM_API_TRANSPORT_FAILED/)).toBeTruthy();
+    expect(screen.getByText(/有 1 条飞书通知待重试/)).toBeTruthy();
+    expect(screen.getByText(/3 条历史通知达到重试上限/)).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "VMID" })).toBeNull();
+  });
+
+  it("keeps older service snapshots readable until the local service restarts", async () => {
+    current.notifications = { available: false, enabled: true, errorCode: "VM_NOTIFY_SEND_FAILED", lastSentAt: null };
+    mount();
+    expect(await screen.findByText(/飞书通知状态需本机 Taskboard 服务重启后更新/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("reflects the verified account without fabricating an expiry and disconnects it", async () => {
     current.session = { ...current.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" } };
     mount();
-    await screen.findByText("测试用户");
+    await screen.findByText(/测试用户/);
     expect(screen.getByText(/有效期未知/)).toBeTruthy();
     expect(screen.getByText(/暂不支持自动续期/)).toBeTruthy();
     expect(screen.getByText(/跨设备直接授权/)).toBeTruthy();
@@ -225,7 +250,7 @@ describe("VM downloads panel", () => {
   });
 
   it("saves preferences and explains unavailable Feishu notifications", async () => {
-    current.notifications = { available: false, enabled: true, errorCode: "VM_NOTIFY_UNAVAILABLE", lastSentAt: null };
+    current.notifications = { available: false, enabled: true, errorCode: "VM_NOTIFY_UNAVAILABLE", lastSentAt: null, pendingCount: 0, failedCount: 0 };
     mount(); await openManualRequest(); await screen.findByDisplayValue("E:\\Downloads");
     expect(screen.getByText(/飞书通知不可用/)).toBeTruthy();
     fireEvent.change(screen.getByRole("textbox", { name: "申请部门" }), { target: { value: "  课程组 " } });
@@ -395,7 +420,7 @@ describe("VM downloads panel", () => {
 
   it("keeps worker failures visible across refreshes until the service reports recovery", async () => {
     current.jobs = [job("pending", "waiting_approval")];
-    current.worker.errorCode = "VM_APPROVAL_STORE_FAILED";
+    current.worker!.errorCode = "VM_APPROVAL_STORE_FAILED";
     mount();
     expect((await screen.findByRole("alert")).textContent).toContain("下载队列处理异常");
     expect(screen.getByRole("alert").textContent).toContain("VM_APPROVAL_STORE_FAILED");
@@ -403,7 +428,7 @@ describe("VM downloads panel", () => {
     fireEvent.click(screen.getByRole("button", { name: "刷新下载状态" }));
     await waitFor(() => expect((screen.getByRole("button", { name: "刷新下载状态" }) as HTMLButtonElement).disabled).toBe(false));
     expect(screen.getByRole("alert").textContent).toContain("VM_APPROVAL_STORE_FAILED");
-    current.worker.errorCode = null;
+    current.worker!.errorCode = null;
     fireEvent.click(screen.getByRole("button", { name: "刷新下载状态" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     expect(screen.getByText("等待审批")).toBeTruthy();
@@ -417,7 +442,7 @@ describe("VM downloads panel", () => {
     expect(screen.getByText("尚未连接")).toBeTruthy();
     current.session = { ...current.session, status: "connected", account: { name: "回调用户", userId: "fixture-user" } };
     await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
-    expect(screen.getByText("回调用户")).toBeTruthy();
+    expect(screen.getByText(/回调用户/)).toBeTruthy();
     view.unmount();
     const requestCount = fetchMock.mock.calls.length;
     await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });

@@ -28,7 +28,7 @@ function activeJobs(snapshot: VmDownloadsSnapshot): number {
 }
 
 export function VmStatusMenu({ onOpenQueue }: Props) {
-  const { text } = useTaskboardI18n();
+  const { text, locale } = useTaskboardI18n();
   const [snapshot, setSnapshot] = useState<VmDownloadsSnapshot | null>(null);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -140,6 +140,23 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
   const attentionCount = snapshot?.jobs.filter((job) => job.status === "needs_attention").length ?? 0;
   const queueCount = snapshot ? activeJobs(snapshot) : 0;
   const accessibleStatus = snapshot ? sessionLabel[0] : text("正在读取", "Loading");
+  const sessionErrorCode = safeCode(snapshot?.session.errorCode);
+  const notificationErrorCode = safeCode(snapshot?.notifications.errorCode);
+  const pendingNotificationCount = snapshot?.notifications.pendingCount ?? 0;
+  const failedNotificationCount = snapshot?.notifications.failedCount ?? 0;
+  const notificationCountsKnown = Number.isSafeInteger(snapshot?.notifications.pendingCount)
+    && Number.isSafeInteger(snapshot?.notifications.failedCount);
+  const notificationStatus = snapshot
+    ? !notificationCountsKnown ? text("通知状态需本机服务重启后更新", "Notification status updates after restarting the local service")
+      : !snapshot.notifications.enabled ? text("飞书提醒已关闭", "Feishu alerts are off")
+      : !snapshot.notifications.available ? text("飞书通知不可用", "Feishu notifications unavailable")
+        : pendingNotificationCount > 0
+          ? text(`${pendingNotificationCount} 条待重试`, `${pendingNotificationCount} pending retry`)
+          : text("飞书通知已配置", "Feishu notifications configured")
+    : null;
+  function date(value: number) {
+    return new Date(value).toLocaleString(locale, { dateStyle: "short", timeStyle: "short" });
+  }
 
   return <div className="header-vm-status" ref={root}>
     <button
@@ -158,10 +175,24 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
     {open && <div className="header-project-menu header-vm-status-menu" role="menu" aria-label={text("VM 状态菜单", "VM status menu")}>
       <div className="header-vm-status-summary" role="status">
         <strong>{text(sessionLabel[0], sessionLabel[1])}</strong>
-        {snapshot?.session.account && <span>{snapshot.session.account.name}</span>}
+        {snapshot?.session.account && <span>{text(snapshot.session.status === "connected" ? "当前账号" : "上次验证账号", snapshot.session.status === "connected" ? "Current account" : "Previously verified account")}: {snapshot.session.account.name}</span>}
+        {snapshot?.session.expirySource === "token" && snapshot.session.expiresAt !== null && <small>
+          {text(snapshot.session.status === "connected" ? `凭据提示到期时间：${date(snapshot.session.expiresAt)}；以服务端验证为准` : `上次凭据提示到期时间：${date(snapshot.session.expiresAt)}；以服务端验证为准`,
+            snapshot.session.status === "connected" ? `Credential expiry hint: ${date(snapshot.session.expiresAt)}; server verification is authoritative` : `Previous credential expiry hint: ${date(snapshot.session.expiresAt)}; server verification is authoritative`)}
+        </small>}
+        {snapshot?.session.lastCheckedAt !== null && snapshot?.session.lastCheckedAt !== undefined && <small>{text(`上次验证：${date(snapshot.session.lastCheckedAt)}`, `Last checked: ${date(snapshot.session.lastCheckedAt)}`)}</small>}
+        {sessionErrorCode && <small className="header-vm-status-error">{text("账号验证提示", "Account check")}: {sessionErrorCode}</small>}
         {snapshot && <small>{text(`${queueCount} 个队列任务 · ${attentionCount} 项需要处理`, `${queueCount} queued · ${attentionCount} need attention`)}</small>}
         {snapshot?.worker?.errorCode && <small className="header-vm-status-error">{text("队列处理异常", "Queue worker error")} · {safeCode(snapshot.worker.errorCode) ?? "VM_ERROR"}</small>}
       </div>
+      {snapshot && <div className="header-vm-status-notifications" role="status">
+        <strong>{text("飞书通知", "Feishu notifications")}</strong>
+        <small>{notificationStatus}{notificationCountsKnown && pendingNotificationCount > 0 && notificationErrorCode ? ` · ${notificationErrorCode}` : ""}</small>
+        {!notificationCountsKnown && notificationErrorCode && <small>{text("旧版状态码", "Legacy status code")} · {notificationErrorCode}</small>}
+        {notificationCountsKnown && failedNotificationCount > 0 && <small>{text(`${failedNotificationCount} 条历史通知发送失败`, `${failedNotificationCount} historical notifications failed`)}</small>}
+        {snapshot.notifications.lastSentAt !== null && <small>{text(`最近发送：${date(snapshot.notifications.lastSentAt)}`, `Last sent: ${date(snapshot.notifications.lastSentAt)}`)}</small>}
+        {notificationCountsKnown && !pendingNotificationCount && !snapshot.notifications.available && notificationErrorCode && <small className="header-vm-status-error">{notificationErrorCode}</small>}
+      </div>}
       {error && <p role="alert" className="header-vm-status-error">{error}</p>}
       <div className="header-vm-status-actions">
         <button type="button" role="menuitem" disabled={loading} onClick={() => void refresh()}>

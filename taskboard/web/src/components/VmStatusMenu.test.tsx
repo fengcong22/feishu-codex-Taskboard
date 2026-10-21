@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskboardLanguageProvider } from "../i18n";
-import { getVmDownloads, loginVmDownloads } from "../vmDownloads";
+import { getVmDownloads, loginVmDownloads, type VmDownloadsSnapshot } from "../vmDownloads";
 import { VmStatusMenu } from "./VmStatusMenu";
 
 vi.mock("../vmDownloads", async (importOriginal) => ({
@@ -11,7 +11,7 @@ vi.mock("../vmDownloads", async (importOriginal) => ({
   loginVmDownloads: vi.fn(),
 }));
 
-const currentSnapshot = {
+const currentSnapshot: VmDownloadsSnapshot = {
   session: {
     status: "disconnected" as const, account: null, expiresAt: null,
     expirySource: "unknown" as const, lastCheckedAt: null, errorCode: null,
@@ -22,7 +22,7 @@ const currentSnapshot = {
     { id: "attention", vmid: "507f1f77bcf86cd799439011", status: "needs_attention", submission_attempts: 1, attempts: 0, next_attempt_at: null, created_at: 1, updated_at: 1, output_root: "E:\\Downloads", department: "动画组", reason: "课程制作" },
     { id: "pending", vmid: "507f1f77bcf86cd799439012", status: "waiting_approval", submission_attempts: 1, attempts: 0, next_attempt_at: null, created_at: 1, updated_at: 1, output_root: "E:\\Downloads", department: "动画组", reason: "课程制作" },
   ],
-  notifications: { available: false, enabled: true, errorCode: "VM_NOTIFY_NOT_CONFIGURED", lastSentAt: null },
+  notifications: { available: false, enabled: true, errorCode: "VM_NOTIFY_NOT_CONFIGURED", lastSentAt: null, pendingCount: 0, failedCount: 0 },
   worker: { running: false, errorCode: null },
 };
 
@@ -51,6 +51,40 @@ describe("VM status menu", () => {
     await waitFor(() => expect((refreshButton as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(refreshButton);
     expect(getVmDownloads).toHaveBeenCalledTimes(3);
+  });
+
+  it("shows verification, expiry and notification health in the topbar menu", async () => {
+    const snapshot = structuredClone(currentSnapshot);
+    snapshot.session = { ...snapshot.session, status: "unavailable", account: { name: "测试用户", userId: "fixture-user" },
+      expiresAt: 1_792_600_000_000, expirySource: "token", lastCheckedAt: 1_792_500_000_000,
+      errorCode: "VM_API_TRANSPORT_FAILED" };
+    snapshot.notifications = { available: true, enabled: true, errorCode: "VM_NOTIFY_SEND_FAILED",
+      lastSentAt: 1_792_400_000_000, pendingCount: 2, failedCount: 7 };
+    vi.mocked(getVmDownloads).mockResolvedValue(snapshot);
+
+    render(<TaskboardLanguageProvider language="zh"><VmStatusMenu onOpenQueue={vi.fn()} /></TaskboardLanguageProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "VM 状态：暂时无法验证" }));
+
+    expect(screen.getByText("上次验证账号: 测试用户")).toBeTruthy();
+    expect(screen.getByText(/凭据提示到期时间/)).toBeTruthy();
+    expect(screen.getByText(/^上次验证：/)).toBeTruthy();
+    expect(screen.getByText(/VM_API_TRANSPORT_FAILED/)).toBeTruthy();
+    expect(screen.getByText(/2 条待重试/)).toBeTruthy();
+    expect(screen.getByText(/7 条历史通知发送失败/)).toBeTruthy();
+  });
+
+  it("labels notification status as awaiting a service restart for older snapshots", async () => {
+    const snapshot = structuredClone(currentSnapshot);
+    delete snapshot.notifications.pendingCount;
+    delete snapshot.notifications.failedCount;
+    snapshot.notifications.available = false;
+    snapshot.notifications.errorCode = "VM_NOTIFY_SEND_FAILED";
+    vi.mocked(getVmDownloads).mockResolvedValue(snapshot);
+    render(<TaskboardLanguageProvider language="zh"><VmStatusMenu onOpenQueue={vi.fn()} /></TaskboardLanguageProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "VM 状态：尚未连接" }));
+    expect(screen.getByText("通知状态需本机服务重启后更新")).toBeTruthy();
+    expect(screen.getByText("旧版状态码 · VM_NOTIFY_SEND_FAILED")).toBeTruthy();
+    expect(screen.queryByText("飞书通知不可用")).toBeNull();
   });
 
   it("retries the initial status read when StrictMode aborts its first mount request", async () => {

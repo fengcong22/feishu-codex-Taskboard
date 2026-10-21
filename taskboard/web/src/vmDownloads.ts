@@ -60,7 +60,7 @@ export interface VmDownloadsSnapshot {
   session: VmDownloadSession;
   settings: VmDownloadSettings;
   jobs: VmDownloadJob[];
-  notifications: { available: boolean; enabled: boolean; errorCode: string | null; lastSentAt: number | null };
+  notifications: { available: boolean; enabled: boolean; errorCode: string | null; lastSentAt: number | null; pendingCount?: number; failedCount?: number };
   worker?: { running: boolean; errorCode: string | null };
 }
 
@@ -83,15 +83,24 @@ function validSession(value: unknown): value is VmDownloadSession {
     && (value.account === null || (record(value.account) && strings(value.account, ["name", "userId"])))
     && ["token", "unknown"].includes(String(value.expirySource))
     && (value.expiresAt === null || (typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)))
+    && (value.lastCheckedAt === null || (typeof value.lastCheckedAt === "number" && Number.isFinite(value.lastCheckedAt)))
+    && (value.errorCode === null || typeof value.errorCode === "string")
     && value.automaticRefreshSupported === false && value.crossDeviceAuthorizationSupported === false;
 }
 
 export async function getVmDownloads(signal?: AbortSignal): Promise<VmDownloadsSnapshot> {
   const value = await requestVmDownloads<unknown>("", { signal });
+  const pendingCount = record(value) && record(value.notifications) ? value.notifications.pendingCount : undefined;
+  const failedCount = record(value) && record(value.notifications) ? value.notifications.failedCount : undefined;
   if (!record(value) || !validSession(value.session)
     || !record(value.settings) || !strings(value.settings, ["outputRoot", "department", "reason"])
     || typeof value.settings.notificationsEnabled !== "boolean"
     || !record(value.notifications) || typeof value.notifications.available !== "boolean" || typeof value.notifications.enabled !== "boolean"
+    || (value.notifications.errorCode !== null && typeof value.notifications.errorCode !== "string")
+    || (value.notifications.lastSentAt !== null && (typeof value.notifications.lastSentAt !== "number" || !Number.isFinite(value.notifications.lastSentAt)))
+    || !((pendingCount === undefined && failedCount === undefined)
+      || (Number.isSafeInteger(pendingCount) && Number(pendingCount) >= 0
+        && Number.isSafeInteger(failedCount) && Number(failedCount) >= 0))
     || !Array.isArray(value.jobs) || value.jobs.some((job) => !record(job)
       || !strings(job, ["id", "vmid", "status", "output_root", "department", "reason"])
       || (job.application_id !== undefined && typeof job.application_id !== "string")

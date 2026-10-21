@@ -88,8 +88,11 @@ export function createVmDownloadMetadata({ database, now = Date.now }) {
     },
     summary() {
       const sent = database.prepare("SELECT MAX(sent_at) AS time FROM vm_download_notifications").get();
-      const failed = database.prepare("SELECT error_code FROM vm_download_notifications WHERE status!='sent' AND error_code IS NOT NULL ORDER BY next_at DESC LIMIT 1").get();
-      return { lastSentAt: sent.time ?? null, errorCode: failed?.error_code ?? null };
+      const pending = database.prepare("SELECT COUNT(*) AS count FROM vm_download_notifications WHERE status='pending'").get();
+      const failed = database.prepare("SELECT COUNT(*) AS count FROM vm_download_notifications WHERE status='failed'").get();
+      const currentError = database.prepare("SELECT error_code FROM vm_download_notifications WHERE status='pending' AND error_code IS NOT NULL ORDER BY next_at DESC LIMIT 1").get();
+      return { lastSentAt: sent.time ?? null, errorCode: currentError?.error_code ?? null,
+        pendingCount: pending.count, failedCount: failed.count };
     },
   };
 }

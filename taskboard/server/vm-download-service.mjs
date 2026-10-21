@@ -276,7 +276,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       const jobs = store.list();
       return { session: session.snapshot(), settings: structuredClone(settings), jobs: jobs
         .filter(job => job.queue_removed_at === undefined && (job.queue_hidden_at === undefined || job.status === "needs_attention")).map(publicJob),
-        notifications: { ...summary, available: notifier.available() && Boolean(lastAccount) && !summary.errorCode, enabled: settings.notificationsEnabled,
+        notifications: { ...summary, available: notifier.available() && Boolean(lastAccount), enabled: settings.notificationsEnabled,
           errorCode: !notifier.available() ? "VM_NOTIFY_NOT_CONFIGURED" : !lastAccount ? "VM_NOTIFY_RECIPIENT_UNAVAILABLE" : summary.errorCode },
         worker: { running: Boolean(running), errorCode: workerError } };
     },

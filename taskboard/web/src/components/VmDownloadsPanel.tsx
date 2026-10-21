@@ -327,6 +327,8 @@ export function VmDownloadsPanel() {
 
   const session = snapshot?.session;
   const sessionLabel = session ? SESSION_LABELS[session.status] ?? SESSION_LABELS.unavailable : null;
+  const notificationCountsKnown = Boolean(snapshot && Number.isSafeInteger(snapshot.notifications.pendingCount)
+    && Number.isSafeInteger(snapshot.notifications.failedCount));
   return <section className="vm-downloads-panel" aria-labelledby="vm-downloads-heading">
     <header className="vm-downloads-heading"><div><h3 id="vm-downloads-heading">{text("VM 账号与队列", "VM account and queue")}</h3><p>{text("管理 auto-cut-slicing 包使用的 Shadow 账号和 VM 下载队列。关闭本页后，队列仍会在本机后台继续。", "Manage the Shadow account and VM download queue used by auto-cut-slicing. The local queue continues after you leave this page.")}</p><p>{text("VMID、申请部门和申请原因在当前学科的“基础与执行”配置中设置；这里负责账号连接和下载队列。", "Set the VMID field, department, and reason under this subject's Basics and execution settings. Manage the account connection and download queue here.")}</p></div>
       <button type="button" className="button secondary" disabled={loading || busy} onClick={() => void refresh()}>{text("刷新下载状态", "Refresh downloads")}</button></header>
@@ -339,12 +341,12 @@ export function VmDownloadsPanel() {
     </section>}
     {loading && !snapshot && <p role="status">{text("正在读取下载队列…", "Loading downloads…")}</p>}
     {session && <section className="vm-downloads-session" aria-label={text("Shadow 账号", "Shadow account")}>
-      <div className="vm-downloads-session-heading"><strong>{text(sessionLabel![0], sessionLabel![1])}</strong>{session.account && <span>{session.account.name}</span>}</div>
+      <div className="vm-downloads-session-heading"><strong>{text(sessionLabel![0], sessionLabel![1])}</strong>{session.account && <span>{text(session.status === "connected" ? "当前账号" : "上次验证账号", session.status === "connected" ? "Current account" : "Previously verified account")}: {session.account.name}</span>}</div>
       {session.account && <p>{text("账号", "Account")}: {session.account.userId}</p>}
-      <p>{session.expirySource === "token" && session.expiresAt
-        ? text(`凭据提示到期时间：${date(session.expiresAt)}；账号是否可用以服务端验证为准。`, `Credential expiry hint: ${date(session.expiresAt)}; server verification determines account availability.`)
+      <p>{session.expirySource === "token" && session.expiresAt !== null
+        ? text(`${session.status === "connected" ? "凭据" : "上次凭据"}提示到期时间：${date(session.expiresAt)}；账号是否可用以服务端验证为准。`, `${session.status === "connected" ? "Credential" : "Previous credential"} expiry hint: ${date(session.expiresAt)}; server verification determines account availability.`)
         : text("有效期未知；账号是否可用以服务端验证为准。", "Expiry unknown; server verification determines account availability.")}</p>
-      {session.lastCheckedAt && <p>{text("上次验证", "Last checked")}: {date(session.lastCheckedAt)}</p>}
+      {session.lastCheckedAt !== null && <p>{text("上次验证", "Last checked")}: {date(session.lastCheckedAt)}</p>}
       {safeCode(session.errorCode) && <p className="vm-downloads-error">{text("账号验证提示", "Account check")}: {safeCode(session.errorCode)}</p>}
       <div className="vm-downloads-actions">
         <button type="button" className="button secondary" disabled={busy} onClick={connect}>{session.status === "connected" ? text("重新连接账号", "Reconnect account") : text("连接 Shadow 账号", "Connect Shadow account")}</button>
@@ -352,6 +354,23 @@ export function VmDownloadsPanel() {
       </div>
       {loginUrl && <p className="vm-downloads-login">{popupBlocked ? text("浏览器未打开登录窗口，请点击链接继续。", "The browser did not open a login window. Use this link to continue.") : text("请在登录窗口完成验证，面板会自动更新。", "Complete sign-in in the login window. This panel will update automatically.")} <a href={loginUrl} target="_blank" rel="noopener noreferrer">{text("打开登录页面", "Open sign-in page")}</a></p>}
       <p className="vm-downloads-help">{text("暂不支持自动续期或手机/电脑飞书跨设备直接授权。Taskboard 重启后需重新连接账号。", "Automatic renewal and cross-device authorization from Feishu are not supported. Reconnect after restarting Taskboard.")}</p>
+    </section>}
+    {snapshot && <section className="vm-downloads-notifications" aria-label={text("飞书通知状态", "Feishu notification status")}>
+      <strong>{text("飞书异常提醒", "Feishu exception notifications")}: {snapshot.notifications.enabled ? text("已开启", "On") : text("已关闭", "Off")}</strong>
+      <p>{!notificationCountsKnown
+        ? text("飞书通知状态需本机 Taskboard 服务重启后更新。", "Feishu notification status updates after restarting the local Taskboard service.")
+        : !snapshot.notifications.enabled
+          ? text("提醒已关闭。", "Alerts are off.")
+        : !snapshot.notifications.available
+          ? text("飞书通知不可用，请检查本机飞书应用配置和接收账号。", "Feishu notifications are unavailable. Check the local Feishu app configuration and recipient account.")
+          : (snapshot.notifications.pendingCount ?? 0) > 0
+            ? text(`有 ${snapshot.notifications.pendingCount} 条飞书通知待重试。`, `${snapshot.notifications.pendingCount} Feishu notifications are waiting to retry.`)
+            : text("飞书通知已配置。", "Feishu notifications are configured.")}
+        {notificationCountsKnown && ((snapshot.notifications.pendingCount ?? 0) > 0 || !snapshot.notifications.available)
+          && safeCode(snapshot.notifications.errorCode) && <> ({safeCode(snapshot.notifications.errorCode)})</>}</p>
+      {!notificationCountsKnown && safeCode(snapshot.notifications.errorCode) && <p className="vm-downloads-help">{text("旧版状态码", "Legacy status code")}: <code>{safeCode(snapshot.notifications.errorCode)}</code></p>}
+      {notificationCountsKnown && (snapshot.notifications.failedCount ?? 0) > 0 && <p className="vm-downloads-help">{text(`${snapshot.notifications.failedCount} 条历史通知达到重试上限，不会自动重发。`, `${snapshot.notifications.failedCount} historical notifications reached the retry limit and will not be resent automatically.`)}</p>}
+      {snapshot.notifications.lastSentAt !== null && <p className="vm-downloads-help">{text(`最近发送：${date(snapshot.notifications.lastSentAt)}`, `Last sent: ${date(snapshot.notifications.lastSentAt)}`)}</p>}
     </section>}
     {snapshot && <>
       <details className="vm-downloads-manual" open={manualOpen} onToggle={(event) => setManualOpen(event.currentTarget.open)}>
@@ -366,11 +385,6 @@ export function VmDownloadsPanel() {
             <label>{text("申请原因", "Reason")}<input value={draft.reason} maxLength={500} onChange={(event) => edit("reason", event.target.value)} /></label>
             <label className="vm-downloads-wide">{text("本机输出目录", "Local output directory")}<input value={draft.outputRoot} maxLength={4096} placeholder="E:\\Downloads" onChange={(event) => edit("outputRoot", event.target.value)} /></label>
             <label className="vm-downloads-checkbox vm-downloads-wide"><input type="checkbox" checked={draft.notificationsEnabled} onChange={(event) => edit("notificationsEnabled", event.target.checked)} />{text("飞书异常提醒", "Feishu exception notifications")}</label>
-            <p className="vm-downloads-help vm-downloads-wide">{!snapshot.notifications.enabled
-              ? text("飞书通知已关闭。", "Feishu notifications are off.")
-              : snapshot.notifications.available ? text("飞书通知可用，异常将提醒当前登录用户。", "Feishu notifications are available for the signed-in user.")
-                : text("飞书通知不可用，请检查账号连接及本机飞书应用权限。", "Feishu notifications are unavailable. Check the account and local Feishu app permissions.")}
-              {safeCode(snapshot.notifications.errorCode) && <> ({safeCode(snapshot.notifications.errorCode)})</>}</p>
             <div className="vm-downloads-actions vm-downloads-wide"><button className="button" type="button" onClick={enqueue}>{text("加入下载队列", "Add to download queue")}</button><button className="button secondary" type="button" onClick={saveSettings}>{text("保存下载设置", "Save download settings")}</button></div>
           </fieldset>
           {session?.status !== "connected" && <p className="vm-downloads-help">{text("可先加入队列；连接账号后才会开始处理。", "You can queue requests now; processing starts after connecting your account.")}</p>}

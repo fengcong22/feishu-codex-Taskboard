@@ -1578,8 +1578,17 @@ kbd {
   font-size: 12px;
 }
 
+.header-vm-status-notifications {
+  display: grid;
+  gap: 3px;
+  padding: 8px 7px 6px;
+  border-top: var(--border-hairline) solid var(--border);
+  font-size: 12px;
+}
+
 .header-vm-status-summary span,
 .header-vm-status-summary small,
+.header-vm-status-notifications small,
 .header-vm-status-note,
 .header-vm-status-login {
   color: var(--text-secondary);
@@ -6555,6 +6564,8 @@ kbd {
 .vm-downloads-heading p, .vm-downloads-panel .vm-downloads-help { color: var(--text-secondary); }
 .vm-downloads-session { margin-top: 16px; padding: 14px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); }
 .vm-downloads-session-heading { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; }
+.vm-downloads-notifications { margin-top: 14px; padding: 10px 0; border-top: 1px solid var(--border); }
+.vm-downloads-notifications > strong { font-size: 12px; }
 .vm-downloads-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .vm-downloads-login a { color: var(--accent); text-decoration: underline; }
 .vm-downloads-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; min-width: 0; padding: 0; margin: 20px 0 0; border: 0; }

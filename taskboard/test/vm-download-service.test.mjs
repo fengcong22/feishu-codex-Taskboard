@@ -363,11 +363,31 @@ test("notifications deduplicate durably, retry failures and never overwrite acti
   const job = f.service.enqueue(f.input()).jobs[0];
   f.update(job.id, value => { value.status = "waiting_approval"; value.application_id = "application"; value.approval_wait_started_at = 1000000000; value.approval_deadline_at = 1000000000 + 7 * day; value.next_attempt_at = 1000000000 + 7 * day; });
   f.advance(day); await f.service.wake(); assert.equal(sends, 1);
+  assert.deepEqual(f.service.snapshot().notifications, {
+    lastSentAt: null, errorCode: "VM_NOTIFY_SEND_FAILED", pendingCount: 1, failedCount: 0,
+    available: true, enabled: true,
+  });
   await f.service.wake(); assert.equal(sends, 1);
   assert.doesNotMatch(JSON.stringify(f.service.snapshot()), /secret transport text/);
   fail = false; f.advance(60000); await f.service.wake(); assert.equal(sends, 2);
+  assert.deepEqual(f.service.snapshot().notifications, {
+    lastSentAt: 1000000000 + day + 60000, errorCode: null, pendingCount: 0, failedCount: 0,
+    available: true, enabled: true,
+  });
   await f.restart({ notifier }); await f.service.wake(); assert.equal(sends, 2);
   assert.equal(f.store.get(job.id).status, "waiting_approval");
+});
+
+test("terminal notification failures are counted as history, not current transport health", async (t) => {
+  const f = await fixture(t, { notifier: { available: () => true, send: async () => { throw new Error("temporary failure"); } } });
+  const job = f.service.enqueue(f.input()).jobs[0];
+  f.update(job.id, value => { value.status = "rejected"; });
+  const retryDelays = [60000, 120000, 240000, 480000, 960000];
+  await f.service.wake();
+  for (const delay of retryDelays) { f.advance(delay); await f.service.wake(); }
+  assert.deepEqual(f.service.snapshot().notifications, {
+    lastSentAt: null, errorCode: null, pendingCount: 0, failedCount: 1, available: true, enabled: true,
+  });
 });
 
 test("expiry reminders start thirty minutes before expiry and remain deduplicated across restart", async (t) => {
