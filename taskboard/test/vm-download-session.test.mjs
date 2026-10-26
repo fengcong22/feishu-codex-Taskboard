@@ -112,6 +112,24 @@ test("background verification and token rotation never advance the explicit auth
   assert.equal(f.session.snapshot().lastAuthorizedAt, null);
 });
 
+test("delayed identity verification keeps the SSO completion time as the authorization time", async (t) => {
+  const f = fixture(t);
+  const authorizedAt = 1_800_000_000_000;
+  f.results.push(new Error("temporary identity lookup failure"));
+  await f.session.beginLogin();
+  f.logins[0].resolve(TOKEN);
+  await until(() => f.session.snapshot().status === "unavailable");
+  assert.equal(f.session.snapshot().lastAuthorizedAt, null);
+
+  f.advance(60_000);
+  f.results.push(response());
+  await f.session.check();
+
+  assert.equal(f.session.snapshot().status, "connected");
+  assert.equal(f.session.snapshot().lastCheckedAt, authorizedAt + 60_000);
+  assert.equal(f.session.snapshot().lastAuthorizedAt, authorizedAt);
+});
+
 test("JWT expiry is metadata and even a past expiry does not replace server verification", async (t) => {
   const f = fixture(t);
   await f.connect(jwt(1_700_000_000));

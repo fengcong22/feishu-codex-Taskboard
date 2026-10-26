@@ -59,7 +59,7 @@ export function createVmDownloadSession({
   if (typeof now !== "function" || typeof startLogin !== "function" || typeof createClient !== "function"
     || !Number.isSafeInteger(checkIntervalMs) || checkIntervalMs <= 0 || checkIntervalMs > 2_147_483_647
     || (onChange !== undefined && typeof onChange !== "function")) fail("VM_AUTH_INPUT_INVALID");
-  let status = "disconnected", errorCode = null, lastCheckedAt = null, lastAuthorizedAt = null;
+  let status = "disconnected", errorCode = null, lastCheckedAt = null, lastAuthorizedAt = null, pendingAuthorizationAt = null;
   let verifiedIdentity = null, currentClient = null, allowsAccountChange = false;
   let expiry = { expiresAt: null, expirySource: "unknown" };
   let generation = 0, closed = false, pending = null, checking = null, timer;
@@ -94,7 +94,10 @@ export function createVmDownloadSession({
           fail("VM_APPLICANT_CHANGED");
         }
         verifiedIdentity = identity;
-        if (allowsAccountChange) lastAuthorizedAt = now();
+        if (allowsAccountChange) {
+          lastAuthorizedAt = pendingAuthorizationAt;
+          pendingAuthorizationAt = null;
+        }
         allowsAccountChange = false;
         status = "connected";
         errorCode = null;
@@ -104,6 +107,8 @@ export function createVmDownloadSession({
         if (AUTH_FAILURES.has(errorCode)) {
           status = "auth_required";
           currentClient = null;
+          allowsAccountChange = false;
+          pendingAuthorizationAt = null;
         } else status = "unavailable";
       }
       if (current(version)) {
@@ -121,6 +126,7 @@ export function createVmDownloadSession({
     try {
       const token = normalizeToken(await entry.receiver.token);
       if (!current(entry.generation)) return;
+      const authorizationAt = now();
       let candidate;
       candidate = createClient({ token, onToken: (renewed) => {
         if (!current(entry.generation, candidate)) return;
@@ -129,6 +135,7 @@ export function createVmDownloadSession({
       } });
       if (!candidate || typeof candidate.getIdentity !== "function") fail("VM_AUTH_FAILED");
       currentClient = candidate;
+      pendingAuthorizationAt = authorizationAt;
       allowsAccountChange = true;
       expiry = expiryFrom(token);
       await verify(entry.generation, candidate);
@@ -153,6 +160,8 @@ export function createVmDownloadSession({
     cancelTimer();
     currentClient = null;
     checking = null;
+    allowsAccountChange = false;
+    pendingAuthorizationAt = null;
     expiry = { expiresAt: null, expirySource: "unknown" };
     status = "connecting";
     errorCode = null;
@@ -200,6 +209,7 @@ export function createVmDownloadSession({
     currentClient = null;
     verifiedIdentity = null;
     allowsAccountChange = false;
+    pendingAuthorizationAt = null;
     expiry = { expiresAt: null, expirySource: "unknown" };
     status = "disconnected";
     errorCode = null;
@@ -218,6 +228,7 @@ export function createVmDownloadSession({
     checking = null;
     currentClient = null;
     allowsAccountChange = false;
+    pendingAuthorizationAt = null;
     status = "auth_required";
     errorCode = AUTH_FAILURES.has(code) ? code : "VM_AUTH_REQUIRED";
     changed();
