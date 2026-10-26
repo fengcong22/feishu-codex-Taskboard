@@ -21,6 +21,7 @@ export interface VmDownloadSession {
   expiresAt: number | null;
   expirySource: "token" | "unknown";
   lastCheckedAt: number | null;
+  lastAuthorizedAt?: number | null;
   errorCode: string | null;
   automaticRefreshSupported: false;
   crossDeviceAuthorizationSupported: false;
@@ -60,7 +61,7 @@ export interface VmDownloadsSnapshot {
   session: VmDownloadSession;
   settings: VmDownloadSettings;
   jobs: VmDownloadJob[];
-  notifications: { available: boolean; enabled: boolean; errorCode: string | null; lastSentAt: number | null; pendingCount?: number; failedCount?: number };
+  notifications: { available: boolean; enabled: boolean; errorCode: string | null; lastFailureCode?: string | null; lastSentAt: number | null; pendingCount?: number; failedCount?: number };
   worker?: { running: boolean; errorCode: string | null };
 }
 
@@ -84,6 +85,8 @@ function validSession(value: unknown): value is VmDownloadSession {
     && ["token", "unknown"].includes(String(value.expirySource))
     && (value.expiresAt === null || (typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)))
     && (value.lastCheckedAt === null || (typeof value.lastCheckedAt === "number" && Number.isFinite(value.lastCheckedAt)))
+    && (value.lastAuthorizedAt === undefined || value.lastAuthorizedAt === null
+      || (typeof value.lastAuthorizedAt === "number" && Number.isFinite(value.lastAuthorizedAt) && value.lastAuthorizedAt > 0))
     && (value.errorCode === null || typeof value.errorCode === "string")
     && value.automaticRefreshSupported === false && value.crossDeviceAuthorizationSupported === false;
 }
@@ -97,6 +100,8 @@ export async function getVmDownloads(signal?: AbortSignal): Promise<VmDownloadsS
     || typeof value.settings.notificationsEnabled !== "boolean"
     || !record(value.notifications) || typeof value.notifications.available !== "boolean" || typeof value.notifications.enabled !== "boolean"
     || (value.notifications.errorCode !== null && typeof value.notifications.errorCode !== "string")
+    || (value.notifications.lastFailureCode !== undefined && value.notifications.lastFailureCode !== null
+      && typeof value.notifications.lastFailureCode !== "string")
     || (value.notifications.lastSentAt !== null && (typeof value.notifications.lastSentAt !== "number" || !Number.isFinite(value.notifications.lastSentAt)))
     || !((pendingCount === undefined && failedCount === undefined)
       || (Number.isSafeInteger(pendingCount) && Number(pendingCount) >= 0
@@ -116,6 +121,10 @@ export async function getVmDownloads(signal?: AbortSignal): Promise<VmDownloadsS
   return value as unknown as VmDownloadsSnapshot;
 }
 export const saveVmDownloadSettings = (settings: VmDownloadSettings, signal?: AbortSignal) => write("/settings", settings, "PUT", signal);
+export async function sendVmDownloadNotificationTest(signal?: AbortSignal): Promise<void> {
+  const value = await write<unknown>("/notifications/test", {}, "POST", signal);
+  if (!record(value) || value.sent !== true) throw new ApiError(0, { error: { code: "VM_DOWNLOAD_RESPONSE_INVALID" } });
+}
 export async function loginVmDownloads(signal?: AbortSignal): Promise<{ loginUrl: string; session: VmDownloadSession }> {
   const value = await write<unknown>("/login", {}, "POST", signal);
   if (!record(value) || typeof value.loginUrl !== "string" || !validSession(value.session)) {

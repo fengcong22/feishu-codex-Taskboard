@@ -3,6 +3,7 @@ import { createFeishuApiContext } from "../../src/feishu-api.mjs";
 import { VmSourceError } from "./vm-source-transfer.mjs";
 
 const MESSAGES = Object.freeze({
+  test: "这是一条 Taskboard 飞书通知测试消息。收到这条消息，表示飞书发送接口已确认受理。",
   auth_required: "Shadow 登录已失效或本机服务已重启，下载队列已暂停。请在运行 Taskboard 的电脑顶部栏打开“VM 状态菜单”，点击“连接 Shadow 账号”或“重新连接账号”，在 Shadow 登录窗口完成授权，之后将继续原申请。当前还不支持手机直接为电脑完成 Shadow 授权。",
   expiring: "Shadow 登录预计将在 30 分钟内到期。请在运行 Taskboard 的电脑顶部栏打开“VM 状态菜单”，点击“重新连接账号”，在 Shadow 登录窗口完成授权。队列和原审批会保留。",
   approval_reminder: "下载申请已等待审批超过 24 小时。审批通过后会自动继续；等待满 7 天将暂停，可在 VM 下载面板延长等待。",
@@ -11,6 +12,28 @@ const MESSAGES = Object.freeze({
   wait_expired: "审批或视频准备等待已超时，任务已暂停。在 VM 下载面板可延长等待，原申请会保留。",
   failed: "下载任务需要处理，已暂停。在 VM 下载面板查看错误和恢复操作，原申请会保留。",
 });
+
+function feishuCode(value) {
+  const code = value?.code ?? value?.response?.data?.code ?? value?.response?.body?.code;
+  if (Number.isSafeInteger(code) && code > 0 && code <= 9_999_999_999) return `VM_NOTIFY_FEISHU_${code}`;
+  if (typeof code === "string" && /^[1-9][0-9]{0,9}$/u.test(code)) return `VM_NOTIFY_FEISHU_${code}`;
+  return null;
+}
+
+function failureCode(error) {
+  if (error instanceof VmSourceError && error.code.startsWith("VM_NOTIFY_")) return error.code;
+  const apiCode = feishuCode(error);
+  if (apiCode) return apiCode;
+  const status = error?.status ?? error?.response?.status;
+  if (Number.isInteger(status) && status >= 100 && status <= 599) return `VM_NOTIFY_HTTP_${status}`;
+  switch (error?.code) {
+    case "ETIMEDOUT": case "ESOCKETTIMEDOUT": return "VM_NOTIFY_TIMEOUT";
+    case "ENOTFOUND": case "EAI_AGAIN": return "VM_NOTIFY_DNS_FAILED";
+    case "ECONNREFUSED": return "VM_NOTIFY_CONNECT_FAILED";
+    case "ECONNRESET": case "EPIPE": return "VM_NOTIFY_CONNECTION_RESET";
+    default: return "VM_NOTIFY_SDK_FAILED";
+  }
+}
 
 export function createVmDownloadNotifier({ appId, appSecret, createContext = createFeishuApiContext, timeoutMs = 15000 } = {}) {
   const configured = Boolean(appId?.trim() && appSecret?.trim());
@@ -30,11 +53,12 @@ export function createVmDownloadNotifier({ appId, appSecret, createContext = cre
             receive_id: recipient, msg_type: "text", uuid: id,
             content: JSON.stringify({ text: `VM 下载${vmid ? ` · ${vmid}` : ""}\n${MESSAGES[kind]}` }),
           } });
-          if (result?.code !== 0 || !result.data?.message_id) throw new Error("notification rejected");
-        })(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("notification timeout")), timeoutMs); })]);
-      } catch {
+          if (result?.code !== 0) throw new VmSourceError(feishuCode(result) ?? "VM_NOTIFY_API_REJECTED");
+          if (!result.data?.message_id) throw new VmSourceError("VM_NOTIFY_ACK_MISSING");
+        })(), new Promise((_, reject) => { timer = setTimeout(() => reject(new VmSourceError("VM_NOTIFY_TIMEOUT")), timeoutMs); })]);
+      } catch (error) {
         context = undefined;
-        throw new VmSourceError("VM_NOTIFY_SEND_FAILED");
+        throw new VmSourceError(failureCode(error));
       } finally { clearTimeout(timer); }
     },
   };
@@ -73,13 +97,15 @@ export function createVmDownloadMetadata({ database, now = Date.now }) {
         AND (lease_id IS NULL OR lease_until<=?) ORDER BY next_at,id LIMIT 1)
         RETURNING *`).get(lease, now() + 60000, now(), now()) ?? null;
     },
-    complete(item, success) {
+    complete(item, success, failure = "VM_NOTIFY_SEND_FAILED") {
       const attempts = item.attempts + 1;
       const status = success ? "sent" : attempts >= 6 ? "failed" : "pending";
+      const errorCode = typeof failure === "string" && /^VM_NOTIFY_[A-Z0-9_]{1,80}$/u.test(failure)
+        ? failure : "VM_NOTIFY_SEND_FAILED";
       database.prepare(`UPDATE vm_download_notifications SET status=?, attempts=?, next_at=?, lease_id=NULL,
         lease_until=NULL, sent_at=?, error_code=? WHERE id=? AND lease_id=? AND lease_until>?`)
         .run(status, attempts, now() + Math.min(1800000, 60000 * 2 ** (attempts - 1)),
-          success ? now() : null, success ? null : "VM_NOTIFY_SEND_FAILED", item.id, item.lease_id, now());
+          success ? now() : null, success ? null : errorCode, item.id, item.lease_id, now());
     },
     dismiss(item) {
       database.prepare(`UPDATE vm_download_notifications SET status='dismissed', lease_id=NULL,
@@ -91,8 +117,9 @@ export function createVmDownloadMetadata({ database, now = Date.now }) {
       const pending = database.prepare("SELECT COUNT(*) AS count FROM vm_download_notifications WHERE status='pending'").get();
       const failed = database.prepare("SELECT COUNT(*) AS count FROM vm_download_notifications WHERE status='failed'").get();
       const currentError = database.prepare("SELECT error_code FROM vm_download_notifications WHERE status='pending' AND error_code IS NOT NULL ORDER BY next_at DESC LIMIT 1").get();
+      const lastFailure = database.prepare("SELECT error_code FROM vm_download_notifications WHERE status='failed' AND error_code IS NOT NULL ORDER BY next_at DESC LIMIT 1").get();
       return { lastSentAt: sent.time ?? null, errorCode: currentError?.error_code ?? null,
-        pendingCount: pending.count, failedCount: failed.count };
+        pendingCount: pending.count, failedCount: failed.count, lastFailureCode: lastFailure?.error_code ?? null };
     },
   };
 }

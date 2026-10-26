@@ -18,7 +18,7 @@ function snapshot(): VmDownloadsSnapshot {
     },
     settings: { outputRoot: "E:\\Downloads", department: "动画组", reason: "课程制作", notificationsEnabled: true },
     jobs: [] as ReturnType<typeof job>[],
-    notifications: { available: true, enabled: true, errorCode: null as string | null, lastSentAt: null, pendingCount: 0, failedCount: 0 },
+    notifications: { available: true, enabled: true, errorCode: null as string | null, lastFailureCode: null as string | null, lastSentAt: null, pendingCount: 0, failedCount: 0 },
     worker: { running: false, errorCode: null as string | null },
   };
 }
@@ -75,6 +75,7 @@ beforeEach(() => {
       current.session.status = "connecting";
       return response({ loginUrl: "https://shadow.yangcong345.com/#/?fromWebUrl=fixture", session: current.session });
     }
+    if (path === `${ROOT}/notifications/test`) return response({ sent: true });
     if (path === `${ROOT}/logout`) { current.session = snapshot().session; return response({ session: current.session }); }
     if (path === `${ROOT}/settings`) { current.settings = { ...current.settings, ...writes.at(-1)!.body }; return response({ settings: current.settings }); }
     if (path === `${ROOT}/jobs`) { current.jobs = [job("queued-job", "queued")]; return response({ jobs: current.jobs }); }
@@ -186,6 +187,7 @@ describe("VM downloads panel", () => {
     mount();
     expect(await screen.findByText(/飞书通知状态需本机 Taskboard 服务重启后更新/)).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "发送测试通知" })).toBeNull();
   });
 
   it("reflects the verified account without fabricating an expiry and disconnects it", async () => {
@@ -193,11 +195,33 @@ describe("VM downloads panel", () => {
     mount();
     await screen.findByText(/测试用户/);
     expect(screen.getByText(/有效期未知/)).toBeTruthy();
-    expect(screen.getByText(/暂不支持自动续期/)).toBeTruthy();
+    expect(screen.getByText(/服务端可能在检查时更新凭据/)).toBeTruthy();
     expect(screen.getByText(/跨设备直接授权/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "断开账号" }));
     await screen.findByText("尚未连接");
     expect(writes[0].path).toBe(`${ROOT}/logout`);
+  });
+
+  it("distinguishes personal authorization from polling and warns when notifications never succeeded", async () => {
+    current.session = { ...current.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" },
+      lastAuthorizedAt: 1_792_400_000_000, lastCheckedAt: 1_792_500_000_000 };
+    current.notifications = { ...current.notifications, failedCount: 7, lastFailureCode: "VM_NOTIFY_FEISHU_99991672" };
+    mount();
+    await screen.findByText("已连接");
+    expect(screen.getByText(/^上次本人登录授权：/)).toBeTruthy();
+    expect(screen.getByText(/^最近后台检查：/)).toBeTruthy();
+    expect(screen.getByText(/发送失败，尚无成功记录/)).toBeTruthy();
+    expect(screen.getByText(/VM_NOTIFY_FEISHU_99991672/)).toBeTruthy();
+    expect(screen.getByText(/队列有可继续处理的申请时才发送登录提醒/)).toBeTruthy();
+    expect(screen.queryByText("飞书通知已配置。")).toBeNull();
+  });
+
+  it("sends an explicit test notification through the local VM notification endpoint", async () => {
+    current.session = { ...current.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" } };
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "发送测试通知" }));
+    await screen.findByText("飞书接口已确认接收测试消息。");
+    expect(writes.at(-1)).toMatchObject({ method: "POST", path: `${ROOT}/notifications/test`, body: {} });
   });
 
   it("shows a reconnect alert only after the server confirms expired authorization", async () => {

@@ -2878,7 +2878,8 @@ export function createTaskboardServer(options = {}) {
       store = createVmApprovalStore({ file: config.statePath });
       vmDownloads = createVmDownloadService({ store,
         metadata: createVmDownloadMetadata({ database: database.database }),
-        notifier: createVmDownloadNotifier({ appId: config.appId, appSecret: config.appSecret }),
+        notifier: options.vmDownloadNotifier ?? createVmDownloadNotifier({ appId: config.appId, appSecret: config.appSecret }),
+        session: options.vmDownloadSession,
         defaultOutputRoot: path.join(PROJECT_ROOT, "input"),
         privateEndpoints: config.privateEndpoints,
       });
@@ -6146,6 +6147,10 @@ export function createTaskboardServer(options = {}) {
           const downloads = getVmDownloads();
           if (pathname === "/api/local/vm-downloads" && request.method === "GET") return sendJson(response, 200, downloads.snapshot());
           if (pathname === "/api/local/vm-downloads/settings" && request.method === "PUT") return sendJson(response, 200, downloads.updateSettings(input));
+          if (pathname === "/api/local/vm-downloads/notifications/test" && request.method === "POST") {
+            assertAllowedKeys(input, new Set());
+            return sendJson(response, 200, await downloads.sendTestNotification());
+          }
           if (pathname === "/api/local/vm-downloads/jobs" && request.method === "POST") return sendJson(response, 201, downloads.enqueue(input));
           if (pathname === "/api/local/vm-downloads/jobs/cleanup" && request.method === "POST") {
             assertAllowedKeys(input, new Set(["jobIds"]));

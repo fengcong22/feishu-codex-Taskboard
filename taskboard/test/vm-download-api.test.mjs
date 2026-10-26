@@ -10,11 +10,11 @@ import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs
 
 const route = "/api/local/vm-downloads";
 const taskboardPackageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-async function fixture(t) {
+async function fixture(t, serverOptions = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "vm-api-"));
   let app;
   async function start() {
-    app = createTaskboardServer({ dataDirectory: directory, codexExecutable: process.execPath, processEnv: {} });
+    app = createTaskboardServer({ dataDirectory: directory, codexExecutable: process.execPath, processEnv: {}, ...serverOptions });
     const address = await listenTaskboardOnFetchSafePort(app);
     return `http://127.0.0.1:${address.port}`;
   }
@@ -54,7 +54,43 @@ test("VM local routes reject nonlocal Host/Origin, query, missing web intent and
   assert.equal((await call(f.baseUrl, "?token=bad")).status, 400);
   assert.equal((await call(f.baseUrl, "/jobs", { method: "POST", body: { ...body, private_endpoints: [] } })).status, 400);
   assert.equal((await call(f.baseUrl, "/logout", { method: "POST", body: { token: "bad" } })).status, 400);
+  assert.equal((await call(f.baseUrl, "/notifications/test", { method: "POST", body: {}, headers: { origin: "https://evil.test" } })).status, 403);
   assert.equal((await call(f.baseUrl)).body.jobs.length, 0);
+});
+
+test("local test notification uses the configured notifier without creating a download job", async (t) => {
+  const sent = [];
+  const identity = { name: "Fixture", user_id: "fixture-user", open_id: "ou_fixture", enterprise_email: "fixture@example.test", departments: ["dept"] };
+  const session = {
+    snapshot: () => ({ status: "connected", account: { name: identity.name, userId: identity.user_id }, expiresAt: null, expirySource: "unknown", lastCheckedAt: 1, lastAuthorizedAt: 1, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false }),
+    identity: () => identity, client: () => ({}), beginLogin: async () => {}, disconnect: async () => {}, close: async () => {},
+  };
+  const f = await fixture(t, { vmDownloadSession: session,
+    vmDownloadNotifier: { available: () => true, send: async (value) => sent.push(value) } });
+
+  const result = await call(f.baseUrl, "/notifications/test", { method: "POST", body: {} });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, { sent: true });
+  assert.equal(sent.length, 1);
+  assert.deepEqual({ recipient: sent[0].recipient, kind: sent[0].kind, vmid: sent[0].vmid }, {
+    recipient: identity.enterprise_email, kind: "test", vmid: null,
+  });
+  assert.deepEqual((await call(f.baseUrl)).body.jobs, []);
+});
+
+test("local test notification exposes only a safe sender error code", async (t) => {
+  const identity = { name: "Fixture", user_id: "fixture-user", open_id: "ou_fixture", enterprise_email: "fixture@example.test", departments: ["dept"] };
+  const session = {
+    snapshot: () => ({ status: "connected", account: { name: identity.name, userId: identity.user_id }, expiresAt: null, expirySource: "unknown", lastCheckedAt: 1, lastAuthorizedAt: 1, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false }),
+    identity: () => identity, client: () => ({}), beginLogin: async () => {}, disconnect: async () => {}, close: async () => {},
+  };
+  const f = await fixture(t, { vmDownloadSession: session,
+    vmDownloadNotifier: { available: () => true, send: async () => { const error = new Error("private response"); error.code = "VM_NOTIFY_FEISHU_99991672"; throw error; } } });
+
+  const result = await call(f.baseUrl, "/notifications/test", { method: "POST", body: {} });
+  assert.equal(result.status, 503);
+  assert.deepEqual(result.body.error, { code: "VM_NOTIFY_FEISHU_99991672", message: "VM_NOTIFY_FEISHU_99991672" });
+  assert.doesNotMatch(JSON.stringify(result.body), /private response/u);
 });
 
 test("VM acquisition recovery accepts only the explicit repeatable-resource confirmation payload", async (t) => {

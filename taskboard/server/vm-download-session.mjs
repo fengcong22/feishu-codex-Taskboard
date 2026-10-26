@@ -59,14 +59,14 @@ export function createVmDownloadSession({
   if (typeof now !== "function" || typeof startLogin !== "function" || typeof createClient !== "function"
     || !Number.isSafeInteger(checkIntervalMs) || checkIntervalMs <= 0 || checkIntervalMs > 2_147_483_647
     || (onChange !== undefined && typeof onChange !== "function")) fail("VM_AUTH_INPUT_INVALID");
-  let status = "disconnected", errorCode = null, lastCheckedAt = null;
+  let status = "disconnected", errorCode = null, lastCheckedAt = null, lastAuthorizedAt = null;
   let verifiedIdentity = null, currentClient = null, allowsAccountChange = false;
   let expiry = { expiresAt: null, expirySource: "unknown" };
   let generation = 0, closed = false, pending = null, checking = null, timer;
 
   function snapshot() {
     return { status, account: verifiedIdentity ? { name: verifiedIdentity.name, userId: verifiedIdentity.user_id } : null,
-      ...expiry, lastCheckedAt, errorCode, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false };
+      ...expiry, lastCheckedAt, lastAuthorizedAt, errorCode, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false };
   }
   function changed() {
     try { Promise.resolve(onChange?.(snapshot())).catch(() => {}); } catch { /* observer only */ }
@@ -94,6 +94,7 @@ export function createVmDownloadSession({
           fail("VM_APPLICANT_CHANGED");
         }
         verifiedIdentity = identity;
+        if (allowsAccountChange) lastAuthorizedAt = now();
         allowsAccountChange = false;
         status = "connected";
         errorCode = null;
@@ -203,6 +204,7 @@ export function createVmDownloadSession({
     status = "disconnected";
     errorCode = null;
     lastCheckedAt = null;
+    lastAuthorizedAt = null;
     changed();
     await stopReceiver(old?.receiver);
     return snapshot();

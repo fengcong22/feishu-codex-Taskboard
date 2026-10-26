@@ -8,7 +8,7 @@ import { VmSourceError } from "../server/vm-source-transfer.mjs";
 const IDENTITY = { name: "测试", user_id: "user-1", open_id: "open-1",
   enterprise_email: "fixture@example.test", departments: ["department-1"] };
 const INITIAL = { status: "disconnected", account: null, expiresAt: null, expirySource: "unknown",
-  lastCheckedAt: null, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false };
+  lastCheckedAt: null, lastAuthorizedAt: null, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false };
 const LOGIN_URL = "https://shadow.yangcong345.com/#/?fromWebUrl=fixture";
 const TOKEN = "session-token-never-public";
 
@@ -78,7 +78,7 @@ test("login returns before SSO completes and concurrent callers reuse the receiv
   f.logins[0].resolve(TOKEN);
   await until(() => f.session.snapshot().status === "connected");
   assert.deepEqual(f.session.snapshot(), { ...INITIAL, status: "connected",
-    account: { name: "测试", userId: "user-1" }, lastCheckedAt: 1_800_000_000_000 });
+    account: { name: "测试", userId: "user-1" }, lastCheckedAt: 1_800_000_000_000, lastAuthorizedAt: 1_800_000_000_000 });
   assert.ok(f.session.client());
   assert.deepEqual(f.session.identity(), IDENTITY);
   assert.equal(f.logins[0].receiver.closed, true);
@@ -86,6 +86,30 @@ test("login returns before SSO completes and concurrent callers reuse the receiv
   copy.departments.push("injected");
   assert.deepEqual(f.session.identity(), IDENTITY);
   assert.doesNotMatch(JSON.stringify({ session: f.session.snapshot(), changes: f.changes }), /session-token|enterprise_email|open_id|raw|shadowToken/u);
+});
+
+test("background verification and token rotation never advance the explicit authorization time", async (t) => {
+  const f = fixture(t);
+  await f.connect(jwt(1_900_000_000));
+  assert.equal(f.session.snapshot().lastAuthorizedAt, 1_800_000_000_000);
+  f.advance(60_000);
+  f.results.push(response(IDENTITY, jwt(1_950_000_000)));
+  await f.session.check();
+  assert.equal(f.session.snapshot().lastCheckedAt, 1_800_000_060_000);
+  assert.equal(f.session.snapshot().lastAuthorizedAt, 1_800_000_000_000);
+  assert.equal(f.session.snapshot().expiresAt, 1_950_000_000_000);
+  const requestCount = f.requests.length;
+  f.session.snapshot();
+  assert.equal(f.requests.length, requestCount);
+  await f.session.beginLogin();
+  f.logins.at(-1).reject(new VmSourceError("VM_AUTH_TIMEOUT"));
+  await until(() => f.session.snapshot().status !== "connecting");
+  assert.equal(f.session.snapshot().lastAuthorizedAt, 1_800_000_000_000);
+  f.advance(60_000);
+  await f.connect();
+  assert.equal(f.session.snapshot().lastAuthorizedAt, 1_800_000_120_000);
+  await f.session.disconnect();
+  assert.equal(f.session.snapshot().lastAuthorizedAt, null);
 });
 
 test("JWT expiry is metadata and even a past expiry does not replace server verification", async (t) => {

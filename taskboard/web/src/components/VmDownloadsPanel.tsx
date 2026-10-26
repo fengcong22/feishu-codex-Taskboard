@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import {
-  enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads,
+  enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads, sendVmDownloadNotificationTest,
   getVmDownloadRefreshInterval, recoverVmDownload, removeVmDownload, removeVmDownloads, resumeVmDownload, saveVmDownloadSettings,
   VM_DOWNLOAD_REFRESH_CHANGE_EVENT, VM_DOWNLOAD_REFRESH_INTERVAL_KEY,
   type VmDownloadJob, type VmDownloadSettings, type VmDownloadsSnapshot,
@@ -224,6 +224,13 @@ export function VmDownloadsPanel() {
     });
   }
 
+  function sendTestNotification() {
+    void action(async (signal) => {
+      await sendVmDownloadNotificationTest(signal);
+      setNotice(text("飞书接口已确认接收测试消息。", "Feishu accepted the test message."));
+    });
+  }
+
   function enqueue() {
     const vmids = [...new Set(vmidsText.trim().split(/[\s,;，；]+/u).filter(Boolean).map((id) => id.toLowerCase()))];
     if (!vmids.length || vmids.some((id) => !/^[a-f0-9]{24}$/u.test(id))) {
@@ -346,14 +353,16 @@ export function VmDownloadsPanel() {
       <p>{session.expirySource === "token" && session.expiresAt !== null
         ? text(`${session.status === "connected" ? "凭据" : "上次凭据"}提示到期时间：${date(session.expiresAt)}；账号是否可用以服务端验证为准。`, `${session.status === "connected" ? "Credential" : "Previous credential"} expiry hint: ${date(session.expiresAt)}; server verification determines account availability.`)
         : text("有效期未知；账号是否可用以服务端验证为准。", "Expiry unknown; server verification determines account availability.")}</p>
-      {session.lastCheckedAt !== null && <p>{text("上次验证", "Last checked")}: {date(session.lastCheckedAt)}</p>}
+      {session.account && <p>{text(`上次本人登录授权：${session.lastAuthorizedAt == null ? "未记录" : date(session.lastAuthorizedAt)}`,
+        `Last personal sign-in: ${session.lastAuthorizedAt == null ? "Not recorded" : date(session.lastAuthorizedAt)}`)}</p>}
+      {session.lastCheckedAt !== null && <p>{text(`最近后台检查：${date(session.lastCheckedAt)}（非重新授权）`, `Last background check: ${date(session.lastCheckedAt)} (not a new sign-in)`)}</p>}
       {safeCode(session.errorCode) && <p className="vm-downloads-error">{text("账号验证提示", "Account check")}: {safeCode(session.errorCode)}</p>}
       <div className="vm-downloads-actions">
         <button type="button" className="button secondary" disabled={busy} onClick={connect}>{session.status === "connected" ? text("重新连接账号", "Reconnect account") : text("连接 Shadow 账号", "Connect Shadow account")}</button>
         {session.status !== "disconnected" && <button type="button" className="button secondary" disabled={busy} onClick={() => void action(async (signal) => { await logoutVmDownloads(signal); setLoginUrl(null); })}>{text("断开账号", "Disconnect account")}</button>}
       </div>
       {loginUrl && <p className="vm-downloads-login">{popupBlocked ? text("浏览器未打开登录窗口，请点击链接继续。", "The browser did not open a login window. Use this link to continue.") : text("请在登录窗口完成验证，面板会自动更新。", "Complete sign-in in the login window. This panel will update automatically.")} <a href={loginUrl} target="_blank" rel="noopener noreferrer">{text("打开登录页面", "Open sign-in page")}</a></p>}
-      <p className="vm-downloads-help">{text("暂不支持自动续期或手机/电脑飞书跨设备直接授权。Taskboard 重启后需重新连接账号。", "Automatic renewal and cross-device authorization from Feishu are not supported. Reconnect after restarting Taskboard.")}</p>
+      <p className="vm-downloads-help">{text("每分钟检查账号；服务端可能在检查时更新凭据和到期提示。登录失效或 Taskboard 重启后需本人重新连接，暂不支持手机/电脑飞书跨设备直接授权。", "The account is checked every minute; the server may update credentials and the expiry hint during checks. Reconnect yourself after sign-in expires or Taskboard restarts. Cross-device authorization from Feishu is not supported.")}</p>
     </section>}
     {snapshot && <section className="vm-downloads-notifications" aria-label={text("飞书通知状态", "Feishu notification status")}>
       <strong>{text("飞书异常提醒", "Feishu exception notifications")}: {snapshot.notifications.enabled ? text("已开启", "On") : text("已关闭", "Off")}</strong>
@@ -365,12 +374,28 @@ export function VmDownloadsPanel() {
           ? text("飞书通知不可用，请检查本机飞书应用配置和接收账号。", "Feishu notifications are unavailable. Check the local Feishu app configuration and recipient account.")
           : (snapshot.notifications.pendingCount ?? 0) > 0
             ? text(`有 ${snapshot.notifications.pendingCount} 条飞书通知待重试。`, `${snapshot.notifications.pendingCount} Feishu notifications are waiting to retry.`)
-            : text("飞书通知已配置。", "Feishu notifications are configured.")}
+            : snapshot.notifications.lastSentAt !== null
+              ? text("有成功发送记录。", "Successful sending recorded.")
+              : (snapshot.notifications.failedCount ?? 0) > 0
+                ? text("发送失败，尚无成功记录。请检查飞书机器人的发送消息权限和用户可用范围。", "Sending failed; no successful sends recorded. Check the Feishu bot's message permissions and user availability.")
+                : text("已配置，尚无成功发送记录。", "Configured; no successful sends recorded.")}
         {notificationCountsKnown && ((snapshot.notifications.pendingCount ?? 0) > 0 || !snapshot.notifications.available)
           && safeCode(snapshot.notifications.errorCode) && <> ({safeCode(snapshot.notifications.errorCode)})</>}</p>
       {!notificationCountsKnown && safeCode(snapshot.notifications.errorCode) && <p className="vm-downloads-help">{text("旧版状态码", "Legacy status code")}: <code>{safeCode(snapshot.notifications.errorCode)}</code></p>}
-      {notificationCountsKnown && (snapshot.notifications.failedCount ?? 0) > 0 && <p className="vm-downloads-help">{text(`${snapshot.notifications.failedCount} 条历史通知达到重试上限，不会自动重发。`, `${snapshot.notifications.failedCount} historical notifications reached the retry limit and will not be resent automatically.`)}</p>}
+      {notificationCountsKnown && (snapshot.notifications.failedCount ?? 0) > 0 && <p className="vm-downloads-help">
+        {text(`${snapshot.notifications.failedCount} 条历史通知达到重试上限，不会自动重发。`, `${snapshot.notifications.failedCount} historical notifications reached the retry limit and will not be resent automatically.`)}
+        {safeCode(snapshot.notifications.lastFailureCode) && <> {text("最近失败码", "Latest failure code")}: <code>{safeCode(snapshot.notifications.lastFailureCode)}</code></>}
+      </p>}
       {snapshot.notifications.lastSentAt !== null && <p className="vm-downloads-help">{text(`最近发送：${date(snapshot.notifications.lastSentAt)}`, `Last sent: ${date(snapshot.notifications.lastSentAt)}`)}</p>}
+      <p className="vm-downloads-help">{text("队列有可继续处理的申请时才发送登录提醒。", "Sign-in alerts are sent when the queue has applications that can resume processing.")}</p>
+      {snapshot.notifications.lastFailureCode !== undefined && <>
+        <div className="vm-downloads-actions">
+          <button className="button secondary" type="button" disabled={busy || !snapshot.notifications.enabled || !snapshot.notifications.available || session?.status !== "connected"} onClick={sendTestNotification}>
+            {text("发送测试通知", "Send test notification")}
+          </button>
+        </div>
+        <p className="vm-downloads-help">{text("测试会向当前已验证的企业邮箱发送一条明确标记的消息，不创建下载任务；成功表示飞书接口已受理，不代表已阅读。", "The test sends a clearly labeled message to the currently verified work email without creating a download job. Success means Feishu accepted it, not that it was read.")}</p>
+      </>}
     </section>}
     {snapshot && <>
       <details className="vm-downloads-manual" open={manualOpen} onToggle={(event) => setManualOpen(event.currentTarget.open)}>

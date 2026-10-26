@@ -67,10 +67,41 @@ describe("VM status menu", () => {
 
     expect(screen.getByText("上次验证账号: 测试用户")).toBeTruthy();
     expect(screen.getByText(/凭据提示到期时间/)).toBeTruthy();
-    expect(screen.getByText(/^上次验证：/)).toBeTruthy();
+    expect(screen.getByText(/^最近后台检查：/)).toBeTruthy();
     expect(screen.getByText(/VM_API_TRANSPORT_FAILED/)).toBeTruthy();
     expect(screen.getByText(/2 条待重试/)).toBeTruthy();
     expect(screen.getByText(/7 条历史通知发送失败/)).toBeTruthy();
+  });
+
+  it("separates personal authorization from background checks and exposes failed notification delivery", async () => {
+    const snapshot = structuredClone(currentSnapshot);
+    snapshot.session = { ...snapshot.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" },
+      lastAuthorizedAt: 1_792_400_000_000, lastCheckedAt: 1_792_500_000_000 };
+    snapshot.jobs = [];
+    snapshot.notifications = { available: true, enabled: true, errorCode: null,
+      lastFailureCode: "VM_NOTIFY_FEISHU_99991672", lastSentAt: null, pendingCount: 0, failedCount: 7 };
+    vi.mocked(getVmDownloads).mockResolvedValue(snapshot);
+    render(<TaskboardLanguageProvider language="zh"><VmStatusMenu onOpenQueue={vi.fn()} /></TaskboardLanguageProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "VM 状态：已连接" }));
+    expect(screen.getByText(/^上次本人登录授权：/)).toBeTruthy();
+    expect(screen.getByText(/^最近后台检查：/)).toBeTruthy();
+    expect(screen.getByText("发送失败，尚无成功记录")).toBeTruthy();
+    expect(screen.getByText(/最近失败码: VM_NOTIFY_FEISHU_99991672/)).toBeTruthy();
+    expect(screen.getByText(/队列有可继续处理的申请时才发送登录提醒/)).toBeTruthy();
+    expect(screen.getByText(/服务端可能在检查时更新凭据/)).toBeTruthy();
+    expect(screen.queryByText("飞书通知已配置")).toBeNull();
+    expect(screen.queryByText(/这里不会自动续期/)).toBeNull();
+  });
+
+  it("does not infer a personal authorization time or successful sending from older snapshots", async () => {
+    const snapshot = structuredClone(currentSnapshot);
+    snapshot.session = { ...snapshot.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" }, lastCheckedAt: 1_792_500_000_000 };
+    snapshot.notifications = { available: true, enabled: true, errorCode: null, lastSentAt: null, pendingCount: 0, failedCount: 0 };
+    vi.mocked(getVmDownloads).mockResolvedValue(snapshot);
+    render(<TaskboardLanguageProvider language="zh"><VmStatusMenu onOpenQueue={vi.fn()} /></TaskboardLanguageProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "VM 状态：已连接" }));
+    expect(screen.getByText("上次本人登录授权：未记录")).toBeTruthy();
+    expect(screen.getByText("已配置，尚无成功发送记录")).toBeTruthy();
   });
 
   it("labels notification status as awaiting a service restart for older snapshots", async () => {

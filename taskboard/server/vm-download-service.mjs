@@ -152,9 +152,12 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
         continue;
       }
       let success = false;
+      let failureCode = "VM_NOTIFY_SEND_FAILED";
       try { await notifier.send({ id: item.id, recipient: item.recipient, kind: item.kind, vmid: item.vmid }); success = true; }
-      catch { /* Persist only a known error, never an SDK response or request. */ }
-      metadata.complete(item, success);
+      catch (error) {
+        if (typeof error?.code === "string" && /^VM_NOTIFY_[A-Z0-9_]{1,80}$/u.test(error.code)) failureCode = error.code;
+      }
+      metadata.complete(item, success, failureCode);
     }
   }
   async function pass() {
@@ -279,6 +282,25 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
         notifications: { ...summary, available: notifier.available() && Boolean(lastAccount), enabled: settings.notificationsEnabled,
           errorCode: !notifier.available() ? "VM_NOTIFY_NOT_CONFIGURED" : !lastAccount ? "VM_NOTIFY_RECIPIENT_UNAVAILABLE" : summary.errorCode },
         worker: { running: Boolean(running), errorCode: workerError } };
+    },
+    async sendTestNotification() {
+      if (closed) fail("VM_DOWNLOAD_CLOSED");
+      if (!settings.notificationsEnabled) fail("VM_NOTIFY_DISABLED");
+      if (!notifier.available()) fail("VM_NOTIFY_NOT_CONFIGURED");
+      const identity = session.identity();
+      if (session.snapshot().status !== "connected" || !session.client() || !identity) fail("VM_NOTIFY_RECIPIENT_UNAVAILABLE");
+      rememberAccount();
+      if (!lastAccount || lastAccount.userId !== identity.user_id || lastAccount.email !== identity.enterprise_email) {
+        fail("VM_NOTIFY_RECIPIENT_UNAVAILABLE");
+      }
+      const id = randomUUID().replaceAll("-", "");
+      try {
+        await notifier.send({ id, recipient: lastAccount.email, kind: "test", vmid: null });
+      } catch (error) {
+        fail(typeof error?.code === "string" && /^VM_NOTIFY_[A-Z0-9_]{1,80}$/u.test(error.code)
+          ? error.code : "VM_NOTIFY_SEND_FAILED");
+      }
+      return { sent: true };
     },
     cleanup(jobIds) {
       if (!Array.isArray(jobIds) || jobIds.length < 1 || jobIds.length > MAX_QUEUE_CLEANUP_ITEMS

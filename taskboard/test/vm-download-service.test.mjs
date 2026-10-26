@@ -365,21 +365,21 @@ test("notifications deduplicate durably, retry failures and never overwrite acti
   f.advance(day); await f.service.wake(); assert.equal(sends, 1);
   assert.deepEqual(f.service.snapshot().notifications, {
     lastSentAt: null, errorCode: "VM_NOTIFY_SEND_FAILED", pendingCount: 1, failedCount: 0,
-    available: true, enabled: true,
+    available: true, enabled: true, lastFailureCode: null,
   });
   await f.service.wake(); assert.equal(sends, 1);
   assert.doesNotMatch(JSON.stringify(f.service.snapshot()), /secret transport text/);
   fail = false; f.advance(60000); await f.service.wake(); assert.equal(sends, 2);
   assert.deepEqual(f.service.snapshot().notifications, {
     lastSentAt: 1000000000 + day + 60000, errorCode: null, pendingCount: 0, failedCount: 0,
-    available: true, enabled: true,
+    available: true, enabled: true, lastFailureCode: null,
   });
   await f.restart({ notifier }); await f.service.wake(); assert.equal(sends, 2);
   assert.equal(f.store.get(job.id).status, "waiting_approval");
 });
 
 test("terminal notification failures are counted as history, not current transport health", async (t) => {
-  const f = await fixture(t, { notifier: { available: () => true, send: async () => { throw new Error("temporary failure"); } } });
+  const f = await fixture(t, { notifier: { available: () => true, send: async () => { throw new VmSourceError("VM_NOTIFY_FEISHU_99991672"); } } });
   const job = f.service.enqueue(f.input()).jobs[0];
   f.update(job.id, value => { value.status = "rejected"; });
   const retryDelays = [60000, 120000, 240000, 480000, 960000];
@@ -387,7 +387,32 @@ test("terminal notification failures are counted as history, not current transpo
   for (const delay of retryDelays) { f.advance(delay); await f.service.wake(); }
   assert.deepEqual(f.service.snapshot().notifications, {
     lastSentAt: null, errorCode: null, pendingCount: 0, failedCount: 1, available: true, enabled: true,
+    lastFailureCode: "VM_NOTIFY_FEISHU_99991672",
   });
+});
+
+test("manual test notification uses the verified account without creating a queue job", async (t) => {
+  const sent = [];
+  const f = await fixture(t, { notifier: { available: () => true, send: async (value) => sent.push(value) } });
+  const result = await f.service.sendTestNotification();
+
+  assert.deepEqual(result, { sent: true });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].id, /^[a-f0-9]{32}$/u);
+  assert.deepEqual({ recipient: sent[0].recipient, kind: sent[0].kind, vmid: sent[0].vmid }, {
+    recipient: identity.enterprise_email, kind: "test", vmid: null,
+  });
+  assert.deepEqual(f.service.snapshot().jobs, []);
+  assert.equal(f.store.list().length, 0);
+});
+
+test("manual test notification returns only a safe notifier error code", async (t) => {
+  const f = await fixture(t, { notifier: { available: () => true, send: async () => {
+    throw new VmSourceError("VM_NOTIFY_FEISHU_99991672");
+  } } });
+
+  await assert.rejects(f.service.sendTestNotification(), { code: "VM_NOTIFY_FEISHU_99991672" });
+  assert.deepEqual(f.service.snapshot().jobs, []);
 });
 
 test("expiry reminders start thirty minutes before expiry and remain deduplicated across restart", async (t) => {
@@ -485,4 +510,17 @@ test("official SDK notification adapter uses verified email, safe text and stabl
   assert.match(expiryText, /Taskboard.*顶部栏.*VM 状态菜单/u);
   assert.match(expiryText, /重新连接账号.*Shadow.*登录/u);
   assert.doesNotMatch(requests[1].data.content, /http|token|fixture-secret|127\.0\.0\.1/iu);
+});
+
+test("notification sender preserves a safe Feishu rejection code and drops response text", async () => {
+  const secretText = "private response with credential material";
+  const notifier = createVmDownloadNotifier({ appId: "fixture", appSecret: "fixture-secret", createContext: async () => ({
+    client: { im: { message: { create: async () => ({ code: 99991672, msg: secretText }) } } },
+  }) });
+
+  await assert.rejects(notifier.send({ id: "c".repeat(32), recipient: identity.enterprise_email, kind: "test", vmid: null }), (error) => {
+    assert.equal(error.code, "VM_NOTIFY_FEISHU_99991672");
+    assert.doesNotMatch(error.message, /private response|credential material/u);
+    return true;
+  });
 });

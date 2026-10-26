@@ -144,6 +144,7 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
   const notificationErrorCode = safeCode(snapshot?.notifications.errorCode);
   const pendingNotificationCount = snapshot?.notifications.pendingCount ?? 0;
   const failedNotificationCount = snapshot?.notifications.failedCount ?? 0;
+  const lastFailureCode = safeCode(snapshot?.notifications.lastFailureCode);
   const notificationCountsKnown = Number.isSafeInteger(snapshot?.notifications.pendingCount)
     && Number.isSafeInteger(snapshot?.notifications.failedCount);
   const notificationStatus = snapshot
@@ -152,7 +153,11 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
       : !snapshot.notifications.available ? text("飞书通知不可用", "Feishu notifications unavailable")
         : pendingNotificationCount > 0
           ? text(`${pendingNotificationCount} 条待重试`, `${pendingNotificationCount} pending retry`)
-          : text("飞书通知已配置", "Feishu notifications configured")
+          : snapshot.notifications.lastSentAt !== null
+            ? text("有成功发送记录", "Successful sending recorded")
+            : failedNotificationCount > 0
+              ? text("发送失败，尚无成功记录", "Sending failed; no successful sends recorded")
+              : text("已配置，尚无成功发送记录", "Configured; no successful sends recorded")
     : null;
   function date(value: number) {
     return new Date(value).toLocaleString(locale, { dateStyle: "short", timeStyle: "short" });
@@ -180,7 +185,9 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
           {text(snapshot.session.status === "connected" ? `凭据提示到期时间：${date(snapshot.session.expiresAt)}；以服务端验证为准` : `上次凭据提示到期时间：${date(snapshot.session.expiresAt)}；以服务端验证为准`,
             snapshot.session.status === "connected" ? `Credential expiry hint: ${date(snapshot.session.expiresAt)}; server verification is authoritative` : `Previous credential expiry hint: ${date(snapshot.session.expiresAt)}; server verification is authoritative`)}
         </small>}
-        {snapshot?.session.lastCheckedAt !== null && snapshot?.session.lastCheckedAt !== undefined && <small>{text(`上次验证：${date(snapshot.session.lastCheckedAt)}`, `Last checked: ${date(snapshot.session.lastCheckedAt)}`)}</small>}
+        {snapshot?.session.account && <small>{text(`上次本人登录授权：${snapshot.session.lastAuthorizedAt == null ? "未记录" : date(snapshot.session.lastAuthorizedAt)}`,
+          `Last personal sign-in: ${snapshot.session.lastAuthorizedAt == null ? "Not recorded" : date(snapshot.session.lastAuthorizedAt)}`)}</small>}
+        {snapshot?.session.lastCheckedAt !== null && snapshot?.session.lastCheckedAt !== undefined && <small>{text(`最近后台检查：${date(snapshot.session.lastCheckedAt)}（非重新授权）`, `Last background check: ${date(snapshot.session.lastCheckedAt)} (not a new sign-in)`)}</small>}
         {sessionErrorCode && <small className="header-vm-status-error">{text("账号验证提示", "Account check")}: {sessionErrorCode}</small>}
         {snapshot && <small>{text(`${queueCount} 个队列任务 · ${attentionCount} 项需要处理`, `${queueCount} queued · ${attentionCount} need attention`)}</small>}
         {snapshot?.worker?.errorCode && <small className="header-vm-status-error">{text("队列处理异常", "Queue worker error")} · {safeCode(snapshot.worker.errorCode) ?? "VM_ERROR"}</small>}
@@ -190,7 +197,9 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
         <small>{notificationStatus}{notificationCountsKnown && pendingNotificationCount > 0 && notificationErrorCode ? ` · ${notificationErrorCode}` : ""}</small>
         {!notificationCountsKnown && notificationErrorCode && <small>{text("旧版状态码", "Legacy status code")} · {notificationErrorCode}</small>}
         {notificationCountsKnown && failedNotificationCount > 0 && <small>{text(`${failedNotificationCount} 条历史通知发送失败`, `${failedNotificationCount} historical notifications failed`)}</small>}
+        {notificationCountsKnown && failedNotificationCount > 0 && lastFailureCode && <small className="header-vm-status-error">{text("最近失败码", "Latest failure code")}: {lastFailureCode}</small>}
         {snapshot.notifications.lastSentAt !== null && <small>{text(`最近发送：${date(snapshot.notifications.lastSentAt)}`, `Last sent: ${date(snapshot.notifications.lastSentAt)}`)}</small>}
+        <small>{text("队列有可继续处理的申请时才发送登录提醒。", "Sign-in alerts are sent when the queue has applications that can resume processing.")}</small>
         {notificationCountsKnown && !pendingNotificationCount && !snapshot.notifications.available && notificationErrorCode && <small className="header-vm-status-error">{notificationErrorCode}</small>}
       </div>}
       {error && <p role="alert" className="header-vm-status-error">{error}</p>}
@@ -216,7 +225,7 @@ export function VmStatusMenu({ onOpenQueue }: Props) {
         </select>
       </label>
       {loginUrl && <p className="header-vm-status-login">{popupBlocked ? text("登录窗口未打开：", "Sign-in window did not open: ") : text("请在登录窗口完成授权。", "Complete authorization in the sign-in window.")} {popupBlocked && <a href={loginUrl} target="_blank" rel="noopener noreferrer">{text("打开登录页面", "Open sign-in page")}</a>}</p>}
-      <p className="header-vm-status-note">{text("Shadow 登录需要本人完成；这里不会自动续期。", "Shadow sign-in requires you; this menu cannot renew it automatically.")}</p>
+      <p className="header-vm-status-note">{text("每分钟检查账号；服务端可能在检查时更新凭据和到期提示。登录失效后需本人重新连接。", "The account is checked every minute; the server may update credentials and the expiry hint during checks. Reconnect yourself if sign-in expires.")}</p>
     </div>}
   </div>;
 }
