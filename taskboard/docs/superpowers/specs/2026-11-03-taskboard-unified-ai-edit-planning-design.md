@@ -36,8 +36,8 @@ The package's validation response identifies each accepted operation and every u
 
 ## Data Flow
 
-1. A user opens a Taskboard task, selects the registered package, and enters editing notes.
-2. Taskboard loads the package's current planning declaration and captures the package protocol/version and task/source binding.
+1. A user opens a task whose trusted Feishu origin and immutable package snapshot identify an enabled registered package, then enters editing notes. The package is resolved from that snapshot; the request cannot choose an alias.
+2. Taskboard loads the package's current planning declaration and captures the package protocol/version and task/source binding. Ordinary tasks, simulated origins, and description/label markers cannot qualify for planning or execution.
 3. Taskboard asks the package adapter for only the evidence allowed by the declaration and needed for the requested capabilities.
 4. The no-tools provider client sends the original notes, the package's declared capabilities/constraints/plan schema, and the selected evidence. It does not send the source video unless a package explicitly requires a bounded visual input.
 5. Taskboard stores the original notes and raw structured proposal, then asks the package validator to validate it against the frozen task/source context and evidence.
@@ -60,7 +60,7 @@ The opt-in package declaration is immutable for a given package identity/revisio
 
 The fixed adapter protocol uses JSON on stdin/stdout and returns closed, versioned response objects. Unknown response fields, adapter versions, capability IDs, or operations fail closed. A package may return `valid`, `needs_clarification`, or `rejected`; the response must identify each issue and its affected source note/operation. The `execute` verb accepts only a Taskboard-confirmed, hash-bound plan plus its frozen context.
 
-Taskboard discovers package planning declarations by reading the registered package manifest. It does not maintain an alias-based capability table. A missing or incompatible declaration disables only AI planning for that package; it does not disable or change the legacy package runner.
+Taskboard discovers package planning declarations by reading the registered package manifest after resolving the package from a trusted task origin and frozen package snapshot. It does not maintain an alias-based capability table. A missing or incompatible declaration disables only AI planning for that package; it does not disable or change the legacy package runner.
 
 ## Evidence and Privacy
 
@@ -107,7 +107,7 @@ Future packages can opt in by shipping a compatible declaration and adapter. Tas
 
 ## Acceptance Tests
 
-Taskboard tests cover provider configuration and credential redaction, call/plan persistence, no-tool request construction, missing/invalid model output, per-package declaration discovery, clarification and confirmation transitions, source/evidence/plan staleness, and the guarantee that generation does not mutate task, approval, or delivery state. Provider tests use a local fake OpenAI-compatible endpoint.
+Taskboard tests cover provider configuration and credential redaction, call/plan persistence, no-tool request construction, missing/invalid model output, per-package declaration discovery, rejection of ordinary/simulated/marker-only tasks, clarification and confirmation transitions, source/evidence/plan staleness, and the guarantee that generation does not mutate task, approval, or delivery state. Provider tests use a local fake OpenAI-compatible endpoint.
 
 Each opted-in package tests its manifest declaration, valid plan validation/execution path, unsupported operation rejection, missing evidence, mismatched source-bound ASR, missing or mismatched visual evidence, and receipt binding. Package tests use synthetic fixtures and do not access production Feishu or deployed runtime data.
 
