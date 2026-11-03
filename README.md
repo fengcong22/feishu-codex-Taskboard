@@ -122,6 +122,8 @@ Auto-cut-slicing 的业务列为：待处理 → 素材准备 → 排队中 → 
 
 若已登记的初稿 run 在审批项创建前因旧申请账号检查被误阻断为 `VM_APPLICANT_CHANGED`，可向本机 `POST /api/local/tasks/:id/vm-pmo-approval-retry` 提交当前任务 `{ "version": 1 }`。接口仅恢复同一 task/run 中未绑定审批、未开始规划或渲染的申请阶段，复核冻结身份和请求后交给正常审批队列；不复用旧批准申请，也不自动恢复其他阻断。
 
+需要按已核对的画面和语音边界返修时，可向 loopback 的 `POST /api/local/tasks/:id/vm-pmo-manual-revision` 提交当前任务版本、`runConsent: {"allowSourceVideo":true,"allowLocalPlanning":true}` 和 `manualRevision: {"sourceSha256":"<64 位 SHA-256>","note":"返修意见","clips":[{"startMs":0,"endMs":1000,"freeze":{"startMs":500,"endMs":750,"frameMs":480}}]}`。仅接受可信 VM 任务在审批前 `VM_APPLICANT_CHANGED` 或获批后、无渲染证据的 `UNSUPPORTED_INSTRUCTION`；后者复核原审批和素材、创建不可覆盖的新规划尝试，不重新申请或下载。原飞书剪辑时间文字保留在输入快照，结构化返修和源摘要一起冻结；若新审批交付的素材 SHA 不同，规划前阻断。静帧仅替换对应画面区间，音轨保持连续。
+
 ## VM 素材下载验证
 
 新增独立审批 CLI `taskboard/cli/vm-approval.mjs`：将 VMID、部门、原因和本机下载配置写入 SQLite 队列，经 `run --login` 正常 Shadow SSO 后提交一次申请、等待批准与制作完成，再领取并校验至少 1280x720 的文件；更高分辨率可用。手动下载仍按规范化请求复用队列项；受控 VM 初稿按 `task/run` 幂等，同一任务重放复用原申请，不同任务可对同一 VMID 独立申请。资源地址摘要按 VM 申请编号隔离，同一申请不可经不同任务重复领取相同素材，不同已批准申请可分别领取相同素材。支持查看状态、中断恢复、有限重试、响应不明时核对申请和该申请范围内的资源地址占用；状态库不保存令牌或下载 URL。`run` 默认最多等待 30 分钟，进程结束后须再次运行，重启后重新登录。现有 `vm-source.mjs` 继续支持操作者提供已获批 URL 或本机 MP4。用法、状态恢复和边界见 [VM 素材采集验证](docs/vm-source-acquisition.md)。

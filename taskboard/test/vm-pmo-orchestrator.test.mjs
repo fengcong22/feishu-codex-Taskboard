@@ -15,6 +15,7 @@ async function fixture(t) {
   const calls = [];
   const attention = [];
   let approvalStatus = "waiting_approval";
+  let planResult = { status: "ready", planSha256: "d".repeat(64) };
   let canExecute = async () => true;
   let deliveryJob = null;
   let now = 1_700_000_000_000;
@@ -57,7 +58,7 @@ async function fixture(t) {
     prepareInput: async (input) => { calls.push(["prepare", input]); return prepared; },
     runOffline: async ({ mode, onStarted }) => {
       calls.push([mode]); await onStarted({ mode, pid: 42, startedAt: new Date(now).toISOString() });
-      return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) }
+      return mode === "plan" ? planResult
         : { status: "rendered", planSha256: "d".repeat(64), artifact };
     },
     recoverOffline: async ({ mode }) => { calls.push(["recover", mode]); return null; },
@@ -78,6 +79,7 @@ async function fixture(t) {
   return { calls, attention, task, origin, packageSnapshot, dependencies, prepared, artifact, binding,
     get f() { return service; }, get db() { return db; },
     setApproval(value) { approvalStatus = value; }, setDelivery(value) { deliveryJob = value; },
+    setPlanResult(value) { planResult = value; },
     advance(ms) { now += ms; },
     setCanExecute(value) { canExecute = value; },
     async restart() { await service.close(); db.close(); db = new DatabaseSync(sqlitePath); service = createVmPmoOrchestrator(dependencies); },
@@ -137,6 +139,27 @@ test("an applicant check blocked before approval can retry the same frozen task 
   x.setApproval("waiting_approval");
   assert.equal((await x.f.pump("run_vm")).approvalStatus, "waiting_approval");
   assert.equal(x.calls.some(([kind]) => ["slot", "plan", "render"].includes(kind)), false);
+});
+
+test("a source-bound manual revision reuses approved materials in a new immutable planning attempt",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});
+  x.setApproval("ready");
+  x.setPlanResult({status:"blocked",errorCode:"UNSUPPORTED_INSTRUCTION"});
+  const blocked=await x.f.pump("run_vm");
+  assert.equal(blocked.state,"blocked");
+  const revision={sourceSha256:"a".repeat(64),note:"Hold the previous tail frame.",clips:[
+    {startMs:0,endMs:1000,freeze:{startMs:500,endMs:750,frameMs:480}},
+  ]};
+  const retried=await x.f.retryManualRevision("run_vm",revision);
+  assert.equal(retried.state,"ready");
+  assert.equal(retried.planAttempt,2);
+  assert.deepEqual(retried.manualRevision,revision);
+  assert.deepEqual(retried.retryHistory.map(item=>item.errorCode),["UNSUPPORTED_INSTRUCTION"]);
+  assert.equal(x.calls.filter(([name])=>name==="reserve").length,1);
+  await x.restart();
+  assert.deepEqual(x.f.get("run_vm").manualRevision,revision);
+  await assert.rejects(x.f.retryManualRevision("run_vm",revision),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
 });
 
 function storeLegacyInitialIdentity(x) {

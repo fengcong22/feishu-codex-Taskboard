@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const HASH = /^[a-f0-9]{64}$/u;
@@ -13,7 +14,8 @@ const MAX_ATTEMPTS = 8;
 const MAX_PLAN_ATTEMPTS = 3;
 const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepared", "planStartedAt",
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
-  "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt"]);
+  "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
+  "manualRevision"]);
 
 function failure(code) { const error = new Error(code); error.code = code; return error; }
 function object(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -165,13 +167,15 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       if (payload.renderResult !== undefined
         && checkedResult(payload.renderResult, "render", payload.planSha256).status !== "rendered")
         throw failure("VM_PMO_STATE_INVALID");
+      if (payload.manualRevision !== undefined) validateVmPmoManualRevision(payload.manualRevision);
       if (payload.planAttempt !== undefined && (!Number.isSafeInteger(payload.planAttempt)
         || payload.planAttempt < 1 || payload.planAttempt > MAX_PLAN_ATTEMPTS)
         || payload.retryHistory !== undefined && (!Array.isArray(payload.retryHistory)
           || payload.retryHistory.length > MAX_PLAN_ATTEMPTS - 1
           || payload.retryHistory.some((entry) => !object(entry) || !Number.isSafeInteger(entry.planAttempt)
             || entry.planAttempt < 1 || entry.planAttempt >= MAX_PLAN_ATTEMPTS
-            || entry.errorCode !== "WORD_ALIGNMENT_UNRESOLVED" || !timestamp(entry.failedAt)
+            || !["WORD_ALIGNMENT_UNRESOLVED","UNSUPPORTED_INSTRUCTION"].includes(entry.errorCode)
+            || !timestamp(entry.failedAt)
             || !HASH.test(entry.inputSha256)))
         || payload.renderRetryHistory !== undefined && (!Array.isArray(payload.renderRetryHistory)
           || payload.renderRetryHistory.length > 1
@@ -283,7 +287,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     }
     return results;
   }
-  async function retryApproval(runId, {beforeCommit = () => {}} = {}) {
+  async function retryApproval(runId, {beforeCommit = () => {},manualRevision} = {}) {
     const run = get(runId);
     if (!run || run.state !== "blocked" || run.errorCode !== "VM_APPLICANT_CHANGED"
       || run.identity.origin.stageId !== "initial" || run.approvalStatus !== "reserved"
@@ -296,19 +300,60 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     checkedBinding(status,run.taskId,run.binding);
     if (status.status !== "reserved" || status.approvalJobId !== null)
       throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    if (run.manualRevision !== undefined) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    const revision = manualRevision === undefined ? undefined : validateVmPmoManualRevision(manualRevision);
     const row = db.prepare("SELECT identity_sha256,payload_json FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const nextPayload = revision === undefined ? row.payload_json
+      : json({...JSON.parse(row.payload_json),manualRevision:revision});
     db.exec("BEGIN IMMEDIATE");
     try {
       beforeCommit();
       assertCurrent(run);
-      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'waiting_materials',error_code = NULL,
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'waiting_materials',payload_json = ?,error_code = NULL,
         attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
         AND state = 'blocked' AND error_code = 'VM_APPLICANT_CHANGED'
         AND identity_sha256 = ? AND payload_json = ? AND lease_token IS NULL`)
-        .run(now(),now(),runId,run.taskId,row.identity_sha256,row.payload_json);
+        .run(nextPayload,now(),now(),runId,run.taskId,row.identity_sha256,row.payload_json);
       if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
       db.exec("COMMIT");
     } catch (error) {db.exec("ROLLBACK");throw error;}
+    return get(runId);
+  }
+  async function retryManualRevision(runId,manualRevision,{beforeCommit = () => {}} = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run || run.state !== "blocked" || run.errorCode !== "UNSUPPORTED_INSTRUCTION"
+      || !run.planStartedAt || !run.prepared || !run.acquisition || run.runnerStartedAt
+      || run.planSha256 || run.renderResult || run.artifactId || run.deliveredFileToken
+      || run.completedAt || run.leaseToken) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    const planAttempt = run.planAttempt ?? 1;
+    if (planAttempt >= MAX_PLAN_ATTEMPTS) throw failure("VM_PMO_RETRY_LIMIT");
+    assertCurrent(run);
+    await verifyRetryInput({run});
+    const revision = validateVmPmoManualRevision(manualRevision,
+      {sourceSha256:run.acquisition.sha256,durationMs:run.acquisition.duration_ms});
+    assertCurrent(run);
+    const history = [...(run.retryHistory ?? []),{planAttempt,errorCode:run.errorCode,
+      failedAt:new Date(now()).toISOString(),inputSha256:run.prepared.inputSha256}];
+    const nextValue = Object.fromEntries(Object.entries(run).filter(([key])=>PAYLOAD_KEYS.has(key)));
+    delete nextValue.prepared;
+    delete nextValue.planStartedAt;
+    nextValue.planAttempt = planAttempt + 1;
+    nextValue.retryHistory = history;
+    nextValue.manualRevision = revision;
+    const nextPayload = json(nextValue);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      assertCurrent(run);
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'ready',payload_json = ?,error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'blocked' AND error_code = 'UNSUPPORTED_INSTRUCTION'
+        AND identity_sha256 = ? AND payload_json = ? AND lease_token IS NULL`)
+        .run(nextPayload,now(),now(),runId,run.taskId,row.identity_sha256,row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch(error) {db.exec("ROLLBACK");throw error;}
     return get(runId);
   }
   async function retryPlan(runId, {beforeCommit = () => {}} = {}) {
@@ -620,7 +665,8 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     })().finally(() => { draining = null; });
     return draining;
   }
-  return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryPlan, retryValidatedPlan,
+  return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryManualRevision,
+    retryPlan, retryValidatedPlan,
     retryFailedRender,
     recoverBindingConflicts,
     start() { if (closed || timer) return; timer = setInterval(() => { void wake().catch(() => {}); }, tickMs);

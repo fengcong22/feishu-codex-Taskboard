@@ -426,6 +426,35 @@ test("VM plan retry reuses the ready approval and source while appending a new i
   }
 });
 
+test("manual revision reuses one approved source and preserves the first failed input",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [before]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(before.runId);
+    const payload={...JSON.parse(row.payload_json),planStartedAt:new Date().toISOString()};
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='blocked',error_code='UNSUPPORTED_INSTRUCTION',
+      payload_json=? WHERE run_id=?`).run(JSON.stringify(payload),before.runId);
+    const task=f.database.getTask(before.taskId);
+    const originalInput=await readFile(path.join(path.dirname(before.prepared.contextPath),"input.json"));
+    const request={version:task.version,runConsent:{allowSourceVideo:true,allowLocalPlanning:true},
+      manualRevision:{sourceSha256:before.acquisition.sha256,note:"Hold the prior tail frame.",
+        clips:[{startMs:0,endMs:500,freeze:{startMs:200,endMs:400,frameMs:180}}]}};
+    assert.equal((await f.runtime.getTaskRun(task.id)).canRetryManualRevision,true);
+    const queued=await f.runtime.retryManualRevision(task.id,request);
+    await f.runtime.wake();
+    const [after]=f.runtime.list();
+    assert.equal(queued.runId,before.runId);
+    assert.equal(after.planAttempt,2);
+    assert.equal(after.state,"prepared");
+    assert.notEqual(after.prepared.contextPath,before.prepared.contextPath);
+    assert.deepEqual(await readFile(path.join(path.dirname(before.prepared.contextPath),"input.json")),originalInput);
+    const revisedInput=JSON.parse(await readFile(path.join(path.dirname(after.prepared.contextPath),"input.json")));
+    assert.equal(revisedInput.instructions[0].raw_text,before.identity.stageSnapshot.vmContext.instruction);
+    assert.equal(revisedInput.manual_revision.source_sha256,before.acquisition.sha256);
+    assert.equal(f.approvals.list().length,1);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
 test("saved-plan validation retry refuses a stray rendered file before changing run state", async t => {
   const f = await fixture(t), hold = await preparedWhileBusy(f);
   try {

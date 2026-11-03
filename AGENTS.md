@@ -13,6 +13,8 @@ Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LA
 
 只允许对 `WORD_ALIGNMENT_UNRESOLVED` 且尚无 render/制品证据的 VM run 提供用户手动规划重试。重试沿用原 task/run、已批准审批项和已校验素材，不重新申请或下载；开始前重新检查审批仍为 `ready`、获批采集回执有效且素材 SHA 未变。每次尝试写入独立、不可覆盖的输入目录并保留旧失败证据，最多三次规划尝试。Taskboard 本机重试接口必须 loopback 保护、校验任务版本，并要求本次明确授权原视频音轨 ASR 和新的本机规划文件写入；不得自动重试、不得对其他错误开放，也不得通过更改数据库状态绕过审批。
 
+对 `UNSUPPORTED_INSTRUCTION` 的人工返修另走源 SHA 绑定的结构化片段入口，仅限可信 VM task/run 在获批、素材与回执重新校验通过且无 render/制品证据时创建新规划尝试；原飞书意见不改写，旧尝试证据不覆盖，最多三次。`VM_APPLICANT_CHANGED` 且尚未产生审批项、规划或渲染证据的初稿 run 可在同一入口冻结返修，再恢复正常审批队列；新 task/run 仍需独立审批，绝不领取旧申请的素材。该入口必须 loopback、任务版本和本次源视频/本机规划授权三重约束；源 SHA 不一致时在渲染前阻断。
+
 若 render 子进程已关闭，且原 run 精确停在 `needs_attention/VM_PMO_START_EVIDENCE_FAILED`、没有结果文件、MP4 或交付证据，可由用户通过 loopback 本机接口按当前任务版本手动恢复一次渲染。恢复前重新验证原审批 `ready`、采集回执、素材 SHA 和已保存规划 SHA；沿用原 task/run、审批及下载，不重新 ASR 或规划，保留首次启动时间证据。待启动的人工恢复仍受当前本机自动剪辑开关约束，关闭开关取消尚未开始的恢复；调用 spawn 前须持久记录启动意向，重启后不得将结果未知的启动意向重新开放为一次恢复。其他有 render 启动证据的 run 不开放此恢复，启动时不得自动恢复。VM 最新阶段判定忽略已归档的误触发任务，但仍以未归档的新阶段任务阻止旧轮次回写。
 
 旧版校验器将合法的画面/语音同步 cue 误判为 `PLAN_INVALID` 时，仅允许人工通过本机 loopback 接口对同一 `needs_attention/PLAN_INVALID` run 重新校验已经保存的 ready 计划；要求任务版本匹配、原审批仍为 `ready`、获批采集回执和源 SHA 有效，并确认尚无 render 启动、结果或 MP4 证据。校验成功后沿用原 plan/run 继续渲染，不重新规划、识别、申请或下载；失败仍停在原状态，其他 `needs_attention` 不开放此恢复。

@@ -277,6 +277,37 @@ test("rejects a stale parent and malformed ordered segments", async (t) => {
     { code: "PLAN_INVALID" });
 });
 
+test("accepts a freeze frame sampled from the preceding clip", async (t) => {
+  const current = await fixture(t);
+  const input = { ...current.input, schema_version: 2 };
+  await replaceInput(current, input);
+  current.context.schema_version = 2;
+  await writeFile(current.contextPath, JSON.stringify(current.context));
+  const plan = { ...current.plan, schema_version: 2, input_sha256: current.context.input_sha256,
+    segments: [{ segment_id: "clip-1", source_id: current.source.source_id,
+      source_start_us: 0, duration_us: 200_000, target_start_us: 0 },
+    { segment_id: "clip-2", source_id: current.source.source_id,
+      source_start_us: 400_000, duration_us: 600_000, target_start_us: 200_000 }],
+    instruction_results: [{ ...current.plan.instruction_results[0], segments: ["clip-1", "clip-2"] }],
+    operations: [{ operation_id: "freeze-1", kind: "freeze_frame",
+      source_start_us: 400_000, source_end_us: 600_000,
+      target_start_us: 200_000, frame_time_us: 160_000, alignment_sha256: null }],
+    expected_duration_ms: 800, alignment_sha256: null };
+  const bytes = Buffer.from(JSON.stringify(plan));
+  await writeFile(current.paths.plan, bytes);
+  await writeFile(current.paths["plan-result"], JSON.stringify({ ...current.planResult,
+    schema_version: 2, input_sha256: current.context.input_sha256,
+    plan_sha256: hash(bytes), instruction_results: plan.instruction_results }));
+  assert.equal((await validateVmPmoPlan({ contextPath: current.contextPath })).status, "ready");
+  const outside = Buffer.from(JSON.stringify({ ...plan, operations: [{ ...plan.operations[0],
+    frame_time_us: 1_000_000 }] }));
+  await writeFile(current.paths.plan, outside);
+  await writeFile(current.paths["plan-result"], JSON.stringify({ ...current.planResult,
+    schema_version: 2, input_sha256: current.context.input_sha256,
+    plan_sha256: hash(outside), instruction_results: plan.instruction_results }));
+  await assert.rejects(validateVmPmoPlan({ contextPath: current.contextPath }), { code: "PLAN_INVALID" });
+});
+
 test("rejects changed source", async (t) => {
   const current = await fixture(t);
   await writeFile(current.paths.source, "changed source");

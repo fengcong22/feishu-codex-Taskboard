@@ -70,6 +70,7 @@ import { createVmDownloadService } from "./vm-download-service.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-download-notifier.mjs";
 import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
+import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { createFeishuVmMp4Adapter } from "./vm-mp4-feishu-adapter.mjs";
 import { createFeishuApiContext } from "../../src/feishu-api.mjs";
 
@@ -907,6 +908,20 @@ function parseVmPmoWritebackRetry(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set(["version"]));
   return {version: parseVersion(value.version)};
+}
+
+function parseVmPmoManualRevision(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value,new Set(["version","runConsent","manualRevision"]));
+  const version=parseVersion(value.version);
+  assertPlainObject(value.runConsent);
+  assertAllowedKeys(value.runConsent,new Set(["allowSourceVideo","allowLocalPlanning"]));
+  if (value.runConsent.allowSourceVideo !== true || value.runConsent.allowLocalPlanning !== true)
+    throw new ApiError(400,"INVALID_FIELD","Explicit source and local planning consent is required");
+  let manualRevision;
+  try {manualRevision=validateVmPmoManualRevision(value.manualRevision);}
+  catch {throw new ApiError(400,"VM_PMO_REVISION_INVALID","VM_PMO_REVISION_INVALID");}
+  return {version,runConsent:{allowSourceVideo:true,allowLocalPlanning:true},manualRevision};
 }
 
 function parseWorkflowVersion(value) {
@@ -7548,6 +7563,33 @@ export function createTaskboardServer(options = {}) {
       }
 
       const vmPmoWritebackRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-writeback-retry$/);
+      const vmPmoManualRevisionRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-manual-revision$/);
+      if (vmPmoManualRevisionRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams,"POST /api/local/tasks/:id/vm-pmo-manual-revision");
+        if (request.method !== "POST") return methodNotAllowed(response,["POST"]);
+        const taskId=decodeRouteSegment(vmPmoManualRevisionRoute[1],"Task id");
+        const body=parseVmPmoManualRevision(await readJson(request));
+        const task=database.getTask(taskId);
+        if (!task) throw new ApiError(404,"TASK_NOT_FOUND",`Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409,"VERSION_CONFLICT","The task changed. Refresh and retry.");
+        const snapshot=database.getFeishuTaskPackageSnapshot(taskId);
+        if (task.archivedAt !== null || database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409,"VM_PMO_RETRY_NOT_ALLOWED","Only an active registered VM/PMO task can be revised");
+        let run;
+        try {run=await getVmRuntime().retryManualRevision(taskId,body);}
+        catch(error) {
+          if (error instanceof ApiError) throw error;
+          if (["VM_PMO_RETRY_NOT_ALLOWED","VM_PMO_RETRY_LIMIT","VM_PMO_REVISION_INVALID",
+            "VM_PMO_RETRY_SOURCE_CHANGED","VM_PMO_RETRY_APPROVAL_NOT_READY","VERSION_CONFLICT"].includes(error?.code))
+            throw new ApiError(409,error.code,error.code);
+          if (error?.code === "VM_PMO_RUN_NOT_FOUND") throw new ApiError(404,error.code,error.code);
+          throw error;
+        }
+        return sendJson(response,202,{run});
+      }
       const vmPmoRenderRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-render-retry$/);
       if (vmPmoRenderRetryRoute) {
         assertAiLoopbackRequest(request);
