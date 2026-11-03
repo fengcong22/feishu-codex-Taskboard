@@ -98,6 +98,10 @@ VM/PMO 有独立运行时：Bridge 认证专用登记 → 初稿审批下载或�
 
 VM 详情中的「重试语音识别与规划」只对尚未渲染且错误码精确为 `WORD_ALIGNMENT_UNRESOLVED` 的运行显示，限制为三次规划尝试。确认前须分别授权原视频音轨 ASR 与新本机规划文件写入。重试复用原 task/run、ready 审批及同一素材，并重新校验采集回执和源 SHA；每次规划使用独立不可覆盖目录，旧失败记录保留。审批失效、素材变化、其他错误、已有 render/制品证据或达到次数上限时均不能重试。该入口只服务本机 loopback，不改变旧 ZIP 通用 Auto-Cut 的重试规则。
 
+若旧版校验器把剪辑包已保存的合法计划误判为 `PLAN_INVALID`，本机 `POST /api/local/tasks/:id/vm-pmo-plan-validation-retry` 可按任务当前 `version` 人工重新校验该计划并沿原 run 继续。仅接受 `needs_attention/PLAN_INVALID`、原审批 `ready`、采集回执及源文件未变、且没有 render 启动、结果或 MP4 证据的任务；重新校验不运行 ASR、不写新计划、不重新申请或下载。任何校验失败都不改变原运行状态，此入口不用于修改原始剪辑意见或重做已完成成片。
+
+若渲染启动时的处理中记录失败，原 run 进入 `needs_attention/VM_PMO_START_EVIDENCE_FAILED`。本机 `POST /api/local/tasks/:id/vm-pmo-render-retry` 接受当前任务 `version`，仅在原渲染进程已退出、没有结果文件或 MP4 且尚未用过该恢复入口时人工恢复一次。恢复会复核原审批、采集回执、源 SHA 及已保存规划 SHA，保留首次启动证据；不再申请审批、下载、识别语音或重新规划。待启动的恢复仍受当前本机自动剪辑开关约束。已归档的误触发任务不参与 VM 最新轮次判定，未归档的新轮次仍会阻止旧轮次回写。
+
 旧版任务绑定若只与 task/run 专属审批 job 在 `private_endpoints` 有差异，Taskboard 仅在原 job id 可重新计算、其他请求字段完全一致且 `ready` 回执和源文件摘要复核通过后迁移绑定；该过程沿用已下载文件，不重新申请或下载。
 
 归档发布会把映射盘解析到已冻结的 UNC 目标，再使用同一目标进行无覆盖复制／发布；映射变更、符号链接或与冻结目标不一致时阻断。历史上在复制前因 `VM_ARCHIVE_DIRECTORY_INVALID` 进入 `conflict` 且尝试数为 0 的作业，可由本机维护人员通过认证的 `POST /api/local/feishu/vm/final-archive/retry-directory` 显式恢复：请求与原登记相同，并必须提供 `expectedSource` 五项成片身份。该接口要求 Bridge 共享密钥及专用 header、loopback Host/Origin，只重排原作业，不解析新目标或新来源；恢复前复核当前轮次、MP4 摘要及冻结目录，并在 `vm_final_archive_recoveries` 保留原错误和计划摘要。其他冲突不允许恢复，也不会自动补跑。

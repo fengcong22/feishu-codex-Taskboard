@@ -27,8 +27,10 @@ function identityFor(origin, snapshot) {
     packageRevision: snapshot.packageRevision, workflowTemplate: snapshot.workflowTemplate,
   };
 }
-function validIdentity(task, origin, snapshot) {
-  return task?.archivedAt === null && ACTIVE_TASK_STATUS.has(task.status) && task.labels?.includes("feishu")
+function validIdentity(task, origin, snapshot, allowStarted = false) {
+  return task?.archivedAt === null
+    && (ACTIVE_TASK_STATUS.has(task.status) || allowStarted && task.status === "in_progress")
+    && task.labels?.includes("feishu")
     && origin?.source === "feishu-base" && origin.packageSource === "subject-config"
     && origin.deliverySource === undefined && origin.stageId === "initial"
     && typeof origin.eventId === "string" && origin.eventId.length > 0
@@ -121,11 +123,11 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     return { taskId: row.task_id, runId: row.run_id, vmid: request.vmid,
       approvalJobId: row.approval_job_id, createdAt: row.created_at, updatedAt: row.updated_at };
   }
-  function currentIdentity(taskId) {
+  function currentIdentity(taskId, allowStarted = false) {
     const task = database.getTask(taskId);
     const origin = database.getFeishuTaskOrigin(taskId);
     const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
-    if (!validIdentity(task, origin, snapshot)) fail("VM_TASK_NOT_ELIGIBLE");
+    if (!validIdentity(task, origin, snapshot, allowStarted)) fail("VM_TASK_NOT_ELIGIBLE");
     return { task, origin, snapshot, identityHash: digest(identityFor(origin, snapshot)) };
   }
   function requestMatchesTask(request, origin) {
@@ -143,10 +145,10 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     if (identityHash !== latest.identityHash || !requestMatchesTask(request, latest.origin)) fail("VM_TASK_BINDING_CONFLICT");
     return { identityHash, request, requestHash: digest(request) };
   }
-  async function checked(taskId) {
+  async function checked(taskId, allowStarted = false) {
     const binding = read(taskId);
     if (!binding) fail("VM_TASK_BINDING_NOT_FOUND");
-    const expected = currentIdentity(taskId);
+    const expected = currentIdentity(taskId, allowStarted);
     if (binding.row.identity_sha256 !== expected.identityHash || !requestMatchesTask(binding.request, expected.origin)) {
       fail("VM_TASK_BINDING_CONFLICT");
     }
@@ -176,7 +178,7 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
       || JSON.stringify(requestWithoutPrivateEndpoints(request))
         !== JSON.stringify(requestWithoutPrivateEndpoints(binding.request))
       || JSON.stringify(request.private_endpoints) === JSON.stringify(binding.request.private_endpoints)
-      || !requestMatchesTask(request, currentIdentity(taskId).origin)) return null;
+      || !requestMatchesTask(request, currentIdentity(taskId, true).origin)) return null;
     const acquisition = job.acquisition;
     if (!acquisition?.receipt_path || !job.application_id || !job.instance_code) return null;
     let verified;
@@ -188,7 +190,7 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
     if (verified.vmid_binding !== "vm_api_verified" || ["receipt_path", "path", "sha256", "bytes", "duration_ms"]
       .some((key) => verified[key] !== acquisition[key])) fail("VM_TASK_ACQUISITION_INVALID");
 
-    const latest = await checked(taskId);
+    const latest = await checked(taskId, true);
     if (latest.row.run_id !== binding.row.run_id || latest.row.approval_job_id !== jobId
       || latest.row.request_sha256 !== binding.row.request_sha256) fail("VM_TASK_BINDING_CONFLICT");
     const requestJson = JSON.stringify(request);
@@ -204,7 +206,7 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
       if (changed.changes !== 1) fail("VM_TASK_BINDING_CONFLICT");
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
-    const migrated = await checked(taskId);
+    const migrated = await checked(taskId, true);
     if (migrated.row.request_sha256 !== job.requestFingerprint) fail("VM_TASK_BINDING_CONFLICT");
     return { binding: migrated, job, acquisition: verified };
   }
@@ -312,7 +314,7 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
       return summary(binding.row, binding.request);
     },
     async status(taskId) {
-      let binding = await checked(taskId);
+      let binding = await checked(taskId, true);
       let recoveredAcquisition = null;
       if (!binding.row.approval_job_id) return { ...summary(binding.row, binding.request), status: "reserved" };
       let job = await approval.lookup({ requestFingerprint: binding.row.request_sha256,
@@ -339,7 +341,7 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
       }
       if (verified.vmid_binding !== "vm_api_verified" || ["receipt_path", "path", "sha256", "bytes", "duration_ms"]
         .some((key) => verified[key] !== job.acquisition[key])) fail("VM_TASK_ACQUISITION_INVALID");
-      await checked(taskId);
+      await checked(taskId, true);
       return { ...base, status: "ready", acquisition: verified };
     },
   };

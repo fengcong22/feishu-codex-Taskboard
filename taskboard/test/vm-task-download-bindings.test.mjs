@@ -115,6 +115,25 @@ test("only a trusted production initial VM task can reserve a download", async (
   assert.equal(f.approvalStore.list().length, 0);
 });
 
+test("an in-progress VM task can recheck its existing ready approval without a new request",async t=>{
+  const f=await fixture(t);
+  await f.service.reserve("task-1");
+  await f.service.reconcile("task-1");
+  const job=f.approvalStore.list()[0],claim=f.approvalStore.claim(job.id);
+  claim.job.status="ready";
+  claim.job.application_id="app_vm";
+  claim.job.instance_code="instance_vm";
+  claim.job.acquisition={receipt_path:path.join(f.directory,"receipt.json"),
+    path:path.join(f.directory,"source.mp4"),sha256:"a".repeat(64),bytes:100,duration_ms:2000};
+  f.approvalStore.save(job.id,claim.leaseToken,claim.job);
+  f.task.status="in_progress";
+
+  const result=await f.service.status("task-1");
+  assert.equal(result.status,"ready");
+  assert.equal(f.approvalEnqueues,1);
+  await assert.rejects(f.service.reconcile("task-1"),{code:"VM_TASK_NOT_ELIGIBLE"});
+});
+
 test("reservation is durable and cannot change its VMID, config or task identity", async (t) => {
   const f = await fixture(t);
   const first = await f.service.reserve("task-1");

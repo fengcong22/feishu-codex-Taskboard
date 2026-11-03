@@ -26,6 +26,10 @@ npm start
 
 飞书 Bridge 接入的 `vm_pmo_review_video` 包包含独立的初稿与审核修改流程：初稿通过正常 VM 审批队列获取源视频，审核修改复用 Taskboard 已确认交付的上一轮 MP4。每轮通过 `plan/render` 生成唯一 MP4，上传并读回 PMO 附件后完成阶段。可选的最终归档 worker 会校验 SHA 并以无覆盖方式发布成片。启用要求本机 Python、包白名单、自动剪辑开关及完整学科配置；保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。
 
+已保存的合法 VM 计划若被旧校验器误判为 `PLAN_INVALID`，本机 `POST /api/local/tasks/:id/vm-pmo-plan-validation-retry` 可在提供当前任务 `version` 后人工重新校验并沿原 task/run 继续。接口只接受未开始 render、无结果或 MP4 证据的 `needs_attention/PLAN_INVALID`，并复核原审批、采集回执和源 SHA；不会重做 ASR、规划、审批或下载。其他失败仍按各自规则处理。
+
+原 render 子进程已关闭且运行停在 `needs_attention/VM_PMO_START_EVIDENCE_FAILED` 时，可在本机调用 `POST /api/local/tasks/:id/vm-pmo-render-retry` 并提交当前任务 `version` 人工恢复一次。接口要求没有结果文件、MP4 或交付证据，复核原审批、采集回执、源 SHA 和已保存规划 SHA；保留首次启动时间，沿原 task/run 继续，不重新审批或下载。待启动的恢复仍受当前本机自动剪辑开关约束。已归档的重复任务不再抢占 VM 最新轮次。
+
 如需在前端实时重载模式下开发：
 
 ```bash

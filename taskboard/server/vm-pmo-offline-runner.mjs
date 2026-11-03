@@ -27,12 +27,16 @@ function processEnvironment(environment) {
 export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPath,
   signal, timeoutMs = 2 * 60 * 60 * 1000, environment = process.env,
   ffprobePath = "ffprobe", ffmpegPath = "ffmpeg", onStarted = null,
+  beforeSpawn = null, assertBeforeSpawn = null, onLaunched = null,
   expectedBound: frozenBound = null } = {}) {
   if (!["plan", "render"].includes(mode) || typeof pythonPath !== "string"
     || !path.isAbsolute(pythonPath) || typeof packageRoot !== "string"
     || !path.isAbsolute(packageRoot) || !Number.isSafeInteger(timeoutMs)
     || timeoutMs < 1 || timeoutMs > 2_147_483_647
-    || (onStarted !== null && typeof onStarted !== "function")) throw failure("VM_PMO_RUN_INPUT_INVALID");
+    || (onStarted !== null && typeof onStarted !== "function")
+    || (beforeSpawn !== null && typeof beforeSpawn !== "function")
+    || (assertBeforeSpawn !== null && typeof assertBeforeSpawn !== "function")
+    || (onLaunched !== null && typeof onLaunched !== "function")) throw failure("VM_PMO_RUN_INPUT_INVALID");
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
   const expectedBound = await validateVmPmoInput({ contextPath, signal, expectedBound: frozenBound });
   const { context } = expectedBound;
@@ -58,8 +62,14 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
   const args = ["-m", "auto_cut_slicing.vm_pmo", mode, "--input",
     path.join(context.run_dir, "input.json"), "--context", contextPath];
   if (mode === "render") args.push("--plan", context.plan_path);
-  const child = spawn(pythonPath, args, { cwd: root, env: processEnvironment(environment),
-    windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore"] });
+  if (beforeSpawn) await beforeSpawn();
+  if (assertBeforeSpawn) assertBeforeSpawn();
+  if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
+  let child;
+  try { child = spawn(pythonPath, args, { cwd: root, env: processEnvironment(environment),
+    windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore"] }); }
+  catch { throw failure("VM_PMO_PROCESS_UNAVAILABLE"); }
+  if (onLaunched && Number.isSafeInteger(child.pid) && child.pid > 0) onLaunched();
   let stopped;
   let grace;
   let resolveStopped;

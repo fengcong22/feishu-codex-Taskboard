@@ -328,9 +328,12 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
       || !Number.isSafeInteger(operation.source_end_us) || operation.source_end_us <= operation.source_start_us
       || operation.source_end_us > input.source.duration_ms * 1000) fail("PLAN_INVALID");
     if (operation.kind === "start_cue") {
+      const visualSyncKeys = ["visual_anchor_us", "visual_sync_tolerance_us", "visual_sync_delta_us"];
+      const hasVisualSyncEvidence = visualSyncKeys.some((key) => Object.hasOwn(operation, key));
       if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us",
         "requested_start_us", "search_end_us", "search_radius_us", "matched_text", "match_strategy",
-        "alignment_sha256", "provider", "model", "adapter"])
+        "alignment_sha256", "provider", "model", "adapter"], visualSyncKeys)
+        || hasVisualSyncEvidence && !visualSyncKeys.every((key) => Object.hasOwn(operation, key))
         || !Number.isSafeInteger(operation.requested_start_us) || operation.requested_start_us < 0
         || operation.requested_start_us > input.source.duration_ms * 1000
         || !Number.isSafeInteger(operation.search_end_us) || operation.search_end_us < operation.source_end_us
@@ -343,6 +346,14 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
         || operation.alignment_sha256 !== plan.alignment_sha256 || !plan.alignment_sha256
         || ![operation.provider, operation.model, operation.adapter].every((value) => typeof value === "string" && value.trim()))
         fail("PLAN_INVALID");
+      if (hasVisualSyncEvidence && (!Number.isSafeInteger(operation.visual_anchor_us)
+        || operation.visual_anchor_us < 0 || operation.visual_anchor_us > input.source.duration_ms * 1000
+        || operation.visual_anchor_us !== operation.requested_start_us
+        || !Number.isSafeInteger(operation.visual_sync_tolerance_us)
+        || operation.visual_sync_tolerance_us < 0
+        || operation.visual_sync_tolerance_us > input.source.duration_ms * 1000
+        || operation.visual_sync_delta_us !== Math.abs(operation.source_start_us - operation.visual_anchor_us)
+        || operation.visual_sync_delta_us > operation.visual_sync_tolerance_us)) fail("PLAN_INVALID");
     } else if (["word", "mute_word"].includes(operation.kind)) {
       if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us", "target_join_us",
         "matched_text", "match_strategy", "alignment_sha256", "provider", "model", "adapter", "must_keep_evidence"])

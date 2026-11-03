@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createVmPmoRuntime } from "../server/vm-pmo-runtime.mjs";
+import { createVmPmoRuntime, latestActiveVmStageOrigin } from "../server/vm-pmo-runtime.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import { mkdtemp, realpath, mkdir, writeFile, readFile, rm, access } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -120,6 +120,167 @@ test("VM runtime cannot start or create a task with missing local runtime bindin
   await assert.rejects(runtime.ready(), {code: "VM_PMO_RUNTIME_UNAVAILABLE"});
   await assert.rejects(runtime.register({}, {}), {code: "VM_PMO_RUNTIME_UNAVAILABLE"});
   assert.deepEqual(runtime.list(), []);
+});
+
+test("latest VM stage ignores an archived duplicate task", async t => {
+  const f = await fixture(t);
+  const first = await f.runtime.register(f.body,ACTOR);
+  const duplicate = await f.runtime.register({...f.body,event:{...f.body.event,
+    eventId:"evt_duplicate",occurredAt:300}},ACTOR);
+  f.database.archiveFeishuTask(duplicate.task.id,duplicate.task.version,ACTOR);
+
+  const latest = latestActiveVmStageOrigin({db:f.database.database,database:f.database,
+    subjectKey:f.subject.subjectKey,baseToken:f.subject.baseToken,tableId:f.subject.tableId,
+    recordId:f.body.event.recordId,fieldId:"fld_output",packageAlias:f.packageRecord.alias,
+    lineageFor: taskId => ({subjectKey:f.database.getFeishuTaskOrigin(taskId).subjectKey})});
+  assert.equal(latest.taskId,first.task.id);
+});
+
+test("turning off automatic execution cancels a queued manual render recovery",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:new Date().toISOString(),renderRetryHistory:[new Date().toISOString()]};
+    f.database.database.prepare("UPDATE vm_pmo_runs SET state='planned',payload_json=? WHERE run_id=?")
+      .run(JSON.stringify(payload),run.runId);
+    f.setPolicy({enabled:false,version:2});
+    await f.runtime.cancelPendingAutomatic();
+    assert.equal(f.runtime.list()[0].state,"needs_attention");
+    assert.equal(f.runtime.list()[0].errorCode,"VM_PMO_START_EVIDENCE_FAILED");
+    assert.equal(f.runtime.list()[0].renderRetryHistory,undefined);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("a disabled policy rejects manual render recovery before consuming its one attempt",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:new Date().toISOString()};
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='needs_attention',
+      error_code='VM_PMO_START_EVIDENCE_FAILED',payload_json=? WHERE run_id=?`)
+      .run(JSON.stringify(payload),run.runId);
+    f.setPolicy({enabled:false,version:2});
+    await assert.rejects(f.runtime.retryFailedRender(run.taskId,
+      {version:f.database.getTask(run.taskId).version}),{code:"AUTOMATIC_EXECUTION_DISABLED"});
+    assert.equal(f.runtime.list()[0].renderRetryHistory,undefined);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("closing automatic execution during source validation preserves manual render recovery",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:new Date().toISOString()};
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='needs_attention',
+      error_code='VM_PMO_START_EVIDENCE_FAILED',payload_json=? WHERE run_id=?`)
+      .run(JSON.stringify(payload),run.runId);
+    const downloads=f.args.getDownloads(),original=downloads.lookupExact;
+    downloads.lookupExact=(input)=>{
+      f.setPolicy({enabled:false,version:2});
+      void f.runtime.cancelPendingAutomatic();
+      return original(input);
+    };
+    await assert.rejects(f.runtime.retryFailedRender(run.taskId,
+      {version:f.database.getTask(run.taskId).version}),{code:"AUTOMATIC_EXECUTION_DISABLED"});
+    assert.equal(f.runtime.list()[0].state,"needs_attention");
+    assert.equal(f.runtime.list()[0].renderRetryHistory,undefined);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("closing execution while reading the policy does not consume render recovery",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:new Date().toISOString()};
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='needs_attention',
+      error_code='VM_PMO_START_EVIDENCE_FAILED',payload_json=? WHERE run_id=?`)
+      .run(JSON.stringify(payload),run.runId);
+    const getPolicy=f.args.getPolicy;
+    let armed=false;
+    f.args.getPolicy=()=>{
+      const snapshot=getPolicy();
+      if (armed) {
+        armed=false;
+        queueMicrotask(()=>{f.setPolicy({enabled:false,version:2});void f.runtime.cancelPendingAutomatic();});
+      }
+      return snapshot;
+    };
+    await f.restart();
+    await f.runtime.getTaskRun(run.taskId);
+    armed=true;
+    await assert.rejects(f.runtime.retryFailedRender(run.taskId,
+      {version:f.database.getTask(run.taskId).version}),{code:"AUTOMATIC_EXECUTION_DISABLED"});
+    assert.equal(f.runtime.list()[0].state,"needs_attention");
+    assert.equal(f.runtime.list()[0].renderRetryHistory,undefined);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("turning off execution cancels a recovered render until its new start is recorded",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:new Date().toISOString(),renderRetryHistory:[new Date().toISOString()]};
+    f.database.database.prepare("UPDATE vm_pmo_runs SET state='rendering',payload_json=? WHERE run_id=?")
+      .run(JSON.stringify(payload),run.runId);
+    f.setPolicy({enabled:false,version:2});
+    await f.runtime.cancelPendingAutomatic();
+    assert.equal(f.runtime.list()[0].state,"needs_attention");
+    assert.equal(f.runtime.list()[0].renderRetryHistory,undefined);
+
+    payload.renderRetryLaunchAt=new Date().toISOString();
+    payload.renderRetryStartedAt=new Date().toISOString();
+    f.database.database.prepare("UPDATE vm_pmo_runs SET state='rendering',payload_json=? WHERE run_id=?")
+      .run(JSON.stringify(payload),run.runId);
+    await f.runtime.cancelPendingAutomatic();
+    assert.equal(f.runtime.list()[0].state,"rendering");
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("restart keeps a durable render launch intent from being reopened",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:new Date().toISOString(),renderRetryHistory:[new Date().toISOString()],
+      renderRetryLaunchAt:new Date().toISOString()};
+    f.database.database.prepare("UPDATE vm_pmo_runs SET state='rendering',payload_json=? WHERE run_id=?")
+      .run(JSON.stringify(payload),run.runId);
+    await f.restart();
+    await f.runtime.getTaskRun(run.taskId);
+    f.setPolicy({enabled:false,version:2});
+    await f.runtime.cancelPendingAutomatic();
+    assert.equal(f.runtime.list()[0].state,"rendering");
+    assert.deepEqual(f.runtime.list()[0].renderRetryHistory,payload.renderRetryHistory);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("legacy persisted render start remains protected without a launch intent",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [run]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id=?").get(run.runId);
+    const startedAt=new Date().toISOString();
+    const payload={...JSON.parse(row.payload_json),planSha256:"d".repeat(64),
+      runnerStartedAt:startedAt,renderRetryHistory:[startedAt],renderRetryStartedAt:startedAt};
+    f.database.database.prepare("UPDATE vm_pmo_runs SET state='rendering',payload_json=? WHERE run_id=?")
+      .run(JSON.stringify(payload),run.runId);
+    await f.restart();
+    await f.runtime.getTaskRun(run.taskId);
+    f.setPolicy({enabled:false,version:2});
+    await f.runtime.cancelPendingAutomatic();
+    assert.equal(f.runtime.list()[0].state,"rendering");
+  } finally {await f.runtime.close();await hold.release();}
 });
 
 test("policy preparation failures leave no task and replay can atomically reserve the automatic run", async t => {
@@ -263,6 +424,26 @@ test("VM plan retry reuses the ready approval and source while appending a new i
     await f.runtime.close();
     await hold.release();
   }
+});
+
+test("saved-plan validation retry refuses a stray rendered file before changing run state", async t => {
+  const f = await fixture(t), hold = await preparedWhileBusy(f);
+  try {
+    const [before] = f.runtime.list();
+    const row = f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(before.runId);
+    const payload = {...JSON.parse(row.payload_json),planStartedAt:new Date().toISOString()};
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='needs_attention',error_code='PLAN_INVALID',
+      payload_json=? WHERE run_id=?`).run(JSON.stringify(payload),before.runId);
+    const context = JSON.parse(await readFile(before.prepared.contextPath,"utf8"));
+    await writeFile(context.output_path,"stray render evidence");
+    const task = f.database.getTask(before.taskId);
+
+    await assert.rejects(f.runtime.retryValidatedPlan(task.id,{version:task.version}),
+      {code:"VM_PMO_RETRY_RENDER_EVIDENCE_PRESENT"});
+    assert.equal(f.runtime.list()[0].state,"needs_attention");
+    assert.equal(f.runtime.list()[0].errorCode,"PLAN_INVALID");
+    assert.equal(f.approvals.list().length,1);
+  } finally {await f.runtime.close();await hold.release();}
 });
 
 for (const mutationTiming of ["before retry", "during source validation"]) {
