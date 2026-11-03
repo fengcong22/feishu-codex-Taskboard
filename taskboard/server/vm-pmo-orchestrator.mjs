@@ -283,6 +283,34 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     }
     return results;
   }
+  async function retryApproval(runId, {beforeCommit = () => {}} = {}) {
+    const run = get(runId);
+    if (!run || run.state !== "blocked" || run.errorCode !== "VM_APPLICANT_CHANGED"
+      || run.identity.origin.stageId !== "initial" || run.approvalStatus !== "reserved"
+      || run.binding.approvalJobId !== null || run.acquisition || run.prepared || run.planStartedAt
+      || run.runnerStartedAt || run.planSha256 || run.renderResult || run.artifactId
+      || run.deliveredFileToken || run.completedAt || run.leaseToken)
+      throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    assertCurrent(run);
+    const status = await bindings.status(run.taskId);
+    checkedBinding(status,run.taskId,run.binding);
+    if (status.status !== "reserved" || status.approvalJobId !== null)
+      throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    const row = db.prepare("SELECT identity_sha256,payload_json FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      assertCurrent(run);
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'waiting_materials',error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'blocked' AND error_code = 'VM_APPLICANT_CHANGED'
+        AND identity_sha256 = ? AND payload_json = ? AND lease_token IS NULL`)
+        .run(now(),now(),runId,run.taskId,row.identity_sha256,row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) {db.exec("ROLLBACK");throw error;}
+    return get(runId);
+  }
   async function retryPlan(runId, {beforeCommit = () => {}} = {}) {
     const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
     const run = fromRow(row);
@@ -592,7 +620,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     })().finally(() => { draining = null; });
     return draining;
   }
-  return Object.freeze({ register, get, getForTask, list, pump, wake, retryPlan, retryValidatedPlan,
+  return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryPlan, retryValidatedPlan,
     retryFailedRender,
     recoverBindingConflicts,
     start() { if (closed || timer) return; timer = setInterval(() => { void wake().catch(() => {}); }, tickMs);

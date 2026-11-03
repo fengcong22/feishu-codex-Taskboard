@@ -224,9 +224,11 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     // Check all existing ownership before creating any jobs.
     const existing = store.list();
     const identity = session.client() ? session.identity() : null;
-    for (const value of requests) {
-      const duplicate = existing.find(job => JSON.stringify(job.request) === JSON.stringify(value));
-      if (duplicate?.requester_id && duplicate.requester_id !== identity?.user_id) fail("VM_APPLICANT_CHANGED");
+    if (!taskJobId) {
+      for (const value of requests) {
+        const duplicate = existing.find(job => JSON.stringify(job.request) === JSON.stringify(value));
+        if (duplicate?.requester_id && duplicate.requester_id !== identity?.user_id) fail("VM_APPLICANT_CHANGED");
+      }
     }
     const jobs = requests.map(value => {
       let job = enqueueVmApproval(store, value, { now,

@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { createVmApprovalStore } from "../server/vm-approval-store.mjs";
+import { vmApprovalJobIdForTaskRun } from "../server/vm-approval-workflow.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "../server/vm-download-notifier.mjs";
 import { createVmDownloadService } from "../server/vm-download-service.mjs";
 import { prepareVmSource } from "../server/vm-source-adapter.mjs";
@@ -71,6 +72,24 @@ test("batch validates every input before enqueue; exact requests reuse persisten
   assert.equal(f.service.snapshot().jobs.length, 2);
   assert.equal(f.service.snapshot().settings.notificationsEnabled, false);
   assert.equal(f.service.enqueue(f.input()).jobs[0].id, jobs[0].id);
+});
+
+test("a new task run queues its own approval when an identical approved request belongs to a disconnected session", async (t) => {
+  const f = await fixture(t);
+  const previous = f.service.enqueue(f.input()).jobs[0];
+  f.update(previous.id, job => { job.status = "ready"; });
+  f.status("disconnected");
+  f.account(null);
+  const scope = { taskId: "task-new", runId: "run-new" };
+  assert.throws(() => f.service.enqueue(f.input()), { code: "VM_APPLICANT_CHANGED" });
+
+  const current = f.service.enqueueForTask(f.input(), scope).jobs[0];
+
+  assert.equal(current.id, vmApprovalJobIdForTaskRun(scope.taskId, scope.runId));
+  assert.notEqual(current.id, previous.id);
+  assert.equal(current.status, "queued");
+  assert.equal(f.service.enqueueForTask(f.input(), scope).jobs[0].id, current.id);
+  assert.equal(f.store.get(previous.id).status, "ready");
 });
 
 test("saved plugin input default follows the installation when its drive changes", async (t) => {

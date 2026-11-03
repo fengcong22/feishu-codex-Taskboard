@@ -700,6 +700,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.deliveredFileToken && run.completedAt)
       && writeback.processing?.state === "dead_letter" && writeback.completed?.state === "dead_letter";
     const planAttempt = run.planAttempt ?? 1;
+    const canRetryApproval = run.state === "blocked" && run.errorCode === "VM_APPLICANT_CHANGED"
+      && run.identity.origin.stageId === "initial" && run.approvalStatus === "reserved"
+      && run.binding.approvalJobId === null && !run.acquisition && !run.prepared
+      && !run.planStartedAt && !run.runnerStartedAt && !run.artifactId;
     const canRetryPlan = run.state === "blocked" && run.errorCode === "WORD_ALIGNMENT_UNRESOLVED"
       && planAttempt < MAX_PLAN_ATTEMPTS && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
@@ -715,6 +719,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && !run.deliveredFileToken && !run.completedAt;
     return {runId:run.runId,taskId:run.taskId,state:run.state,errorCode:run.errorCode,
       approvalStatus:run.approvalStatus,planAttempt,retryLimit:MAX_PLAN_ATTEMPTS,
+      canRetryApproval,
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
         failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,
       canRetryWriteback,writeback,
@@ -725,6 +730,22 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     await ready();
     const run = initialize().orchestrator.getForTask(taskId);
     return publicRun(run);
+  }
+
+  async function retryApproval(taskId,request) {
+    await ready();
+    if (!object(request) || Object.keys(request).length !== 1
+      || !Number.isSafeInteger(request.version) || request.version < 1)
+      throw fail("VM_PMO_RETRY_NOT_ALLOWED",400);
+    const assertTaskVersion = () => {
+      if (database.getTask(taskId).version !== request.version) throw fail("VERSION_CONFLICT",409);
+    };
+    assertTaskVersion();
+    const service = initialize(), run = service.orchestrator.getForTask(taskId);
+    if (!run) throw fail("VM_PMO_RUN_NOT_FOUND",404);
+    const queued = await service.orchestrator.retryApproval(run.runId,{beforeCommit:assertTaskVersion});
+    void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
+    return publicRun(queued);
   }
 
   async function retryPlanning(taskId,request) {
@@ -916,7 +937,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     releaseTerminalSlots();
   }
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
-    getTaskRun,retryPlanning,retryValidatedPlan,retryFailedRender,retryWriteback,
+    getTaskRun,retryApproval,retryPlanning,retryValidatedPlan,retryFailedRender,retryWriteback,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),
     list: () => services?.orchestrator.list() ?? [],
     enqueueFinalArchive,

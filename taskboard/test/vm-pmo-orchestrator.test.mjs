@@ -115,6 +115,30 @@ test("registered tasks wait durably for approval without taking an execution slo
   assert.equal(x.f.list().length, 1);
 });
 
+test("an applicant check blocked before approval can retry the same frozen task run", async (t) => {
+  const x = await fixture(t);
+  x.binding.approvalJobId = null;
+  const reconcile = x.dependencies.bindings.reconcile;
+  let blocked = true;
+  x.dependencies.bindings.reconcile = async taskId => {
+    if (blocked) throw Object.assign(new Error("applicant changed"), { code: "VM_APPLICANT_CHANGED" });
+    return reconcile(taskId);
+  };
+  await x.f.register({ taskId: "task_vm" });
+  assert.equal((await x.f.pump("run_vm")).errorCode, "VM_APPLICANT_CHANGED");
+
+  blocked = false;
+  x.setApproval("reserved");
+  const retried = await x.f.retryApproval("run_vm");
+  assert.equal(retried.runId, "run_vm");
+  assert.equal(retried.state, "waiting_materials");
+  assert.equal(retried.errorCode, null);
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+  x.setApproval("waiting_approval");
+  assert.equal((await x.f.pump("run_vm")).approvalStatus, "waiting_approval");
+  assert.equal(x.calls.some(([kind]) => ["slot", "plan", "render"].includes(kind)), false);
+});
+
 function storeLegacyInitialIdentity(x) {
   const run = x.f.get("run_vm");
   const { stageSnapshot, ...identity } = run.identity;
