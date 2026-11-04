@@ -76,6 +76,27 @@ test("request deduplication can be scoped to a separate task run", async (t) => 
   assert.equal(store.enqueue(job("manual-replay")).id, first.id);
 });
 
+test("cancels only an unsubmitted queued approval without touching VM", async (t) => {
+  const f = await fixture(t);
+  const store = f.open({ now: () => 5000 });
+  store.enqueue(job("unsubmitted", { submission_attempts: 0 }), { dedupeByRequest: false });
+  store.enqueue(job("submitted", { status: "submitting", submission_attempts: 1 }), { dedupeByRequest: false });
+  store.enqueue(job("leased", { submission_attempts: 0 }), { dedupeByRequest: false });
+  const lease = store.claim("leased");
+
+  assert.throws(() => store.cancelUnsubmitted("submitted"), code("VM_APPROVAL_CANCEL_NOT_ALLOWED"));
+  assert.throws(() => store.cancelUnsubmitted("leased"), code("VM_APPROVAL_JOB_BUSY"));
+  const canceled = store.cancelUnsubmitted("unsubmitted");
+  assert.equal(canceled.status, "canceled");
+  assert.equal(canceled.last_error, "VM_APPROVAL_CANCELED_LOCALLY");
+  assert.equal(canceled.submission_attempts, 0);
+  assert.equal(canceled.application_id, undefined);
+  assert.deepEqual(store.cancelUnsubmitted("unsubmitted"), canceled);
+  assert.equal(store.get("submitted").status, "submitting");
+  assert.equal(store.get("leased").status, "queued");
+  store.save("leased", lease.leaseToken, lease.job);
+});
+
 test("queue removal accepts settled and needs-attention jobs but protects active work", async (t) => {
   let time = 5000;
   const f = await fixture(t);

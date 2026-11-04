@@ -310,6 +310,7 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       return { removedCount: store.removeFromQueue(jobIds).length };
     },
     remove(id) { store.removeFromQueue([id]); return { removed: true }; },
+    cancelUnsubmitted(id) { return publicJob(store.cancelUnsubmitted(id)); },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); persistSettings(settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },

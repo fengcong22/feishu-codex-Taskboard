@@ -455,6 +455,57 @@ test("manual revision reuses one approved source and preserves the first failed 
   } finally {await f.runtime.close();await hold.release();}
 });
 
+test("manual revision can resume after instruction-only record drift without another approval",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [before]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(before.runId);
+    const task=f.database.getTask(before.taskId);
+    const revision={sourceSha256:before.acquisition.sha256,note:"Hold the prior tail frame.",
+      clips:[{startMs:0,endMs:500,freeze:{startMs:200,endMs:400,frameMs:180}}]};
+    const payload={...JSON.parse(row.payload_json),planAttempt:2,manualRevision:revision};
+    delete payload.prepared;
+    delete payload.planStartedAt;
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='blocked',error_code='VM_PMO_RECORD_CHANGED',
+      payload_json=? WHERE run_id=?`).run(JSON.stringify(payload),before.runId);
+    f.record.fields.fld_instruction="0:00--0:20";
+    const request={version:task.version,runConsent:{allowSourceVideo:true,allowLocalPlanning:true},manualRevision:revision};
+    assert.equal((await f.runtime.getTaskRun(task.id)).canRetryManualRevision,true);
+    await f.runtime.retryManualRevision(task.id,request);
+    await f.runtime.wake();
+    const resumed=f.runtime.list()[0];
+    assert.equal(resumed.runId,before.runId);
+    assert.equal(resumed.planAttempt,2);
+    assert.equal(resumed.state,"prepared");
+    assert.equal(resumed.manualRevision.sourceSha256,before.acquisition.sha256);
+    assert.equal(f.record.fields.fld_instruction,"0:00--0:20");
+    assert.equal(f.approvals.list().length,1);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
+test("manual revision does not ignore VMID drift",async t=>{
+  const f=await fixture(t),hold=await preparedWhileBusy(f);
+  try {
+    const [before]=f.runtime.list();
+    const row=f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(before.runId);
+    const revision={sourceSha256:before.acquisition.sha256,note:"Hold the prior tail frame.",
+      clips:[{startMs:0,endMs:500}]};
+    const payload={...JSON.parse(row.payload_json),planAttempt:2,manualRevision:revision};
+    delete payload.prepared;
+    delete payload.planStartedAt;
+    f.database.database.prepare(`UPDATE vm_pmo_runs SET state='blocked',error_code='VM_PMO_RECORD_CHANGED',
+      payload_json=? WHERE run_id=?`).run(JSON.stringify(payload),before.runId);
+    f.record.fields.fld_vmid="678465c3d94605d24bb9361b";
+    const task=f.database.getTask(before.taskId);
+    await f.runtime.retryManualRevision(task.id,{version:task.version,
+      runConsent:{allowSourceVideo:true,allowLocalPlanning:true},manualRevision:revision});
+    await f.runtime.wake();
+    assert.equal(f.runtime.list()[0].state,"blocked");
+    assert.equal(f.runtime.list()[0].errorCode,"VM_PMO_RECORD_CHANGED");
+    assert.equal(f.approvals.list().length,1);
+  } finally {await f.runtime.close();await hold.release();}
+});
+
 test("saved-plan validation retry refuses a stray rendered file before changing run state", async t => {
   const f = await fixture(t), hold = await preparedWhileBusy(f);
   try {

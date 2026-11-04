@@ -322,6 +322,29 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
   async function retryManualRevision(runId,manualRevision,{beforeCommit = () => {}} = {}) {
     const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
     const run = fromRow(row);
+    if (run?.state === "blocked" && run.errorCode === "VM_PMO_RECORD_CHANGED") {
+      if (run.identity.origin.stageId !== "initial" || !run.manualRevision || !run.acquisition
+        || (run.planAttempt ?? 1) <= 1 || (run.planAttempt ?? 1) > MAX_PLAN_ATTEMPTS
+        || run.prepared || run.planStartedAt || run.runnerStartedAt || run.planSha256
+        || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt || run.leaseToken
+        || json(validateVmPmoManualRevision(manualRevision)) !== json(run.manualRevision))
+        throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      assertCurrent(run);
+      await verifyRetryInput({run});
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        beforeCommit();
+        assertCurrent(run);
+        const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'ready',error_code = NULL,
+          attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+          AND state = 'blocked' AND error_code = 'VM_PMO_RECORD_CHANGED'
+          AND identity_sha256 = ? AND payload_json = ? AND lease_token IS NULL`)
+          .run(now(),now(),runId,run.taskId,row.identity_sha256,row.payload_json);
+        if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+        db.exec("COMMIT");
+      } catch(error) {db.exec("ROLLBACK");throw error;}
+      return get(runId);
+    }
     if (!run || run.state !== "blocked" || run.errorCode !== "UNSUPPORTED_INSTRUCTION"
       || !run.planStartedAt || !run.prepared || !run.acquisition || run.runnerStartedAt
       || run.planSha256 || run.renderResult || run.artifactId || run.deliveredFileToken

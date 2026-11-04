@@ -564,7 +564,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const record = normalizeVmRecordContext(await readCurrentRecord({subject: local.subject,event: origin,
           stageId: origin.stageId}),
           {expectedStatusOptionId: origin.afterOptionId});
-        if (!same(record,origin.stageSnapshot?.vmContext)) throw fail("VM_PMO_RECORD_CHANGED");
+        const frozenContext=origin.stageSnapshot?.vmContext;
+        const instructionOnlyDrift=run.manualRevision !== undefined
+          && origin.stageId === "initial" && same({...record,instruction:frozenContext?.instruction},frozenContext);
+        if (!same(record,frozenContext) && !instructionOnlyDrift) throw fail("VM_PMO_RECORD_CHANGED");
         const prepared = await prepareVmPmoRunInput({runRoot,runId: run.runId,taskId: run.taskId,origin,
           profile: local.subject.vmWorkflow,packageSnapshot: database.getFeishuTaskPackageSnapshot(run.taskId),
           packageIdentity,acquisition,pythonPath,planAttempt,manualRevision:run.manualRevision});
@@ -607,9 +610,13 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const keys = ["receipt_path","path","sha256","bytes","duration_ms","vmid_binding","vmid"];
         if (!run.acquisition || keys.some(key => status.acquisition[key] !== run.acquisition[key]))
           throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
-        try {await boundFor(run.prepared.runnerOptions,{runId:run.runId,taskId:run.taskId,
-          planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256});}
-        catch {throw fail("VM_PMO_RETRY_SOURCE_CHANGED");}
+        if (run.prepared) {
+          try {await boundFor(run.prepared.runnerOptions,{runId:run.runId,taskId:run.taskId,
+            planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256});}
+          catch {throw fail("VM_PMO_RETRY_SOURCE_CHANGED");}
+        } else if (run.errorCode !== "VM_PMO_RECORD_CHANGED" || run.manualRevision === undefined) {
+          throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
+        }
       },
       validateSavedPlan: async ({run}) => {
         const options = {...run.prepared.runnerOptions,runId:run.runId,taskId:run.taskId,
@@ -708,6 +715,11 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     const canRetryManualRevision = canRetryApproval && run.manualRevision === undefined
       || run.state === "blocked" && run.errorCode === "UNSUPPORTED_INSTRUCTION"
         && planAttempt < MAX_PLAN_ATTEMPTS && Boolean(run.planStartedAt && run.prepared && run.acquisition)
+        && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
+        && !run.deliveredFileToken && !run.completedAt
+      || run.state === "blocked" && run.errorCode === "VM_PMO_RECORD_CHANGED"
+        && run.identity.origin.stageId === "initial" && Boolean(run.manualRevision && run.acquisition)
+        && planAttempt > 1 && planAttempt <= MAX_PLAN_ATTEMPTS && !run.prepared && !run.planStartedAt
         && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
         && !run.deliveredFileToken && !run.completedAt;
     const canRetryPlan = run.state === "blocked" && run.errorCode === "WORD_ALIGNMENT_UNRESOLVED"
