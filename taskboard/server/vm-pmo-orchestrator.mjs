@@ -214,7 +214,11 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       attempt_count = ?, next_attempt_at = ?, updated_at = ? WHERE run_id = ? AND lease_token = ? AND lease_until > ?`)
       .run(state, json(payload), errorCode, attempts ?? row.attempt_count, next, now(), runId, owner, now());
     if (changed.changes !== 1) throw failure("VM_PMO_LEASE_LOST");
-    return get(runId);
+    const updated = get(runId);
+    if (["blocked", "needs_attention"].includes(state) && row.state !== state) {
+      try { Promise.resolve(onAttention({ run: updated })).catch(() => {}); } catch {}
+    }
+    return updated;
   }
   async function register({ taskId } = {}) {
     if (closed || !id(taskId)) throw failure("VM_PMO_INPUT_INVALID");

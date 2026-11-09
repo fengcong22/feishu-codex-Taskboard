@@ -71,6 +71,7 @@ import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-downloa
 import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
+import { describeBlockedFeishuTask } from "./blocked-notification.mjs";
 import { createFeishuVmMp4Adapter } from "./vm-mp4-feishu-adapter.mjs";
 import { createFeishuApiContext } from "../../src/feishu-api.mjs";
 
@@ -2369,8 +2370,9 @@ function parseComposerTurn(body) {
 }
 
 class EventHub {
-  constructor() {
+  constructor({ onTaskUpdated = null } = {}) {
     this.clients = new Set();
+    this.onTaskUpdated = onTaskUpdated;
     this.keepAlive = setInterval(() => {
       for (const response of this.clients) response.write(": keep-alive\n\n");
     }, 20_000);
@@ -2390,6 +2392,9 @@ class EventHub {
   }
 
   emit(type, value) {
+    if (type === "task.updated" && typeof this.onTaskUpdated === "function") {
+      try { Promise.resolve(this.onTaskUpdated(value.task)).catch(() => {}); } catch {}
+    }
     const event = {
       type,
       projectId: value.projectId ?? value.project?.id ?? value.task?.projectId,
@@ -3695,7 +3700,18 @@ export function createTaskboardServer(options = {}) {
       return { ...preview, sourceUrlLabel: url };
     },
   });
-  const events = new EventHub();
+  function notifyBlockedTask(task) {
+    if (task?.status !== "blocked") return;
+    try {
+      const origin = database.getFeishuTaskOrigin(task.id);
+      const transition = database.latestTaskStatusChange(task.id);
+      const subject = origin && database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+      const runs = database.listFeishuAutoCutRuns(task.id);
+      const notification = describeBlockedFeishuTask({ task, transition, origin, subject, latestRun: runs.at(-1) });
+      if (notification) void getVmDownloads().notifyWorkflowBlocked(notification).catch(() => {});
+    } catch {}
+  }
+  const events = new EventHub({ onTaskUpdated: notifyBlockedTask });
   async function dispatchFeishuWritebackClaim(claim) {
     let bridgeUrl;
     try {

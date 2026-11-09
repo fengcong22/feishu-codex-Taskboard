@@ -114,6 +114,8 @@ async function createFixture({
   packageZipSourceDirectory = undefined,
   packageZipOutputMode = undefined,
   coursePathResolver = undefined,
+  vmDownloadNotifier = undefined,
+  vmDownloadSession = undefined,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-autocut-lifecycle-"));
   const workspacePath = path.join(directory, "workspace");
@@ -196,6 +198,8 @@ if (args[0] === "debug") {
     allowAutomaticExecution,
     autoCutRunner,
     localAutoCutArtifactReportTimeoutMs,
+    ...(vmDownloadNotifier ? { vmDownloadNotifier } : {}),
+    ...(vmDownloadSession ? { vmDownloadSession } : {}),
     ...(coursePathResolver ? { coursePathResolver } : {}),
   };
   const app = createTaskboardServer(serverOptions);
@@ -1801,7 +1805,14 @@ test("a trusted phased Auto-Cut start persists an immutable run and injects priv
 });
 
 test("controlled-context preparation failure blocks and preserves the task and AI run", async () => {
-  const fixture = await createFixture({ controlledContext: "document_link_missing", bridgeStatus: 409 });
+  const sent = [];
+  const identity = { user_id: "fixture-user", enterprise_email: "fixture@example.test" };
+  const client = {};
+  const fixture = await createFixture({ controlledContext: "document_link_missing", bridgeStatus: 409,
+    vmDownloadNotifier: { available: () => true, send: async (value) => sent.push(value) },
+    vmDownloadSession: { snapshot: () => ({ status: "connected", expiresAt: null, expirySource: "unknown" }),
+      identity: () => identity, client: () => client, check: async () => {}, beginLogin: async () => ({}),
+      disconnect: async () => {}, requireLogin: async () => {}, close: async () => {} } });
   try {
     const subject = await registerSubject(fixture);
     const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, {
@@ -1821,10 +1832,57 @@ test("controlled-context preparation failure blocks and preserves the task and A
     assert.equal(aiRuns.length, 1);
     assert.equal(aiRuns[0].status, "failed");
     assert.equal(fixture.app.database.getFeishuExecution(task.id), null);
+    const notificationDeadline = Date.now() + 3_000;
+    while (sent.length === 0 && Date.now() < notificationDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].kind, "workflow_blocked");
+    assert.equal(sent[0].payload.subject, "数学");
+    assert.equal(sent[0].payload.taskId, task.identifier);
+    assert.equal(sent[0].payload.status, "blocked");
+    assert.equal(sent[0].payload.reason, "没有取得有效的素材文档链接。");
     await assert.rejects(() => readFile(fixture.capturePath, "utf8"), /ENOENT/);
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("editing a blocked task after enabling notifications does not backfill its old edge", async () => {
+  const sent = [];
+  const identity = { user_id: "fixture-user", enterprise_email: "fixture@example.test" };
+  const client = {};
+  const fixture = await createFixture({ controlledContext: "document_link_missing", bridgeStatus: 409,
+    vmDownloadNotifier: { available: () => true, send: async value => sent.push(value) },
+    vmDownloadSession: { snapshot: () => ({ status: "connected", expiresAt: null, expirySource: "unknown" }),
+      identity: () => identity, client: () => client, check: async () => {}, beginLogin: async () => ({}),
+      disconnect: async () => {}, requireLogin: async () => {}, close: async () => {} } });
+  try {
+    const headers = { "x-taskboard-client": "web" };
+    const current = await jsonRequest(fixture.baseUrl, "/api/local/vm-downloads", undefined, { method: "GET", headers });
+    const settings = current.body.settings;
+    const disabled = await jsonRequest(fixture.baseUrl, "/api/local/vm-downloads/settings",
+      { ...settings, notificationsEnabled: false }, { method: "PUT", headers });
+    assert.equal(disabled.response.status, 200, JSON.stringify(disabled.body));
+    const subject = await registerSubject(fixture);
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, {
+      documentLinks: ["https://guanghe.feishu.cn/docx/stale"], namingDisplayValue: "课程002", namingValueUnique: true,
+    }));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    const task = fixture.app.database.getTask(created.body.task.id);
+    assert.equal(task.status, "blocked");
+    await jsonRequest(fixture.baseUrl, "/api/local/vm-downloads/settings",
+      { ...settings, notificationsEnabled: true }, { method: "PUT", headers });
+    const edited = await jsonRequest(fixture.baseUrl, `/api/tasks/${task.id}`,
+      { title: "修改标题后仍然阻塞", version: task.version }, { method: "PATCH" });
+    assert.equal(edited.response.status, 200, JSON.stringify(edited.body));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, 0);
+    assert.equal(fixture.app.database.database.prepare(
+      "SELECT COUNT(*) AS total FROM vm_download_notifications WHERE kind='workflow_blocked'").get().total, 0);
+  } finally {
+    await fixture.app.close(); await fixture.bridge.close();
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });

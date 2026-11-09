@@ -12,6 +12,27 @@ const MESSAGES = Object.freeze({
   wait_expired: "审批或视频准备等待已超时，任务已暂停。在 VM 下载面板可延长等待，原申请会保留。",
   failed: "下载任务需要处理，已暂停。在 VM 下载面板查看错误和恢复操作，原申请会保留。",
 });
+const WORKFLOW_STAGES = Object.freeze({ initial: "初稿", review: "审核修改", first_review: "一审", final_review: "终审", workflow: "流程" });
+const CONTROL = /[\u0000-\u001f\u007f]/u;
+
+function workflowPayload(value) {
+  const fields = ["subject", "taskId", "taskTitle", "recordId", "stage", "status", "occurredAt", "reason"];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))) return false;
+  if (fields.filter((field) => field !== "occurredAt").some((field) => typeof value[field] !== "string"
+    || !value[field].trim() || value[field].length > (field === "reason" ? 800 : 512) || CONTROL.test(value[field]))) return false;
+  return ["blocked", "needs_attention"].includes(value.status)
+    && Number.isFinite(Date.parse(value.occurredAt))
+    && new Date(Date.parse(value.occurredAt)).toISOString() === value.occurredAt;
+}
+
+function workflowMessage(value) {
+  const occurredAt = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", dateStyle: "medium", timeStyle: "short" })
+    .format(new Date(value.occurredAt));
+  const state = value.status === "needs_attention" ? "需要处理" : "遇到阻碍";
+  const stage = WORKFLOW_STAGES[value.stage] ?? value.stage;
+  return `Taskboard 学科流程${state}\n学科：${value.subject}\n任务：${value.taskTitle}（${value.taskId}）\n飞书记录：${value.recordId}\n阶段：${stage}\n发生时间：${occurredAt}\n原因：${value.reason}\n请在 Taskboard 中查看任务详情并处理。`;
+}
 
 function feishuCode(value) {
   const code = value?.code ?? value?.response?.data?.code ?? value?.response?.body?.code;
@@ -40,10 +61,13 @@ export function createVmDownloadNotifier({ appId, appSecret, createContext = cre
   let context;
   return {
     available: () => configured,
-    async send({ id, recipient, kind, vmid }) {
+    async send(input) {
+      const { id, recipient, kind, vmid } = input ?? {};
+      const payload = input?.payload;
       if (!configured) throw new VmSourceError("VM_NOTIFY_NOT_CONFIGURED");
       if (!/^[a-f0-9]{32}$/u.test(id) || typeof recipient !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(recipient)
-        || !MESSAGES[kind] || (vmid !== null && !/^[a-f0-9]{24}$/u.test(vmid))) throw new VmSourceError("VM_NOTIFY_INPUT_INVALID");
+        || !(MESSAGES[kind] || kind === "workflow_blocked") || (vmid !== null && !/^[a-f0-9]{24}$/u.test(vmid))
+        || kind === "workflow_blocked" && !workflowPayload(payload)) throw new VmSourceError("VM_NOTIFY_INPUT_INVALID");
       let timer;
       try {
         context ??= createContext({ appId, appSecret });
@@ -51,7 +75,8 @@ export function createVmDownloadNotifier({ appId, appSecret, createContext = cre
           const { client } = await context;
           const result = await client.im.message.create({ params: { receive_id_type: "email" }, data: {
             receive_id: recipient, msg_type: "text", uuid: id,
-            content: JSON.stringify({ text: `VM 下载${vmid ? ` · ${vmid}` : ""}\n${MESSAGES[kind]}` }),
+            content: JSON.stringify({ text: kind === "workflow_blocked" ? workflowMessage(payload)
+              : `VM 下载${vmid ? ` · ${vmid}` : ""}\n${MESSAGES[kind]}` }),
           } });
           if (result?.code !== 0) throw new VmSourceError(feishuCode(result) ?? "VM_NOTIFY_API_REJECTED");
           if (!result.data?.message_id) throw new VmSourceError("VM_NOTIFY_ACK_MISSING");
@@ -72,9 +97,15 @@ export function createVmDownloadMetadata({ database, now = Date.now }) {
     CREATE TABLE IF NOT EXISTS vm_download_notifications (
       id TEXT PRIMARY KEY, recipient TEXT NOT NULL, kind TEXT NOT NULL, vmid TEXT,
       status TEXT NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL,
-      lease_id TEXT, lease_until INTEGER, sent_at INTEGER, error_code TEXT
+      lease_id TEXT, lease_until INTEGER, sent_at INTEGER, error_code TEXT, payload_json TEXT
+    );
+    CREATE TABLE IF NOT EXISTS vm_workflow_notification_edges (
+      event_key TEXT PRIMARY KEY, consumed_at INTEGER NOT NULL
     );
   `);
+  if (!database.prepare("PRAGMA table_info(vm_download_notifications)").all().some((column) => column.name === "payload_json")) {
+    database.exec("ALTER TABLE vm_download_notifications ADD COLUMN payload_json TEXT");
+  }
   return {
     read(key) {
       const row = database.prepare("SELECT value_json FROM vm_download_local_state WHERE key = ?").get(key);
@@ -84,11 +115,30 @@ export function createVmDownloadMetadata({ database, now = Date.now }) {
     write(key, value) {
       database.prepare("INSERT INTO vm_download_local_state(key,value_json) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json").run(key, JSON.stringify(value));
     },
-    enqueue({ key, recipient, kind, vmid = null }) {
+    enqueue({ key, recipient, kind, vmid = null, payload = null }) {
       const id = createHash("sha256").update(`${recipient}:${key}`).digest("hex").slice(0, 32);
-      database.prepare("INSERT OR IGNORE INTO vm_download_notifications(id,recipient,kind,vmid,status,attempts,next_at) VALUES (?,?,?,?,'pending',0,?)")
-        .run(id, recipient, kind, vmid, now());
+      database.prepare("INSERT OR IGNORE INTO vm_download_notifications(id,recipient,kind,vmid,status,attempts,next_at,payload_json) VALUES (?,?,?,?,'pending',0,?,?)")
+        .run(id, recipient, kind, vmid, now(), payload === null ? null : JSON.stringify(payload));
       return id;
+    },
+    consumeWorkflowEdge({ key, recipient = null, payload }) {
+      database.exec("SAVEPOINT workflow_notification_edge");
+      try {
+        const consumed = database.prepare("INSERT OR IGNORE INTO vm_workflow_notification_edges(event_key,consumed_at) VALUES (?,?)")
+          .run(key, now());
+        let id = null;
+        if (consumed.changes === 1 && recipient !== null) {
+          id = createHash("sha256").update(`${recipient}:${key}`).digest("hex").slice(0, 32);
+          database.prepare(`INSERT OR IGNORE INTO vm_download_notifications
+            (id,recipient,kind,vmid,status,attempts,next_at,payload_json) VALUES (?,?,'workflow_blocked',NULL,'pending',0,?,?)`)
+            .run(id, recipient, now(), JSON.stringify(payload));
+        }
+        database.exec("RELEASE workflow_notification_edge");
+        return id;
+      } catch (error) {
+        database.exec("ROLLBACK TO workflow_notification_edge; RELEASE workflow_notification_edge");
+        throw error;
+      }
     },
     claim() {
       const lease = randomUUID();

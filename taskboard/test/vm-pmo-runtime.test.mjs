@@ -320,6 +320,41 @@ test("a policy version changed while Taskboard was stopped blocks the previous a
   assert.equal(f.runtime.list()[0].state,"blocked");assert.equal(f.runtime.list()[0].errorCode,"VM_PMO_POLICY_CHANGED");
 });
 
+test("VM attention notifications await an asynchronous download service and emit one edge", async t => {
+  const f = await fixture(t);
+  const notifications = [];
+  const getDownloads = f.args.getDownloads;
+  f.args.getDownloads = async () => ({ ...getDownloads(),
+    notifyWorkflowBlocked: async value => notifications.push(value) });
+  await f.restart();
+  await f.runtime.register(f.body, ACTOR);
+  f.setPolicy({ enabled: false, version: 2 });
+  await f.runtime.wake();
+  await f.runtime.wake();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.runtime.list()[0].state, "blocked");
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].subject, "VM 测试");
+  assert.equal(notifications[0].status, "blocked");
+  assert.match(notifications[0].reason, /自动剪辑开关已关闭/u);
+});
+
+test("explicit automatic cancellation notifies its new blocked edge once", async t => {
+  const f = await fixture(t);
+  const notifications = [];
+  const getDownloads = f.args.getDownloads;
+  f.args.getDownloads = () => ({ ...getDownloads(), notifyWorkflowBlocked: async value => notifications.push(value) });
+  await f.restart();
+  await f.runtime.register(f.body, ACTOR);
+  f.setPolicy({ enabled: false, version: 2 });
+  await f.runtime.cancelPendingAutomatic();
+  await f.runtime.cancelPendingAutomatic();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.runtime.list()[0].state, "blocked");
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0].reason, /自动剪辑开关已关闭/u);
+});
+
 test("startup recovers a binding-conflict run only after its original approved receipt is ready", async t => {
   const oldPrivateEndpoint = {origin: "https://vm-resource.yangcong345.com",addresses: ["10.8.8.10"]};
   const currentPrivateEndpoint = {origin: "https://vm-resource.yangcong345.com",addresses: ["10.8.8.11"]};

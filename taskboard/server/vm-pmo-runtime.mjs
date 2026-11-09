@@ -20,6 +20,7 @@ import { createFeishuWritebackWorker } from "./feishu-writeback-worker.mjs";
 import { createVmFinalArchiveService } from "./vm-pmo-final-archive.mjs";
 import { isVmFinalArchiveTransition, planVmFinalArchive } from "./feishu-vm-delivery-plan.mjs";
 import { readVmPackageBoard } from "./vm-package-board.mjs";
+import { describeVmPmoAttention } from "./blocked-notification.mjs";
 
 const TEMPLATE = Object.freeze({id: "vm_pmo_review_video",version: 1});
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -294,6 +295,13 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       return adapter[method](input);
     }])));
   const readCurrentRecord = createVmRegistrationRecordReader(localAdapter);
+
+  async function notifyAttention({run}) {
+    const task = database.getTask(run.taskId), origin = database.getFeishuTaskOrigin(run.taskId);
+    const subject = origin && database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+    const notification = describeVmPmoAttention({run, task, origin, subject});
+    if (notification) await (await getDownloads()).notifyWorkflowBlocked(notification);
+  }
 
   function initialize() {
     if (services) return services;
@@ -664,6 +672,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       },delivery,
       onRunStarted: async ({run}) => {taskStatus(run,"in_progress");await enqueueWriteback(run,"processing");},
       onCompleted: async ({run}) => {await enqueueWriteback(run,"completed");taskStatus(run,"in_review");},
+      onAttention: notifyAttention,
     });
     services = {orchestrator,delivery,finalArchive,writebackStore,writebackWorker,metadata,
       registration: createVmTaskRegistration({database,getPackage,getActiveSubject,readCurrentRecord,
@@ -961,7 +970,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
           lease_until = NULL,updated_at = ? WHERE run_id = ? AND payload_json = ?
           AND state NOT IN ('completed','blocked','needs_attention')`)
           .run(JSON.stringify(restored),now(),run.runId,stored.payload_json);
-        if (changed.changes === 1) cancelSlot(run.runId);
+        if (changed.changes === 1) {
+          cancelSlot(run.runId);
+          void notifyAttention({run: services.orchestrator.get(run.runId)}).catch(() => {});
+        }
         continue;
       }
       const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'blocked',error_code = 'AUTOMATIC_EXECUTION_DISABLED',
@@ -972,7 +984,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
             AND json_extract(payload_json,'$.renderRetryLaunchAt') IS NULL
             AND json_extract(payload_json,'$.renderRetryStartedAt') IS NULL)`)
         .run(now(),run.runId);
-      if (changed.changes === 1) cancelSlot(run.runId);
+      if (changed.changes === 1) {
+        cancelSlot(run.runId);
+        void notifyAttention({run: services.orchestrator.get(run.runId)}).catch(() => {});
+      }
     }
     releaseTerminalSlots();
   }

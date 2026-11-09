@@ -397,6 +397,155 @@ test("notifications deduplicate durably, retry failures and never overwrite acti
   assert.equal(f.store.get(job.id).status, "waiting_approval");
 });
 
+test("workflow blocker notifications include trusted task context and deduplicate across wakeups", async (t) => {
+  const sent = [];
+  const f = await fixture(t, { notifier: { available: () => true, send: async (value) => sent.push(value) } });
+  const notification = {
+    eventKey: "task:task_vm:activity:7",
+    subject: "数学学科",
+    taskId: "task_vm",
+    taskTitle: "课程002 初稿",
+    recordId: "rec_001",
+    stage: "initial",
+    status: "blocked",
+    occurredAt: "2026-10-28T02:30:00.000Z",
+    reason: "词级语音对齐无法确认，请人工处理。",
+  };
+
+  const first = await f.service.notifyWorkflowBlocked(notification);
+  await f.service.notifyWorkflowBlocked(notification);
+
+  assert.equal(first.queued, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, "workflow_blocked");
+  assert.equal(sent[0].recipient, identity.enterprise_email);
+  assert.deepEqual(sent[0].payload, {
+    subject: "数学学科", taskId: "task_vm", taskTitle: "课程002 初稿", recordId: "rec_001",
+    stage: "initial", status: "blocked", occurredAt: "2026-10-28T02:30:00.000Z",
+    reason: "词级语音对齐无法确认，请人工处理。",
+  });
+  assert.equal(f.service.snapshot().notifications.pendingCount, 0);
+});
+
+test("workflow blocker notification retries the same message after restart", async (t) => {
+  const sent = [];
+  let fail = true;
+  const notifier = { available: () => true, send: async (value) => {
+    sent.push(value);
+    if (fail) throw new VmSourceError("VM_NOTIFY_SEND_FAILED");
+  } };
+  const f = await fixture(t, { notifier });
+  const notification = { eventKey: "vm-pmo:run_vm:needs_attention:1000000000", subject: "数学学科",
+    taskId: "MATH-12", taskTitle: "课程002初稿", recordId: "rec_001", stage: "initial",
+    status: "needs_attention", occurredAt: "2026-10-28T02:30:00.000Z", reason: "剪辑结果需要处理。" };
+
+  const queued = await f.service.notifyWorkflowBlocked(notification);
+  assert.equal(queued.queued, true);
+  assert.equal(f.service.snapshot().notifications.pendingCount, 1);
+  fail = false;
+  await f.restart({ notifier });
+  f.advance(60_000);
+  await f.service.wake();
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].id, sent[1].id);
+  assert.deepEqual(sent[1].payload, { subject: "数学学科", taskId: "MATH-12", taskTitle: "课程002初稿",
+    recordId: "rec_001", stage: "initial", status: "needs_attention",
+    occurredAt: "2026-10-28T02:30:00.000Z", reason: "剪辑结果需要处理。" });
+  assert.equal(f.service.snapshot().notifications.pendingCount, 0);
+});
+
+test("workflow blocker edges skipped without delivery eligibility stay consumed after restart", async (t) => {
+  for (const scenario of ["disabled", "unavailable", "no-account"]) {
+    await t.test(scenario, async (t) => {
+      const sent = [];
+      let available = scenario !== "unavailable";
+      const notifier = { available: () => available, send: async value => sent.push(value) };
+      const f = await fixture(t, { notifier });
+      if (scenario === "disabled") f.service.updateSettings({ ...f.service.snapshot().settings, notificationsEnabled: false });
+      if (scenario === "no-account") { f.account(null); f.status("disconnected"); }
+      const edge = { eventKey: "task:task_vm:activity:9", subject: "数学", taskId: "MATH-12",
+        taskTitle: "课程初稿", recordId: "rec_001", stage: "initial", status: "blocked",
+        occurredAt: "2026-10-28T02:30:00.000Z", reason: "需要处理。" };
+      assert.equal((await f.service.notifyWorkflowBlocked(edge)).queued, false);
+      available = true;
+      f.account(identity); f.status("connected");
+      f.service.updateSettings({ ...f.service.snapshot().settings, notificationsEnabled: true });
+      await f.restart({ notifier });
+      await f.service.notifyWorkflowBlocked({ ...edge, taskTitle: "已修改标题" });
+      assert.equal(sent.length, 0);
+      await f.service.notifyWorkflowBlocked({ ...edge, eventKey: "task:task_vm:activity:11" });
+      assert.equal(sent.length, 1);
+    });
+  }
+});
+
+test("workflow blocker replay cannot deliver the same edge to a new account", async (t) => {
+  const sent = [];
+  const notifier = { available: () => true, send: async value => sent.push(value) };
+  const f = await fixture(t, { notifier });
+  const edge = { eventKey: "task:task_vm:activity:9", subject: "数学", taskId: "MATH-12",
+    taskTitle: "课程初稿", recordId: "rec_001", stage: "initial", status: "blocked",
+    occurredAt: "2026-10-28T02:30:00.000Z", reason: "需要处理。" };
+  await f.service.notifyWorkflowBlocked(edge);
+  f.account({ ...identity, user_id: "other-user", enterprise_email: "other@example.test" });
+  await f.restart({ notifier });
+  await f.service.notifyWorkflowBlocked(edge);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].recipient, identity.enterprise_email);
+});
+
+test("workflow blocker notification sender formats context without exposing local paths or credentials", async () => {
+  const requests = [];
+  const notifier = createVmDownloadNotifier({ appId: "fixture", appSecret: "fixture-secret", createContext: async () => ({
+    client: { im: { message: { create: async (request) => {
+      requests.push(request);
+      return { code: 0, data: { message_id: "message-1" } };
+    } } } },
+  }) });
+
+  await notifier.send({ id: "d".repeat(32), recipient: identity.enterprise_email, kind: "workflow_blocked",
+    vmid: null, payload: { subject: "数学学科", taskId: "task_vm", taskTitle: "课程002 初稿", recordId: "rec_001",
+      stage: "initial", status: "blocked", occurredAt: "2026-10-28T02:30:00.000Z",
+      reason: "词级语音对齐无法确认，请人工处理。" } });
+
+  const text = JSON.parse(requests[0].data.content).text;
+  for (const value of ["数学学科", "课程002 初稿", "rec_001", "初稿", "2026", "词级语音对齐无法确认"]) {
+    assert.match(text, new RegExp(value, "u"));
+  }
+  assert.doesNotMatch(text, /fixture-secret|127\.0\.0\.1|[A-Z]:\\/iu);
+});
+
+test("notification metadata migrates the existing outbox and stores workflow context", () => {
+  const database = new DatabaseSync(":memory:");
+  database.exec(`CREATE TABLE vm_download_notifications (
+    id TEXT PRIMARY KEY, recipient TEXT NOT NULL, kind TEXT NOT NULL, vmid TEXT,
+    status TEXT NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL,
+    lease_id TEXT, lease_until INTEGER, sent_at INTEGER, error_code TEXT
+  )`);
+  database.prepare(`INSERT INTO vm_download_notifications
+    (id, recipient, kind, vmid, status, attempts, next_at, sent_at)
+    VALUES (?, ?, ?, NULL, 'sent', 1, 1000, 1000)`)
+    .run("a".repeat(32), identity.enterprise_email, "test");
+
+  const metadata = createVmDownloadMetadata({ database, now: () => 2000 });
+  const notification = { subject: "数学学科", taskId: "MATH-12", taskTitle: "课程002 初稿",
+    recordId: "rec_001", stage: "initial", status: "blocked",
+    occurredAt: "2026-10-28T02:30:00.000Z", reason: "需要人工处理。" };
+  metadata.enqueue({ key: "workflow-blocked:task:MATH-12:activity:42",
+    recipient: identity.enterprise_email, kind: "workflow_blocked", payload: notification });
+
+  const columns = database.prepare("PRAGMA table_info(vm_download_notifications)").all().map(({ name }) => name);
+  const oldRow = database.prepare("SELECT status, sent_at, payload_json FROM vm_download_notifications WHERE id = ?")
+    .get("a".repeat(32));
+  const queued = metadata.claim();
+
+  assert.ok(columns.includes("payload_json"));
+  assert.deepEqual({ ...oldRow }, { status: "sent", sent_at: 1000, payload_json: null });
+  assert.deepEqual(JSON.parse(queued.payload_json), notification);
+  database.close();
+});
+
 test("terminal notification failures are counted as history, not current transport health", async (t) => {
   const f = await fixture(t, { notifier: { available: () => true, send: async () => { throw new VmSourceError("VM_NOTIFY_FEISHU_99991672"); } } });
   const job = f.service.enqueue(f.input()).jobs[0];
