@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { test } from "node:test";
 import os from "node:os";
@@ -23,7 +24,7 @@ async function fixture() {
     },
     feishuWorkflowSync: async () => ({ ok: true }),
   });
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = await listenTaskboardOnFetchSafePort(app);
   return { app, directory, baseUrl: `http://127.0.0.1:${address.port}` };
 }
 
