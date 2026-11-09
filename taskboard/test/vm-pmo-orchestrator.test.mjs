@@ -13,7 +13,10 @@ async function fixture(t) {
   const sqlitePath = path.join(directory, "runs.sqlite");
   let db = new DatabaseSync(sqlitePath);
   const calls = [];
+  const attention = [];
   let approvalStatus = "waiting_approval";
+  let planResult = { status: "ready", planSha256: "d".repeat(64) };
+  let canExecute = async () => true;
   let deliveryJob = null;
   let now = 1_700_000_000_000;
   const task = { id: "task_vm", status: "todo", archivedAt: null, labels: ["feishu"] };
@@ -41,17 +44,21 @@ async function fixture(t) {
       status: async (taskId) => { calls.push(["status", taskId]); return { ...binding, status: approvalStatus,
         ...(approvalStatus === "ready" ? { acquisition } : {}) }; },
     },
-    canExecute: async () => true,
+    canExecute: (...args) => canExecute(...args),
     verifyRetryInput: async ({ run }) => {
       calls.push(["verifyRetryInput", run.runId]);
       if (approvalStatus !== "ready") { const error = new Error("approval not ready");
         error.code = "VM_PMO_RETRY_APPROVAL_NOT_READY"; throw error; }
     },
+    validateSavedPlan: async ({ run }) => {
+      calls.push(["validateSavedPlan", run.runId]);
+      return { status: "ready", planSha256: "d".repeat(64) };
+    },
     acquireSlot: async () => { calls.push(["slot"]); return { release: async () => { calls.push(["release"]); } }; },
     prepareInput: async (input) => { calls.push(["prepare", input]); return prepared; },
     runOffline: async ({ mode, onStarted }) => {
       calls.push([mode]); await onStarted({ mode, pid: 42, startedAt: new Date(now).toISOString() });
-      return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) }
+      return mode === "plan" ? planResult
         : { status: "rendered", planSha256: "d".repeat(64), artifact };
     },
     recoverOffline: async ({ mode }) => { calls.push(["recover", mode]); return null; },
@@ -64,16 +71,39 @@ async function fixture(t) {
     },
     onRunStarted: async ({ run }) => { calls.push(["processing", run.runnerStartedAt]); },
     onCompleted: async ({ run }) => { calls.push(["completed", run.runId]); },
+    onAttention: async ({ run }) => { attention.push({ runId: run.runId, taskId: run.taskId,
+      state: run.state, errorCode: run.errorCode, updatedAt: run.updatedAt }); },
   };
   let service = createVmPmoOrchestrator(dependencies);
   t.after(async () => { await service.close(); db.close(); await rm(directory, { recursive: true, force: true }); });
-  return { calls, task, origin, packageSnapshot, dependencies, prepared, artifact, binding,
+  return { calls, attention, task, origin, packageSnapshot, dependencies, prepared, artifact, binding,
     get f() { return service; }, get db() { return db; },
     setApproval(value) { approvalStatus = value; }, setDelivery(value) { deliveryJob = value; },
+    setPlanResult(value) { planResult = value; },
     advance(ms) { now += ms; },
+    setCanExecute(value) { canExecute = value; },
     async restart() { await service.close(); db.close(); db = new DatabaseSync(sqlitePath); service = createVmPmoOrchestrator(dependencies); },
   };
 }
+
+test("VM workflow emits one attention notification on the first transition into a blocked state", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.setCanExecute(async () => {
+    const error = new Error("VM_PMO_CONFIG_CHANGED");
+    error.code = "VM_PMO_CONFIG_CHANGED";
+    throw error;
+  });
+
+  const blocked = await x.f.pump("run_vm");
+  await x.f.pump("run_vm");
+
+  assert.equal(blocked.state, "blocked");
+  assert.deepEqual(x.attention.map(({ runId, taskId, state, errorCode }) => ({ runId, taskId, state, errorCode })), [{
+    runId: "run_vm", taskId: "task_vm", state: "blocked", errorCode: "VM_PMO_CONFIG_CHANGED",
+  }]);
+});
 
 test("registered tasks wait durably for approval without taking an execution slot", async (t) => {
   const x = await fixture(t);
@@ -85,6 +115,51 @@ test("registered tasks wait durably for approval without taking an execution slo
   await x.restart();
   assert.equal((await x.f.register({ taskId: "task_vm" })).runId, "run_vm");
   assert.equal(x.f.list().length, 1);
+});
+
+test("an applicant check blocked before approval can retry the same frozen task run", async (t) => {
+  const x = await fixture(t);
+  x.binding.approvalJobId = null;
+  const reconcile = x.dependencies.bindings.reconcile;
+  let blocked = true;
+  x.dependencies.bindings.reconcile = async taskId => {
+    if (blocked) throw Object.assign(new Error("applicant changed"), { code: "VM_APPLICANT_CHANGED" });
+    return reconcile(taskId);
+  };
+  await x.f.register({ taskId: "task_vm" });
+  assert.equal((await x.f.pump("run_vm")).errorCode, "VM_APPLICANT_CHANGED");
+
+  blocked = false;
+  x.setApproval("reserved");
+  const retried = await x.f.retryApproval("run_vm");
+  assert.equal(retried.runId, "run_vm");
+  assert.equal(retried.state, "waiting_materials");
+  assert.equal(retried.errorCode, null);
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+  x.setApproval("waiting_approval");
+  assert.equal((await x.f.pump("run_vm")).approvalStatus, "waiting_approval");
+  assert.equal(x.calls.some(([kind]) => ["slot", "plan", "render"].includes(kind)), false);
+});
+
+test("a source-bound manual revision reuses approved materials in a new immutable planning attempt",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});
+  x.setApproval("ready");
+  x.setPlanResult({status:"blocked",errorCode:"UNSUPPORTED_INSTRUCTION"});
+  const blocked=await x.f.pump("run_vm");
+  assert.equal(blocked.state,"blocked");
+  const revision={sourceSha256:"a".repeat(64),note:"Hold the previous tail frame.",clips:[
+    {startMs:0,endMs:1000,freeze:{startMs:500,endMs:750,frameMs:480}},
+  ]};
+  const retried=await x.f.retryManualRevision("run_vm",revision);
+  assert.equal(retried.state,"ready");
+  assert.equal(retried.planAttempt,2);
+  assert.deepEqual(retried.manualRevision,revision);
+  assert.deepEqual(retried.retryHistory.map(item=>item.errorCode),["UNSUPPORTED_INSTRUCTION"]);
+  assert.equal(x.calls.filter(([name])=>name==="reserve").length,1);
+  await x.restart();
+  assert.deepEqual(x.f.get("run_vm").manualRevision,revision);
+  await assert.rejects(x.f.retryManualRevision("run_vm",revision),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
 });
 
 function storeLegacyInitialIdentity(x) {
@@ -196,6 +271,174 @@ test("a manual alignment retry revalidates the same approval and starts a new pl
   assert.equal(x.calls.filter(([kind]) => kind === "verifyRetryInput").length, 1);
   assert.equal(x.calls.filter(([kind]) => kind === "plan").length, 2);
   assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+});
+
+test("manual validation recovery resumes a saved plan without another approval, plan, or download", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    x.calls.push([mode]);
+    await onStarted({ mode, pid: 42, startedAt: "2026-10-16T00:00:00.000Z" });
+    if (mode === "plan") { const error = new Error("plan rejected"); error.code = "PLAN_INVALID"; throw error; }
+    return { status: "rendered", planSha256: "d".repeat(64), artifact: x.artifact };
+  };
+  await x.restart();
+  const failed = await x.f.pump("run_vm");
+  assert.equal(failed.state, "needs_attention");
+  assert.equal(failed.errorCode, "PLAN_INVALID");
+  assert.equal(failed.runnerStartedAt, undefined);
+
+  const resumed = await x.f.retryValidatedPlan("run_vm");
+  assert.equal(resumed.state, "planned");
+  assert.equal(resumed.planSha256, "d".repeat(64));
+  assert.equal(resumed.planAttempt, 1);
+  assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "verifyRetryInput").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "validateSavedPlan").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "plan").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+});
+
+test("manual validation recovery refuses unready approval and any render evidence", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    await onStarted({ mode, pid: 42, startedAt: "2026-10-16T00:00:00.000Z" });
+    const error = new Error("plan rejected"); error.code = "PLAN_INVALID"; throw error;
+  };
+  await x.restart();
+  await x.f.pump("run_vm");
+  x.setApproval("waiting_approval");
+  await assert.rejects(x.f.retryValidatedPlan("run_vm"), { code: "VM_PMO_RETRY_APPROVAL_NOT_READY" });
+  assert.equal(x.f.get("run_vm").state, "needs_attention");
+
+  x.setApproval("ready");
+  const current = x.f.get("run_vm");
+  const payload = { binding: current.binding, approvalStatus: current.approvalStatus,
+    acquisition: current.acquisition, prepared: current.prepared,
+    planStartedAt: current.planStartedAt, runnerStartedAt: "2026-10-16T00:00:00.000Z",
+    planAttempt: current.planAttempt, retryHistory: current.retryHistory };
+  x.db.prepare("UPDATE vm_pmo_runs SET payload_json = ? WHERE run_id = ?")
+    .run(JSON.stringify(payload), "run_vm");
+  await assert.rejects(x.f.retryValidatedPlan("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+});
+
+test("manual render recovery reuses the approved source and saved plan after start evidence fails", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({taskId:"task_vm"});
+  x.setApproval("ready");
+  let renderStarts = 0;
+  x.dependencies.runOffline = async ({mode,onStarted,beforeSpawn,assertBeforeSpawn,onLaunched}) => {
+    x.calls.push([mode]);
+    if (mode === "render" && renderStarts > 0) {
+      await beforeSpawn();
+      assertBeforeSpawn();
+      onLaunched();
+    }
+    await onStarted({mode,pid:42,startedAt:new Date(1_700_000_000_000 + renderStarts * 1000).toISOString()});
+    if (mode === "render" && renderStarts++ === 0) {
+      const error = new Error("start evidence failed");error.code = "VM_PMO_START_EVIDENCE_FAILED";throw error;
+    }
+    return mode === "plan" ? {status:"ready",planSha256:"d".repeat(64)}
+      : {status:"rendered",planSha256:"d".repeat(64),artifact:x.artifact};
+  };
+  await x.restart();
+  const failed = await x.f.pump("run_vm");
+  assert.equal(failed.state,"needs_attention");
+  assert.equal(failed.errorCode,"VM_PMO_START_EVIDENCE_FAILED");
+  assert.ok(failed.runnerStartedAt);
+  x.task.status = "in_progress";
+
+  const retried = await x.f.retryFailedRender("run_vm");
+  assert.equal(retried.state,"planned");
+  assert.equal(retried.runnerStartedAt,failed.runnerStartedAt);
+  assert.deepEqual(retried.renderRetryHistory,[failed.runnerStartedAt]);
+  assert.equal((await x.f.pump("run_vm")).state,"delivery_pending");
+  assert.ok(x.f.get("run_vm").renderRetryStartedAt);
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length,1);
+  assert.equal(x.calls.filter(([kind]) => kind === "verifyRetryInput").length,1);
+  assert.equal(x.calls.filter(([kind]) => kind === "validateSavedPlan").length,1);
+  assert.equal(x.calls.filter(([kind]) => kind === "plan").length,1);
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length,2);
+  await assert.rejects(x.f.retryFailedRender("run_vm"),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
+});
+
+test("manual render recovery checks policy before spawning and retains its attempt when disabled",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});x.setApproval("ready");
+  let rendering=0;
+  let policyEnabled=true;
+  x.dependencies.canExecute=async()=>{
+    if (!policyEnabled) {const error=new Error("disabled");
+      error.code="AUTOMATIC_EXECUTION_DISABLED";throw error;}
+    return true;
+  };
+  x.dependencies.runOffline=async ({mode,onStarted,beforeSpawn,assertBeforeSpawn,onLaunched})=>{
+    if (mode === "render" && rendering++ === 1) {
+      policyEnabled=false;
+      await beforeSpawn();
+      assertBeforeSpawn();
+      onLaunched();
+    }
+    await onStarted({mode,pid:42,startedAt:new Date(1_700_000_000_000 + rendering * 1000).toISOString()});
+    if (mode === "render" && rendering === 1) {
+      const error=new Error("start failed");error.code="VM_PMO_START_EVIDENCE_FAILED";throw error;
+    }
+    return mode === "plan" ? {status:"ready",planSha256:"d".repeat(64)}
+      : {status:"rendered",planSha256:"d".repeat(64),artifact:x.artifact};
+  };
+  await x.restart();
+  assert.equal((await x.f.pump("run_vm")).errorCode,"VM_PMO_START_EVIDENCE_FAILED");
+  await x.f.retryFailedRender("run_vm");
+  const result=await x.f.pump("run_vm");
+  assert.equal(result.state,"needs_attention");
+  assert.equal(result.errorCode,"VM_PMO_START_EVIDENCE_FAILED");
+  assert.equal(result.renderRetryStartedAt,undefined);
+  assert.equal(result.renderRetryHistory,undefined);
+});
+
+test("manual render recovery preserves its attempt when policy changes during validation",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});x.setApproval("ready");
+  x.dependencies.runOffline=async ({mode,onStarted})=>{
+    await onStarted({mode,pid:42,startedAt:"2026-10-16T00:00:00.000Z"});
+    if (mode === "render") {const error=new Error("start failed");
+      error.code="VM_PMO_START_EVIDENCE_FAILED";throw error;}
+    return {status:"ready",planSha256:"d".repeat(64)};
+  };
+  await x.restart();
+  await x.f.pump("run_vm");
+  const error=new Error("disabled");error.code="AUTOMATIC_EXECUTION_DISABLED";
+  await assert.rejects(x.f.retryFailedRender("run_vm",{beforeCommit:()=>{throw error;}}),
+    {code:"AUTOMATIC_EXECUTION_DISABLED"});
+  assert.equal(x.f.get("run_vm").state,"needs_attention");
+  assert.equal(x.f.get("run_vm").renderRetryHistory,undefined);
+});
+
+test("manual render recovery retains its retry when the child never spawns",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});x.setApproval("ready");
+  let renderCount=0;
+  x.dependencies.runOffline=async ({mode,onStarted,beforeSpawn})=>{
+    if (mode === "render" && renderCount++ === 1) {
+      await beforeSpawn();
+      const error=new Error("spawn failed");error.code="VM_PMO_PROCESS_UNAVAILABLE";throw error;
+    }
+    await onStarted({mode,pid:42,startedAt:"2026-10-16T00:00:00.000Z"});
+    if (mode === "render") {const error=new Error("start failed");
+      error.code="VM_PMO_START_EVIDENCE_FAILED";throw error;}
+    return {status:"ready",planSha256:"d".repeat(64)};
+  };
+  await x.restart();
+  await x.f.pump("run_vm");
+  await x.f.retryFailedRender("run_vm");
+  const result=await x.f.pump("run_vm");
+  assert.equal(result.state,"needs_attention");
+  assert.equal(result.errorCode,"VM_PMO_START_EVIDENCE_FAILED");
+  assert.equal(result.renderRetryHistory,undefined);
 });
 
 test("manual alignment retry rejects unready approval and package failures", async (t) => {

@@ -82,6 +82,31 @@ test("initial v2 package emits and validates schema v2 input for semantic editin
   assert.equal(bound.input.schema_version, 2);
 });
 
+test("manual revision is frozen beside the unchanged Feishu instruction and approved source",async t=>{
+  const args=await fixture(t);
+  const manifestPath=path.join(args.packageSnapshot.workspacePath,"PACKAGE-MANIFEST.json");
+  await writeFile(manifestPath,JSON.stringify({name:"auto-cut-slicing",version:"0.3.0",
+    interface:{workflowTemplate:{id:"vm_pmo_review_video",version:1},
+      contract:{id:"vm_pmo_review_video",version:2},driverId:"vm_pmo_review_video_v2",
+      artifactKind:"review_mp4"}}));
+  args.packageIdentity={name:"auto-cut-slicing",version:"0.3.0",
+    manifestSha256:createHash("sha256").update(await readFile(manifestPath)).digest("hex"),
+    contractVersion:2,driverId:"vm_pmo_review_video_v2"};
+  args.manualRevision={sourceSha256:args.acquisition.sha256,note:"Finish H2O and hold its last frame.",
+    clips:[{startMs:0,endMs:20000,freeze:{startMs:18000,endMs:18520,frameMs:18000}}]};
+  const prepared=await prepareVmPmoRunInput(args);
+  const input=JSON.parse(await readFile(path.join(path.dirname(prepared.contextPath),"input.json"),"utf8"));
+  assert.equal(input.instructions[0].raw_text,"0:00-0:20");
+  assert.deepEqual(input.manual_revision,{source_sha256:args.acquisition.sha256,
+    note:args.manualRevision.note,clips:[{start_ms:0,end_ms:20000,
+      freeze:{start_ms:18000,end_ms:18520,frame_ms:18000}}]});
+  assert.deepEqual((await validateVmPmoInput({contextPath:prepared.contextPath})).input.manual_revision,
+    input.manual_revision);
+  args.manualRevision.sourceSha256="0".repeat(64);
+  await assert.rejects(prepareVmPmoRunInput({...args,runId:"run-2"}),
+    {code:"VM_PMO_REVISION_INVALID"});
+});
+
 test("review input v2 binds the exact delivered parent and emits the persisted draft number", async t => {
   const args = await fixture(t);
   const manifestPath = path.join(args.packageSnapshot.workspacePath, "PACKAGE-MANIFEST.json");

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { listenOnFetchSafePort, listenTaskboardOnFetchSafePort } from "../../test/fetch-safe-listen.mjs";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -201,7 +202,7 @@ if (args[0] === "debug") {
     allowAutomaticExecution,
     autoCutRunner,
   });
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = await listenTaskboardOnFetchSafePort(app);
   app.database.createProject({
     id: FEISHU_PROJECT_ID,
     name: "Fixture subject",
@@ -449,7 +450,7 @@ test("new automatic subject drafts execute only after enable and preserve the ac
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ controlledContext }));
   });
-  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  await listenOnFetchSafePort(bridge);
   const fixture = await createFixture({
     allowAutomaticExecution: true,
     turnDelayMs: 100,

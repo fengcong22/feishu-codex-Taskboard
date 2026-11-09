@@ -24,7 +24,15 @@ npm start
 
 本机模式下，顶部栏“本机设置”旁有 VM 状态菜单，可查看 Shadow 登录状态和队列数量、手动刷新、连接/重连账号，并直接打开完整 VM 队列。队列状态默认每 30 秒刷新，也可设为关闭、15 秒、1 分钟或 5 分钟；设置保存在当前浏览器。Shadow 登录仍需本人完成授权。已结束记录和 `needs_attention` 项都可单条或批量直接删除；等待中或正在处理的任务不能删除。删除仅将记录移出队列，后台仍保留审批、任务绑定和素材占用证据，不会释放素材占用。
 
+取消尚未提交的误建审批可在本机调用 `POST /api/local/vm-downloads/jobs/:id/cancel-unsubmitted`，请求体为 `{}`，并带 `x-taskboard-client: web`。仅 `queued`、提交次数为零、没有申请号或采集证据且无有效租约的项目可取消；状态和取消原因保留在队列中，不会请求 VM，也不能取消已提交的审批。
+
 飞书 Bridge 接入的 `vm_pmo_review_video` 包包含独立的初稿与审核修改流程：初稿通过正常 VM 审批队列获取源视频，审核修改复用 Taskboard 已确认交付的上一轮 MP4。每轮通过 `plan/render` 生成唯一 MP4，上传并读回 PMO 附件后完成阶段。可选的最终归档 worker 会校验 SHA 并以无覆盖方式发布成片。启用要求本机 Python、包白名单、自动剪辑开关及完整学科配置；保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。
+
+初稿手动返修已冻结剪辑方案且尚未开始下一次规划时，如果仅飞书保留时间文字与原任务快照不同，`vm-pmo-manual-revision` 可携带同一方案、当前任务版本及本次素材/规划授权恢复原 task/run。恢复会复核原审批与素材 SHA；VMID、标题或状态变化仍阻断，不会修改飞书保留时间文字，也不会重新申请或下载。
+
+已保存的合法 VM 计划若被旧校验器误判为 `PLAN_INVALID`，本机 `POST /api/local/tasks/:id/vm-pmo-plan-validation-retry` 可在提供当前任务 `version` 后人工重新校验并沿原 task/run 继续。接口只接受未开始 render、无结果或 MP4 证据的 `needs_attention/PLAN_INVALID`，并复核原审批、采集回执和源 SHA；不会重做 ASR、规划、审批或下载。其他失败仍按各自规则处理。
+
+原 render 子进程已关闭且运行停在 `needs_attention/VM_PMO_START_EVIDENCE_FAILED` 时，可在本机调用 `POST /api/local/tasks/:id/vm-pmo-render-retry` 并提交当前任务 `version` 人工恢复一次。接口要求没有结果文件、MP4 或交付证据，复核原审批、采集回执、源 SHA 和已保存规划 SHA；保留首次启动时间，沿原 task/run 继续，不重新审批或下载。待启动的恢复仍受当前本机自动剪辑开关约束。已归档的重复任务不再抢占 VM 最新轮次。
 
 如需在前端实时重载模式下开发：
 
@@ -179,6 +187,10 @@ npm run codex:inject -- --port 9229 --open
 ## 飞书 Auto-Cut 集成
 
 飞书 Bridge 与 Taskboard 的集成只在本机运行。Bridge 必须通过带有 `x-taskboard-client: feishu-bridge` 和本机共享密钥 `x-feishu-bridge-secret` 的 `POST /api/local/feishu/tasks` 创建工作流任务；启动脚本会把同一个 `CODEX_FEISHU_BRIDGE_SECRET` 注入两个服务。Taskboard 会把 Base/子表/记录的来源信息作为服务端数据单独登记。普通的 `POST /api/tasks` 即使复制了飞书描述标记或 `feishu` 标签，也不能启动 Auto-Cut、上传产物或出现在 Bridge 的待处理查询中。
+
+可信飞书学科任务首次进入“遇到阻碍”，或 VM/PMO 运行首次进入“遇到阻碍 / 需要处理”时，Taskboard 可通过“飞书异常提醒”发送一条消息。消息发往当前已验证的 Shadow 账号企业邮箱，包含所属学科、任务及飞书记录、流程阶段、问题发生时间（中国标准时间）和安全原因说明；不显示上线时间，也不发送原始堆栈、本机路径或凭据。同一状态边沿只通知一次；发送失败会保存在通知队列中退避重试，重启后继续。需开启“飞书异常提醒”、Taskboard 服务保持运行，并配置可用的飞书应用凭据、机器人发送权限和已验证的 Shadow 账号。关闭开关或没有可用收件账号时不排队，之后开启也不会补发先前的问题通知。
+
+边沿处理记录独立于账号持久保存，任务标题修改、账号切换及重启均不会补发旧边沿。关闭本机自动剪辑导致待执行运行进入问题状态时，也使用此通知流程，发送失败不影响取消操作。
 
 通过本机专用接口登记的可信飞书任务，可以在未初始化 Git 的目录中运行其本机已登记 Auto-Cut 包。Taskboard 只有在服务端来源和可信包快照都匹配后，才会向 Codex 添加非 Git 工作区参数；普通任务、复制的标记、浏览器输入和飞书单元格都不能申请该权限。
 

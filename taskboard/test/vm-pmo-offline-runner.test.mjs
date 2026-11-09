@@ -139,6 +139,17 @@ test("runner reports actual spawn once and stops if start evidence cannot persis
   assert.equal(new Date(starts[0].startedAt).toISOString(), starts[0].startedAt);
 });
 
+test("runner does not mark a launch when spawn fails", async (t) => {
+  const current = await fixture(t, "raise RuntimeError('must not launch')\n", false);
+  const invalidExecutable = path.join(current.root, "not-python.exe");
+  await writeFile(invalidExecutable, "not an executable", "utf8");
+  let launched = 0;
+  await assert.rejects(runVmPmoOffline({ mode: "plan", pythonPath: invalidExecutable,
+    packageRoot: current.root, contextPath: current.contextPath,
+    onLaunched: () => { launched += 1; } }), { code: "VM_PMO_PROCESS_UNAVAILABLE" });
+  assert.equal(launched, 0);
+});
+
 test("runner timeout also bounds a start evidence callback that never settles", { timeout: 5000 }, async (t) => {
   if (!PYTHON) return t.skip("python is unavailable");
   const current = await fixture(t, "import time\ntime.sleep(20)\n", false);

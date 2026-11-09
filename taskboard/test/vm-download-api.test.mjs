@@ -129,3 +129,17 @@ test("VM queue removal has a local route and rejects unknown queue evidence", as
   assert.equal(missing.status, 404);
   assert.equal(missing.body.error.code, "VM_APPROVAL_JOB_NOT_FOUND");
 });
+
+test("local cancellation stops an unsubmitted approval from later submission", async (t) => {
+  const f = await fixture(t);
+  const fields = { department: "动画组", reason: "切片剪辑", outputRoot: f.directory };
+  const queued = await call(f.baseUrl, "/jobs", { method: "POST", body: { ...fields, vmids: ["678465c3d94605d24bb9361a"] } });
+  const id = queued.body.jobs[0].id;
+  const canceled = await call(f.baseUrl, `/jobs/${id}/cancel-unsubmitted`, { method: "POST", body: {} });
+  assert.equal(canceled.status, 200);
+  assert.equal(canceled.body.status, "canceled");
+  assert.equal(canceled.body.submission_attempts, 0);
+  assert.equal(canceled.body.error.code, "VM_APPROVAL_CANCELED_LOCALLY");
+  assert.equal((await call(f.baseUrl)).body.jobs[0].status, "canceled");
+  assert.equal((await call(await f.restart())).body.jobs[0].status, "canceled");
+});

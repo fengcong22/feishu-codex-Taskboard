@@ -351,6 +351,30 @@ export function createVmApprovalStore({ file, now = Date.now } = {}) {
     },
     get(id) { return operation(() => decode(row(id))); },
     list() { return operation(() => database.prepare("SELECT * FROM vm_approval_jobs ORDER BY id").all().map(decode)); },
+    cancelUnsubmitted(id) {
+      identifier(id);
+      return transaction(() => {
+        const current = timestamp();
+        const entry = database.prepare("SELECT * FROM vm_approval_jobs WHERE id = ?").get(id);
+        const job = decode(entry);
+        if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND");
+        if (entry.lease_token !== null && entry.lease_expires_at > current) fail("VM_APPROVAL_JOB_BUSY");
+        if (job.status === "canceled" && job.last_error === "VM_APPROVAL_CANCELED_LOCALLY") return job;
+        if (job.status !== "queued" || job.submission_attempts !== 0 || job.application_id
+          || job.instance_code || job.acquisition || job.intended_at || job.baseline_ids) {
+          fail("VM_APPROVAL_CANCEL_NOT_ALLOWED");
+        }
+        job.status = "canceled";
+        job.next_attempt_at = null;
+        job.updated_at = current;
+        job.last_error = "VM_APPROVAL_CANCELED_LOCALLY";
+        const updated = database.prepare(`UPDATE vm_approval_jobs SET job_json = ?
+          WHERE id = ? AND (lease_token IS NULL OR lease_expires_at <= ?)`)
+          .run(encodeJob(job), id, current);
+        if (updated.changes !== 1) fail("VM_APPROVAL_JOB_BUSY");
+        return job;
+      });
+    },
     removeFromQueue(ids) {
       if (!Array.isArray(ids) || ids.length < 1 || ids.length > MAX_QUEUE_CLEANUP_ITEMS
         || ids.some((id) => typeof id !== "string") || new Set(ids).size !== ids.length) fail("VM_APPROVAL_STORE_INPUT_INVALID");

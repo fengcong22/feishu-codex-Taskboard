@@ -14,6 +14,16 @@ const PLUGIN_INPUT_OUTPUT_ROOT = "@taskboard-plugin-input";
 const fail = code => { throw new VmSourceError(code); };
 function object(value) { return value && typeof value === "object" && !Array.isArray(value); }
 function keys(value, allowed) { if (!object(value) || Object.keys(value).some(key => !allowed.includes(key))) fail("VM_DOWNLOAD_INPUT_INVALID"); }
+function workflowNotification(value) {
+  const fields = ["subject", "taskId", "taskTitle", "recordId", "stage", "status", "occurredAt", "reason"];
+  return object(value) && Object.keys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field))
+    && fields.filter(field => field !== "occurredAt").every(field => typeof value[field] === "string"
+      && value[field].trim() && value[field].length <= (field === "reason" ? 800 : 512)
+      && !/[\u0000-\u001f\u007f]/u.test(value[field]))
+    && ["blocked", "needs_attention"].includes(value.status)
+    && typeof value.occurredAt === "string" && Number.isFinite(Date.parse(value.occurredAt))
+    && new Date(Date.parse(value.occurredAt)).toISOString() === value.occurredAt;
+}
 function accountValid(value) {
   return object(value) && typeof value.userId === "string" && /^[A-Za-z0-9_.:-]{1,128}$/u.test(value.userId)
     && typeof value.email === "string" && value.email.length <= 320 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value.email)
@@ -153,7 +163,8 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       }
       let success = false;
       let failureCode = "VM_NOTIFY_SEND_FAILED";
-      try { await notifier.send({ id: item.id, recipient: item.recipient, kind: item.kind, vmid: item.vmid }); success = true; }
+      try { await notifier.send({ id: item.id, recipient: item.recipient, kind: item.kind, vmid: item.vmid,
+        ...(item.payload_json ? { payload: JSON.parse(item.payload_json) } : {}) }); success = true; }
       catch (error) {
         if (typeof error?.code === "string" && /^VM_NOTIFY_[A-Z0-9_]{1,80}$/u.test(error.code)) failureCode = error.code;
       }
@@ -224,9 +235,11 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
     // Check all existing ownership before creating any jobs.
     const existing = store.list();
     const identity = session.client() ? session.identity() : null;
-    for (const value of requests) {
-      const duplicate = existing.find(job => JSON.stringify(job.request) === JSON.stringify(value));
-      if (duplicate?.requester_id && duplicate.requester_id !== identity?.user_id) fail("VM_APPLICANT_CHANGED");
+    if (!taskJobId) {
+      for (const value of requests) {
+        const duplicate = existing.find(job => JSON.stringify(job.request) === JSON.stringify(value));
+        if (duplicate?.requester_id && duplicate.requester_id !== identity?.user_id) fail("VM_APPLICANT_CHANGED");
+      }
     }
     const jobs = requests.map(value => {
       let job = enqueueVmApproval(store, value, { now,
@@ -302,12 +315,26 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       }
       return { sent: true };
     },
+    async notifyWorkflowBlocked(input) {
+      if (closed) fail("VM_DOWNLOAD_CLOSED");
+      keys(input, ["eventKey", "subject", "taskId", "taskTitle", "recordId", "stage", "status", "occurredAt", "reason"]);
+      if (typeof input.eventKey !== "string" || !/^[A-Za-z0-9:_-]{1,512}$/u.test(input.eventKey)) fail("VM_NOTIFY_INPUT_INVALID");
+      const { eventKey, ...payload } = input;
+      if (!workflowNotification(payload)) fail("VM_NOTIFY_INPUT_INVALID");
+      rememberAccount();
+      const recipient = settings.notificationsEnabled && notifier.available() && lastAccount ? lastAccount.email : null;
+      const id = metadata.consumeWorkflowEdge({ key: `workflow-blocked:${eventKey}`, recipient, payload });
+      if (id === null) return { queued: false };
+      await wake();
+      return { queued: true, id };
+    },
     cleanup(jobIds) {
       if (!Array.isArray(jobIds) || jobIds.length < 1 || jobIds.length > MAX_QUEUE_CLEANUP_ITEMS
         || jobIds.some(id => typeof id !== "string") || new Set(jobIds).size !== jobIds.length) fail("VM_DOWNLOAD_INPUT_INVALID");
       return { removedCount: store.removeFromQueue(jobIds).length };
     },
     remove(id) { store.removeFromQueue([id]); return { removed: true }; },
+    cancelUnsubmitted(id) { return publicJob(store.cancelUnsubmitted(id)); },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); persistSettings(settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
     async logout() { await session.disconnect(); lastClient = undefined; return { session: session.snapshot() }; },

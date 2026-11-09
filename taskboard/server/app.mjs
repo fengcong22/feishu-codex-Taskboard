@@ -70,6 +70,8 @@ import { createVmDownloadService } from "./vm-download-service.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-download-notifier.mjs";
 import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
+import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
+import { describeBlockedFeishuTask } from "./blocked-notification.mjs";
 import { createFeishuVmMp4Adapter } from "./vm-mp4-feishu-adapter.mjs";
 import { createFeishuApiContext } from "../../src/feishu-api.mjs";
 
@@ -907,6 +909,20 @@ function parseVmPmoWritebackRetry(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set(["version"]));
   return {version: parseVersion(value.version)};
+}
+
+function parseVmPmoManualRevision(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value,new Set(["version","runConsent","manualRevision"]));
+  const version=parseVersion(value.version);
+  assertPlainObject(value.runConsent);
+  assertAllowedKeys(value.runConsent,new Set(["allowSourceVideo","allowLocalPlanning"]));
+  if (value.runConsent.allowSourceVideo !== true || value.runConsent.allowLocalPlanning !== true)
+    throw new ApiError(400,"INVALID_FIELD","Explicit source and local planning consent is required");
+  let manualRevision;
+  try {manualRevision=validateVmPmoManualRevision(value.manualRevision);}
+  catch {throw new ApiError(400,"VM_PMO_REVISION_INVALID","VM_PMO_REVISION_INVALID");}
+  return {version,runConsent:{allowSourceVideo:true,allowLocalPlanning:true},manualRevision};
 }
 
 function parseWorkflowVersion(value) {
@@ -2354,8 +2370,9 @@ function parseComposerTurn(body) {
 }
 
 class EventHub {
-  constructor() {
+  constructor({ onTaskUpdated = null } = {}) {
     this.clients = new Set();
+    this.onTaskUpdated = onTaskUpdated;
     this.keepAlive = setInterval(() => {
       for (const response of this.clients) response.write(": keep-alive\n\n");
     }, 20_000);
@@ -2375,6 +2392,9 @@ class EventHub {
   }
 
   emit(type, value) {
+    if (type === "task.updated" && typeof this.onTaskUpdated === "function") {
+      try { Promise.resolve(this.onTaskUpdated(value.task)).catch(() => {}); } catch {}
+    }
     const event = {
       type,
       projectId: value.projectId ?? value.project?.id ?? value.task?.projectId,
@@ -3680,7 +3700,18 @@ export function createTaskboardServer(options = {}) {
       return { ...preview, sourceUrlLabel: url };
     },
   });
-  const events = new EventHub();
+  function notifyBlockedTask(task) {
+    if (task?.status !== "blocked") return;
+    try {
+      const origin = database.getFeishuTaskOrigin(task.id);
+      const transition = database.latestTaskStatusChange(task.id);
+      const subject = origin && database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+      const runs = database.listFeishuAutoCutRuns(task.id);
+      const notification = describeBlockedFeishuTask({ task, transition, origin, subject, latestRun: runs.at(-1) });
+      if (notification) void getVmDownloads().notifyWorkflowBlocked(notification).catch(() => {});
+    } catch {}
+  }
+  const events = new EventHub({ onTaskUpdated: notifyBlockedTask });
   async function dispatchFeishuWritebackClaim(claim) {
     let bridgeUrl;
     try {
@@ -6162,7 +6193,7 @@ export function createTaskboardServer(options = {}) {
               if (pathname.endsWith("/login")) return sendJson(response, 200, await downloads.beginLogin());
               return sendJson(response, 200, await downloads.logout());
             }
-            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|remove)$/u.exec(pathname);
+            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|remove|cancel-unsubmitted)$/u.exec(pathname);
             if (action) {
               if (action[2] === "recover") {
                 assertAllowedKeys(input, new Set(["confirmRepeatableResource"]));
@@ -6170,6 +6201,7 @@ export function createTaskboardServer(options = {}) {
               } else assertAllowedKeys(input, new Set());
               const result = action[2] === "remove"
                 ? downloads.remove(action[1])
+                : action[2] === "cancel-unsubmitted" ? downloads.cancelUnsubmitted(action[1])
                 : downloads[action[2]](action[1], input);
               return sendJson(response, 200, result);
             }
@@ -6181,7 +6213,7 @@ export function createTaskboardServer(options = {}) {
           const code = /^VM_[A-Z0-9_]{1,100}$/u.test(error?.code) ? error.code : "VM_DOWNLOAD_FAILED";
           const status = code === "VM_APPROVAL_JOB_NOT_FOUND" ? 404
               : ["VM_AUTH_REQUIRED", "VM_APPLICANT_CHANGED", "VM_APPROVAL_JOB_BUSY", "VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE", "VM_APPROVAL_NOT_RESUMABLE", "VM_APPROVAL_NOT_EXTENDABLE",
-              "VM_DOWNLOAD_RECOVERY_NOT_ALLOWED", "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT", "VM_DOWNLOAD_RECOVERY_PATH_INVALID", "VM_RESOURCE_ALREADY_CLAIMED"].includes(code) ? 409
+              "VM_DOWNLOAD_RECOVERY_NOT_ALLOWED", "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT", "VM_DOWNLOAD_RECOVERY_PATH_INVALID", "VM_RESOURCE_ALREADY_CLAIMED", "VM_APPROVAL_CANCEL_NOT_ALLOWED"].includes(code) ? 409
               : ["VM_DOWNLOAD_INPUT_INVALID", "VM_DOWNLOAD_BATCH_INVALID", "VM_APPROVAL_REQUEST_INVALID", "VM_APPROVAL_STORE_INPUT_INVALID"].includes(code) ? 400 : 503;
           throw new ApiError(status, code, code);
         }
@@ -7519,7 +7551,107 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 202, {run});
       }
 
+      const vmPmoApprovalRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-approval-retry$/);
+      if (vmPmoApprovalRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-approval-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoApprovalRetryRoute[1], "Task id");
+        const body = parseVmPmoWritebackRetry(await readJson(request));
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        let run;
+        try { run = await getVmRuntime().retryApproval(taskId, body); }
+        catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (["VM_PMO_RETRY_NOT_ALLOWED", "VERSION_CONFLICT"].includes(error?.code))
+            throw new ApiError(409, error.code, error.code);
+          if (error?.code === "VM_PMO_RUN_NOT_FOUND")
+            throw new ApiError(404, error.code, error.code);
+          throw error;
+        }
+        return sendJson(response, 202, {run});
+      }
+
       const vmPmoWritebackRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-writeback-retry$/);
+      const vmPmoManualRevisionRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-manual-revision$/);
+      if (vmPmoManualRevisionRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams,"POST /api/local/tasks/:id/vm-pmo-manual-revision");
+        if (request.method !== "POST") return methodNotAllowed(response,["POST"]);
+        const taskId=decodeRouteSegment(vmPmoManualRevisionRoute[1],"Task id");
+        const body=parseVmPmoManualRevision(await readJson(request));
+        const task=database.getTask(taskId);
+        if (!task) throw new ApiError(404,"TASK_NOT_FOUND",`Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409,"VERSION_CONFLICT","The task changed. Refresh and retry.");
+        const snapshot=database.getFeishuTaskPackageSnapshot(taskId);
+        if (task.archivedAt !== null || database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409,"VM_PMO_RETRY_NOT_ALLOWED","Only an active registered VM/PMO task can be revised");
+        let run;
+        try {run=await getVmRuntime().retryManualRevision(taskId,body);}
+        catch(error) {
+          if (error instanceof ApiError) throw error;
+          if (["VM_PMO_RETRY_NOT_ALLOWED","VM_PMO_RETRY_LIMIT","VM_PMO_REVISION_INVALID",
+            "VM_PMO_RETRY_SOURCE_CHANGED","VM_PMO_RETRY_APPROVAL_NOT_READY","VERSION_CONFLICT"].includes(error?.code))
+            throw new ApiError(409,error.code,error.code);
+          if (error?.code === "VM_PMO_RUN_NOT_FOUND") throw new ApiError(404,error.code,error.code);
+          throw error;
+        }
+        return sendJson(response,202,{run});
+      }
+      const vmPmoRenderRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-render-retry$/);
+      if (vmPmoRenderRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-render-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoRenderRetryRoute[1], "Task id");
+        const body = parseVmPmoWritebackRetry(await readJson(request));
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        let run;
+        try {run = await getVmRuntime().retryFailedRender(taskId, body);}
+        catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (typeof error?.code === "string"
+            && /^(?:VM_[A-Z0-9_]+|SOURCE_HASH_MISMATCH|RUN_BINDING_MISMATCH|PLAN_INVALID)$/u.test(error.code))
+            throw new ApiError(409, error.code, error.code);
+          throw error;
+        }
+        return sendJson(response, 202, {run});
+      }
+      const vmPmoPlanValidationRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-plan-validation-retry$/);
+      if (vmPmoPlanValidationRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-plan-validation-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoPlanValidationRetryRoute[1], "Task id");
+        const body = parseVmPmoWritebackRetry(await readJson(request));
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        const run = await getVmRuntime().retryValidatedPlan(taskId, body);
+        return sendJson(response, 202, {run});
+      }
+
       if (vmPmoWritebackRetryRoute) {
         assertAiLoopbackRequest(request);
         assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-writeback-retry");

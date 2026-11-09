@@ -4,6 +4,7 @@ import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { packageWorkflowFromManifest } from "../shared/feishu-package-workflow.mjs";
 import { resolveVmStageFilename } from "./feishu-vm-delivery-plan.mjs";
+import {toVmPmoInputManualRevision} from "./vm-pmo-manual-revision.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
@@ -48,7 +49,8 @@ async function immutableJson(target, value) {
 
 /** All descriptors must come from registered origin, frozen profile, and verified acquisition. */
 export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, profile,
-  packageSnapshot, packageIdentity, acquisition, pythonPath, planAttempt = 1 } = {}) {
+  packageSnapshot, packageIdentity, acquisition, pythonPath, planAttempt = 1,
+  manualRevision } = {}) {
   const contextValue = origin?.stageSnapshot?.vmContext;
   const stageId = origin?.stageId;
   const review = stageId === "review";
@@ -117,6 +119,9 @@ export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, pro
     if (!packageIdentity || packageIdentity.name !== manifest.name || packageIdentity.version !== manifest.version
       || packageIdentity.manifestSha256 !== manifestSha256) fail("VM_PMO_PACKAGE_CHANGED");
   }
+  const revision = manualRevision === undefined ? undefined : toVmPmoInputManualRevision(
+    manualRevision,{sourceSha256:acquisition.sha256,durationMs:acquisition.duration_ms});
+  if (revision && contractVersion !== 2) fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
   const outputFilename = resolveVmStageFilename({config: profile,stageId,
     metadata: {fields: [{fieldId: profile.fields.namingFieldId,type: 1,uiType: "Text"}]},
     fields: {[profile.fields.namingFieldId]: contextValue.title},
@@ -147,6 +152,7 @@ export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, pro
       sha256: acquisition.sha256,bytes: acquisition.bytes,duration_ms: acquisition.duration_ms},
     instructions: [{instruction_id: "instruction-1",source_field_id: instructionFieldId,
       raw_text: contextValue.instruction,timeline_basis: review ? "previous_review_video" : "vm_original",applicability: "current_round"}],
+    ...(revision ? {manual_revision:revision} : {}),
     output_profile: {id: "review_mp4_v1",width: 1920,height: 1080,fps: 25,audio: "preserve"},
     delivery_target: {attachment_field_id: profile.fields.outputAttachmentFieldId},
   };

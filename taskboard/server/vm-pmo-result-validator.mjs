@@ -5,6 +5,7 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { isDeepStrictEqual } from "node:util";
+import {validateVmPmoInputManualRevision} from "./vm-pmo-manual-revision.mjs";
 
 const execFileAsync = promisify(execFile);
 const PROTOCOL = "vm_pmo_review_video";
@@ -140,7 +141,8 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
   if (expectedBound && (!same(input, expectedBound.input)
     || inputSha256 !== expectedBound.context.input_sha256)) fail("RUN_BINDING_MISMATCH");
   const version = input?.schema_version;
-  if (!exactKeys(input, ["protocol", "schema_version", ...IDENTITY, "source", "instructions", "output_profile"])
+  if (!exactKeys(input, ["protocol", "schema_version", ...IDENTITY, "source", "instructions", "output_profile"],
+    version === 2 ? ["manual_revision"] : [])
     || input.protocol !== PROTOCOL || ![1, 2].includes(version) || version !== context.schema_version
     || inputSha256 !== context.input_sha256
     || !object(input.package) || !object(input.binding) || !object(input.record)
@@ -176,6 +178,11 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
     || !Number.isSafeInteger(input.source.duration_ms) || input.source.duration_ms < 1)
     fail("RUN_BINDING_MISMATCH");
   if (version === 2) {
+    if (input.manual_revision !== undefined) {
+      try { validateVmPmoInputManualRevision(input.manual_revision,
+        {sourceSha256:input.source.sha256,durationMs:input.source.duration_ms}); }
+      catch { fail("RUN_BINDING_MISMATCH"); }
+    }
     const stageId = input.binding.stage_id;
     const timeline = stageId === "review" ? "previous_review_video"
       : stageId === "initial" ? "vm_original" : null;
@@ -328,9 +335,12 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
       || !Number.isSafeInteger(operation.source_end_us) || operation.source_end_us <= operation.source_start_us
       || operation.source_end_us > input.source.duration_ms * 1000) fail("PLAN_INVALID");
     if (operation.kind === "start_cue") {
+      const visualSyncKeys = ["visual_anchor_us", "visual_sync_tolerance_us", "visual_sync_delta_us"];
+      const hasVisualSyncEvidence = visualSyncKeys.some((key) => Object.hasOwn(operation, key));
       if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us",
         "requested_start_us", "search_end_us", "search_radius_us", "matched_text", "match_strategy",
-        "alignment_sha256", "provider", "model", "adapter"])
+        "alignment_sha256", "provider", "model", "adapter"], visualSyncKeys)
+        || hasVisualSyncEvidence && !visualSyncKeys.every((key) => Object.hasOwn(operation, key))
         || !Number.isSafeInteger(operation.requested_start_us) || operation.requested_start_us < 0
         || operation.requested_start_us > input.source.duration_ms * 1000
         || !Number.isSafeInteger(operation.search_end_us) || operation.search_end_us < operation.source_end_us
@@ -343,6 +353,14 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
         || operation.alignment_sha256 !== plan.alignment_sha256 || !plan.alignment_sha256
         || ![operation.provider, operation.model, operation.adapter].every((value) => typeof value === "string" && value.trim()))
         fail("PLAN_INVALID");
+      if (hasVisualSyncEvidence && (!Number.isSafeInteger(operation.visual_anchor_us)
+        || operation.visual_anchor_us < 0 || operation.visual_anchor_us > input.source.duration_ms * 1000
+        || operation.visual_anchor_us !== operation.requested_start_us
+        || !Number.isSafeInteger(operation.visual_sync_tolerance_us)
+        || operation.visual_sync_tolerance_us < 0
+        || operation.visual_sync_tolerance_us > input.source.duration_ms * 1000
+        || operation.visual_sync_delta_us !== Math.abs(operation.source_start_us - operation.visual_anchor_us)
+        || operation.visual_sync_delta_us > operation.visual_sync_tolerance_us)) fail("PLAN_INVALID");
     } else if (["word", "mute_word"].includes(operation.kind)) {
       if (!exactKeys(operation, ["operation_id", "kind", "source_start_us", "source_end_us", "target_join_us",
         "matched_text", "match_strategy", "alignment_sha256", "provider", "model", "adapter", "must_keep_evidence"])
@@ -357,8 +375,8 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
         "target_start_us", "frame_time_us", "alignment_sha256"])
         || operation.alignment_sha256 !== null
         || !Number.isSafeInteger(operation.target_start_us) || operation.target_start_us < 0
-        || !Number.isSafeInteger(operation.frame_time_us) || operation.frame_time_us < operation.source_start_us
-        || operation.frame_time_us >= operation.source_end_us) fail("PLAN_INVALID");
+        || !Number.isSafeInteger(operation.frame_time_us) || operation.frame_time_us < 0
+        || operation.frame_time_us >= input.source.duration_ms * 1000) fail("PLAN_INVALID");
     } else fail("PLAN_INVALID");
   }
 }

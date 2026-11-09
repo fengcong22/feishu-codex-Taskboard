@@ -112,6 +112,114 @@ test("VM plan retry is loopback-local and requires the task version plus explici
   assert.equal(calls.length,1);
 });
 
+test("VM approval retry reports a controlled conflict when a submitted request is replayed",async t=>{
+  let submitted=false;
+  const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
+    retryApproval:async(taskId)=>{
+      if (submitted) throw Object.assign(new Error("private detail"),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
+      submitted=true;return {runId:"run_vm",taskId,state:"waiting_materials"};
+    }};
+  const {app,request}=await fixture(t,runtime);
+  app.database.createProject({id:"project-approval-retry",name:"VM approval retry",workspacePath:process.cwd()});
+  const task=app.database.createTask({title:"VM approval retry",projectId:"project-approval-retry",status:"todo",
+    labels:["feishu"],priority:"high",description:"",
+    actor:{type:"user",id:"test",name:"Test",avatarUrl:null},
+    assignee:{type:"user",id:"test",name:"Test",avatarUrl:null},developmentContext:null,
+    startDate:null,dueDate:null,recurrence:null,
+    feishuOrigin:{version:1,source:"feishu-base",eventId:"evt_vm",baseToken:"bas_vm",tableId:"tbl_vm",
+      recordId:"rec_vm",subjectKey:"bas_vm:tbl_vm",configVersion:1,stageId:"initial",executionMode:"manual"},
+    packageSnapshot:{packageAlias:"slicing",packageRevision:1,
+      workflowTemplate:{id:"vm_pmo_review_video",version:1}}});
+  const route=`/api/local/tasks/${task.id}/vm-pmo-approval-retry`;
+  assert.equal((await request(route,{version:task.version})).status,202);
+  const replay=await request(route,{version:task.version});
+  assert.equal(replay.status,409);
+  assert.equal(replay.body.error.code,"VM_PMO_RETRY_NOT_ALLOWED");
+  assert.equal(replay.body.error.message,"VM_PMO_RETRY_NOT_ALLOWED");
+});
+
+test("VM manual revision requires a current trusted task, explicit local consent, and loopback",async t=>{
+  const calls=[];
+  const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
+    retryManualRevision:async(taskId,body)=>{calls.push({taskId,body});return {runId:"run_vm",taskId,state:"ready"};}};
+  const {app,request}=await fixture(t,runtime);
+  app.database.createProject({id:"project-manual-revision",name:"VM manual revision",workspacePath:process.cwd()});
+  const task=app.database.createTask({title:"VM manual revision",projectId:"project-manual-revision",status:"todo",
+    labels:["feishu"],priority:"high",description:"",
+    actor:{type:"user",id:"test",name:"Test",avatarUrl:null},
+    assignee:{type:"user",id:"test",name:"Test",avatarUrl:null},developmentContext:null,
+    startDate:null,dueDate:null,recurrence:null,
+    feishuOrigin:{version:1,source:"feishu-base",eventId:"evt_vm",baseToken:"bas_vm",tableId:"tbl_vm",
+      recordId:"rec_vm",subjectKey:"bas_vm:tbl_vm",configVersion:1,stageId:"initial",executionMode:"manual"},
+    packageSnapshot:{packageAlias:"slicing",packageRevision:1,
+      workflowTemplate:{id:"vm_pmo_review_video",version:1}}});
+  const route=`/api/local/tasks/${task.id}/vm-pmo-manual-revision`;
+  const body={version:task.version,runConsent:{allowSourceVideo:true,allowLocalPlanning:true},
+    manualRevision:{sourceSha256:"a".repeat(64),note:"Hold the last frame.",
+      clips:[{startMs:0,endMs:1000,freeze:{startMs:500,endMs:750,frameMs:480}}]}};
+  assert.equal((await request(route,{...body,version:task.version+1})).status,409);
+  assert.equal((await request(route,{...body,runConsent:null})).status,400);
+  assert.equal((await request(route,body,{origin:"https://example.com"})).status,403);
+  assert.equal(calls.length,0);
+  assert.equal((await request(route,body)).status,202);
+  assert.deepEqual(calls,[{taskId:task.id,body}]);
+});
+
+test("VM saved-plan validation retry is loopback-local and version guarded",async t=>{
+  const calls=[];
+  const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
+    retryValidatedPlan:async(taskId,body)=>{calls.push({taskId,body});return {runId:"run_vm",taskId,state:"planned"};}};
+  const {app,request}=await fixture(t,runtime);
+  app.database.createProject({id:"project-validation",name:"VM validation retry",workspacePath:process.cwd()});
+  const task=app.database.createTask({title:"VM validation retry",projectId:"project-validation",status:"todo",
+    labels:["feishu"],priority:"high",description:"",
+    actor:{type:"user",id:"test",name:"Test",avatarUrl:null},
+    assignee:{type:"user",id:"test",name:"Test",avatarUrl:null},developmentContext:null,
+    startDate:null,dueDate:null,recurrence:null,
+    feishuOrigin:{version:1,source:"feishu-base",eventId:"evt_vm",baseToken:"bas_vm",tableId:"tbl_vm",
+      recordId:"rec_vm",subjectKey:"bas_vm:tbl_vm",configVersion:1,stageId:"initial",executionMode:"manual"},
+    packageSnapshot:{packageAlias:"slicing",packageRevision:1,
+      workflowTemplate:{id:"vm_pmo_review_video",version:1}}});
+  const route=`/api/local/tasks/${task.id}/vm-pmo-plan-validation-retry`;
+  assert.equal((await request(`${route}?ignored=1`,{version:task.version})).status,400);
+  assert.equal((await request(route,{version:task.version+1})).status,409);
+  assert.equal((await request(route,{version:task.version},{origin:"https://example.com"})).status,403);
+  assert.equal(calls.length,0);
+  const result=await request(route,{version:task.version});
+  assert.equal(result.status,202);
+  assert.deepEqual(calls,[{taskId:task.id,body:{version:task.version}}]);
+});
+
+test("VM failed-render retry requires a current task version on loopback",async t=>{
+  const calls=[];
+  const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
+    retryFailedRender:async(taskId,body)=>{calls.push({taskId,body});return {runId:"run_vm",taskId,state:"planned"};}};
+  const {app,request}=await fixture(t,runtime);
+  app.database.createProject({id:"project-render-retry",name:"VM render retry",workspacePath:process.cwd()});
+  const task=app.database.createTask({title:"VM render retry",projectId:"project-render-retry",status:"in_progress",
+    labels:["feishu"],priority:"high",description:"",
+    actor:{type:"user",id:"test",name:"Test",avatarUrl:null},
+    assignee:{type:"user",id:"test",name:"Test",avatarUrl:null},developmentContext:null,
+    startDate:null,dueDate:null,recurrence:null,
+    feishuOrigin:{version:1,source:"feishu-base",eventId:"evt_vm",baseToken:"bas_vm",tableId:"tbl_vm",
+      recordId:"rec_vm",subjectKey:"bas_vm:tbl_vm",configVersion:1,stageId:"initial",executionMode:"manual"},
+    packageSnapshot:{packageAlias:"slicing",packageRevision:1,
+      workflowTemplate:{id:"vm_pmo_review_video",version:1}}});
+  const route=`/api/local/tasks/${task.id}/vm-pmo-render-retry`;
+  assert.equal((await request(`${route}?ignored=1`,{version:task.version})).status,400);
+  assert.equal((await request(route,{version:task.version+1})).status,409);
+  assert.equal((await request(route,{version:task.version},{origin:"https://example.com"})).status,403);
+  assert.equal(calls.length,0);
+  assert.equal((await request(route,{version:task.version})).status,202);
+  assert.deepEqual(calls,[{taskId:task.id,body:{version:task.version}}]);
+  runtime.retryFailedRender=async()=>{const error=new Error("private detail");
+    error.code="VM_PMO_RETRY_SOURCE_CHANGED";throw error;};
+  const rejected=await request(route,{version:task.version});
+  assert.equal(rejected.status,409);
+  assert.equal(rejected.body.error.code,"VM_PMO_RETRY_SOURCE_CHANGED");
+  assert.equal(rejected.body.error.message,"VM_PMO_RETRY_SOURCE_CHANGED");
+});
+
 test("VM writeback retry requires a current VM task version and delegates only eligible runs",async t=>{
   const calls=[];
   const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},

@@ -160,6 +160,53 @@ test("validates a v2 initial plan with source-bound semantic operations", async 
   assert.equal(validated.plan.operations[0].kind, "mute_word");
 });
 
+test("accepts visual and speech synchronized start cues and rejects forged sync evidence", async (t) => {
+  const current = await fixture(t);
+  const identity = { ...current.identity, schema_version: 2 };
+  const instruction = { ...current.input.instructions[0], raw_text: "画面与‘咱们来总结’语音双重定位" };
+  const input = { ...identity, source: current.source, instructions: [instruction],
+    output_profile: current.input.output_profile };
+  await replaceInput(current, input);
+  current.context.schema_version = 2;
+  await writeFile(current.contextPath, JSON.stringify(current.context));
+
+  const alignmentSha256 = "c".repeat(64);
+  const cue = { operation_id: "part1/start_cue", kind: "start_cue", source_start_us: 322_650,
+    source_end_us: 323_410, requested_start_us: 323_000, search_end_us: 348_000,
+    search_radius_us: 500_000, matched_text: "咱们来总结", match_strategy: "unique_exact_whole_token",
+    alignment_sha256: alignmentSha256, provider: "fixture", model: "fixture", adapter: "fixture",
+    visual_anchor_us: 323_000, visual_sync_tolerance_us: 500_000, visual_sync_delta_us: 350 };
+  const plan = { ...identity, source: current.source, input_sha256: current.context.input_sha256,
+    source_sha256: current.source.sha256,
+    instruction_results: [{ instruction_id: instruction.instruction_id,
+      source_field_id: instruction.source_field_id, raw_text: instruction.raw_text,
+      status: "resolved", segments: ["s1"] }],
+    segments: [{ segment_id: "s1", source_id: current.source.source_id,
+      source_start_us: 0, duration_us: 1_000_000, target_start_us: 0 }],
+    operations: [cue], expected_duration_ms: 1_000, engine_plan_sha256: "b".repeat(64),
+    alignment_sha256: alignmentSha256 };
+  const writePlanAndReceipt = async (candidate) => {
+    const bytes = Buffer.from(JSON.stringify(candidate));
+    await writeFile(current.paths.plan, bytes);
+    await writeFile(current.paths["plan-result"], JSON.stringify({ ...current.planResult, ...identity,
+      status: "ready", input_sha256: current.context.input_sha256, source_sha256: current.source.sha256,
+      plan_sha256: hash(bytes), instruction_results: candidate.instruction_results, error: null }));
+  };
+
+  await writePlanAndReceipt(plan);
+  assert.equal((await validateVmPmoPlan({ contextPath: current.contextPath })).status, "ready");
+
+  for (const changes of [{ visual_sync_delta_us: 600 }, { visual_sync_delta_us: 349 },
+    { visual_anchor_us: 322_000 }, { visual_sync_tolerance_us: -1 }]) {
+    await writePlanAndReceipt({ ...plan, operations: [{ ...cue, ...changes }] });
+    await assert.rejects(validateVmPmoPlan({ contextPath: current.contextPath }), { code: "PLAN_INVALID" });
+  }
+  const incompleteCue = { ...cue };
+  delete incompleteCue.visual_sync_delta_us;
+  await writePlanAndReceipt({ ...plan, operations: [incompleteCue] });
+  await assert.rejects(validateVmPmoPlan({ contextPath: current.contextPath }), { code: "PLAN_INVALID" });
+});
+
 test("validates frozen review text identity without parsing requested edit operations", async (t) => {
   const current = await fixture(t);
   const parent = { kind: "managed_run", run_id: "parent-run", artifact_id: "parent-artifact",
@@ -228,6 +275,37 @@ test("rejects a stale parent and malformed ordered segments", async (t) => {
   await replacePlan({ ...current.plan, segments: [{ ...current.plan.segments[0], end_ms: 2000 }] });
   await assert.rejects(validateVmPmoPlan({ contextPath: current.contextPath }),
     { code: "PLAN_INVALID" });
+});
+
+test("accepts a freeze frame sampled from the preceding clip", async (t) => {
+  const current = await fixture(t);
+  const input = { ...current.input, schema_version: 2 };
+  await replaceInput(current, input);
+  current.context.schema_version = 2;
+  await writeFile(current.contextPath, JSON.stringify(current.context));
+  const plan = { ...current.plan, schema_version: 2, input_sha256: current.context.input_sha256,
+    segments: [{ segment_id: "clip-1", source_id: current.source.source_id,
+      source_start_us: 0, duration_us: 200_000, target_start_us: 0 },
+    { segment_id: "clip-2", source_id: current.source.source_id,
+      source_start_us: 400_000, duration_us: 600_000, target_start_us: 200_000 }],
+    instruction_results: [{ ...current.plan.instruction_results[0], segments: ["clip-1", "clip-2"] }],
+    operations: [{ operation_id: "freeze-1", kind: "freeze_frame",
+      source_start_us: 400_000, source_end_us: 600_000,
+      target_start_us: 200_000, frame_time_us: 160_000, alignment_sha256: null }],
+    expected_duration_ms: 800, alignment_sha256: null };
+  const bytes = Buffer.from(JSON.stringify(plan));
+  await writeFile(current.paths.plan, bytes);
+  await writeFile(current.paths["plan-result"], JSON.stringify({ ...current.planResult,
+    schema_version: 2, input_sha256: current.context.input_sha256,
+    plan_sha256: hash(bytes), instruction_results: plan.instruction_results }));
+  assert.equal((await validateVmPmoPlan({ contextPath: current.contextPath })).status, "ready");
+  const outside = Buffer.from(JSON.stringify({ ...plan, operations: [{ ...plan.operations[0],
+    frame_time_us: 1_000_000 }] }));
+  await writeFile(current.paths.plan, outside);
+  await writeFile(current.paths["plan-result"], JSON.stringify({ ...current.planResult,
+    schema_version: 2, input_sha256: current.context.input_sha256,
+    plan_sha256: hash(outside), instruction_results: plan.instruction_results }));
+  await assert.rejects(validateVmPmoPlan({ contextPath: current.contextPath }), { code: "PLAN_INVALID" });
 });
 
 test("rejects changed source", async (t) => {

@@ -5916,13 +5916,13 @@ export class TaskboardDatabase {
   latestTaskStatusChange(taskId, afterRowid = 0) {
     const task = this.#requireTask(taskId);
     const activities = this.database.prepare(`
-      SELECT changes, created_at FROM task_activities
+      SELECT rowid AS activity_id, changes, created_at FROM task_activities
       WHERE task_id = ? AND rowid > ?
       ORDER BY rowid DESC
     `).all(task.id, afterRowid ?? 0);
     for (const activity of activities) {
       const change = JSON.parse(activity.changes).find((entry) => entry?.field === "status");
-      if (change) return { createdAt: activity.created_at, ...change };
+      if (change) return { activityId: activity.activity_id, createdAt: activity.created_at, ...change };
     }
     return null;
   }
