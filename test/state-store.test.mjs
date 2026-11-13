@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readdir, readFile, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1743,4 +1743,22 @@ test("normalizes legacy v2 snapshots before a due record is persisted again", as
   const claimed = await store.claimNextDue({ ownerId: "one", now: 100, leaseMs: 10 });
   assert.equal(claimed.event.command, undefined);
   assert.equal((await store.get("evt_extra")).event.command, undefined);
+});
+
+test("removes only stale orphaned state temporary files", async () => {
+  const filename = await stateFilename();
+  const directory = path.dirname(filename);
+  const store = new JsonStateStore(filename);
+  await store.claimEvent(event("evt_temp_cleanup"), { ownerId: "one", now: 100, leaseMs: 1_000 });
+  const stale = `${path.basename(filename)}.11111111-2222-4333-8444-555555555555.tmp`;
+  const fresh = `${path.basename(filename)}.66666666-7777-4888-9999-aaaaaaaaaaaa.tmp`;
+  const unrelated = `${path.basename(filename)}.backup.tmp`;
+  for (const name of [stale, fresh, unrelated]) await writeFile(path.join(directory, name), "{}");
+  const old = new Date(Date.now() - 60 * 60_000);
+  await utimes(path.join(directory, stale), old, old);
+  await utimes(path.join(directory, unrelated), old, old);
+
+  assert.equal(await store.removeStaleTemporaryFiles(), 1);
+  assert.deepEqual((await readdir(directory)).sort(), [path.basename(filename), fresh, unrelated].sort());
+  assert.equal((await store.get("evt_temp_cleanup")).deliveryState, "processing");
 });

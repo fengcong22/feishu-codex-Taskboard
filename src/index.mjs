@@ -75,6 +75,12 @@ const workflowRuntime = createWorkflowRuntime({
   metadataReader,
 });
 const store = new JsonStateStore(config.stateFile);
+try {
+  const removed = await store.removeStaleTemporaryFiles();
+  if (removed > 0) console.log(`Removed ${removed} stale state temporary file(s)`);
+} catch {
+  console.error("State temporary file cleanup skipped: STATE_TEMP_CLEANUP_FAILED");
+}
 const taskboard = new TaskboardClient(config.taskboardUrl, {
   bridgeSecret: process.env.CODEX_FEISHU_BRIDGE_SECRET,
 });

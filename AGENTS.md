@@ -27,7 +27,7 @@ Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LA
 
 ## 标准命令
 
-在仓库根目录 `D:\codex\codex-feishu` 执行：
+在仓库根目录执行：
 
 ```powershell
 npm install
