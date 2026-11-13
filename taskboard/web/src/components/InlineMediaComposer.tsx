@@ -29,7 +29,7 @@ import {
   EditorState,
   NodeSelection,
   TextSelection,
-  type Plugin,
+  Plugin,
   type Selection,
 } from "prosemirror-state";
 import { liftListItem, sinkListItem } from "prosemirror-schema-list";
@@ -1573,7 +1573,24 @@ function composerPlugins(): Plugin[] {
     })),
   ];
   const [, ...setupPlugins] = exampleSetup({ schema: composerSchema, menuBar: false });
-  return [inputRules({ rules }), ...setupPlugins];
+  return [inputRules({ rules }), ...setupPlugins.map(ignoreComposingKeyDown)];
+}
+
+// IME keydowns (isComposing / keyCode 229) belong to the input method. The editor already hands
+// them to the parent handler; the setup keymaps must not also act on them (e.g. Enter -> splitBlock).
+function ignoreComposingKeyDown(plugin: Plugin): Plugin {
+  const handleKeyDown = plugin.spec.props?.handleKeyDown;
+  if (!handleKeyDown) return plugin;
+  return new Plugin({
+    ...plugin.spec,
+    props: {
+      ...plugin.spec.props,
+      handleKeyDown(view, event) {
+        if (event.isComposing || event.keyCode === 229) return false;
+        return handleKeyDown.call(this, view, event);
+      },
+    },
+  });
 }
 
 function handleIndentKey(view: EditorView, event: globalThis.KeyboardEvent): boolean {
@@ -2248,13 +2265,19 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
           : null;
         if (insertedText === null) return;
         const insertion = createInlineMediaSegments(insertedText, referenceTasksRef.current);
-        populateAtomSegments(atomSegments.current, insertion);
-        const insertionDocument = editorDocumentFromSegments(insertion);
-        const transaction = view.state.tr
-          .setSelection(TextSelection.create(view.state.doc, freshQuery.from, freshQuery.to))
-          .replaceSelection(Slice.maxOpen(insertionDocument.content))
-          .scrollIntoView();
-        view.dispatch(transaction);
+        let transaction;
+        if (insertion.every((segment) => segment.type === "text")) {
+          // Plain insertText must land verbatim: the document round trip trims trailing
+          // whitespace, which would drop the separator that ends the completion query.
+          transaction = view.state.tr.insertText(insertedText, freshQuery.from, freshQuery.to);
+        } else {
+          populateAtomSegments(atomSegments.current, insertion);
+          const insertionDocument = editorDocumentFromSegments(insertion);
+          transaction = view.state.tr
+            .setSelection(TextSelection.create(view.state.doc, freshQuery.from, freshQuery.to))
+            .replaceSelection(Slice.maxOpen(insertionDocument.content));
+        }
+        view.dispatch(transaction.scrollIntoView());
         closeCompletion();
         view.focus();
         return;
@@ -2603,7 +2626,12 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         {atomPortals}
         {mermaidPortals}
         {completionQuery
-          && (completionLoading || completionError !== null || completionSelections.length > 0)
+          && (
+            completionLoading
+            || completionError !== null
+            || completionResponse !== null
+            || completionSelections.length > 0
+          )
           && (
           <ComposerCompletionMenu
             anchor={completionQuery.anchor}

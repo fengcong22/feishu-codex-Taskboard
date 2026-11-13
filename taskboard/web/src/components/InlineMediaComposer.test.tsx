@@ -53,24 +53,33 @@ function TestComposer({
   );
 }
 
-function placeCaretAtEnd(editor: HTMLElement) {
-  const text = editor.querySelector(".inline-media-text")?.firstChild;
-  if (!(text instanceof Text)) throw new Error("Expected an inline text node");
+// The composer is a ProseMirror view: completion state follows the editor selection, which
+// ProseMirror reads from the DOM on `selectionchange` while the editor has focus. jsdom does not
+// emit that event for programmatic range changes, so the helpers dispatch it explicitly.
+function applyCaret(editor: HTMLElement, node: Node, offset: number) {
+  editor.focus();
   const range = document.createRange();
-  range.setStart(text, text.length);
+  range.setStart(node, offset);
   range.collapse(true);
   const selection = window.getSelection()!;
   selection.removeAllRanges();
   selection.addRange(range);
+  fireEvent(document, new Event("selectionchange"));
+}
+
+function placeCaretAtEnd(editor: HTMLElement) {
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+  let text: Text | null = null;
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (!node.parentElement?.closest("[contenteditable='false']")) text = node;
+  }
+  if (!text) throw new Error("Expected an editable text node");
+  applyCaret(editor, text, text.length);
 }
 
 function placeCaretAtRootEnd(editor: HTMLElement) {
-  const range = document.createRange();
-  range.setStart(editor, editor.childNodes.length);
-  range.collapse(true);
-  const selection = window.getSelection()!;
-  selection.removeAllRanges();
-  selection.addRange(range);
+  applyCaret(editor, editor, editor.childNodes.length);
 }
 
 function response(candidates: ComposerCandidatesResponse["candidates"]): ComposerCandidatesResponse {
@@ -87,6 +96,11 @@ describe("InlineMediaComposer completion references", () => {
     Object.defineProperty(Range.prototype, "getBoundingClientRect", {
       configurable: true,
       value: () => new DOMRect(20, 20, 1, 18),
+    });
+    // ProseMirror's coordsAtPos measures caret ranges with getClientRects, which jsdom lacks.
+    Object.defineProperty(Range.prototype, "getClientRects", {
+      configurable: true,
+      value: () => [new DOMRect(20, 20, 1, 18)],
     });
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
@@ -202,7 +216,7 @@ describe("InlineMediaComposer completion references", () => {
     fireEvent.keyDown(editor, { key: "Tab" });
 
     await waitFor(() => expect(screen.getByTestId("serialized").textContent).toBe(
-      "![proof](api/attachments/attachment-1/content) E2 "
+      "![proof](api/attachments/attachment-1/content)\nE2 "
       + "[@任务总管](taskboard://composer-reference/v1/agent/bWFzdGVy) ",
     ));
   });
@@ -235,7 +249,7 @@ describe("InlineMediaComposer completion references", () => {
     fireEvent.keyDown(editor, { key: "Enter" });
 
     await waitFor(() => expect(screen.getByTestId("serialized").textContent).toBe(
-      "![proof](api/attachments/attachment-1/content) /review ",
+      "![proof](api/attachments/attachment-1/content)\n/review ",
     ));
   });
 

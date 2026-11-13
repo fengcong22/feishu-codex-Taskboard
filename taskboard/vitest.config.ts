@@ -6,12 +6,6 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     include: ["web/src/**/*.test.{ts,tsx}"],
-    exclude: [
-      "**/node_modules/**",
-      // Known failing since the upstream Taskboard import (d7d3592) and never part of the
-      // previous hand-maintained list: 7/8 completion-menu cases fail. Remove this entry
-      // once the test or InlineMediaComposer is fixed.
-      "web/src/components/InlineMediaComposer.test.tsx",
-    ],
+    exclude: ["**/node_modules/**"],
   },
 });
