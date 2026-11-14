@@ -631,6 +631,12 @@ export interface VmPmoRunSummary {
   retryLimit: number;
   retryHistory: Array<{ planAttempt: number; errorCode: string; failedAt: string }>;
   canRetryPlan: boolean;
+  canRetryValidatedPlan?: boolean;
+  canRetryFailedRender?: boolean;
+  canRetryManualRevision?: boolean;
+  canRetryApproval?: boolean;
+  sourceSha256?: string | null;
+  sourceDurationMs?: number | null;
   canRetryWriteback?: boolean;
   writeback?: {
     processing: { state: string; errorCode: string | null; attemptCount: number } | null;

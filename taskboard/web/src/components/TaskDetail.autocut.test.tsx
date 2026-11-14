@@ -101,6 +101,11 @@ describe("TaskDetail Auto-Cut execution", () => {
         }
         return json({ run: vmRun });
       }
+      if (/^\/api\/local\/tasks\/[^/]+\/vm-pmo-(plan-validation-retry|render-retry|approval-retry|manual-revision)$/.test(pathname)) {
+        vmRun = { ...vmRun!, state: "ready", errorCode: null, canRetryValidatedPlan: false,
+          canRetryFailedRender: false, canRetryApproval: false, canRetryManualRevision: false };
+        return json({ run: vmRun }, 202);
+      }
       if (/^\/api\/local\/tasks\/[^/]+\/vm-pmo-writeback-retry$/.test(pathname)) {
         vmRun = { ...vmRun!, canRetryWriteback: false,
           writeback: { processing: { state: "pending", errorCode: null, attemptCount: 0 },
@@ -244,5 +249,98 @@ describe("TaskDetail Auto-Cut execution", () => {
       String(url).endsWith("/vm-pmo-writeback-retry") && init?.method === "POST")!;
     expect(JSON.parse(request.body)).toEqual({ version: task.version });
     await waitFor(() => expect(screen.queryByRole("button", { name: "重试进度回写" })).toBeNull());
+  });
+
+  it("shows the saved-plan revalidation button only when the server allows it", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "needs_attention", errorCode: "PLAN_INVALID",
+      approvalStatus: "ready", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,
+      canRetryValidatedPlan: true, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    const button = await screen.findByRole("button", { name: "重新校验已保存的规划" });
+    expect(screen.queryByRole("button", { name: "重试语音识别与规划" })).toBeNull();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("vm-pmo-plan-validation-retry"))).toBe(false);
+
+    fireEvent.click(button);
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-plan-validation-retry") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/vm-pmo-plan-validation-retry"))!;
+    expect(JSON.parse(request.body)).toEqual({ version: TASK.version });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重新校验已保存的规划" })).toBeNull());
+  });
+
+  it("resumes a failed render only from its own button and only once per click", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "needs_attention",
+      errorCode: "VM_PMO_START_EVIDENCE_FAILED", approvalStatus: "ready", planAttempt: 1, retryLimit: 3,
+      retryHistory: [], canRetryPlan: false, canRetryFailedRender: true, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("vm-pmo-render-retry"))).toBe(false);
+
+    fireEvent.click(await screen.findByRole("button", { name: "用原规划重新渲染" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-render-retry") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/vm-pmo-render-retry"))!;
+    expect(JSON.parse(request.body)).toEqual({ version: TASK.version });
+  });
+
+  it("requeues approval only when the server says the applicant change can be retried", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "blocked", errorCode: "VM_APPLICANT_CHANGED",
+      approvalStatus: "reserved", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,
+      canRetryApproval: true, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    expect(screen.queryByRole("button", { name: "提交人工修改方案" })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "重新排队审批" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-approval-retry") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/vm-pmo-approval-retry"))!;
+    expect(JSON.parse(request.body)).toEqual({ version: TASK.version });
+  });
+
+  it("submits a manual revision bound to the source video only after both consents", async () => {
+    const sourceSha256 = "a".repeat(64);
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "blocked", errorCode: "UNSUPPORTED_INSTRUCTION",
+      approvalStatus: "ready", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,
+      canRetryManualRevision: true, sourceSha256, sourceDurationMs: 10_000, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    fireEvent.click(await screen.findByRole("button", { name: "提交人工修改方案" }));
+
+    const submit = screen.getByRole("button", { name: "确认提交" });
+    expect((submit as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("修改说明"), { target: { value: "删掉开头的口误" } });
+    fireEvent.change(screen.getByLabelText("保留开始（毫秒）"), { target: { value: "1500" } });
+    fireEvent.change(screen.getByLabelText("保留结束（毫秒）"), { target: { value: "9000" } });
+    fireEvent.click(submit);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("vm-pmo-manual-revision"))).toBe(false);
+
+    fireEvent.click(screen.getByLabelText("允许本次使用原视频"));
+    fireEvent.click(screen.getByLabelText("允许本次写入新的本机规划文件"));
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-manual-revision") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/vm-pmo-manual-revision"))!;
+    expect(JSON.parse(request.body)).toEqual({ version: TASK.version,
+      runConsent: { allowSourceVideo: true, allowLocalPlanning: true },
+      manualRevision: { sourceSha256, note: "删掉开头的口误", clips: [{ startMs: 1500, endMs: 9000 }] } });
+  });
+
+  it("keeps an out-of-range manual revision local and never sends it", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "blocked", errorCode: "UNSUPPORTED_INSTRUCTION",
+      approvalStatus: "ready", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,
+      canRetryManualRevision: true, sourceSha256: "b".repeat(64), sourceDurationMs: 5_000, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    fireEvent.click(await screen.findByRole("button", { name: "提交人工修改方案" }));
+    fireEvent.change(screen.getByLabelText("修改说明"), { target: { value: "保留后半段" } });
+    fireEvent.change(screen.getByLabelText("保留开始（毫秒）"), { target: { value: "1000" } });
+    fireEvent.change(screen.getByLabelText("保留结束（毫秒）"), { target: { value: "8000" } });
+    fireEvent.click(screen.getByLabelText("允许本次使用原视频"));
+    fireEvent.click(screen.getByLabelText("允许本次写入新的本机规划文件"));
+    fireEvent.click(screen.getByRole("button", { name: "确认提交" }));
+
+    expect(await screen.findByText("请填写修改说明，并给出落在原视频时长内的整数毫秒区间。")).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("vm-pmo-manual-revision"))).toBe(false);
   });
 });

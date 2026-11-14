@@ -1521,6 +1521,62 @@ export async function retryTaskVmPmoWriteback(
   return data.run;
 }
 
+// 重新校验已保存的规划，不重新规划、不重新识别。
+export async function retryTaskVmPmoPlanValidation(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-plan-validation-retry`,
+    { method: "POST", body: JSON.stringify({ version }) },
+  );
+  return data.run;
+}
+
+// 渲染启动失败后，用原规划重新渲染一次。是否真正开始受本机自动剪辑开关约束，由服务端判定。
+export async function retryTaskVmPmoRender(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-render-retry`,
+    { method: "POST", body: JSON.stringify({ version }) },
+  );
+  return data.run;
+}
+
+// 申请人变更后重新排队审批，不领取旧申请的素材。
+export async function retryTaskVmPmoApproval(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-approval-retry`,
+    { method: "POST", body: JSON.stringify({ version }) },
+  );
+  return data.run;
+}
+
+export interface VmPmoManualRevisionInput {
+  sourceSha256: string;
+  note: string;
+  clips: Array<{ startMs: number; endMs: number }>;
+}
+
+// 人工修改方案：方案绑定原视频校验值，对不上由服务端拒绝。
+export async function retryTaskVmPmoManualRevision(
+  taskId: string,
+  version: number,
+  manualRevision: VmPmoManualRevisionInput,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-manual-revision`,
+    { method: "POST", body: JSON.stringify({ version,
+      runConsent: { allowSourceVideo: true, allowLocalPlanning: true }, manualRevision }) },
+  );
+  return data.run;
+}
+
 export async function rerunTaskAutoCutCurrent(
   taskId: string,
   version: number,
