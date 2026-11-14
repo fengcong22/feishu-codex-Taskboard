@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   rename,
   unlink,
@@ -946,6 +947,31 @@ export class JsonStateStore {
     if (typeof operation !== "function") throw new Error("event lock operation must be a function");
     await mkdir(path.dirname(this.#filename), { recursive: true });
     return withEventIpcLock(this.#filename, eventId, operation);
+  }
+
+  // Removes `<state>.<uuid>.tmp` files orphaned by a process killed mid-write or a failed
+  // Windows unlink. Runs under the inter-process state lock, so no write can be in flight;
+  // the age threshold is an extra guard. Never touches the state file or lock files.
+  async removeStaleTemporaryFiles({ now = Date.now(), olderThanMs = 10 * 60_000 } = {}) {
+    return this.#withFileLock(async () => {
+      const directory = path.dirname(this.#filename);
+      const prefix = `${path.basename(this.#filename)}.`;
+      const pattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/u;
+      let removed = 0;
+      for (const name of await readdir(directory)) {
+        if (!name.startsWith(prefix) || !pattern.test(name.slice(prefix.length))) continue;
+        const candidate = path.join(directory, name);
+        try {
+          const info = await lstat(candidate);
+          if (!info.isFile() || info.nlink !== 1 || now - info.mtimeMs < olderThanMs) continue;
+          await unlink(candidate);
+          removed += 1;
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+      return removed;
+    });
   }
 
   async #writeState(state) {
