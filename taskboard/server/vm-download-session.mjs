@@ -51,25 +51,56 @@ async function stopReceiver(receiver) {
   try { await receiver?.close?.(); } catch { /* Receiver cleanup never changes authorization state. */ }
 }
 
-/** Shared credentials live only in the client closure and never in public session snapshots. */
+/**
+ * Shared credentials live only in the client closure and never in public session snapshots.
+ * An optional credential store keeps one DPAPI-encrypted session for the current Windows user,
+ * so a restart resumes the same account without another login.
+ */
 export function createVmDownloadSession({
   now = Date.now, startLogin = startVmLogin, createClient = createVmApprovalClient,
-  checkIntervalMs = 60_000, onChange,
+  checkIntervalMs = 60_000, onChange, credentialStore = null, openLoginPage = null,
 } = {}) {
   if (typeof now !== "function" || typeof startLogin !== "function" || typeof createClient !== "function"
     || !Number.isSafeInteger(checkIntervalMs) || checkIntervalMs <= 0 || checkIntervalMs > 2_147_483_647
-    || (onChange !== undefined && typeof onChange !== "function")) fail("VM_AUTH_INPUT_INVALID");
+    || (onChange !== undefined && typeof onChange !== "function")
+    || (credentialStore !== null && ["available", "load", "save", "clear"].some((key) => typeof credentialStore?.[key] !== "function"))
+    || (openLoginPage !== null && typeof openLoginPage !== "function")) fail("VM_AUTH_INPUT_INVALID");
   let status = "disconnected", errorCode = null, lastCheckedAt = null, lastAuthorizedAt = null, pendingAuthorizationAt = null;
   let verifiedIdentity = null, currentClient = null, allowsAccountChange = false;
   let expiry = { expiresAt: null, expirySource: "unknown" };
   let generation = 0, closed = false, pending = null, checking = null, timer;
+  // The bearer value is kept only to re-encrypt it after the server renews it.
+  let currentToken = null, restoredUserId = null, credentialSaved = false;
+  // One automatic login page per lost session; a successful connection re-arms it.
+  let autoLoginArmed = false;
 
   function snapshot() {
     return { status, account: verifiedIdentity ? { name: verifiedIdentity.name, userId: verifiedIdentity.user_id } : null,
-      ...expiry, lastCheckedAt, lastAuthorizedAt, errorCode, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false };
+      ...expiry, lastCheckedAt, lastAuthorizedAt, errorCode, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false,
+      credentialSaved };
   }
   function changed() {
     try { Promise.resolve(onChange?.(snapshot())).catch(() => {}); } catch { /* observer only */ }
+  }
+  function persist() {
+    if (!credentialStore?.available() || status !== "connected" || !currentToken || !verifiedIdentity) return;
+    const value = { token: currentToken, userId: verifiedIdentity.user_id, authorizedAt: lastAuthorizedAt ?? now() };
+    const version = generation;
+    void credentialStore.save(value).then((saved) => {
+      if (saved && current(version) && !credentialSaved) { credentialSaved = true; changed(); }
+    }, () => {});
+  }
+  function forget() {
+    currentToken = null;
+    restoredUserId = null;
+    credentialSaved = false;
+    if (credentialStore) void credentialStore.clear().catch(() => {});
+  }
+  /** After a lost session, opens the Shadow login page once so the user only has to confirm it. */
+  function openLoginAutomatically() {
+    if (!autoLoginArmed || !openLoginPage || closed || pending) return;
+    autoLoginArmed = false;
+    void beginLogin().then(({ loginUrl }) => openLoginPage(loginUrl)).catch(() => {});
   }
   function cancelTimer() { clearTimeout(timer); timer = undefined; }
   function scheduleCheck() {
@@ -93,6 +124,8 @@ export function createVmDownloadSession({
         if (verifiedIdentity && !allowsAccountChange && identity.user_id !== verifiedIdentity.user_id) {
           fail("VM_APPLICANT_CHANGED");
         }
+        if (restoredUserId && identity.user_id !== restoredUserId) fail("VM_APPLICANT_CHANGED");
+        restoredUserId = null;
         verifiedIdentity = identity;
         if (allowsAccountChange) {
           lastAuthorizedAt = pendingAuthorizationAt;
@@ -101,6 +134,8 @@ export function createVmDownloadSession({
         allowsAccountChange = false;
         status = "connected";
         errorCode = null;
+        autoLoginArmed = true;
+        persist();
       } catch (error) {
         if (!current(version, client)) return snapshot();
         errorCode = safeCode(error, "VM_API_TRANSPORT_FAILED");
@@ -109,12 +144,14 @@ export function createVmDownloadSession({
           currentClient = null;
           allowsAccountChange = false;
           pendingAuthorizationAt = null;
+          forget();
         } else status = "unavailable";
       }
       if (current(version)) {
         lastCheckedAt = now();
         changed();
         scheduleCheck();
+        if (status === "auth_required") openLoginAutomatically();
       }
       return snapshot();
     })().finally(() => { if (checking === operation) checking = null; });
@@ -127,17 +164,10 @@ export function createVmDownloadSession({
       const token = normalizeToken(await entry.receiver.token);
       if (!current(entry.generation)) return;
       const authorizationAt = now();
-      let candidate;
-      candidate = createClient({ token, onToken: (renewed) => {
-        if (!current(entry.generation, candidate)) return;
-        expiry = expiryFrom(renewed);
-        changed();
-      } });
-      if (!candidate || typeof candidate.getIdentity !== "function") fail("VM_AUTH_FAILED");
+      const candidate = connectClient(token, entry.generation);
       currentClient = candidate;
       pendingAuthorizationAt = authorizationAt;
       allowsAccountChange = true;
-      expiry = expiryFrom(token);
       await verify(entry.generation, candidate);
     } catch (error) {
       if (current(entry.generation)) {
@@ -150,6 +180,45 @@ export function createVmDownloadSession({
     } finally {
       if (pending === entry) pending = null;
       await stopReceiver(entry.receiver);
+    }
+  }
+
+  function connectClient(token, version) {
+    let candidate;
+    candidate = createClient({ token, onToken: (renewed) => {
+      if (!current(version, candidate)) return;
+      currentToken = renewed;
+      expiry = expiryFrom(renewed);
+      changed();
+      persist();
+    } });
+    if (!candidate || typeof candidate.getIdentity !== "function") fail("VM_AUTH_FAILED");
+    currentToken = token;
+    expiry = expiryFrom(token);
+    return candidate;
+  }
+
+  /** Resumes the saved account after a restart; a stale or foreign credential is discarded. */
+  async function restore() {
+    if (closed || !credentialStore?.available() || status !== "disconnected" || pending || currentClient) return snapshot();
+    let saved;
+    try { saved = await credentialStore.load(); } catch { saved = null; }
+    if (!saved || closed || status !== "disconnected" || pending || currentClient) return snapshot();
+    const version = generation;
+    try {
+      const client = connectClient(normalizeToken(saved.token), version);
+      currentClient = client;
+      restoredUserId = saved.userId;
+      lastAuthorizedAt = saved.authorizedAt;
+      credentialSaved = true;
+      status = "connecting";
+      // The saved login proves a previous session, so an expired one opens the login page.
+      autoLoginArmed = true;
+      changed();
+      return await verify(version, client);
+    } catch {
+      if (current(version)) { currentClient = null; forget(); status = "disconnected"; changed(); }
+      return snapshot();
     }
   }
 
@@ -200,8 +269,10 @@ export function createVmDownloadSession({
     return entry.promise;
   }
 
-  async function disconnect() {
+  async function disconnect({ keepCredential = false } = {}) {
     generation += 1;
+    autoLoginArmed = false;
+    if (keepCredential) { currentToken = null; restoredUserId = null; } else forget();
     cancelTimer();
     const old = pending;
     pending = null;
@@ -231,8 +302,10 @@ export function createVmDownloadSession({
     pendingAuthorizationAt = null;
     status = "auth_required";
     errorCode = AUTH_FAILURES.has(code) ? code : "VM_AUTH_REQUIRED";
+    forget();
     changed();
     await stopReceiver(old?.receiver);
+    openLoginAutomatically();
     return snapshot();
   }
   function check() {
@@ -241,10 +314,11 @@ export function createVmDownloadSession({
   async function close() {
     if (closed) return;
     closed = true;
-    await disconnect();
+    // Shutting down is not a sign-out: the saved login must survive the restart.
+    await disconnect({ keepCredential: true });
   }
 
   return Object.freeze({ snapshot, client: () => status === "connected" ? currentClient : null,
     identity: () => verifiedIdentity ? structuredClone(verifiedIdentity) : null,
-    beginLogin, disconnect, requireLogin, check, close });
+    beginLogin, disconnect: () => disconnect(), requireLogin, check, restore, close });
 }

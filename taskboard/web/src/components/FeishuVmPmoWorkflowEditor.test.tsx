@@ -801,7 +801,8 @@ describe("VM package draft editing boundaries", () => {
     expect(onErrorClear).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "保存流程草稿" }));
     await screen.findByText("流程草稿已保存。");
-    expect(onErrorClear).toHaveBeenCalledTimes(1);
+    // The editor clears the recovered error from an effect that runs after the saved notice renders.
+    await waitFor(() => expect(onErrorClear).toHaveBeenCalledTimes(1));
     expect(onErrorClear).toHaveBeenCalledWith("流程草稿读取或保存失败，请重试。");
   });
 

@@ -350,7 +350,12 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       kick(); return { job: publicJob(result) };
     },
     extend(id) { const job = store.get(id); if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND"); owner(job, true); const result = extendVmApprovalWait(store, id, { now }); kick(); return { job: publicJob(result) }; },
-    start() { if (closed || started) return; started = true; timer = setInterval(() => { void wake(); }, tickMs); timer.unref?.(); kick(); },
+    start() {
+      if (closed || started) return;
+      started = true; timer = setInterval(() => { void wake(); }, tickMs); timer.unref?.();
+      // Resume the saved Shadow account before the queue first looks for a client.
+      void Promise.resolve(session.restore?.()).catch(() => {}).finally(() => kick());
+    },
     wake,
     close() {
       closePromise ??= (async () => { closed = true; started = false; clearInterval(timer); await running; await session.close(); store.close(); })();

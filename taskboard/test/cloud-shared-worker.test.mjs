@@ -716,16 +716,18 @@ test("authenticated WebSockets receive a revision only after business data chang
   assert.equal(response.status, 101);
   assert.ok(socket);
 
-  const message = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timed out waiting for revision push")), 1_000);
-    socket.addEventListener("message", (event) => {
-      clearTimeout(timeout);
-      resolve(JSON.parse(event.data));
-    }, { once: true });
-  });
+  // Listen before mutating so an early push is not missed, but only start the
+  // deadline once the mutation has returned: slow CI runners can spend most of
+  // a fixed budget on the insert itself.
+  let received;
+  const message = new Promise((resolve) => { received = resolve; });
+  socket.addEventListener("message", (event) => received(JSON.parse(event.data)), { once: true });
   const created = await createTask("alpha", "WebSocket revision mutation", bob);
   assert.equal(created.response.status, 201);
-  const payload = await message;
+  let timeout;
+  const payload = await Promise.race([message, new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error("Timed out waiting for revision push")), 5_000);
+  })]).finally(() => clearTimeout(timeout));
   assert.equal(payload.type, "revision");
   assert.ok(Number.isSafeInteger(payload.revision));
   socket.close(1000, "test complete");

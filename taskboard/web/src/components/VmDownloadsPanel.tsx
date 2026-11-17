@@ -4,7 +4,7 @@ import { useTaskboardI18n } from "../i18n";
 import {
   enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads, sendVmDownloadNotificationTest,
   getVmDownloadRefreshInterval, recoverVmDownload, removeVmDownload, removeVmDownloads, resumeVmDownload, saveVmDownloadSettings,
-  VM_DOWNLOAD_REFRESH_CHANGE_EVENT, VM_DOWNLOAD_REFRESH_INTERVAL_KEY,
+  VM_DOWNLOAD_REFRESH_CHANGE_EVENT, VM_DOWNLOAD_REFRESH_INTERVAL_KEY, vmSessionTimeLeft,
   type VmDownloadJob, type VmDownloadSettings, type VmDownloadsSnapshot,
 } from "../vmDownloads";
 
@@ -287,18 +287,21 @@ export function VmDownloadsPanel() {
         </label>
         <code>{job.vmid}</code><span className={`vm-downloads-badge vm-downloads-state-${job.status}`}>{text(label[0], label[1])}</span>
       </div>
-      <dl>
-        {job.application_id && <><dt>{text("申请编号", "Application")}</dt><dd>{job.application_id}</dd></>}
-        {job.instance_code && <><dt>{text("审批编号", "Approval")}</dt><dd>{job.instance_code}</dd></>}
-        <dt>{text("申请", "Request")}</dt><dd>{job.department} · {job.reason}</dd>
-        <dt>{text("输出目录", "Output directory")}</dt><dd>{job.output_root}</dd>
-        <dt>{text("创建时间", "Created")}</dt><dd>{date(job.created_at)}</dd>
-        {job.approval_deadline_at && <><dt>{text("审批等待截止", "Approval deadline")}</dt><dd>{date(job.approval_deadline_at)}</dd></>}
-        {job.media_deadline_at && <><dt>{text("制作等待截止", "Media deadline")}</dt><dd>{date(job.media_deadline_at)}</dd></>}
-        {job.next_attempt_at && <><dt>{text("下次检查", "Next check")}</dt><dd>{date(job.next_attempt_at)}</dd></>}
-        {job.acquisition?.path && <><dt>{text("下载文件", "Downloaded file")}</dt><dd>{job.acquisition.path}</dd></>}
-      </dl>
-      {code && <p className="vm-downloads-job-error"><code>{code}</code></p>}
+      <details className="vm-downloads-job-details">
+        <summary>{text("详细信息", "Details")}{code ? ` · ${code}` : ""}</summary>
+        <dl>
+          {job.application_id && <><dt>{text("申请编号", "Application")}</dt><dd>{job.application_id}</dd></>}
+          {job.instance_code && <><dt>{text("审批编号", "Approval")}</dt><dd>{job.instance_code}</dd></>}
+          <dt>{text("申请", "Request")}</dt><dd>{job.department} · {job.reason}</dd>
+          <dt>{text("输出目录", "Output directory")}</dt><dd>{job.output_root}</dd>
+          <dt>{text("创建时间", "Created")}</dt><dd>{date(job.created_at)}</dd>
+          {job.approval_deadline_at && <><dt>{text("审批等待截止", "Approval deadline")}</dt><dd>{date(job.approval_deadline_at)}</dd></>}
+          {job.media_deadline_at && <><dt>{text("制作等待截止", "Media deadline")}</dt><dd>{date(job.media_deadline_at)}</dd></>}
+          {job.next_attempt_at && <><dt>{text("下次检查", "Next check")}</dt><dd>{date(job.next_attempt_at)}</dd></>}
+          {job.acquisition?.path && <><dt>{text("下载文件", "Downloaded file")}</dt><dd>{job.acquisition.path}</dd></>}
+        </dl>
+        {code && <p className="vm-downloads-job-error"><code>{code}</code></p>}
+      </details>
       {job.status === "auth_required" && <p>{text("使用原账号重新连接后自动恢复，不会重新申请。", "Reconnect with the original account to resume without submitting a new application.")}</p>}
       {extendable && <p>{text("已暂停等待。延长后继续检查原申请。", "Waiting is paused. Extending continues to check the original application.")}</p>}
       {privateAddressBlocked && <p>{text("域名解析到未放行的私网地址，下载请求没有发出。更新本机精确白名单后，可继续使用原审批。", "The hostname resolved to an unapproved private address, so no download request was sent. Update the exact local allowlist to continue with the existing approval.")}</p>}
@@ -334,38 +337,44 @@ export function VmDownloadsPanel() {
 
   const session = snapshot?.session;
   const sessionLabel = session ? SESSION_LABELS[session.status] ?? SESSION_LABELS.unavailable : null;
+  const timeLeft = session ? vmSessionTimeLeft(session, Date.now(), text) : null;
   const notificationCountsKnown = Boolean(snapshot && Number.isSafeInteger(snapshot.notifications.pendingCount)
     && Number.isSafeInteger(snapshot.notifications.failedCount));
   return <section className="vm-downloads-panel" aria-labelledby="vm-downloads-heading">
-    <header className="vm-downloads-heading"><div><h3 id="vm-downloads-heading">{text("VM 账号与队列", "VM account and queue")}</h3><p>{text("管理 auto-cut-slicing 包使用的 Shadow 账号和 VM 下载队列。关闭本页后，队列仍会在本机后台继续。", "Manage the Shadow account and VM download queue used by auto-cut-slicing. The local queue continues after you leave this page.")}</p><p>{text("VMID、申请部门和申请原因在当前学科的“基础与执行”配置中设置；这里负责账号连接和下载队列。", "Set the VMID field, department, and reason under this subject's Basics and execution settings. Manage the account connection and download queue here.")}</p></div>
+    <header className="vm-downloads-heading"><div><h3 id="vm-downloads-heading">{text("VM 账号与队列", "VM account and queue")}</h3><p>{text("关闭本页后，下载队列仍会在本机后台继续。", "The download queue keeps running locally after you leave this page.")}</p></div>
       <button type="button" className="button secondary" disabled={loading || busy} onClick={() => void refresh()}>{text("刷新下载状态", "Refresh downloads")}</button></header>
     {readError && <p role="alert" className="vm-downloads-error">{readError}</p>}
     {safeCode(snapshot?.worker?.errorCode) && <p role="alert" className="vm-downloads-error">{text("下载队列处理异常，请检查本机服务；已有申请仍保留。", "The download worker encountered an error. Check the local service; existing applications are retained.")} ({safeCode(snapshot?.worker?.errorCode)})</p>}
     {session?.status === "auth_required" && <section role="alert" aria-label={text("Shadow 登录已失效", "Shadow sign-in expired")} className="vm-downloads-auth-alert">
       <div><strong>{text("Shadow 登录已失效，下载队列已暂停。", "Shadow sign-in expired. The download queue is paused.")}</strong>
-        <p>{text("重新连接原账号后会继续处理；已提交的审批和下载记录会保留。", "Reconnect the original account to resume processing. Existing approvals and download records are retained.")}</p></div>
+        <p>{text("登录失效时会自动打开登录页面，在浏览器里确认即可；没看到就点右边的按钮。已提交的审批和下载记录会保留。", "The sign-in page opens automatically when sign-in expires; confirm it in the browser, or use the button. Existing approvals and download records are retained.")}</p></div>
       <button type="button" className="button secondary" disabled={busy} onClick={connect}>{text("从提示重新连接", "Reconnect from alert")}</button>
     </section>}
     {loading && !snapshot && <p role="status">{text("正在读取下载队列…", "Loading downloads…")}</p>}
     {session && <section className="vm-downloads-session" aria-label={text("Shadow 账号", "Shadow account")}>
-      <div className="vm-downloads-session-heading"><strong>{text(sessionLabel![0], sessionLabel![1])}</strong>{session.account && <span>{text(session.status === "connected" ? "当前账号" : "上次验证账号", session.status === "connected" ? "Current account" : "Previously verified account")}: {session.account.name}</span>}</div>
-      {session.account && <p>{text("账号", "Account")}: {session.account.userId}</p>}
-      <p>{session.expirySource === "token" && session.expiresAt !== null
-        ? text(`${session.status === "connected" ? "凭据" : "上次凭据"}提示到期时间：${date(session.expiresAt)}；账号是否可用以服务端验证为准。`, `${session.status === "connected" ? "Credential" : "Previous credential"} expiry hint: ${date(session.expiresAt)}; server verification determines account availability.`)
-        : text("有效期未知；账号是否可用以服务端验证为准。", "Expiry unknown; server verification determines account availability.")}</p>
-      {session.account && <p>{text(`上次本人登录授权：${session.lastAuthorizedAt == null ? "未记录" : date(session.lastAuthorizedAt)}`,
-        `Last personal sign-in: ${session.lastAuthorizedAt == null ? "Not recorded" : date(session.lastAuthorizedAt)}`)}</p>}
-      {session.lastCheckedAt !== null && <p>{text(`最近后台检查：${date(session.lastCheckedAt)}（非重新授权）`, `Last background check: ${date(session.lastCheckedAt)} (not a new sign-in)`)}</p>}
-      {safeCode(session.errorCode) && <p className="vm-downloads-error">{text("账号验证提示", "Account check")}: {safeCode(session.errorCode)}</p>}
+      <div className="vm-downloads-session-heading"><strong>{text(sessionLabel![0], sessionLabel![1])}{session.account ? ` · ${session.account.name}` : ""}</strong>
+        {session.status === "connected" && timeLeft && <span>{timeLeft}</span>}</div>
+      {session.status === "connected" && session.credentialSaved && <p>{text("已在本机加密保存，Taskboard 重启后自动恢复，不用重新登录。", "Saved encrypted on this computer; restored automatically after Taskboard restarts.")}</p>}
+      <details className="vm-downloads-session-details">
+        <summary>{text("账号详细信息", "Account details")}</summary>
+        {session.account && <p>{text("账号", "Account")}: {session.account.userId}</p>}
+        <p>{session.expirySource === "token" && session.expiresAt !== null
+          ? text(`${session.status === "connected" ? "凭据" : "上次凭据"}到期时间：${date(session.expiresAt)}；账号是否可用以服务端验证为准。`, `${session.status === "connected" ? "Credential" : "Previous credential"} expiry: ${date(session.expiresAt)}; server verification determines account availability.`)
+          : text("有效期未知；账号是否可用以服务端验证为准。", "Expiry unknown; server verification determines account availability.")}</p>
+        {session.account && <p>{text(`上次本人登录授权：${session.lastAuthorizedAt == null ? "未记录" : date(session.lastAuthorizedAt)}`,
+          `Last personal sign-in: ${session.lastAuthorizedAt == null ? "Not recorded" : date(session.lastAuthorizedAt)}`)}</p>}
+        {session.lastCheckedAt !== null && <p>{text(`最近后台检查：${date(session.lastCheckedAt)}（非重新授权）`, `Last background check: ${date(session.lastCheckedAt)} (not a new sign-in)`)}</p>}
+        {safeCode(session.errorCode) && <p className="vm-downloads-error">{text("账号验证提示", "Account check")}: {safeCode(session.errorCode)}</p>}
+        <p className="vm-downloads-help">{text("每分钟检查一次账号，服务端续期后会同步更新本机保存的登录。点“断开账号”会同时删除本机保存的登录。暂不支持手机飞书跨设备直接授权。", "The account is checked every minute and the saved sign-in follows server renewals. Disconnecting also deletes the saved sign-in. Cross-device authorization from Feishu mobile is not supported.")}</p>
+      </details>
       <div className="vm-downloads-actions">
         <button type="button" className="button secondary" disabled={busy} onClick={connect}>{session.status === "connected" ? text("重新连接账号", "Reconnect account") : text("连接 Shadow 账号", "Connect Shadow account")}</button>
         {session.status !== "disconnected" && <button type="button" className="button secondary" disabled={busy} onClick={() => void action(async (signal) => { await logoutVmDownloads(signal); setLoginUrl(null); })}>{text("断开账号", "Disconnect account")}</button>}
       </div>
       {loginUrl && <p className="vm-downloads-login">{popupBlocked ? text("浏览器未打开登录窗口，请点击链接继续。", "The browser did not open a login window. Use this link to continue.") : text("请在登录窗口完成验证，面板会自动更新。", "Complete sign-in in the login window. This panel will update automatically.")} <a href={loginUrl} target="_blank" rel="noopener noreferrer">{text("打开登录页面", "Open sign-in page")}</a></p>}
-      <p className="vm-downloads-help">{text("每分钟检查账号；服务端可能在检查时更新凭据和到期提示。登录失效或 Taskboard 重启后需本人重新连接，暂不支持手机/电脑飞书跨设备直接授权。", "The account is checked every minute; the server may update credentials and the expiry hint during checks. Reconnect yourself after sign-in expires or Taskboard restarts. Cross-device authorization from Feishu is not supported.")}</p>
     </section>}
-    {snapshot && <section className="vm-downloads-notifications" aria-label={text("飞书通知状态", "Feishu notification status")}>
-      <strong>{text("飞书异常提醒", "Feishu exception notifications")}: {snapshot.notifications.enabled ? text("已开启", "On") : text("已关闭", "Off")}</strong>
+    {snapshot && <details className="vm-downloads-notifications" aria-label={text("飞书通知状态", "Feishu notification status")}>
+      <summary><strong>{text("飞书异常提醒", "Feishu exception notifications")}: {snapshot.notifications.enabled ? text("已开启", "On") : text("已关闭", "Off")}</strong></summary>
       <p>{!notificationCountsKnown
         ? text("飞书通知状态需本机 Taskboard 服务重启后更新。", "Feishu notification status updates after restarting the local Taskboard service.")
         : !snapshot.notifications.enabled
@@ -396,7 +405,7 @@ export function VmDownloadsPanel() {
         </div>
         <p className="vm-downloads-help">{text("测试会向当前已验证的企业邮箱发送一条明确标记的消息，不创建下载任务；成功表示飞书接口已受理，不代表已阅读。", "The test sends a clearly labeled message to the currently verified work email without creating a download job. Success means Feishu accepted it, not that it was read.")}</p>
       </>}
-    </section>}
+    </details>}
     {snapshot && <>
       <details className="vm-downloads-manual" open={manualOpen} onToggle={(event) => setManualOpen(event.currentTarget.open)}>
         <summary>{text("手动批量下载（补救入口）", "Manual batch download (fallback)")}</summary>

@@ -8,7 +8,8 @@ import { VmSourceError } from "../server/vm-source-transfer.mjs";
 const IDENTITY = { name: "测试", user_id: "user-1", open_id: "open-1",
   enterprise_email: "fixture@example.test", departments: ["department-1"] };
 const INITIAL = { status: "disconnected", account: null, expiresAt: null, expirySource: "unknown",
-  lastCheckedAt: null, lastAuthorizedAt: null, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false };
+  lastCheckedAt: null, lastAuthorizedAt: null, errorCode: null, automaticRefreshSupported: false, crossDeviceAuthorizationSupported: false,
+  credentialSaved: false };
 const LOGIN_URL = "https://shadow.yangcong345.com/#/?fromWebUrl=fixture";
 const TOKEN = "session-token-never-public";
 
@@ -395,4 +396,87 @@ test("invalid session dependencies fail before any login or timers", () => {
     { checkIntervalMs: 0 }, { checkIntervalMs: 1.1 }, { checkIntervalMs: 2_147_483_648 }, { onChange: false }]) {
     assert.throws(() => createVmDownloadSession(options), { code: "VM_AUTH_INPUT_INVALID" });
   }
+});
+
+function memoryCredentials(initial = null, { available = true } = {}) {
+  let value = initial ? structuredClone(initial) : null;
+  const saves = [];
+  return { saves, get value() { return value; },
+    available: () => available,
+    load: async () => (value ? structuredClone(value) : null),
+    save: async (next) => { saves.push(structuredClone(next)); value = structuredClone(next); return true; },
+    clear: async () => { value = null; } };
+}
+
+test("a verified login and every server renewal are saved for the same account", async (t) => {
+  const store = memoryCredentials();
+  const f = fixture(t, { credentialStore: store });
+  await f.connect();
+  await until(() => f.session.snapshot().credentialSaved === true);
+  assert.deepEqual(store.value, { token: TOKEN, userId: "user-1", authorizedAt: 1_800_000_000_000 });
+  const renewed = jwt(1_800_007_200);
+  f.results.push(response(IDENTITY, renewed));
+  f.advance(60_000);
+  await f.session.check();
+  await until(() => store.value?.token === renewed);
+  assert.equal(store.value.authorizedAt, 1_800_000_000_000);
+  assert.equal(JSON.stringify(f.session.snapshot()).includes(renewed), false);
+});
+
+test("restart restores the saved account without a login page and closing keeps the credential", async (t) => {
+  const store = memoryCredentials({ token: TOKEN, userId: "user-1", authorizedAt: 5 });
+  const opened = [];
+  const f = fixture(t, { credentialStore: store, openLoginPage: (url) => opened.push(url) });
+  const restored = await f.session.restore();
+  assert.equal(restored.status, "connected");
+  assert.equal(restored.account.userId, "user-1");
+  assert.equal(restored.lastAuthorizedAt, 5);
+  assert.equal(restored.credentialSaved, true);
+  assert.equal(f.logins.length, 0);
+  assert.deepEqual(opened, []);
+  await f.session.close();
+  assert.equal(store.value.token, TOKEN);
+});
+
+test("a saved credential for another account is discarded", async (t) => {
+  const store = memoryCredentials({ token: TOKEN, userId: "someone-else", authorizedAt: 5 });
+  const f = fixture(t, { credentialStore: store });
+  const restored = await f.session.restore();
+  assert.equal(restored.status, "auth_required");
+  assert.equal(restored.account, null);
+  await until(() => store.value === null);
+});
+
+test("an expired saved login opens the login page once and signing out removes the credential", async (t) => {
+  const store = memoryCredentials({ token: TOKEN, userId: "user-1", authorizedAt: 5 });
+  const opened = [];
+  const f = fixture(t, { credentialStore: store, openLoginPage: (url) => opened.push(url) });
+  f.results.push(new Response("{}", { status: 401 }));
+  await f.session.restore();
+  await until(() => opened.length === 1);
+  assert.deepEqual(opened, [LOGIN_URL]);
+  assert.equal(store.value, null);
+  assert.equal(f.session.snapshot().status, "connecting");
+  f.logins.at(-1).resolve(TOKEN);
+  await until(() => f.session.snapshot().status === "connected");
+  await until(() => store.value?.token === TOKEN);
+  await f.session.requireLogin();
+  await until(() => opened.length === 2);
+  f.logins.at(-1).reject(new VmSourceError("VM_AUTH_TIMEOUT"));
+  await until(() => f.session.snapshot().status !== "connecting");
+  assert.equal(opened.length, 2);
+  await f.session.disconnect();
+  assert.equal(store.value, null);
+});
+
+test("without a saved login nothing opens automatically and an unavailable store saves nothing", async (t) => {
+  const opened = [];
+  const store = memoryCredentials(null, { available: false });
+  const f = fixture(t, { credentialStore: store, openLoginPage: (url) => opened.push(url) });
+  assert.equal((await f.session.restore()).status, "disconnected");
+  await f.session.requireLogin();
+  assert.deepEqual(opened, []);
+  await f.connect();
+  assert.equal(f.session.snapshot().credentialSaved, false);
+  assert.deepEqual(store.saves, []);
 });
