@@ -22,7 +22,7 @@ const DELIVERY_STATES = new Set([
   "succeeded",
   "dead_letter",
 ]);
-const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting", "final_archive", "directory_operation"]);
+const DECISIONS = new Set(["ready", "blocked", "ignored", "register", "archive_waiting", "final_archive", "directory_operation", "manual_source_ready"]);
 const FINAL_ARCHIVE_STATES = new Set(["pending", "copying", "retry_wait", "published", "conflict", "dead_letter"]);
 const DECISION_SNAPSHOT_VERSION = 1;
 const LEGACY_DECISION_SNAPSHOT_ACTIONS = new Set(["create", "archive"]);
@@ -61,6 +61,7 @@ const PHASED_DECISION_SNAPSHOT_ACTIONS = new Set([
   "archive_waiting",
   "final_archive",
   "directory_operation",
+  "manual_source_ready",
 ]);
 const PHASED_DECISION_SNAPSHOT_ROOT_FIELDS = new Set([
   "version",
@@ -691,7 +692,8 @@ function normalizeOutcome(value, decision, { requireTaskIdentifier = false } = {
     || value.kind === "archive_waiting"
     || value.kind === "blocked"
     || value.kind === "final_archive"
-    || value.kind === "directory_operation";
+    || value.kind === "directory_operation"
+    || value.kind === "manual_source_ready";
   if (!noTaskOutcome && !outcome.taskId && !outcome.taskIdentifier) return null;
   if (requireTaskIdentifier && !noTaskOutcome && (!outcome.taskId || !outcome.taskIdentifier)) return null;
   return outcome;

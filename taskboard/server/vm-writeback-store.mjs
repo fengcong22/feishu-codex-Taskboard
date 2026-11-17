@@ -1,13 +1,51 @@
 import { randomUUID } from "node:crypto";
 import { FEISHU_WRITEBACK_LEASE_DURATION_MS, FEISHU_WRITEBACK_MAX_LEASE_DURATION_MS }
   from "./feishu-delivery-store.mjs";
+import { parseVmWritebackIdempotencyKey } from "./vm-stage-writeback.mjs";
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const MAX_ATTEMPTS = 8;
+// Each moment waits for the earlier progress writes of the same run, so Feishu sees them in order.
 const READY_SQL = `q.state IN ('pending', 'retry_wait') AND NOT EXISTS (
   SELECT 1 FROM vm_writeback_outbox p WHERE p.run_id = q.run_id
-  AND q.moment = 'completed' AND p.moment = 'processing'
+  AND ((q.moment = 'completed' AND p.moment = 'processing')
+    OR (q.moment = 'processing' AND p.moment = 'materials_ready')
+    OR (q.moment = 'download_failed' AND p.moment = 'download_failed' AND p.created_at < q.created_at))
   AND p.state IN ('pending', 'processing', 'retry_wait'))`;
+const OUTBOX_SQL = `CREATE TABLE IF NOT EXISTS vm_writeback_outbox (
+    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL, run_id TEXT NOT NULL,
+    moment TEXT NOT NULL CHECK(moment IN ('processing','completed','materials_ready','download_failed')),
+    target_json TEXT NOT NULL, operation_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','processing','retry_wait','succeeded','conflict','dead_letter')),
+    version INTEGER NOT NULL, attempt_count INTEGER NOT NULL,
+    next_attempt_at TEXT, claim_token TEXT, lease_until TEXT, error_code TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  )`;
+const OUTBOX_INDEXES = `CREATE INDEX IF NOT EXISTS vm_writeback_due ON vm_writeback_outbox(state, next_attempt_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS vm_writeback_run_moment ON vm_writeback_outbox(run_id, moment)
+    WHERE moment IN ('processing','completed','materials_ready');`;
+
+/** Rebuilds the pre-material outbox in place; every existing row and identifier is preserved. */
+function migrateOutbox(db) {
+  const current = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vm_writeback_outbox'").get();
+  if (!current) { db.exec(OUTBOX_SQL); db.exec(OUTBOX_INDEXES); return; }
+  if (current.sql.includes("download_failed")) { db.exec(OUTBOX_INDEXES); return; }
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`ALTER TABLE vm_writeback_outbox RENAME TO vm_writeback_outbox_legacy;
+      DROP INDEX IF EXISTS vm_writeback_due;`);
+    db.exec(OUTBOX_SQL);
+    db.exec(`INSERT INTO vm_writeback_outbox (id, idempotency_key, task_id, run_id, moment, target_json,
+      operation_json, state, version, attempt_count, next_attempt_at, claim_token, lease_until, error_code,
+      created_at, updated_at) SELECT id, idempotency_key, task_id, run_id, moment, target_json,
+      operation_json, state, version, attempt_count, next_attempt_at, claim_token, lease_until, error_code,
+      created_at, updated_at FROM vm_writeback_outbox_legacy;
+      DROP TABLE vm_writeback_outbox_legacy;`);
+    db.exec(OUTBOX_INDEXES);
+    db.exec("COMMIT");
+  } catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+}
 
 function fail(code = "WRITEBACK_INVALID", status = 400) {
   return Object.assign(new Error(code), { code, status });
@@ -33,8 +71,7 @@ function operation(value) {
 function intent(value) {
   if (!exactKeys(value, ["idempotencyKey", "taskId", "runId", "courseBindingId", "operation"])
     || !id(value.taskId) || !id(value.runId) || value.courseBindingId !== null) throw fail();
-  const moment = ["processing", "completed"].find((entry) => value.idempotencyKey === `vm:${value.runId}:${entry}`);
-  if (!moment) throw fail();
+  if (!parseVmWritebackIdempotencyKey(value.idempotencyKey, value.runId)) throw fail();
   return { idempotencyKey: value.idempotencyKey, taskId: value.taskId, runId: value.runId,
     courseBindingId: null, operation: operation(value.operation) };
 }
@@ -69,16 +106,7 @@ export function createVmWritebackStore({ database, validateIntent, now = Date.no
   const db = database?.database ?? database;
   if (typeof db?.prepare !== "function" || typeof db?.exec !== "function"
     || typeof validateIntent !== "function") throw fail("WRITEBACK_UNAVAILABLE", 503);
-  db.exec(`CREATE TABLE IF NOT EXISTS vm_writeback_outbox (
-    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
-    task_id TEXT NOT NULL, run_id TEXT NOT NULL, moment TEXT NOT NULL CHECK(moment IN ('processing','completed')),
-    target_json TEXT NOT NULL, operation_json TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending','processing','retry_wait','succeeded','conflict','dead_letter')),
-    version INTEGER NOT NULL, attempt_count INTEGER NOT NULL,
-    next_attempt_at TEXT, claim_token TEXT, lease_until TEXT, error_code TEXT,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    UNIQUE(run_id, moment)
-  ); CREATE INDEX IF NOT EXISTS vm_writeback_due ON vm_writeback_outbox(state, next_attempt_at);`);
+  migrateOutbox(db);
   const time = () => new Date(now()).toISOString();
   const lookup = (key) => rowValue(db.prepare("SELECT * FROM vm_writeback_outbox WHERE id = ?").get(key));
   function transaction(callback) {
@@ -123,7 +151,7 @@ export function createVmWritebackStore({ database, validateIntent, now = Date.no
             || JSON.stringify(previous.target) !== JSON.stringify(trusted.target)) throw fail("WRITEBACK_REFERENCE_INVALID", 409);
           return previous;
         }
-        const moment = input.idempotencyKey.endsWith(":completed") ? "completed" : "processing";
+        const { moment } = parseVmWritebackIdempotencyKey(input.idempotencyKey, input.runId);
         if (moment === "processing" && db.prepare("SELECT id FROM vm_writeback_outbox WHERE run_id = ? AND moment = 'completed'")
           .get(input.runId)) throw fail("WRITEBACK_REFERENCE_INVALID", 409);
         const key = `vm-${randomUUID()}`;
@@ -153,6 +181,7 @@ export function createVmWritebackStore({ database, validateIntent, now = Date.no
     async retryDeadLetterWritebacks({ taskId, runId } = {}, beforeCommit = () => {}) {
       if (!id(taskId) || !id(runId) || typeof beforeCommit !== "function") throw fail();
       const entries = db.prepare(`SELECT * FROM vm_writeback_outbox WHERE run_id = ?
+        AND moment IN ('processing', 'completed')
         ORDER BY CASE moment WHEN 'processing' THEN 0 ELSE 1 END`).all(runId).map(rowValue);
       if (entries.length !== 2 || entries.some(entry => entry.taskId !== taskId)
         || entries[0].moment !== "processing" || entries[0].state !== "dead_letter"

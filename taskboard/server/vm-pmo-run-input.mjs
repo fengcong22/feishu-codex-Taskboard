@@ -75,7 +75,8 @@ export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, pro
     || typeof pythonPath !== "string" || !path.isAbsolute(pythonPath)
     || !Number.isSafeInteger(planAttempt) || planAttempt < 1 || planAttempt > 3)
     fail("VM_PMO_INPUT_UNTRUSTED");
-  if (!review && (acquisition.vmid_binding !== "vm_api_verified"
+  // An operator-supplied source is accepted only by the orchestrator for a VM-approved application.
+  if (!review && (!["vm_api_verified", "operator_asserted"].includes(acquisition.vmid_binding)
     || (acquisition.vmid !== undefined && acquisition.vmid !== contextValue.vmid)))
     fail("VM_PMO_INPUT_UNTRUSTED");
   if (review && (!reviewParent || acquisition.vmid_binding !== "managed_review_parent"

@@ -302,3 +302,51 @@ test("unknown or ambiguous option IDs cannot trigger task effects", () => {
     options: [{ optionId: "opt_wait" }, { optionId: "opt_edit" }, { optionId: "opt_edit" }] } });
   assert.equal(decideVmInitialRecordChange(duplicate, event()).kind, "blocked");
 });
+
+function materialSubject() {
+  const configured = subject();
+  configured.statusField.options.push(
+    { optionId: "opt_ready", value: "素材已就绪" }, { optionId: "opt_failed", value: "下载失败" });
+  configured.vmWorkflow.stages.initial.writeback = {
+    processing: { fieldId: "fld_status", optionId: "opt_done" },
+    completed: { fieldId: "fld_status", optionId: "opt_done" },
+    materialsReady: { fieldId: "fld_status", optionId: "opt_ready" },
+    downloadFailed: { fieldId: "fld_status", optionId: "opt_failed" },
+  };
+  return configured;
+}
+
+test("Taskboard's own source writebacks never archive the waiting initial task", () => {
+  for (const after of ["opt_ready", "opt_failed"]) {
+    const actual = decideVmInitialRecordChange(materialSubject(), event({ beforeOptionId: "opt_edit", afterOptionId: after }));
+    assert.deepEqual([actual.kind, actual.reason], ["ignored", "material_writeback_option"]);
+  }
+});
+
+test("only download failed to materials ready asks Taskboard for an operator source", () => {
+  const actual = decideVmInitialRecordChange(materialSubject(), event({ beforeOptionId: "opt_failed", afterOptionId: "opt_ready" }));
+  assert.equal(actual.kind, "manual_source_ready");
+  assert.equal(actual.stageId, "initial");
+  assert.equal(actual.subjectKey, "bas_test:tbl_test");
+  assert.equal(actual.configVersion, 2);
+  for (const before of ["opt_wait", "opt_edit"]) {
+    const other = decideVmInitialRecordChange(materialSubject(), event({ beforeOptionId: before, afterOptionId: "opt_ready" }));
+    assert.notEqual(other.kind, "manual_source_ready");
+  }
+  const simulated = decideVmInitialRecordChange(materialSubject(),
+    event({ beforeOptionId: "opt_failed", afterOptionId: "opt_ready", deliverySource: "simulation" }));
+  assert.equal(simulated.kind, "ignored");
+});
+
+test("restarting from download failed registers a new initial task", () => {
+  const actual = decideVmInitialRecordChange(materialSubject(), event({ beforeOptionId: "opt_failed", afterOptionId: "opt_edit" }));
+  assert.equal(actual.kind, "register");
+  assert.equal(actual.stageId, "initial");
+});
+
+test("without source options the previous leave-trigger archive behavior is unchanged", () => {
+  const configured = subject();
+  configured.statusField.options.push({ optionId: "opt_ready", value: "素材已就绪" });
+  const actual = decideVmInitialRecordChange(configured, event({ beforeOptionId: "opt_edit", afterOptionId: "opt_ready" }));
+  assert.equal(actual.kind, "archive_waiting");
+});

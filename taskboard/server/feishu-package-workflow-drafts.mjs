@@ -161,10 +161,14 @@ function normalizeFinalArchive(value, sharedNaming, allowLegacyArchive) {
   return { archive, legacyArchivePathNeedsReview };
 }
 
-function normalizeWriteback(value, metadata, name) {
-  assertShape(value, ["processing", "completed"], name);
+const MATERIAL_WRITEBACK_STATES = Object.freeze(["materialsReady", "downloadFailed"]);
+
+function normalizeWriteback(value, metadata, name, { allowMaterialEdges = false } = {}) {
+  const optional = allowMaterialEdges ? MATERIAL_WRITEBACK_STATES : [];
+  assertShape(value, ["processing", "completed"], name, optional);
   const writeback = {};
-  for (const state of ["processing", "completed"]) {
+  for (const state of ["processing", "completed", ...optional]) {
+    if (!Object.hasOwn(value, state)) continue;
     const binding = value[state];
     const bindingName = `${name}.${state}`;
     assertShape(binding, ["fieldId", "optionId"], bindingName);
@@ -173,6 +177,8 @@ function normalizeWriteback(value, metadata, name) {
     if (optionId !== null && fieldId === null) {
       throw new ApiError(400, "INVALID_FIELD", `${bindingName}.optionId requires a writeback field`);
     }
+    // Unbound material edges are omitted so saved drafts keep their previous canonical form.
+    if (optional.includes(state) && fieldId === null && optionId === null) continue;
     if (metadata !== undefined) {
       const field = validateMetadataField(metadata, fieldId, isSingleSelectMetadataField, `${bindingName}.fieldId`);
       validateMetadataOption(field, optionId, `${bindingName}.optionId`);
@@ -180,6 +186,21 @@ function normalizeWriteback(value, metadata, name) {
     writeback[state] = { fieldId, optionId };
   }
   return writeback;
+}
+
+function validateMaterialWriteback(stage, name) {
+  const bindings = MATERIAL_WRITEBACK_STATES.map((state) => [state, stage.writeback[state]]).filter(([, binding]) => binding);
+  for (const [state, binding] of bindings) {
+    if (binding.optionId === null || binding.fieldId !== stage.statusFieldId) {
+      throw new ApiError(400, "INVALID_FIELD", `${name}.writeback.${state} must use an option of the initial status field`);
+    }
+    if (binding.optionId === stage.triggerOptionId) {
+      throw new ApiError(400, "INVALID_FIELD", `${name}.writeback.${state} must differ from the initial trigger`);
+    }
+  }
+  if (bindings.length === 2 && bindings[0][1].optionId === bindings[1][1].optionId) {
+    throw new ApiError(400, "INVALID_FIELD", `${name}.writeback material options must be distinct`);
+  }
 }
 
 function normalizeStage(stage, stageId, legacy, sharedNaming) {
@@ -202,7 +223,8 @@ function normalizeStage(stage, stageId, legacy, sharedNaming) {
     ...(Object.hasOwn(stage, "namingFieldId")
       ? { namingFieldId: optionalIdentifier(stage.namingFieldId, `${name}.namingFieldId`) } : {}),
     writeback: Object.hasOwn(stage, "writeback")
-      ? normalizeWriteback(stage.writeback, undefined, `${name}.writeback`) : emptyWriteback(),
+      ? normalizeWriteback(stage.writeback, undefined, `${name}.writeback`,
+        { allowMaterialEdges: !legacy && stageId === "initial" }) : emptyWriteback(),
   };
   if (!legacy && stageId === "review") {
     normalized.instructionAttachmentsFieldId = optionalIdentifier(stage.instructionAttachmentsFieldId, `${name}.instructionAttachmentsFieldId`);
@@ -228,7 +250,8 @@ function validateConfigMetadata(config, metadata) {
     if (stageId === "review") {
       validateMetadataField(metadata, stage.instructionAttachmentsFieldId, isAttachmentMetadataField, `${name}.instructionAttachmentsFieldId`);
     }
-    normalizeWriteback(stage.writeback, metadata, `${name}.writeback`);
+    normalizeWriteback(stage.writeback, metadata, `${name}.writeback`,
+      { allowMaterialEdges: stageId === "initial" });
   }
   const archive = config.finalArchive;
   const field = validateMetadataField(metadata, archive.statusFieldId, isProgressField, "config.finalArchive.statusFieldId");
@@ -296,6 +319,11 @@ function normalizeConfig(value, metadata = undefined, { allowLegacyArchive = fal
       && stage.triggerOptionId === finalArchive.triggerOptionId;
   })) {
     throw new ApiError(400, "INVALID_FIELD", "config.finalArchive must use a different trigger from enabled editing stages");
+  }
+  validateMaterialWriteback(config.stages.initial, "config.stages.initial");
+  if (finalArchive.enabled && finalArchive.statusFieldId === config.stages.initial.statusFieldId
+    && MATERIAL_WRITEBACK_STATES.some((state) => config.stages.initial.writeback[state]?.optionId === finalArchive.triggerOptionId)) {
+    throw new ApiError(400, "INVALID_FIELD", "config.finalArchive must use a different trigger from material writeback options");
   }
   // Only the bindings retained by the canonical draft must still exist in Feishu.
   if (metadata !== undefined) validateConfigMetadata(config, metadata);
