@@ -149,6 +149,8 @@ test("AI intent session runs in the run directory with the package prompt and no
   assert.deepEqual(Object.keys(seen.env).sort(), ["PATH", "USERPROFILE"]);
   assert.match(seen.prompt, /edit-intent\.json/u);
   assert.match(seen.prompt, /不运行 render/u);
+  assert.ok(seen.prompt.includes("Set-Location E:\\pkg"));
+  assert.ok(seen.prompt.includes("包仓库：E:\\pkg"));
   assert.equal(await readFile(path.join(sessionDir, "report.txt"), "utf8"), "报告");
   assert.equal(JSON.parse(await readFile(path.join(sessionDir, "outcome.json"), "utf8")).outcome, "completed");
   assert.deepEqual(Object.keys(vmPmoAiEnvironment({ JIRA_TOKEN: "x", HOME: "h" })), ["HOME"]);
@@ -170,5 +172,13 @@ test("AI intent session failure and unconfigured model are explicit", async t =>
   const runner = createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "gpt-test", spawnTurn });
   assert.equal((await runner.run({ context, packageRoot: "E:\\pkg", pythonPath: "C:\\py.exe", sessionDir })).outcome, "failed");
   assert.throws(() => createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "bad model" }),
+    { code: "VM_PMO_AI_NOT_CONFIGURED" });
+});
+
+test("AI intent session can put a sandbox-readable FFmpeg directory first on PATH", () => {
+  const env = vmPmoAiEnvironment({ Path: "C:\Windows", FEISHU_APP_ID: "x" }, { toolDir: "E:\tools\ffmpeg" });
+  assert.deepEqual(Object.keys(env), ["Path"]);
+  assert.equal(env.Path.split(path.delimiter)[0], "E:\tools\ffmpeg");
+  assert.throws(() => createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "gpt-test", toolDir: "tools" }),
     { code: "VM_PMO_AI_NOT_CONFIGURED" });
 });

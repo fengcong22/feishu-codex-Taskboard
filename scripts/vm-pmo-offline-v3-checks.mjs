@@ -97,11 +97,14 @@ function fakeAi(behaviour, descriptor) {
   }};
 }
 
-export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, checks}) {
+/** Synthetic v3 run directories bound to a v3-manifest copy of the package, with word timing
+ * pre-written so analyze never calls ASR. Shared by the offline checks and the opt-in AI smoke test. */
+export async function createV3Fixture({root, packageRoot, pythonPath, safeEnv, model = MODEL}) {
   // Deployment preview: the same package code with the manifest the v3 switch will publish.
   const v3Root = path.join(root, 'package-v3');
   await mkdir(v3Root);
-  for (const name of ['auto_cut_slicing', 'schemas']) {
+  // docs and AGENTS.md are what a real AI session is told to read first.
+  for (const name of ['auto_cut_slicing', 'schemas', 'docs', 'AGENTS.md']) {
     await cp(path.join(packageRoot, name), path.join(v3Root, name), {recursive: true,
       filter: source => !source.split(path.sep).includes('__pycache__')});
   }
@@ -139,13 +142,19 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
       packageIdentity: identity, manualRevision,
       acquisition: {path: sourcePath, sha256: descriptor.sha256, bytes: sourceBytes.length,
         duration_ms: Math.round(descriptor.duration_us / 1000), vmid_binding: 'vm_api_verified', vmid: 'offline-vmid'},
-      aiSession: manualRevision ? undefined : {agent: 'codex', model: MODEL}});
+      aiSession: manualRevision ? undefined : {agent: 'codex', model}});
     const bound = await validateVmPmoInput({contextPath: prepared.contextPath});
     const {context, input} = bound;
     if (!manualRevision) await save(path.join(context.run_dir, 'alignment.words.json'), alignment(descriptor.sha256));
     const options = {pythonPath, packageRoot: v3Root, contextPath: prepared.contextPath, timeoutMs: 120000, environment};
     return {prepared, context, input, options};
   }
+
+  return {prepare, descriptor, manifestSha256, v3Root, raw: RAW};
+}
+
+export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, checks}) {
+  const {prepare, descriptor, manifestSha256} = await createV3Fixture({root, packageRoot, pythonPath, safeEnv});
 
   // 1. Taskboard-generated v3 input, analyze -> AI intent -> plan, render, QA with reverse ASR.
   const happy = await prepare('ai-intent');
@@ -196,25 +205,52 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
   assert.ok(review.qa.needsHuman.every(row => row.status === 'needs_human'));
   checks.push('approval summary exposes coverage and the QA needs_human items');
 
+  // Tampering helpers rewrite qa.json and, where stated, re-sign qa-result.json so the check reaches
+  // the binding under test instead of stopping at the receipt hash.
+  const qaResultPath = path.join(happy.context.run_dir, 'qa-result.json');
   const qaBytes = await readFile(happy.context.qa_path);
+  const receiptBytes = await readFile(qaResultPath);
+  const qaReceipt = JSON.parse(receiptBytes);
+  assert.deepEqual([qaReceipt.status, qaReceipt.overall, qaReceipt.reverse_asr], ['checked', 'ready_for_review', true]);
+  assert.equal(qaReceipt.plan_sha256, sha256(await readFile(happy.context.plan_path)));
+  assert.equal(JSON.parse(qaBytes).bindings.plan_sha256, qaReceipt.plan_sha256);
+  const counts = report => report.checks.reduce((all, row) => ({...all, [row.status]: (all[row.status] ?? 0) + 1}), {});
+  async function forge(report, {sign = true, receipt = {}} = {}) {
+    const bytes = Buffer.from(JSON.stringify(report));
+    await writeFile(happy.context.qa_path, bytes);
+    await writeFile(qaResultPath, JSON.stringify(sign ? {...qaReceipt, qa_sha256: sha256(bytes),
+      overall: report.overall, counts: counts(report), ...receipt} : qaReceipt));
+  }
+  async function restore() { await writeFile(happy.context.qa_path, qaBytes); await writeFile(qaResultPath, receiptBytes); }
+  const contextPath = happy.prepared.contextPath;
   const failedReport = JSON.parse(qaBytes);
   failedReport.checks[0].status = 'failed';
   failedReport.overall = 'failed';
-  await writeFile(happy.context.qa_path, JSON.stringify(failedReport));
-  const qaFailed = await validateVmPmoRender({contextPath: happy.prepared.contextPath});
+  await forge(failedReport);
+  const qaFailed = await validateVmPmoRender({contextPath});
   assert.deepEqual([qaFailed.status, qaFailed.errorCode], ['failed', 'VM_PMO_QA_FAILED']);
+  await forge(failedReport, {sign: false});
+  await assert.rejects(validateVmPmoRender({contextPath}), {code: 'QA_RESULT_INVALID'});
   const otherOutput = JSON.parse(qaBytes);
   otherOutput.bindings.output_sha256 = '0'.repeat(64);
-  await writeFile(happy.context.qa_path, JSON.stringify(otherOutput));
-  await assert.rejects(validateVmPmoRender({contextPath: happy.prepared.contextPath}), {code: 'QA_REPORT_INVALID'});
+  await forge(otherOutput);
+  await assert.rejects(validateVmPmoRender({contextPath}), {code: 'QA_REPORT_INVALID'});
+  const otherPlan = JSON.parse(qaBytes);
+  otherPlan.bindings.plan_sha256 = '0'.repeat(64);
+  await forge(otherPlan);
+  await assert.rejects(validateVmPmoRender({contextPath}), {code: 'QA_REPORT_INVALID'});
   const unlabelled = JSON.parse(qaBytes);
-  unlabelled.overall = 'ready_for_review';
   unlabelled.checks[0].status = 'failed';
-  await writeFile(happy.context.qa_path, JSON.stringify(unlabelled));
-  await assert.rejects(validateVmPmoRender({contextPath: happy.prepared.contextPath}), {code: 'QA_REPORT_INVALID'});
-  await writeFile(happy.context.qa_path, qaBytes);
-  assert.equal((await validateVmPmoRender({contextPath: happy.prepared.contextPath})).status, 'rendered');
-  checks.push('QA overall failed blocks delivery; QA for another MP4 or with a hidden failure is rejected');
+  await forge(unlabelled, {receipt: {overall: 'ready_for_review'}});
+  await assert.rejects(validateVmPmoRender({contextPath}), {code: 'QA_REPORT_INVALID'});
+  await restore();
+  await writeFile(qaResultPath, JSON.stringify({...qaReceipt, status: 'blocked', qa_sha256: null, overall: null,
+    counts: null, error: {code: 'WORD_ALIGNMENT_UNRESOLVED', message: 'Output transcription is unavailable'}}));
+  const qaBlocked = await validateVmPmoRender({contextPath});
+  assert.deepEqual([qaBlocked.status, qaBlocked.errorCode], ['blocked', 'VM_PMO_QA_BLOCKED']);
+  await restore();
+  assert.equal((await validateVmPmoRender({contextPath})).status, 'rendered');
+  checks.push('qa-result.json binds plan.json and qa.json; failed or blocked QA never delivers; forged reports are rejected');
 
   // 2. A timed-out session blocks; a manual rerun reuses the attempt's ASR and evidence.
   const timeout = await prepare('ai-timeout');

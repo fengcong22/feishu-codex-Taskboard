@@ -26,7 +26,7 @@ export function resolveVmDownloadConfig({ dataDirectory, environment = {}, envFi
     if (!path.isAbsolute(selected)) throw new Error("invalid state path");
     return { statePath: selected, appId: value("FEISHU_APP_ID"), appSecret: value("FEISHU_APP_SECRET"),
       vmPmoPythonPath: value("CODEX_VM_PMO_PYTHON_PATH"), vmPmoRunRoot: value("CODEX_VM_PMO_RUN_ROOT"),
-      vmPmoAiModel: value("CODEX_VM_PMO_AI_MODEL"),
+      vmPmoAiModel: value("CODEX_VM_PMO_AI_MODEL"), vmPmoAiToolDir: value("CODEX_VM_PMO_AI_TOOL_DIR"),
       privateEndpoints: value("CODEX_VM_DOWNLOAD_PRIVATE_ENDPOINTS_JSON") ? JSON.parse(value("CODEX_VM_DOWNLOAD_PRIVATE_ENDPOINTS_JSON")) : [] };
   } catch (error) {
     if (error instanceof VmSourceError) throw error;

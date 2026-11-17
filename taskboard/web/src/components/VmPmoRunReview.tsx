@@ -83,6 +83,12 @@ export function VmPmoRunReview({ review }: { review: Review }) {
           ))}
         </ul>
       )}
+      {review.qaError && (
+        <div className="vm-pmo-run-meta" role="status">
+          <span>{text("成片检查未能完成，不会交付", "Video QA could not run; it will not be delivered")}</span>
+          {review.qaError.code && <code className="vm-pmo-run-error-code">{review.qaError.code}</code>}
+        </div>
+      )}
       {qa && (
         <div aria-label={text("成片质量检查", "Video QA")}>
           <div className="vm-pmo-run-meta">

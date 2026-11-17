@@ -2865,9 +2865,11 @@ export function createTaskboardServer(options = {}) {
     return vmAdapter;
   }
   /** v3 driver step 2. Without CODEX_VM_PMO_AI_MODEL a v3 package cannot be activated. */
-  function vmPmoAiIntentRunner(model) {
+  function vmPmoAiIntentRunner(model, toolDir) {
     if (!validVmPmoAiModel(model) || !resolved.codexExecutable) return null;
-    return createVmPmoAiIntentRunner({codexExecutable: resolved.codexExecutable, model, environment: serviceEnvironment});
+    if (toolDir !== undefined && toolDir !== null && !path.isAbsolute(toolDir)) return null;
+    return createVmPmoAiIntentRunner({codexExecutable: resolved.codexExecutable, model, environment: serviceEnvironment,
+      toolDir: toolDir ?? null});
   }
   function getVmRuntime() {
     if (vmRuntime) return vmRuntime;
@@ -2886,7 +2888,8 @@ export function createTaskboardServer(options = {}) {
       onTaskUpdated: task => events.emit("task.updated", {task}),
       runRoot: options.vmPmoRunRoot ?? config.vmPmoRunRoot ?? path.join(resolved.dataDirectory, "vm-pmo-runs"),
       pythonPath: options.vmPmoPythonPath ?? config.vmPmoPythonPath ?? null,
-      aiIntent: options.vmPmoAiIntent ?? vmPmoAiIntentRunner(options.vmPmoAiModel ?? config.vmPmoAiModel),
+      aiIntent: options.vmPmoAiIntent ?? vmPmoAiIntentRunner(options.vmPmoAiModel ?? config.vmPmoAiModel,
+        options.vmPmoAiToolDir ?? config.vmPmoAiToolDir),
       coursePathResolver,
     });
     return vmRuntime;

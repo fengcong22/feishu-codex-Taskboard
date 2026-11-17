@@ -3,11 +3,10 @@ import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
-import { validateVmPmoAnalyze, validateVmPmoInput, validateVmPmoPlan,
+import { VM_PMO_QA_RESULT, validateVmPmoAnalyze, validateVmPmoInput, validateVmPmoPlan,
   validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 
 const MODES = ["analyze", "plan", "render", "qa"];
-const STDOUT_LIMIT = 64 * 1024;
 
 function failure(code) {
   const error = new Error(code);
@@ -28,8 +27,8 @@ function processEnvironment(environment) {
   return result;
 }
 
-/** One package command. `analyze` and `qa` exist only for schema v3 AI intent runs; `qa` writes no
- * receipt when blocked, so a missing qa.json is reported as VM_PMO_QA_BLOCKED. `qa: "skip"` lets the
+/** One package command. `analyze` and `qa` exist only for schema v3 AI intent runs; `qa` always
+ * publishes qa-result.json (checked, blocked or failed), which is its receipt. `qa: "skip"` lets the
  * v3 driver validate the MP4 before its QA step; every other render validation requires QA. */
 export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPath,
   signal, timeoutMs = 2 * 60 * 60 * 1000, environment = process.env,
@@ -68,7 +67,11 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
     if (mode === "qa" && !(await regularFile(context.result_path))) throw new Error("missing render");
   } catch { throw failure("VM_PMO_RUN_INPUT_INVALID"); }
   const receiptPath = { analyze: context.analyze_result_path, plan: context.plan_result_path,
-    render: context.result_path, qa: context.qa_path }[mode];
+    render: context.result_path, qa: path.join(context.run_dir, VM_PMO_QA_RESULT) }[mode];
+  if (mode === "qa") {
+    try { await lstat(context.qa_path); throw failure("VM_PMO_RUN_INPUT_INVALID"); }
+    catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
   try { await lstat(receiptPath); throw failure("VM_PMO_RUN_INPUT_INVALID"); }
   catch (error) { if (error?.code !== "ENOENT") throw error; }
   const args = ["-m", "auto_cut_slicing.vm_pmo", mode, "--input",
@@ -80,13 +83,8 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
   let child;
   try { child = spawn(pythonPath, args, { cwd: root, env: processEnvironment(environment),
-    windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "ignore"] }); }
+    windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore"] }); }
   catch { throw failure("VM_PMO_PROCESS_UNAVAILABLE"); }
-  // stdout is only read for its bounded one-line status; receipts on disk stay authoritative.
-  let stdout = Buffer.alloc(0);
-  child.stdout?.on("data", (chunk) => {
-    if (stdout.length < STDOUT_LIMIT) stdout = Buffer.concat([stdout, chunk.subarray(0, STDOUT_LIMIT - stdout.length)]);
-  });
   if (onLaunched && Number.isSafeInteger(child.pid) && child.pid > 0) onLaunched();
   let stopped;
   let grace;
@@ -123,17 +121,8 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
     signal?.removeEventListener("abort", abort);
   }
   if (stopped) throw stopped;
-  if (exitCode !== 0) throw failure("VM_PMO_PROCESS_FAILED");
-  if (mode === "qa") {
-    try { await lstat(receiptPath); }
-    catch (error) {
-      if (error?.code !== "ENOENT") throw failure("VM_PMO_RECEIPT_MISSING");
-      let reported;
-      try { reported = JSON.parse(stdout.toString("utf8")); } catch { throw failure("VM_PMO_RECEIPT_MISSING"); }
-      if (reported?.status !== "blocked") throw failure("VM_PMO_RECEIPT_MISSING");
-      return { status: "blocked", errorCode: "VM_PMO_QA_BLOCKED", receiptPath: null, exitCode };
-    }
-  }
+  // A failed QA exits 1 but still publishes its receipt; validate that instead of guessing.
+  if (exitCode !== 0 && !(mode === "qa" && await regularFile(receiptPath))) throw failure("VM_PMO_PROCESS_FAILED");
   try { if (!(await regularFile(receiptPath))) throw new Error("not regular"); }
   catch { throw failure("VM_PMO_RECEIPT_MISSING"); }
   const limit = Math.min(timeoutMs, 120_000);

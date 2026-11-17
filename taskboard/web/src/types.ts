@@ -670,6 +670,7 @@ export interface VmPmoRunReview {
     failed: VmPmoQaItem[];
     limitations: string[];
   } | null;
+  qaError?: { code: string | null; message: string | null } | null;
 }
 
 export type PackageBoardStage = UnifiedWorkflowStage | "materials" | "editing" | "feishu_delivery"

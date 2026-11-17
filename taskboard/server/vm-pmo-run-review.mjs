@@ -1,4 +1,5 @@
 import { lstat, readFile } from "node:fs/promises";
+import path from "node:path";
 
 /** Read-only summary of a v3 run for the approval view: the plan receipt's coverage and blockers and
  * the QA items a human still has to check. Display only — it never decides delivery (the validator
@@ -45,8 +46,11 @@ function qaRow(row) {
 
 export async function readVmPmoRunReview(context) {
   if (!object(context) || context.schema_version !== 3) return null;
-  const [receipt, report] = await Promise.all([readJson(context.plan_result_path), readJson(context.qa_path)]);
-  const review = { planningMode: null, planStatus: null, coverage: [], blockers: [], qa: null };
+  const [receipt, report, qaResult] = await Promise.all([readJson(context.plan_result_path), readJson(context.qa_path),
+    readJson(typeof context.run_dir === "string" ? path.join(context.run_dir, "qa-result.json") : null)]);
+  const review = { planningMode: null, planStatus: null, coverage: [], blockers: [], qa: null, qaError: null };
+  if (qaResult && qaResult.status !== "checked" && object(qaResult.error))
+    review.qaError = { code: code(qaResult.error.code), message: text(qaResult.error.message) };
   if (receipt) {
     review.planningMode = text(receipt.planning_mode);
     review.planStatus = text(receipt.status);

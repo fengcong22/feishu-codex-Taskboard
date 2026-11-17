@@ -31,17 +31,16 @@ export function validVmPmoAiModel(value) {
 export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context }) {
   const doc = (name) => path.join(packageRoot, ...name.split("/"));
   return [
-    "你在 auto-cut-slicing 仓库中执行一次 VM/PMO 剪辑规划。",
+    "你在为 auto-cut-slicing 执行一次 VM/PMO 剪辑规划。",
     "",
-    `包仓库：${packageRoot}`,
-    `Python：${pythonPath}（证据命令在包仓库目录下运行：${pythonPath} -m auto_cut_slicing ...）`,
-    `运行目录：${context.run_dir}`,
+    `包仓库：${packageRoot}（只读；下面提到的文档都在这里）`,
+    `运行目录：${context.run_dir}（你的工作目录，唯一可写的位置）`,
     `输入：${path.join(context.run_dir, "input.json")}`,
     `上下文：${path.join(context.run_dir, "execution-context.json")}`,
     `意图上下文：${context.intent_context_path}（证据命令的 --context 用它）`,
     `证据清单：${path.join(context.evidence_dir, "manifest.json")}（已由 analyze 生成，含完整转写 transcript-full）`,
     "",
-    "先阅读：",
+    "先阅读（路径相对包仓库）：",
     `1. ${doc("AGENTS.md")}`,
     `2. ${doc("docs/editing-standards.md")}`,
     `3. ${doc("docs/ai-editing-workflow.md")}`,
@@ -49,6 +48,10 @@ export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context }) {
     "",
     "任务：按 docs/ai-editing-workflow.md 第 1–4 步，为 input.json 中的全部 instructions 写出",
     `${context.intent_path}。需要更多证据时只使用工作流“能力状态”表中列出的命令。`,
+    "",
+    `运行证据命令：包没有安装到 Python 环境，\`${pythonPath} -m auto_cut_slicing ...\` 必须在包仓库目录下执行`,
+    `（先 \`Set-Location ${packageRoot}\`，再执行命令），`,
+    `\`--context\` 写意图上下文的绝对路径 ${context.intent_context_path}。证据文件会写进 ${context.evidence_dir}${path.sep}。`,
     "",
     "边界：",
     "- 只在运行目录内写文件，不修改仓库文件，不运行 render，不上传或回写任何系统。",
@@ -60,17 +63,25 @@ export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context }) {
   ].join("\n");
 }
 
-export function vmPmoAiEnvironment(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !PRIVATE_ENVIRONMENT.test(key)));
+/** On Windows the Codex sandbox runs as a restricted user that cannot open per-user install folders
+ * such as WinGet packages, so evidence commands need FFmpeg from a directory it can read (`toolDir`). */
+export function vmPmoAiEnvironment(environment = process.env, { toolDir = null } = {}) {
+  const result = Object.fromEntries(Object.entries(environment).filter(([key]) => !PRIVATE_ENVIRONMENT.test(key)));
+  if (toolDir) {
+    const key = Object.keys(result).find((name) => name.toLowerCase() === "path") ?? "PATH";
+    result[key] = [toolDir, result[key]].filter(Boolean).join(path.delimiter);
+  }
+  return result;
 }
 
 /** Returns a runner `({context, packageRoot, pythonPath, sessionDir, signal, onSpawn}) =>
  * {outcome: "completed" | "failed" | "timeout", threadId}`. Interruption throws VM_PMO_RUN_INTERRUPTED.
  * Session evidence (prompt, bounded JSONL events, final report, outcome) goes to sessionDir, which
  * the caller keeps outside the AI-writable run directory. */
-export function createVmPmoAiIntentRunner({ codexExecutable, model, environment = process.env,
+export function createVmPmoAiIntentRunner({ codexExecutable, model, environment = process.env, toolDir = null,
   timeoutMs = AI_INTENT_TIMEOUT_MS, spawnTurn = spawnCodexTurn, now = () => new Date() } = {}) {
   if (typeof codexExecutable !== "string" || !codexExecutable.trim() || !validVmPmoAiModel(model)
+    || toolDir !== null && (typeof toolDir !== "string" || !path.isAbsolute(toolDir))
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof spawnTurn !== "function")
     throw failure("VM_PMO_AI_NOT_CONFIGURED");
   const session = Object.freeze({ agent: AI_INTENT_AGENT, model });
@@ -86,7 +97,7 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
     let logged = 0, threadId = null, report = "", turnFailed = false;
     let writes = Promise.resolve();
     const { child, completion } = spawnTurn({ executable: codexExecutable, args, prompt,
-      env: vmPmoAiEnvironment(environment),
+      env: vmPmoAiEnvironment(environment, { toolDir }),
       onRawEvent: (event) => {
         if (event?.type === "thread.started" && typeof event.thread_id === "string") threadId = event.thread_id.slice(0, 200);
         if (event?.type === "turn.failed" || event?.type === "error") turnFailed = true;

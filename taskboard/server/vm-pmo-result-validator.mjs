@@ -18,7 +18,9 @@ const CONTEXT_KEYS = ["protocol", "schema_version", "input_sha256", "run_dir", "
 const V3_CONTEXT_KEYS = ["evidence_dir", "intent_context_path", "intent_path", "analyze_result_path",
   "qa_path", "qa_review_path"];
 const V3_JSON_KEYS = V3_CONTEXT_KEYS.filter((key) => key !== "evidence_dir");
-const V3_FIXED_FILES = ["alignment.words.json", "output.words.json", ".plan.lock"];
+// qa-result.json is the package's fixed QA receipt (written once, beside qa.json).
+const V3_FIXED_FILES = ["alignment.words.json", "output.words.json", "qa-result.json", ".plan.lock"];
+export const VM_PMO_QA_RESULT = "qa-result.json";
 const QA_KINDS = new Set(["coverage_complete", "operation_compiled", "phrase_absent", "phrase_present",
   "cue_first_word", "must_keep_present", "duration_match", "cut_not_inside_word", "sentence_complete",
   "seam_gap", "seam_discontinuity", "opening_frame", "seam_frames", "seam_pause_picture", "freeze_frames",
@@ -609,11 +611,10 @@ export async function validateVmPmoRender({ contextPath, ffprobePath = "ffprobe"
   if (!sameInfo(actual.info, after.info) || actual.sha256 !== after.sha256) fail("MEDIA_VALIDATION_FAILED");
   if (input.schema_version === 3 && input.planning_mode === "ai_intent" && qa !== "skip") {
     let checked;
-    try { checked = await validateVmPmoQa({ contextPath, signal, expectedBound: plan, plan: plan.plan, artifact }); }
-    catch (error) {
-      if (error?.code === "QA_REPORT_INVALID" && !await exists(context.qa_path)) fail("QA_REQUIRED");
-      throw error;
-    }
+    if (!await exists(path.join(context.run_dir, VM_PMO_QA_RESULT))) fail("QA_REQUIRED");
+    checked = await validateVmPmoQa({ contextPath, signal, expectedBound: plan, plan: plan.plan,
+      planSha256, artifact });
+    if (checked.status === "blocked") return { status: "blocked", errorCode: "VM_PMO_QA_BLOCKED", context, input, qa: checked };
     if (checked.overall === "failed") return { status: "failed", errorCode: "VM_PMO_QA_FAILED", context, input, qa: checked };
     return { ...plan, status: "rendered", artifact, media, result, qa: checked };
   }
@@ -662,18 +663,32 @@ function qaCheck(row) {
 
 /** Schema v3 AI intent only: qa.json must describe this run's plan and rendered MP4.
  * `overall: failed` is returned as a result, not thrown, so callers can block delivery. */
-export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan, artifact } = {}) {
+export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan, planSha256, artifact } = {}) {
   const bound = await loadBoundInput(contextPath, signal, expectedBound, false);
   const { context, input } = bound;
-  if (input.schema_version !== 3 || input.planning_mode !== "ai_intent" || !object(plan) || !object(artifact))
-    fail("QA_REPORT_INVALID");
+  if (input.schema_version !== 3 || input.planning_mode !== "ai_intent" || !object(plan) || !object(artifact)
+    || !digest(planSha256)) fail("QA_REPORT_INVALID");
+  // qa-result.json is the receipt for every outcome; qa.json exists only when QA actually checked.
+  const { value: receipt } = await jsonFile(path.join(context.run_dir, VM_PMO_QA_RESULT), "QA_RESULT_INVALID");
+  if (!exactKeys(receipt, ["protocol", "schema_version", "status", ...IDENTITY, "input_sha256", "source_sha256",
+    "plan_sha256", "qa_sha256", "overall", "counts", "reverse_asr", "error"])
+    || typeof receipt.reverse_asr !== "boolean") fail("QA_RESULT_INVALID");
+  assertIdentity(receipt, input, context, input.source.sha256, "RUN_BINDING_MISMATCH");
+  if (receipt.status !== "checked") {
+    if (!["blocked", "failed"].includes(receipt.status) || !safeError(receipt.error) || receipt.qa_sha256 !== null
+      || receipt.overall !== null || receipt.counts !== null
+      || receipt.plan_sha256 !== null && receipt.plan_sha256 !== planSha256) fail("QA_RESULT_INVALID");
+    return { status: "blocked", errorCode: receipt.error.code, reverseAsr: receipt.reverse_asr };
+  }
+  if (receipt.error !== null || receipt.plan_sha256 !== planSha256 || !digest(receipt.qa_sha256))
+    fail("QA_RESULT_INVALID");
   const { value: report, sha256 } = await jsonFile(context.qa_path, "QA_REPORT_INVALID");
   const bindings = report.bindings;
   if (!exactKeys(report, ["schema", "schema_version", "bindings", "overall", "checks", "limitations"])
     || report.schema !== "auto-cut-slicing/qa-report" || report.schema_version !== 1
     || !exactKeys(bindings, ["intent_sha256", "plan_sha256", "output_id", "output_sha256", "source_sha256s",
       "output_alignment_sha256"])
-    || bindings.intent_sha256 !== plan.intent_sha256 || !digest(bindings.plan_sha256)
+    || bindings.intent_sha256 !== plan.intent_sha256 || bindings.plan_sha256 !== planSha256
     || bindings.output_id !== plan.output_id || bindings.output_sha256 !== artifact.sha256
     || !Array.isArray(bindings.source_sha256s) || !bindings.source_sha256s.includes(input.source.sha256)
     || !bindings.source_sha256s.every(digest)
@@ -686,6 +701,8 @@ export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan
     fail("QA_REPORT_INVALID");
   const counts = {};
   for (const row of report.checks) counts[row.status] = (counts[row.status] ?? 0) + 1;
-  return { overall: report.overall, qaSha256: sha256, counts,
-    reverseAsr: bindings.output_alignment_sha256 !== null, report };
+  const reverseAsr = bindings.output_alignment_sha256 !== null;
+  if (receipt.qa_sha256 !== sha256 || receipt.overall !== report.overall || !same(receipt.counts, counts)
+    || receipt.reverse_asr !== reverseAsr) fail("QA_RESULT_INVALID");
+  return { status: "checked", overall: report.overall, qaSha256: sha256, counts, reverseAsr, report };
 }
