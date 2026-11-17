@@ -1,4 +1,5 @@
-import { lstat, mkdir, readdir, rename } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { runVmPmoOffline } from "./vm-pmo-offline-runner.mjs";
@@ -10,6 +11,8 @@ import { validateVmPmoAnalyze, validateVmPmoInput } from "./vm-pmo-result-valida
  * Inputs that are not schema v3 `ai_intent` (v1, v2 and v3 `rule`) run unchanged through
  * runVmPmoOffline. Start evidence is reported once, when the first process of a step spawns. */
 export const AI_INTENT_BLOCKS = Object.freeze(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"]);
+// Not rerunnable in the same attempt: the files a rerun would reuse can no longer be trusted.
+export const AI_INTENT_SCOPE_VIOLATION = "AI_INTENT_SCOPE_VIOLATION";
 const MAX_AI_SESSIONS = 9;
 
 function failure(code) {
@@ -23,11 +26,10 @@ async function present(file) {
   catch (error) { if (error?.code === "ENOENT") return false; throw failure("VM_PMO_RUN_INPUT_INVALID"); }
 }
 
+function regularInfo(info) { return info.isFile() && !info.isSymbolicLink() && info.nlink === 1; }
+
 async function regularFile(file) {
-  try {
-    const info = await lstat(file);
-    return info.isFile() && !info.isSymbolicLink() && info.nlink === 1;
-  } catch { return false; }
+  try { return regularInfo(await lstat(file)); } catch { return false; }
 }
 
 /** AI sessions live beside the attempt directories (`<runRoot>/<runId>/ai-sessions/`), outside the
@@ -43,6 +45,47 @@ async function nextSessionDir(context) {
   const directory = path.join(root, `${prefix}${used + 1}`);
   await mkdir(directory);
   return directory;
+}
+
+async function fileDigest(file) {
+  let info;
+  try { info = await lstat(file); } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return "unreadable";
+  }
+  if (!regularInfo(info)) return "irregular";
+  try { return createHash("sha256").update(await readFile(file)).digest("hex"); } catch { return "unreadable"; }
+}
+
+/** The AI may add evidence and write edit-intent.json. Taskboard's input and context, analyze's
+ * receipt, intent context and source-bound ASR must keep their bytes, and no planning, render or
+ * QA output may appear before the package runs those steps itself. */
+function aiBoundary(context) {
+  return {
+    protected: [path.join(context.run_dir, "input.json"), path.join(context.run_dir, "execution-context.json"),
+      context.intent_context_path, context.analyze_result_path, path.join(context.run_dir, "alignment.words.json")],
+    outputs: [context.plan_path, context.plan_result_path, context.result_path, context.output_path,
+      context.qa_path, context.qa_review_path, path.join(context.run_dir, "qa-result.json")],
+  };
+}
+
+async function snapshotBoundary(context) {
+  const boundary = aiBoundary(context);
+  const digests = await Promise.all(boundary.protected.map(fileDigest));
+  if (digests.some((value) => !/^[a-f0-9]{64}$/u.test(value ?? ""))) throw failure("VM_PMO_RUN_INPUT_INVALID");
+  for (const file of boundary.outputs) if (await present(file)) throw failure("VM_PMO_RUN_INPUT_INVALID");
+  return digests;
+}
+
+/** Names (relative to the run directory) of protected files that changed and outputs that appeared. */
+async function boundaryBreaches(context, before) {
+  const boundary = aiBoundary(context);
+  const after = await Promise.all(boundary.protected.map(fileDigest));
+  const changed = boundary.protected.filter((_, index) => after[index] !== before[index]);
+  const outputs = [];
+  for (const file of boundary.outputs) if (await fileDigest(file) !== null) outputs.push(file);
+  const name = (file) => path.relative(context.run_dir, file);
+  return { changed: changed.map(name), outputs: outputs.map(name) };
 }
 
 export function isVmPmoAiIntentInput(input) {
@@ -88,6 +131,8 @@ async function planWithIntent(options) {
   }
   if (analyzed.status !== "ready") return { status: "blocked", errorCode: analyzed.errorCode };
 
+  // Checked before a session slot is used, so a broken attempt never consumes one.
+  const before = await snapshotBoundary(context);
   const sessionDir = await nextSessionDir(context);
   if (await present(context.intent_path)) {
     // An intent left by an interrupted or timed-out session is evidence, not input to this session.
@@ -96,6 +141,14 @@ async function planWithIntent(options) {
   const ai = await aiIntent.run({ context, packageRoot: step.packageRoot, pythonPath: step.pythonPath,
     sessionDir, signal, onSpawn: started ? (evidence) => started(evidence) : null });
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
+  // Checked before the outcome: a timed-out or failed session may still have overstepped.
+  const breaches = await boundaryBreaches(context, before);
+  if (breaches.changed.length || breaches.outputs.length) {
+    // The operator is told to inspect the run; this names exactly what the session touched.
+    await writeFile(path.join(sessionDir, "scope-violation.json"), JSON.stringify({ outcome: ai.outcome,
+      changed_protected_files: breaches.changed, unexpected_outputs: breaches.outputs }, null, 2) + "\n", { flag: "wx" });
+    return { status: "blocked", errorCode: AI_INTENT_SCOPE_VIOLATION };
+  }
   const written = await regularFile(context.intent_path);
   if (ai.outcome === "timeout") return { status: "blocked", errorCode: "AI_INTENT_TIMEOUT" };
   if (ai.outcome !== "completed") return { status: "blocked", errorCode: "AI_INTENT_FAILED" };

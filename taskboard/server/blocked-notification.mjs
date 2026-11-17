@@ -8,6 +8,7 @@ const SAFE_REASONS = Object.freeze({
   VM_PMO_START_NOT_CONFIRMED: "未能确认剪辑进程已正常启动。",
   VM_TASK_BINDING_CONFLICT: "Taskboard 任务与 VM 审批绑定冲突。",
   WORD_ALIGNMENT_UNRESOLVED: "语音识别词条无法与素材准确匹配，需要人工规划处理。",
+  AI_INTENT_SCOPE_VIOLATION: "AI 规划改动了受保护的运行文件或越过规划步骤，已在渲染前阻断，需要人工检查后重新登记任务。",
   document_link_missing: "没有取得有效的素材文档链接。",
   document_link_ambiguous: "素材文档链接不唯一，无法确定本次剪辑来源。",
   docx_anchor_missing: "素材文档中没有找到当前流程要求的内容章节。",
