@@ -76,3 +76,22 @@ test("only the fixed Shadow origin is opened in the default browser", async () =
   }
   assert.equal(launched.length, 1);
 });
+
+test("the file manager selects one stored file and never runs it", async () => {
+  const { revealLocalFile } = await import("../server/local-file-reveal.mjs");
+  const launched = [];
+  const spawnProcess = (command, args, options) => {
+    launched.push([command, args, options.windowsVerbatimArguments]);
+    const child = new EventEmitter();
+    child.unref = () => {};
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  };
+  const file = path.win32.join("E:\\", "VM 下载", "vm-x", "source.mp4");
+  assert.equal(await revealLocalFile(file, { platform: "win32", spawnProcess }), true);
+  assert.deepEqual(launched[0], ["explorer.exe", [`/select,"${file}"`], true]);
+  for (const bad of ["relative.mp4", path.win32.join("E:\\", "a\"b.mp4"), path.win32.join("E:\\", "a\nb.mp4"), null]) {
+    assert.equal(await revealLocalFile(bad, { platform: "win32", spawnProcess }), false);
+  }
+  assert.equal(launched.length, 1);
+});

@@ -692,3 +692,30 @@ test("notification sender preserves a safe Feishu rejection code and drops respo
     return true;
   });
 });
+
+test("only a finished job's stored video inside its output folder is revealed", async (t) => {
+  const revealed = [];
+  const f = await fixture(t, { revealFile: async (file) => { revealed.push(file); return true; } });
+  const [ready, waiting] = f.service.enqueue(f.input([vmid, second])).jobs;
+  const folder = path.join(f.dir, `vm-${vmid}-fixture`);
+  await (await import("node:fs/promises")).mkdir(folder);
+  const file = path.join(folder, "source.mp4");
+  await writeFile(file, "video");
+  f.update(ready.id, (job) => { job.status = "ready"; job.acquisition = { path: file, receipt_path: path.join(folder, "acquisition.json") }; });
+
+  assert.deepEqual(await f.service.revealFile(ready.id), { revealed: true });
+  assert.equal(revealed.length, 1);
+  assert.equal(path.basename(revealed[0]), "source.mp4");
+  await assert.rejects(f.service.revealFile(waiting.id), { code: "VM_DOWNLOAD_FILE_UNAVAILABLE" });
+  await assert.rejects(f.service.revealFile("missing-job"), { code: "VM_APPROVAL_JOB_NOT_FOUND" });
+
+  const outside = path.join(os.tmpdir(), `vm-reveal-outside-${Date.now()}.mp4`);
+  await writeFile(outside, "video");
+  t.after(() => rm(outside, { force: true }));
+  f.update(ready.id, (job) => { job.acquisition = { ...job.acquisition, path: outside }; });
+  await assert.rejects(f.service.revealFile(ready.id), { code: "VM_DOWNLOAD_FILE_UNAVAILABLE" });
+
+  f.update(ready.id, (job) => { job.acquisition = { ...job.acquisition, path: path.join(folder, "moved.mp4") }; });
+  await assert.rejects(f.service.revealFile(ready.id), { code: "VM_DOWNLOAD_FILE_MISSING" });
+  assert.equal(revealed.length, 1);
+});

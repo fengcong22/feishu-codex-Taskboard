@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createVmDownloadSession } from "./vm-download-session.mjs";
@@ -6,6 +7,7 @@ import { enqueueVmApproval, extendVmApprovalWait, processVmApproval, recoverVmAp
   validateVmApprovalRequest, vmApprovalJobIdForTaskRun } from "./vm-approval-workflow.mjs";
 import { VmSourceError } from "./vm-source-transfer.mjs";
 import { prepareVmSource } from "./vm-source-adapter.mjs";
+import { revealLocalFile } from "./local-file-reveal.mjs";
 
 const TERMINAL = new Set(["ready", "rejected", "canceled", "needs_attention", "auth_required", "dead_letter"]);
 const MAX_QUEUE_CLEANUP_ITEMS = 1000;
@@ -34,8 +36,8 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
   notifier = { available: () => false }, now = Date.now,
   defaultOutputRoot = path.join(os.homedir(), "Desktop"),
   allowedOrigins = ["https://vm-resource.yangcong345.com"], privateEndpoints = [],
-  processJob = processVmApproval, workerOptions = {}, tickMs = 1000 } = {}) {
-  if (!store || !metadata || !Number.isSafeInteger(tickMs) || tickMs < 10) fail("VM_DOWNLOAD_INPUT_INVALID");
+  processJob = processVmApproval, workerOptions = {}, tickMs = 1000, revealFile = revealLocalFile } = {}) {
+  if (!store || !metadata || !Number.isSafeInteger(tickMs) || tickMs < 10 || typeof revealFile !== "function") fail("VM_DOWNLOAD_INPUT_INVALID");
   let timer;
   let running;
   let requested = false;
@@ -334,6 +336,28 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       return { removedCount: store.removeFromQueue(jobIds).length };
     },
     remove(id) { store.removeFromQueue([id]); return { removed: true }; },
+    /** Selects a finished job's verified video in the local file manager; the path comes only from the stored job. */
+    async revealFile(id) {
+      if (closed) fail("VM_DOWNLOAD_CLOSED");
+      const job = store.get(id);
+      if (!job) fail("VM_APPROVAL_JOB_NOT_FOUND");
+      const file = job.acquisition?.path, root = job.request?.output_root;
+      if (job.status !== "ready" || typeof file !== "string" || !path.isAbsolute(file)
+        || typeof root !== "string" || !path.isAbsolute(root)) fail("VM_DOWNLOAD_FILE_UNAVAILABLE");
+      let real;
+      try {
+        const info = await lstat(file);
+        if (!info.isFile() || info.isSymbolicLink()) fail("VM_DOWNLOAD_FILE_MISSING");
+        real = await realpath(file);
+        const relative = path.relative(await realpath(root), real);
+        if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) fail("VM_DOWNLOAD_FILE_UNAVAILABLE");
+      } catch (error) {
+        if (error instanceof VmSourceError) throw error;
+        fail("VM_DOWNLOAD_FILE_MISSING");
+      }
+      if (await revealFile(real) !== true) fail("VM_DOWNLOAD_REVEAL_FAILED");
+      return { revealed: true };
+    },
     cancelUnsubmitted(id) { return publicJob(store.cancelUnsubmitted(id)); },
     updateSettings(input) { if (closed) fail("VM_DOWNLOAD_CLOSED"); settings = validateSettings(input); persistSettings(settings); kick(); return { settings: structuredClone(settings) }; },
     async beginLogin() { if (closed) fail("VM_DOWNLOAD_CLOSED"); return session.beginLogin(); },
