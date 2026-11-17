@@ -793,8 +793,13 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
       && !run.renderRetryHistory?.length && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    // 只读摘要，供看板填写人工修改方案时绑定原视频；不含路径、回执等敏感字段。
+    const sourceSha256 = /^[a-f0-9]{64}$/u.test(run.acquisition?.sha256 ?? "") ? run.acquisition.sha256 : null;
+    const sourceDurationMs = Number.isSafeInteger(run.acquisition?.duration_ms) && run.acquisition.duration_ms > 0
+      ? run.acquisition.duration_ms : null;
     return {runId:run.runId,taskId:run.taskId,state:run.state,errorCode:run.errorCode,
       approvalStatus:run.approvalStatus,planAttempt,retryLimit:MAX_PLAN_ATTEMPTS,
+      sourceSha256,sourceDurationMs,
       materialSource: run.acquisition?.vmid_binding === "operator_asserted" ? "manual"
         : run.acquisition ? "vm" : null,
       ...(run.errorCode === "VM_DOWNLOAD_FAILED" && run.downloadFailure ? {downloadFailure: {

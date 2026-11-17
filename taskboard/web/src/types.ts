@@ -634,6 +634,12 @@ export interface VmPmoRunSummary {
   retryLimit: number;
   retryHistory: Array<{ planAttempt: number; errorCode: string; failedAt: string }>;
   canRetryPlan: boolean;
+  canRetryValidatedPlan?: boolean;
+  canRetryFailedRender?: boolean;
+  canRetryManualRevision?: boolean;
+  canRetryApproval?: boolean;
+  sourceSha256?: string | null;
+  sourceDurationMs?: number | null;
   canRetryWriteback?: boolean;
   /** "vm" for a VM API download, "manual" for an operator-supplied VMID.mp4. */
   materialSource?: "vm" | "manual" | null;

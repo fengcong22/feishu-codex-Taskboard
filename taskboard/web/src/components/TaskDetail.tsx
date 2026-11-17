@@ -36,6 +36,10 @@ import {
   rerunTaskAutoCutCurrent,
   retryTaskVmPmoPlan,
   retryTaskVmPmoWriteback,
+  retryTaskVmPmoPlanValidation,
+  retryTaskVmPmoRender,
+  retryTaskVmPmoApproval,
+  retryTaskVmPmoManualRevision,
   uploadAttachment,
   uploadCommentAttachment,
   uploadTaskArtifact,
@@ -480,6 +484,16 @@ export function TaskDetail({
   const [vmPmoRunError, setVmPmoRunError] = useState<TaskDetailError | null>(null);
   const [retryingVmPmoPlan, setRetryingVmPmoPlan] = useState(false);
   const [retryingVmPmoWriteback, setRetryingVmPmoWriteback] = useState(false);
+  const [retryingVmPmoValidation, setRetryingVmPmoValidation] = useState(false);
+  const [retryingVmPmoRender, setRetryingVmPmoRender] = useState(false);
+  const [retryingVmPmoApproval, setRetryingVmPmoApproval] = useState(false);
+  const [submittingVmPmoRevision, setSubmittingVmPmoRevision] = useState(false);
+  const [showVmPmoRevisionForm, setShowVmPmoRevisionForm] = useState(false);
+  const [vmPmoRevisionNote, setVmPmoRevisionNote] = useState("");
+  const [vmPmoRevisionStart, setVmPmoRevisionStart] = useState("");
+  const [vmPmoRevisionEnd, setVmPmoRevisionEnd] = useState("");
+  const [allowVmPmoRevisionSource, setAllowVmPmoRevisionSource] = useState(false);
+  const [allowVmPmoRevisionPlanning, setAllowVmPmoRevisionPlanning] = useState(false);
   const [showVmPmoRetryConsent, setShowVmPmoRetryConsent] = useState(false);
   const [allowVmPmoAsr, setAllowVmPmoAsr] = useState(false);
   const [allowVmPmoLocalWrite, setAllowVmPmoLocalWrite] = useState(false);
@@ -596,6 +610,16 @@ export function TaskDetail({
       setAllowVmPmoAsr(false);
       setAllowVmPmoLocalWrite(false);
       setRetryingVmPmoPlan(false);
+      setRetryingVmPmoValidation(false);
+      setRetryingVmPmoRender(false);
+      setRetryingVmPmoApproval(false);
+      setSubmittingVmPmoRevision(false);
+      setShowVmPmoRevisionForm(false);
+      setVmPmoRevisionNote("");
+      setVmPmoRevisionStart("");
+      setVmPmoRevisionEnd("");
+      setAllowVmPmoRevisionSource(false);
+      setAllowVmPmoRevisionPlanning(false);
     }
   }, [task]);
 
@@ -1352,6 +1376,67 @@ export function TaskDetail({
     }
   }
 
+  // 版本号类补救共用：按钮是否可用由服务端返回的标志决定，这里只负责提交和刷新。
+  async function retryVmPmoByVersion(
+    allowed: boolean,
+    setBusy: (value: boolean) => void,
+    action: (taskId: string, version: number) => Promise<VmPmoRunSummary>,
+  ) {
+    if (!allowed) return;
+    const taskId = currentTask.id;
+    setBusy(true);
+    setVmPmoRunError(null);
+    try {
+      const run = await action(taskId, currentTask.version);
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRun(run);
+    } catch (error) {
+      if (currentTaskIdRef.current === taskId) setVmPmoRunError(messageFor(error));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setBusy(false);
+    }
+  }
+
+  // 人工修改方案：保留区间必须是整数毫秒且落在原视频时长内，方案绑定原视频校验值。
+  async function submitVmPmoRevision() {
+    if (!vmPmoRun?.canRetryManualRevision || !vmPmoRun.sourceSha256 || submittingVmPmoRevision) return;
+    const startMs = Number(vmPmoRevisionStart.trim());
+    const endMs = Number(vmPmoRevisionEnd.trim());
+    const duration = vmPmoRun.sourceDurationMs ?? null;
+    if (!vmPmoRevisionNote.trim()
+      || !Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs)
+      || startMs < 0 || endMs <= startMs
+      || (duration !== null && endMs > duration)) {
+      setVmPmoRunError(text(
+        "请填写修改说明，并给出落在原视频时长内的整数毫秒区间。",
+        "Enter a note and an integer millisecond range within the source video.",
+      ));
+      return;
+    }
+    const taskId = currentTask.id;
+    setSubmittingVmPmoRevision(true);
+    setVmPmoRunError(null);
+    try {
+      const run = await retryTaskVmPmoManualRevision(taskId, currentTask.version, {
+        sourceSha256: vmPmoRun.sourceSha256,
+        note: vmPmoRevisionNote.trim(),
+        clips: [{ startMs, endMs }],
+      });
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRun(run);
+      setShowVmPmoRevisionForm(false);
+      setVmPmoRevisionNote("");
+      setVmPmoRevisionStart("");
+      setVmPmoRevisionEnd("");
+      setAllowVmPmoRevisionSource(false);
+      setAllowVmPmoRevisionPlanning(false);
+    } catch (error) {
+      if (currentTaskIdRef.current === taskId) setVmPmoRunError(messageFor(error));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setSubmittingVmPmoRevision(false);
+    }
+  }
+
   function updateArtifactUpload(nextUpload: ArtifactUpload) {
     setArtifactUploads((current) => [
       nextUpload,
@@ -1861,6 +1946,81 @@ export function TaskDetail({
                             setShowVmPmoRetryConsent(false);
                             setAllowVmPmoAsr(false);
                             setAllowVmPmoLocalWrite(false);
+                          }}>{text("取消", "Cancel")}</button>
+                        </div>
+                      </div>
+                    )}
+                    {vmPmoRun.canRetryValidatedPlan && (
+                      <button type="button" disabled={retryingVmPmoValidation}
+                        onClick={() => void retryVmPmoByVersion(true, setRetryingVmPmoValidation, retryTaskVmPmoPlanValidation)}>
+                        {retryingVmPmoValidation
+                          ? text("正在重新校验…", "Revalidating…")
+                          : text("重新校验已保存的规划", "Revalidate the saved plan")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryFailedRender && (
+                      <button type="button" disabled={retryingVmPmoRender}
+                        onClick={() => void retryVmPmoByVersion(true, setRetryingVmPmoRender, retryTaskVmPmoRender)}>
+                        {retryingVmPmoRender
+                          ? text("正在恢复渲染…", "Resuming render…")
+                          : text("用原规划重新渲染", "Render again with the saved plan")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryApproval && (
+                      <button type="button" disabled={retryingVmPmoApproval}
+                        onClick={() => void retryVmPmoByVersion(true, setRetryingVmPmoApproval, retryTaskVmPmoApproval)}>
+                        {retryingVmPmoApproval
+                          ? text("正在重新排队…", "Requeueing…")
+                          : text("重新排队审批", "Requeue for approval")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryManualRevision && !showVmPmoRevisionForm && (
+                      <button type="button" disabled={submittingVmPmoRevision}
+                        onClick={() => setShowVmPmoRevisionForm(true)}>
+                        {text("提交人工修改方案", "Submit a manual revision")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryManualRevision && showVmPmoRevisionForm && (
+                      <div className="vm-pmo-retry-consent">
+                        <p>{vmPmoRun.sourceDurationMs
+                          ? text(`原视频时长 ${vmPmoRun.sourceDurationMs} 毫秒，保留区间必须落在其中。`,
+                            `The source video is ${vmPmoRun.sourceDurationMs} ms long; the kept range must stay within it.`)
+                          : text("保留区间按原视频的毫秒位置填写。", "Enter the kept range as millisecond positions in the source video.")}</p>
+                        <label>
+                          {text("修改说明", "Revision note")}
+                          <input type="text" maxLength={1024} value={vmPmoRevisionNote}
+                            onChange={(event) => setVmPmoRevisionNote(event.target.value)} />
+                        </label>
+                        <label>
+                          {text("保留开始（毫秒）", "Keep from (ms)")}
+                          <input type="number" min={0} step={1} value={vmPmoRevisionStart}
+                            onChange={(event) => setVmPmoRevisionStart(event.target.value)} />
+                        </label>
+                        <label>
+                          {text("保留结束（毫秒）", "Keep until (ms)")}
+                          <input type="number" min={1} step={1} value={vmPmoRevisionEnd}
+                            onChange={(event) => setVmPmoRevisionEnd(event.target.value)} />
+                        </label>
+                        <label>
+                          <input type="checkbox" checked={allowVmPmoRevisionSource}
+                            onChange={(event) => setAllowVmPmoRevisionSource(event.target.checked)} />
+                          {text("允许本次使用原视频", "Allow this attempt to use the source video")}
+                        </label>
+                        <label>
+                          <input type="checkbox" checked={allowVmPmoRevisionPlanning}
+                            onChange={(event) => setAllowVmPmoRevisionPlanning(event.target.checked)} />
+                          {text("允许本次写入新的本机规划文件", "Allow this attempt to write a new local plan")}
+                        </label>
+                        <div className="vm-pmo-retry-actions">
+                          <button type="button"
+                            disabled={submittingVmPmoRevision || !allowVmPmoRevisionSource || !allowVmPmoRevisionPlanning}
+                            onClick={() => void submitVmPmoRevision()}>
+                            {submittingVmPmoRevision ? text("正在提交…", "Submitting…") : text("确认提交", "Submit revision")}
+                          </button>
+                          <button type="button" disabled={submittingVmPmoRevision} onClick={() => {
+                            setShowVmPmoRevisionForm(false);
+                            setAllowVmPmoRevisionSource(false);
+                            setAllowVmPmoRevisionPlanning(false);
                           }}>{text("取消", "Cancel")}</button>
                         </div>
                       </div>
