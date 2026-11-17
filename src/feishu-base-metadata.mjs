@@ -821,6 +821,12 @@ function assertVmSubjectMetadata(subject, metadata) {
       const writebackField = vmField(table, binding?.fieldId, `${pathName}.fieldId`, "select");
       vmOption(writebackField, binding?.optionId, `${pathName}.optionId`);
     }
+    // Optional source-result options must still exist live on the initial status field.
+    for (const moment of stageId === "initial" ? ["materialsReady", "downloadFailed"] : []) {
+      const binding = stage.writeback?.[moment];
+      if (binding === undefined) continue;
+      vmOption(status, binding?.optionId, `${prefix}.writeback.${moment}.optionId`);
+    }
   }
   const archive = config.finalArchive;
   if (archive.enabled) {

@@ -370,6 +370,31 @@ export class TaskboardClient {
     return task;
   }
 
+  async submitFeishuVmManualSource(payload, { bridgeSecret = this.bridgeSecret } = {}) {
+    const pathname = "/api/local/feishu/vm/manual-source";
+    const event = payload?.event;
+    if (!objectPayload(payload) || !objectPayload(event) || !objectPayload(payload.binding)
+      || !["eventId", "baseToken", "tableId", "recordId", "statusFieldId", "beforeOptionId", "afterOptionId"]
+        .every((key) => typeof event[key] === "string" && event[key].length > 0)
+      || typeof payload.binding.subjectKey !== "string"
+      || !Number.isSafeInteger(payload.binding.configVersion)) throw invalidResponse(pathname);
+    const secret = typeof bridgeSecret === "string" ? bridgeSecret.trim() : "";
+    if (!secret) throw new TaskboardError("Feishu Bridge secret is not configured", {
+      code: "FEISHU_BRIDGE_SECRET_NOT_CONFIGURED", status: 503,
+    });
+    const response = await this.#request(pathname, {
+      body: payload,
+      // Taskboard only records the request here; copying and decoding run in the background.
+      timeoutMs: Math.max(this.timeoutMs, 30_000),
+      headers: { "x-taskboard-client": "feishu-bridge", "x-feishu-bridge-secret": secret },
+    });
+    const result = response?.result;
+    if (!objectPayload(result) || !["accepted", "rejected", "ignored"].includes(result.state)
+      || (result.taskId !== undefined && (typeof result.taskId !== "string" || !result.taskId)))
+      throw invalidResponse(pathname);
+    return { state: result.state, ...(result.taskId ? { taskId: result.taskId } : {}) };
+  }
+
   async archiveFeishuVmFinalVideo(payload, { bridgeSecret = this.bridgeSecret } = {}) {
     const pathname = "/api/local/feishu/vm/final-archive";
     if (!validVmFinalArchiveRegistration(payload)) throw invalidResponse(pathname);

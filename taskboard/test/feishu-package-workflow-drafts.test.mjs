@@ -1041,3 +1041,37 @@ test("canonical shared naming can be cleared without hidden legacy inheritance",
   assert.equal(saved.config.fields.namingFieldId, null);
   assert.equal(Object.hasOwn(saved, "legacyNamingConflict"), false);
 });
+
+test("VM drafts keep optional source-result options on the initial status field only", async (t) => {
+  const f = await fixture(t);
+  const fields = structuredClone(metadata);
+  fields.find((field) => field.fieldId === "fld_status").options.push(
+    { id: "opt_source", name: "素材已就绪" }, { id: "opt_failed", name: "下载失败" });
+  await f.workflowStore.upsertBasePreview({ baseToken: "bas_preview", baseName: "预览测试", sourceUrlLabel: null,
+    metadataRefreshedAt: Date.now(), tables: [{ tableId: "tbl_chemistry", tableName: "化学", fields }] });
+  const unbound = await populatedConfig(f);
+  unbound.stages.initial.writeback = { ...unbound.stages.initial.writeback,
+    materialsReady: { fieldId: null, optionId: null } };
+  const plain = (await f.put(unbound)).body;
+  assert.deepEqual(Object.keys(plain.config.stages.initial.writeback), ["processing", "completed"]);
+
+  const config = await populatedConfig(f);
+  config.stages.initial.writeback = { ...config.stages.initial.writeback,
+    materialsReady: { fieldId: "fld_status", optionId: "opt_source" },
+    downloadFailed: { fieldId: "fld_status", optionId: "opt_failed" } };
+  const saved = (await f.put(config, 1)).body;
+  assert.deepEqual(saved.config.stages.initial.writeback.materialsReady, { fieldId: "fld_status", optionId: "opt_source" });
+  assert.deepEqual(saved.config.stages.initial.writeback.downloadFailed, { fieldId: "fld_status", optionId: "opt_failed" });
+
+  for (const mutate of [
+    (draft) => { draft.stages.initial.writeback.materialsReady.optionId = "opt_initial"; },
+    (draft) => { draft.stages.initial.writeback.downloadFailed.optionId = "opt_source"; },
+    (draft) => { draft.stages.initial.writeback.downloadFailed.fieldId = "fld_writeback"; },
+    (draft) => { draft.stages.review.writeback = { ...draft.stages.review.writeback,
+      materialsReady: { fieldId: "fld_status", optionId: "opt_source" } }; },
+  ]) {
+    const draft = structuredClone(saved.config);
+    mutate(draft);
+    await assert.rejects(() => f.put(draft, saved.revision), (error) => error.status === 400);
+  }
+});

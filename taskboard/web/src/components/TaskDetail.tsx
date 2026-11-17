@@ -1871,6 +1871,20 @@ export function TaskDetail({
                       <code>{vmPmoRun.runId}</code>
                       {vmPmoRun.errorCode && <code className="vm-pmo-run-error-code">{vmPmoRun.errorCode}</code>}
                     </div>
+                    {vmPmoRun.materialSource === "manual" && (
+                      <p className="vm-pmo-material-source">{text("素材来源：人工提供", "Source: supplied manually")}</p>
+                    )}
+                    {vmPmoRun.downloadFailure && (
+                      <div className="vm-pmo-download-failure" aria-label={text("VM 视频下载失败", "VM source download failed")}>
+                        {vmPmoRun.downloadFailure.manualSourceState === "pending"
+                          ? <p>{text("正在校验人工放入的视频…", "Checking the manually supplied video…")}</p>
+                          : vmPmoRun.downloadFailure.message && <p>{vmPmoRun.downloadFailure.message}</p>}
+                        {vmPmoRun.downloadFailure.manualSourceFile && (
+                          <p>{text("人工素材位置：VM 下载目录下的", "Manual source location: in the VM download folder,")} <code>{vmPmoRun.downloadFailure.manualSourceFile}</code></p>
+                        )}
+                        <code className="vm-pmo-run-error-code">{vmPmoRun.downloadFailure.reason}</code>
+                      </div>
+                    )}
                     {vmPmoRun.writeback && (
                       <div aria-label={text("飞书进度回写", "Feishu progress writeback")}>
                         {(["processing", "completed"] as const).map(moment => {

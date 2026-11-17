@@ -7081,6 +7081,14 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, result.created ? 201 : 200, {task: result.task});
       }
 
+      if (pathname === "/api/local/feishu/vm/manual-source") {
+        assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
+        assertNoQuery(url.searchParams, "POST /api/local/feishu/vm/manual-source");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const result = await getVmRuntime().submitManualSource(await readJson(request));
+        return sendJson(response, result.state === "accepted" ? 202 : 200, {result});
+      }
+
       if (pathname === "/api/local/feishu/vm/final-archive") {
         assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
         assertNoQuery(url.searchParams, "POST /api/local/feishu/vm/final-archive");

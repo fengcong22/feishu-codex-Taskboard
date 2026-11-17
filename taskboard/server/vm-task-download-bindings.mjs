@@ -329,7 +329,10 @@ export function createVmTaskDownloadBindings({ database, approval, resolveReques
       }
       job = validateApproval(job, binding);
       const base = summary(binding.row, binding.request);
-      if (job.status !== "ready") return { ...base, status: job.status, ...(job.error ? { error: job.error } : {}) };
+      if (job.status !== "ready") return { ...base, status: job.status, ...(job.error ? { error: job.error } : {}),
+        // Evidence that VM approved the application, so an operator may supply the approved video.
+        ...(job.media_wait_started_at && job.application_id && job.instance_code
+          ? { approvalEvidence: { applicationId: job.application_id, instanceCode: job.instance_code } } : {}) };
       if (!job.acquisition?.receipt_path || !job.application_id || !job.instance_code) fail("VM_TASK_ACQUISITION_INVALID");
       let verified = recoveredAcquisition;
       if (!verified) {

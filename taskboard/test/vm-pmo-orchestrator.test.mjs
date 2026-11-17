@@ -659,3 +659,125 @@ test("corrupted persisted render evidence is rejected before artifact registrati
     .run(JSON.stringify(payload), "run_vm");
   assert.throws(() => x.f.get("run_vm"), { code: "VM_PMO_STATE_INVALID" });
 });
+
+async function materialFixture(t, { ready = true, failed = true } = {}) {
+  const x = await fixture(t);
+  const events = [];
+  let status = { status: "waiting_approval" };
+  x.dependencies.bindings.status = async () => ({ ...x.binding, ...status });
+  x.dependencies.materialEdges = async () => ({ materialsReady: ready, downloadFailed: failed });
+  x.dependencies.onMaterialsReady = async ({ run }) => { events.push(["materials_ready", run.runId]); };
+  x.dependencies.onDownloadFailed = async ({ run, slot }) => { events.push(["download_failed", slot, run.errorCode]); };
+  await x.restart();
+  return Object.assign(x, { events, setStatus(value) { status = value; } });
+}
+
+const APPROVED = { approvalEvidence: { applicationId: "app_vm", instanceCode: "inst_vm" } };
+
+test("without a download-failed option a stopped approval keeps the previous waiting behavior", async (t) => {
+  const x = await materialFixture(t, { ready: false, failed: false });
+  await x.f.register({ taskId: "task_vm" });
+  x.setStatus({ status: "needs_attention", error: { code: "VM_MEDIA_WAIT_EXPIRED" }, ...APPROVED });
+  const run = await x.f.pump("run_vm");
+  assert.equal(run.state, "waiting_materials");
+  assert.deepEqual(x.events, []);
+});
+
+test("a stopped approved download blocks the run, records the cause and writes download failed once", async (t) => {
+  const x = await materialFixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setStatus({ status: "dead_letter", error: { code: "VM_SOURCE_TIMEOUT" }, ...APPROVED });
+  const run = await x.f.pump("run_vm");
+  assert.equal(run.state, "blocked");
+  assert.equal(run.errorCode, "VM_DOWNLOAD_FAILED");
+  assert.deepEqual({ ...run.downloadFailure, failedAt: undefined }, { reason: "VM_SOURCE_TIMEOUT", approved: true,
+    applicationId: "app_vm", instanceCode: "inst_vm", failedAt: undefined });
+  await x.f.pump("run_vm");
+  assert.deepEqual(x.events, [["download_failed", "auto", "VM_DOWNLOAD_FAILED"]]);
+  assert.equal(x.attention.length, 1);
+  assert.equal(x.calls.some(([name]) => ["slot", "prepare", "plan", "render"].includes(name)), false);
+});
+
+test("a rejected application is a failure that cannot take an operator source", async (t) => {
+  const x = await materialFixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setStatus({ status: "rejected" });
+  const run = await x.f.pump("run_vm");
+  assert.equal(run.errorCode, "VM_DOWNLOAD_FAILED");
+  assert.equal(run.downloadFailure.reason, "VM_APPROVAL_REJECTED");
+  assert.equal(run.downloadFailure.approved, false);
+  assert.throws(() => x.f.requestManualSource("run_vm", { eventId: "evt_manual" }),
+    { code: "VM_PMO_MANUAL_SOURCE_NOT_ALLOWED" });
+});
+
+test("a Shadow login pause fails only after two unattended hours", async (t) => {
+  const x = await materialFixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setStatus({ status: "auth_required", ...APPROVED });
+  assert.equal((await x.f.pump("run_vm")).state, "waiting_materials");
+  x.advance(60 * 60 * 1000);
+  x.setStatus({ status: "waiting_media", ...APPROVED });
+  const resumed = await x.f.pump("run_vm");
+  assert.equal(resumed.authRequiredSince, undefined);
+  x.setStatus({ status: "auth_required", ...APPROVED });
+  x.advance(60 * 60 * 1000);
+  assert.equal((await x.f.pump("run_vm")).state, "waiting_materials");
+  x.advance(2 * 60 * 60 * 1000);
+  const failed = await x.f.pump("run_vm");
+  assert.equal(failed.errorCode, "VM_DOWNLOAD_FAILED");
+  assert.equal(failed.downloadFailure.reason, "VM_AUTH_EXPIRED");
+});
+
+test("a verified VM download writes materials ready once before editing", async (t) => {
+  const x = await materialFixture(t);
+  x.dependencies.bindings.status = async () => ({ ...x.binding, status: "ready", acquisition: {
+    receipt_path: path.join(os.tmpdir(), "receipt.json"), path: path.join(os.tmpdir(), "source.mp4"),
+    sha256: "a".repeat(64), bytes: 100, duration_ms: 1000, vmid_binding: "vm_api_verified" } });
+  await x.restart();
+  await x.f.register({ taskId: "task_vm" });
+  const run = await x.f.pump("run_vm");
+  assert.equal(run.materialsReadyNotified, true);
+  await x.f.pump("run_vm");
+  assert.deepEqual(x.events, [["materials_ready", "run_vm"]]);
+  assert.equal(x.calls.some(([name]) => name === "prepare"), true);
+});
+
+test("an approved failed run binds one verified operator source and continues the same run", async (t) => {
+  const x = await materialFixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setStatus({ status: "needs_attention", error: { code: "VM_DOWNLOAD_OUTCOME_UNKNOWN" }, ...APPROVED });
+  await x.f.pump("run_vm");
+  const pending = x.f.requestManualSource("run_vm", { eventId: "evt_manual" });
+  assert.equal(pending.manualSource.state, "pending");
+  assert.equal(x.f.requestManualSource("run_vm", { eventId: "evt_manual" }).manualSource.state, "pending");
+  assert.throws(() => x.f.requestManualSource("run_vm", { eventId: "evt_other" }),
+    { code: "VM_PMO_MANUAL_SOURCE_NOT_ALLOWED" });
+  const acquisition = { receipt_path: path.join(os.tmpdir(), "manual", "acquisition.json"),
+    path: path.join(os.tmpdir(), "manual", "source.mp4"), sha256: "e".repeat(64), bytes: 100,
+    duration_ms: 1000, vmid_binding: "operator_asserted", vmid: x.binding.vmid };
+  assert.throws(() => x.f.completeManualSource("run_vm", { eventId: "evt_manual",
+    acquisition: { ...acquisition, vmid: "000000000000000000000000" } }), { code: "VM_PMO_ACQUISITION_INVALID" });
+  const accepted = x.f.completeManualSource("run_vm", { eventId: "evt_manual", acquisition });
+  assert.equal(accepted.state, "ready");
+  assert.equal(accepted.errorCode, null);
+  assert.equal(accepted.manualSource.state, "accepted");
+  assert.equal(accepted.acquisition.vmid_binding, "operator_asserted");
+  await x.f.pump("run_vm");
+  const prepare = x.calls.find(([name]) => name === "prepare");
+  assert.equal(prepare[1].acquisition.sha256, "e".repeat(64));
+  assert.deepEqual(x.events.filter(([kind]) => kind === "materials_ready"), []);
+});
+
+test("a refused operator source stays blocked and a later status edge may try again", async (t) => {
+  const x = await materialFixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setStatus({ status: "dead_letter", ...APPROVED });
+  await x.f.pump("run_vm");
+  x.f.requestManualSource("run_vm", { eventId: "evt_manual" });
+  const refused = x.f.completeManualSource("run_vm", { eventId: "evt_manual", failureCode: "VM_MANUAL_SOURCE_MISSING" });
+  assert.equal(refused.state, "blocked");
+  assert.deepEqual([refused.manualSource.state, refused.manualSource.reason], ["failed", "VM_MANUAL_SOURCE_MISSING"]);
+  assert.equal(x.f.requestManualSource("run_vm", { eventId: "evt_second" }).manualSource.eventId, "evt_second");
+  await x.restart();
+  assert.equal(x.f.get("run_vm").manualSource.state, "pending");
+});

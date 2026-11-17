@@ -245,3 +245,57 @@ test("VM worker retains the concrete failure code when the automatic retry budge
   assert.equal(f.store.getWritebackIntent(queued.id).state, "dead_letter");
   assert.equal(f.store.getWritebackIntent(queued.id).errorCode, "WRITEBACK_UNAVAILABLE");
 });
+
+function materialIntent(key, optionId, runId = "run_vm") {
+  return { idempotencyKey: `vm:${runId}:${key}`, taskId: "task_vm", runId, courseBindingId: null,
+    operation: { type: "single_select", fieldId: "fld_status", optionId } };
+}
+
+test("VM outbox migrates the pre-material table in place and keeps every row", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "vm-writeback-migrate-"));
+  const db = new DatabaseSync(path.join(directory, "state.sqlite"));
+  t.after(async () => { db.close(); await rm(directory, { recursive: true, force: true }); });
+  db.exec(`CREATE TABLE vm_writeback_outbox (
+    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL, run_id TEXT NOT NULL, moment TEXT NOT NULL CHECK(moment IN ('processing','completed')),
+    target_json TEXT NOT NULL, operation_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','processing','retry_wait','succeeded','conflict','dead_letter')),
+    version INTEGER NOT NULL, attempt_count INTEGER NOT NULL,
+    next_attempt_at TEXT, claim_token TEXT, lease_until TEXT, error_code TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(run_id, moment)
+  ); CREATE INDEX vm_writeback_due ON vm_writeback_outbox(state, next_attempt_at);
+  INSERT INTO vm_writeback_outbox VALUES ('vm-old', 'vm:run_old:processing', 'task_old', 'run_old', 'processing',
+    '{"baseToken":"bas_vm","tableId":"tbl_vm","recordId":"rec_vm"}',
+    '{"type":"single_select","fieldId":"fld_status","optionId":"opt_processing"}',
+    'succeeded', 3, 1, NULL, NULL, NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');`);
+  const store = createVmWritebackStore({ database: db, now: () => 1_700_000_000_000,
+    validateIntent: async (input) => ({ target, operation: input.operation }) });
+  assert.equal(store.getWritebackIntent("vm-old").state, "succeeded");
+  assert.equal((await store.enqueueWritebackIntent({ ...intent("processing", "run_old"), taskId: "task_old" })).id, "vm-old");
+  const failed = await store.enqueueWritebackIntent(materialIntent("download_failed:auto", "opt_failed"));
+  assert.equal(failed.moment, "download_failed");
+  createVmWritebackStore({ database: db, validateIntent: async (input) => ({ target, operation: input.operation }) });
+  assert.equal(store.listWritebackIntents().length, 2);
+});
+
+test("VM source moments dispatch before processing and repeated failures keep their order", async (t) => {
+  const f = await fixture(t);
+  await f.store.enqueueWritebackIntent(materialIntent("materials_ready", "opt_ready"));
+  await f.store.enqueueWritebackIntent(intent("processing"));
+  const first = f.store.claimNextWritebackIntent();
+  assert.equal(first.moment, "materials_ready");
+  assert.equal(f.store.claimNextWritebackIntent(), null);
+  f.store.markWritebackIntentSucceeded(first.id, first.claimToken);
+  assert.equal(f.store.claimNextWritebackIntent().moment, "processing");
+
+  await f.store.enqueueWritebackIntent(materialIntent("download_failed:auto", "opt_failed", "run_failed"));
+  f.advance(1);
+  await f.store.enqueueWritebackIntent(materialIntent(`download_failed:e${"a".repeat(32)}`, "opt_failed", "run_failed"));
+  const auto = f.store.claimNextWritebackIntent();
+  assert.equal(auto.idempotencyKey, "vm:run_failed:download_failed:auto");
+  assert.equal(f.store.claimNextWritebackIntent(), null);
+  for (const key of ["download_failed", "download_failed:other", "materials_ready:1"]) {
+    await assert.rejects(() => f.store.enqueueWritebackIntent(materialIntent(key, "opt_failed")), { code: "WRITEBACK_INVALID" });
+  }
+});

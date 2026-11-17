@@ -142,3 +142,37 @@ test("VM final archive recovery sends a path-free expected source guard", async 
     expectedSource: { ...payload.expectedSource, localPath: "C:\\source.mp4" } }),
   { code: "TASKBOARD_INVALID_RESPONSE" });
 });
+
+function manualSource() {
+  return {
+    event: { eventId: "evt_manual", baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
+      statusFieldId: "fld_status", beforeOptionId: "opt_failed", afterOptionId: "opt_source" },
+    binding: { subjectKey: "bas_vm:tbl_vm", configVersion: 2 },
+  };
+}
+
+test("VM manual source request uses only the authenticated narrow route", async () => {
+  const requests = [];
+  const client = new TaskboardClient("http://127.0.0.1:5178", {
+    bridgeSecret: "test-bridge-secret",
+    fetchImplementation: async (url, options) => {
+      requests.push({ url, headers: options.headers, body: JSON.parse(options.body) });
+      return Response.json({ result: { state: "accepted", taskId: "task_vm" } }, { status: 202 });
+    },
+  });
+  assert.deepEqual(await client.submitFeishuVmManualSource(manualSource()), { state: "accepted", taskId: "task_vm" });
+  assert.equal(requests[0].url, "http://127.0.0.1:5178/api/local/feishu/vm/manual-source");
+  assert.equal(requests[0].headers["x-feishu-bridge-secret"], "test-bridge-secret");
+  assert.deepEqual(requests[0].body, manualSource());
+});
+
+test("VM manual source request rejects malformed payloads and responses", async () => {
+  const client = new TaskboardClient("http://127.0.0.1:5178", {
+    bridgeSecret: "test-bridge-secret",
+    fetchImplementation: async () => Response.json({ result: { state: "started" } }),
+  });
+  await assert.rejects(client.submitFeishuVmManualSource(manualSource()));
+  const missing = manualSource();
+  delete missing.event.beforeOptionId;
+  await assert.rejects(client.submitFeishuVmManualSource(missing));
+});

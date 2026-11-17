@@ -13842,6 +13842,10 @@ kbd {
 .vm-pmo-retry-consent label { display: flex; align-items: flex-start; gap: 7px; }
 .vm-pmo-retry-consent input { flex: 0 0 auto; margin: 2px 0 0; }
 .vm-pmo-retry-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.vm-pmo-material-source { margin: 0; color: var(--text-secondary); font-size: 11px; }
+.vm-pmo-download-failure { display: grid; gap: 4px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.vm-pmo-download-failure p { margin: 0; }
+.vm-pmo-download-failure code { overflow-wrap: anywhere; }
 
 @media (max-width: 1000px) {
   .feishu-workflow-panel {
