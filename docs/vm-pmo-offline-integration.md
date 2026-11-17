@@ -16,6 +16,30 @@ node scripts/check-vm-pmo-offline.mjs --package-root 'E:\codex\Auto-cut-slicing-
 
 脚本用合成媒体调用真实剪辑包和 Taskboard 校验器，验证 v1 范围编辑及 v2 父片删词、唯一词起点 cue、连续两轮复用、ASR 源哈希绑定、重复词歧义阻断；还独立验证 H.264/AAC、1920×1080、25 fps、全量解码、时长和哈希。被修改的输入/计划/成片、其他 run 的回执、伪装媒体和几乎空的音轨均会被拒绝。离线脚本只在 `.runtime/vm-pmo-offline` 下生成合成源、对齐、计划和成片，不调用审批、飞书上传、PMO 回写或归档目标。
 
+## v3：AI 参与规划
+
+包 manifest 声明 contract v3 与 driver `vm_pmo_review_video_v3` 后，Taskboard 对该包的新 run 改走 AI 规划：`analyze` → 一次无人值守 Codex 会话写 `edit-intent.json` → `plan`（包按 V01–V14 校验意图，并与固定句式交叉核对）→ `render` → `qa --reverse-asr` → 照常上传与回写。约束以 `AGENTS.md` 为准，要点：
+
+- Codex 会话的工作目录是 `<runRoot>/<runId>/attempt-N`，这是唯一可写位置；沙箱 `workspace-write`，`approval_policy="never"`，命令不联网。启动提示取自包内 `docs/prompts/taskboard-ai-editing.md`，模型和推理强度取自包管理里的“GPT 模型 / 推理强度”。包管理里的“启动 Prompt”不用于 VM 流程。
+- 会话记录写在 `<runRoot>/<runId>/attempt-N.ai-session.jsonl`，AI 无法改写；AI 结束时的报告和包给出的阻断原因显示在任务详情里。
+- 15 分钟超时，不自动重试。AI 没写出意图、越权改动受保护文件或提前写出计划时，都会在渲染前阻断，可在任务详情点“重新 AI 规划”（和语音识别重试共用 3 次）。
+- QA `overall: failed` 不上传；`ready_for_review` 照常上传，`needs_human` 项由飞书审核时人工看。
+
+离线检查（合成媒体、合成 ASR、脚本替身代替 Codex；不调用 AI、ASR、飞书）：
+
+```powershell
+node scripts/check-vm-pmo-v3-offline.mjs --package-root 'E:\codex\Auto-cut-slicing-src' --python 'E:\codex\Auto-cut-slicing-src\.venv\Scripts\python.exe'
+```
+
+脚本把包复制到 `.runtime/vm-pmo-v3-offline/run-*/package` 并只在副本里把 manifest 改为 v3，用真实包跑完 `analyze/plan/render/qa`，再用 Taskboard 校验器逐一核对回执；同时验证第二次尝试复用 ASR，以及 AI 写出计划文件会以 `VM_PMO_AI_SCOPE_VIOLATION` 阻断。它不验证真实 AI 的判断质量。
+
+**切换真实包到 v3 的步骤**（包侧已确定“升级前清空”，Taskboard 不做重新登记迁移）：
+
+1. 确认该包没有未完成的 v2 run：看板上没有处于等待素材、规划、渲染或交付中的 VM 任务。包的 manifest 字节一变，未完成的 v2 run 都会以 `PACKAGE_MISMATCH` / `VM_PMO_PACKAGE_CHANGED` 阻断。
+2. 在剪辑包仓库把 `PACKAGE-MANIFEST.json` 的 `interface.contract.version` 改为 `3`、`interface.driverId` 改为 `vm_pmo_review_video_v3`，按包的发布规则提交。
+3. 在 Taskboard 包管理中对该包“验证并读取”，并确认“GPT 模型 / 推理强度”是本机 Codex 可用的组合。
+4. 用测试表先跑一条初稿，在任务详情确认 AI 报告、计划和 QA 结果，再放开生产记录。
+
 ## 接口与边界
 
 入口固定为 `python -m auto_cut_slicing.vm_pmo plan --input ... --context ...` 和 `render --input ... --context ... --plan ...`。当前包身份为 `auto-cut-slicing` `0.3.0`。可执行包在初稿和审核阶段均须显式声明 `vm_pmo_review_video` contract v2 与固定 `vm_pmo_review_video_v2` driver，并发送 schema v2。历史 schema v1 输入与回执仍可读取和离线校验，但不再授权新的 v1 自动执行。字段、计划与错误码分别见剪辑包的 [v1 契约](../../Auto-cut-slicing-src/docs/vm-pmo-offline-contract-v1.md) 和 [v2 契约](../../Auto-cut-slicing-src/docs/vm-pmo-offline-contract-v2.md)。

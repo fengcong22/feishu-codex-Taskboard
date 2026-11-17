@@ -6,7 +6,8 @@ const code = value => typeof value === "string" && /^[A-Z][A-Z0-9_]{1,100}$/u.te
 const iso = value => value != null && Number.isFinite(new Date(value).getTime()) ? new Date(value).toISOString() : null;
 const parse = value => {try {return JSON.parse(value);} catch {return null;}};
 const hash = value => createHash("sha256").update(value).digest("hex");
-const states = new Set(["waiting_materials","ready","preparing","prepared","planning","planned","rendering",
+const states = new Set(["waiting_materials","ready","preparing","prepared","analyzing","analyzed","ai_planning",
+  "intent_ready","planning","planned","rendering","qa_checking",
   "rendered","delivery_pending","delivery_confirmed","completed","blocked","needs_attention"]);
 const approvalStates = new Set(["reserved","queued","submitting","reconciling","waiting_approval","waiting_media",
   "acquiring","retry_wait","auth_required","needs_attention","dead_letter","ready","rejected","canceled"]);
@@ -75,7 +76,7 @@ export function readVmPackageBoard({database,subjectKey,packageAlias} = {}) {
       planStartedAt:valid ? iso(payload?.planStartedAt) : null,
       runnerStartedAt:valid ? iso(payload?.runnerStartedAt) : null,
       completedAt:valid ? iso(payload?.completedAt) : null,
-      waitingForSlot:Boolean(valid && ["prepared","planned"].includes(row.state) && !payload?.runnerStartedAt),
+      waitingForSlot:Boolean(valid && ["prepared","analyzed","intent_ready","planned"].includes(row.state) && !payload?.runnerStartedAt),
       parentTaskId,parentRunId,reviewRound:origin.stageSnapshot?.reviewRound ?? 0,
       latestDelivered:Boolean(valid && last?.run_id === row.run_id),
       supersededByTaskId:latestTask.get(group(origin)) !== origin.taskId ? latestTask.get(group(origin)) : null,

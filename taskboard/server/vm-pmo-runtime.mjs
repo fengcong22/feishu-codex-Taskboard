@@ -8,11 +8,13 @@ import { packageWorkflowFromManifest } from "../shared/feishu-package-workflow.m
 import { createVmTaskRegistration, createVmRegistrationRecordReader, normalizeVmRecordContext } from "./vm-task-registration.mjs";
 import { createVmTaskDownloadAdapter } from "./vm-task-download-adapter.mjs";
 import { createVmTaskDownloadBindings } from "./vm-task-download-bindings.mjs";
-import { createVmPmoOrchestrator } from "./vm-pmo-orchestrator.mjs";
+import { createVmPmoOrchestrator, VM_PMO_AI_RETRY_CODES } from "./vm-pmo-orchestrator.mjs";
+import { runVmPmoAiPlanning } from "./vm-pmo-ai-planner.mjs";
 import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
-import { runVmPmoOffline } from "./vm-pmo-offline-runner.mjs";
-import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
+import { runVmPmoOffline, vmPmoReceiptPath } from "./vm-pmo-offline-runner.mjs";
+import { validateVmPmoAnalyze, validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoQa,
+  validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
 import { createVmStageWriteback, parseVmWritebackIdempotencyKey } from "./vm-stage-writeback.mjs";
 import { createVmWritebackStore } from "./vm-writeback-store.mjs";
@@ -237,7 +239,8 @@ function initialProfile(subject, config) {
  * Neither the registration body nor PMO record may choose an executable or a workspace.
  * Local readiness never initializes the approval queue, a remote adapter, or run directories. */
 export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubjectVersion,getDownloads,getAdapter,getPolicy,
-  scheduler,dispatchWriteback,onTaskUpdated = () => {},runRoot,pythonPath,
+  scheduler,dispatchWriteback,onTaskUpdated = () => {},runRoot,pythonPath,codexExecutable = null,
+  runAiPlanning = runVmPmoAiPlanning,
   ffprobePath = "ffprobe",ffmpegPath = "ffmpeg",coursePathResolver = {},tickMs = 5_000,now = Date.now} = {}) {
   const db = database?.database;
   let services, closed = false, timer, archiveTimer, draining, archiveDraining;
@@ -274,8 +277,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       await canonicalLocation(filename);
       const bytes = await readFile(filename), manifest = JSON.parse(bytes.toString("utf8"));
       if (!template(packageWorkflowFromManifest(manifest.interface))
-        || manifest.interface?.contract?.id !== TEMPLATE.id || manifest.interface?.contract?.version !== 2
-        || manifest.interface?.driverId !== "vm_pmo_review_video_v2"
+        || manifest.interface?.contract?.id !== TEMPLATE.id || ![2, 3].includes(manifest.interface?.contract?.version)
+        || manifest.interface?.driverId !== `vm_pmo_review_video_v${manifest.interface?.contract?.version}`
         || typeof manifest.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(manifest.name)
         || typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(manifest.version))
         throw new Error("manifest invalid");
@@ -305,8 +308,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     if (record?.state !== "enabled" || record.alias !== packageAlias) throw fail("PACKAGE_DISABLED");
     const identity = await inspectPackage(record);
     initialProfile(subject,config);
-    if (config.stages.review.enabled && (identity.contractVersion !== 2
-      || identity.driverId !== "vm_pmo_review_video_v2")) throw fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
+    if (config.stages.review.enabled && (![2, 3].includes(identity.contractVersion)
+      || identity.driverId !== `vm_pmo_review_video_v${identity.contractVersion}`)) throw fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
     return true;
   }
   const localAdapter = Object.freeze(Object.fromEntries(["listFields","getRecord","updateRecord","uploadMedia"].map(method => [method,
@@ -695,10 +698,27 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       recoverOffline: async options => {
         const bound = await boundFor(options,{runId:options.runId,taskId:options.taskId,
           planAttempt:options.planAttempt,inputSha256:options.inputSha256});
-        const receipt = options.mode === "plan" ? bound.context.plan_result_path : bound.context.result_path;
+        const receipt = vmPmoReceiptPath(bound.context,options.mode);
         try {await lstat(receipt);} catch (error) {if (error?.code === "ENOENT") return null;throw fail("VM_PMO_RUN_OUTCOME_UNKNOWN");}
+        if (options.mode === "analyze") return validateVmPmoAnalyze({...options,expectedBound: bound});
+        if (options.mode === "qa") return validateVmPmoQa({...options,expectedBound: bound});
         return options.mode === "plan" ? validateVmPmoPlan({...options,ffprobePath,expectedBound: bound})
           : validateVmPmoRender({...options,ffprobePath,ffmpegPath,expectedBound: bound});
+      },
+      runAiPlanning: async ({run,signal,onStarted}) => {
+        const options = {...run.prepared.runnerOptions,runId:run.runId,taskId:run.taskId,
+          planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256};
+        const bound = await boundFor(options,{runId:run.runId,taskId:run.taskId,
+          planAttempt:options.planAttempt,inputSha256:options.inputSha256});
+        const analyzed = await validateVmPmoAnalyze({contextPath: options.contextPath,signal,expectedBound: bound});
+        if (analyzed.status !== "ready" || analyzed.analyzeSha256 !== run.analyzeSha256) throw fail("VM_PMO_AI_INPUT_INVALID");
+        if (typeof codexExecutable !== "string" || !codexExecutable) throw fail("VM_PMO_AI_PROCESS_UNAVAILABLE");
+        const snapshot = database.getFeishuTaskPackageSnapshot(run.taskId), runDir = bound.context.run_dir;
+        // The frozen ai_session names the model this attempt was prepared for.
+        if (bound.input.ai_session?.model !== (snapshot?.model ?? "codex-default")) throw fail("VM_PMO_PACKAGE_CHANGED");
+        return runAiPlanning({codexExecutable,packageRoot: options.packageRoot,pythonPath: options.pythonPath,
+          context: bound.context,model: snapshot.model ?? null,reasoningEffort: snapshot.reasoningEffort ?? null,
+          signal,onStarted,transcriptPath: path.join(path.dirname(runDir),`${path.basename(runDir)}.ai-session.jsonl`)});
       },
       registerArtifact: async ({run,prepared,result}) => {
         trustedRun(run.runId);
@@ -780,10 +800,12 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         && planAttempt > 1 && planAttempt <= MAX_PLAN_ATTEMPTS && !run.prepared && !run.planStartedAt
         && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
         && !run.deliveredFileToken && !run.completedAt;
-    const canRetryPlan = run.state === "blocked" && run.errorCode === "WORD_ALIGNMENT_UNRESOLVED"
-      && planAttempt < MAX_PLAN_ATTEMPTS && Boolean(run.planStartedAt && run.prepared && run.acquisition)
-      && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
-      && !run.deliveredFileToken && !run.completedAt;
+    const noRenderEvidence = Boolean(run.prepared && run.acquisition) && !run.runnerStartedAt && !run.planSha256
+      && !run.renderResult && !run.artifactId && !run.deliveredFileToken && !run.completedAt;
+    const canRetryPlan = planAttempt < MAX_PLAN_ATTEMPTS && noRenderEvidence && (
+      run.state === "blocked" && run.errorCode === "WORD_ALIGNMENT_UNRESOLVED" && Boolean(run.planStartedAt)
+      || run.prepared?.planningMode === "ai_intent" && ["blocked","needs_attention"].includes(run.state)
+        && VM_PMO_AI_RETRY_CODES.includes(run.errorCode) && Boolean(run.analyzeStartedAt));
     const canRetryValidatedPlan = run.state === "needs_attention" && run.errorCode === "PLAN_INVALID"
       && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
@@ -813,6 +835,11 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
         failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,
       canRetryWriteback,writeback,
+      planningMode: run.prepared?.planningMode ?? null,
+      ...(run.aiSession ? {aiPlanning: {startedAt: run.aiSession.startedAt,finishedAt: run.aiSession.finishedAt,
+        report: run.aiSession.report}} : {}),
+      ...(run.planBlockers?.length ? {planBlockers: run.planBlockers.map(row => ({code: row.code,message: row.message}))} : {}),
+      ...(run.qaResult ? {qa: {overall: run.qaResult.overall,counts: {...run.qaResult.counts}}} : {}),
       updatedAt:new Date(run.updatedAt).toISOString()};
   }
 
@@ -1068,7 +1095,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         else if (edges.downloadFailed) await writeDownloadFailed(run,
           run.manualSource?.state === "failed" ? manualSlot(run.manualSource.eventId) : "auto");
       } else if (edges.materialsReady && run.acquisition?.vmid_binding === "vm_api_verified"
-        && ["ready","preparing","prepared","planning","planned"].includes(run.state)) {
+        && ["ready","preparing","prepared","analyzing","analyzed","ai_planning","intent_ready","planning","planned"]
+          .includes(run.state)) {
         try {await enqueueWritebackFor(run,"materials_ready",null);} catch {}
       }
     }

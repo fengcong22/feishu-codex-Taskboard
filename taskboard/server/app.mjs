@@ -2882,6 +2882,8 @@ export function createTaskboardServer(options = {}) {
       onTaskUpdated: task => events.emit("task.updated", {task}),
       runRoot: options.vmPmoRunRoot ?? config.vmPmoRunRoot ?? path.join(resolved.dataDirectory, "vm-pmo-runs"),
       pythonPath: options.vmPmoPythonPath ?? config.vmPmoPythonPath ?? null,
+      // v3 AI planning runs one unattended Codex turn per attempt; v2 runs never use it.
+      codexExecutable: resolved.codexExecutable,
       coursePathResolver,
     });
     return vmRuntime;

@@ -1858,7 +1858,14 @@ export function TaskDetail({
                                 : vmPmoRun.state === "ready" ? text("等待重新规划", "Ready to plan")
                                   : vmPmoRun.state === "preparing" ? text("准备输入", "Preparing input")
                                     : vmPmoRun.state === "prepared" ? text("等待剪辑资源", "Waiting for editing capacity")
-                                      : vmPmoRun.state === "planning" ? text("语音识别与规划中", "Recognizing speech and planning")
+                                      : vmPmoRun.state === "analyzing" ? text("语音识别与证据准备中", "Recognizing speech and gathering evidence")
+                                      : vmPmoRun.state === "analyzed" ? text("等待 AI 规划", "Waiting for AI planning")
+                                      : vmPmoRun.state === "ai_planning" ? text("AI 理解意见并规划中", "AI is reading the comments and planning")
+                                      : vmPmoRun.state === "intent_ready" ? text("AI 剪辑意图已写出", "AI edit intent written")
+                                      : vmPmoRun.state === "qa_checking" ? text("成片内容质检中", "Checking the rendered video")
+                                      : vmPmoRun.state === "planning" ? (vmPmoRun.planningMode === "ai_intent"
+                                        ? text("校验剪辑意图并规划", "Validating the edit intent and planning")
+                                        : text("语音识别与规划中", "Recognizing speech and planning"))
                                         : vmPmoRun.state === "planned" ? text("规划完成", "Plan ready")
                                           : vmPmoRun.state === "rendering" ? text("生成成片中", "Rendering video")
                                             : vmPmoRun.state === "rendered" ? text("校验成片中", "Validating video")
@@ -1884,6 +1891,29 @@ export function TaskDetail({
                         )}
                         <code className="vm-pmo-run-error-code">{vmPmoRun.downloadFailure.reason}</code>
                       </div>
+                    )}
+                    {vmPmoRun.planBlockers && vmPmoRun.planBlockers.length > 0 && (
+                      <ul className="vm-pmo-plan-blockers" aria-label={text("剪辑意图阻断原因", "Edit intent blockers")}>
+                        {vmPmoRun.planBlockers.map((blocker, index) => (
+                          <li key={`${blocker.code}-${index}`}><code>{blocker.code}</code> {blocker.message}</li>
+                        ))}
+                      </ul>
+                    )}
+                    {vmPmoRun.qa && (
+                      <p className="vm-pmo-qa-summary" aria-label={text("成片质检", "Video QA")}>
+                        {vmPmoRun.qa.overall === "failed"
+                          ? text("成片质检未通过，未上传", "Video QA failed; not uploaded")
+                          : text("成片质检通过，待飞书审核", "Video QA passed; awaiting Feishu review")}
+                        {Object.entries(vmPmoRun.qa.counts).map(([status, count]) => (
+                          <code key={status}>{status} {count}</code>
+                        ))}
+                      </p>
+                    )}
+                    {vmPmoRun.aiPlanning?.report && (
+                      <details className="vm-pmo-ai-report">
+                        <summary>{text("AI 规划报告", "AI planning report")}</summary>
+                        <pre>{vmPmoRun.aiPlanning.report}</pre>
+                      </details>
                     )}
                     {vmPmoRun.writeback && (
                       <div aria-label={text("飞书进度回写", "Feishu progress writeback")}>
@@ -1922,7 +1952,9 @@ export function TaskDetail({
                     {vmPmoRun.canRetryPlan && !showVmPmoRetryConsent && (
                       <button type="button" disabled={retryingVmPmoPlan}
                         onClick={() => setShowVmPmoRetryConsent(true)}>
-                        {text("重试语音识别与规划", "Retry speech recognition and planning")}
+                        {vmPmoRun.planningMode === "ai_intent"
+                          ? text("重新 AI 规划", "Plan again with AI")
+                          : text("重试语音识别与规划", "Retry speech recognition and planning")}
                       </button>
                     )}
                     {vmPmoRun.canRetryPlan && showVmPmoRetryConsent && (
@@ -1930,7 +1962,10 @@ export function TaskDetail({
                         <label>
                           <input type="checkbox" checked={allowVmPmoAsr}
                             onChange={(event) => setAllowVmPmoAsr(event.target.checked)} />
-                          {text("允许本次重试重新识别原视频音轨", "Allow speech recognition on the original audio for this retry")}
+                          {vmPmoRun.planningMode === "ai_intent"
+                            ? text("允许本次重试复用或重新识别原视频音轨，并启动新的 AI 规划会话",
+                              "Allow this retry to reuse or redo speech recognition and start a new AI planning session")
+                            : text("允许本次重试重新识别原视频音轨", "Allow speech recognition on the original audio for this retry")}
                         </label>
                         <label>
                           <input type="checkbox" checked={allowVmPmoLocalWrite}

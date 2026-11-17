@@ -16238,3 +16238,19 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
     z-index: 1;
   }
 }
+
+.vm-pmo-plan-blockers {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.vm-pmo-qa-summary code {
+  margin-left: 6px;
+}
+
+.vm-pmo-ai-report pre {
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

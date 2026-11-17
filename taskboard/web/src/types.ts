@@ -625,8 +625,9 @@ export interface FeishuAutoCutRun {
 export interface VmPmoRunSummary {
   runId: string;
   taskId: string;
-  state: "waiting_materials" | "ready" | "preparing" | "prepared" | "planning" | "planned"
-    | "rendering" | "rendered" | "delivery_pending" | "delivery_confirmed"
+  state: "waiting_materials" | "ready" | "preparing" | "prepared" | "analyzing" | "analyzed"
+    | "ai_planning" | "intent_ready" | "planning" | "planned"
+    | "rendering" | "rendered" | "qa_checking" | "delivery_pending" | "delivery_confirmed"
     | "completed" | "blocked" | "needs_attention";
   errorCode: string | null;
   approvalStatus: string;
@@ -655,6 +656,14 @@ export interface VmPmoRunSummary {
     processing: { state: string; errorCode: string | null; attemptCount: number } | null;
     completed: { state: string; errorCode: string | null; attemptCount: number } | null;
   };
+  /** "ai_intent" when a v3 Codex session writes the edit intent; "rule" for fixed sentences. */
+  planningMode?: "ai_intent" | "rule" | null;
+  /** The closing report of the latest AI planning session. */
+  aiPlanning?: { startedAt: string; finishedAt: string; report: string };
+  /** Why the package refused the edit intent, before any render. */
+  planBlockers?: Array<{ code: string; message: string }>;
+  /** Content QA of the rendered MP4; failed never reaches delivery. */
+  qa?: { overall: "failed" | "ready_for_review"; counts: Record<string, number> };
   updatedAt: string;
 }
 

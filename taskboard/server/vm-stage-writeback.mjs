@@ -1,9 +1,10 @@
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
-const STARTED_STATES = new Set(["running", "reported", "completed", "rendering", "rendered",
+const STARTED_STATES = new Set(["running", "reported", "completed", "rendering", "rendered", "qa_checking",
   "delivery_pending", "delivery_confirmed"]);
 // Material moments describe the source acquisition, so they precede any render evidence.
 const MATERIAL_MOMENTS = Object.freeze({ materials_ready: "materialsReady", download_failed: "downloadFailed" });
-const MATERIAL_READY_STATES = new Set(["ready", "preparing", "prepared", "planning", "planned", "blocked", "needs_attention"]);
+const MATERIAL_READY_STATES = new Set(["ready", "preparing", "prepared", "analyzing", "analyzed", "ai_planning",
+  "intent_ready", "planning", "planned", "blocked", "needs_attention"]);
 const MOMENTS = new Set(["processing", "completed", ...Object.keys(MATERIAL_MOMENTS)]);
 const FAILURE_SLOT = /^(?:auto|e[a-f0-9]{32})$/u;
 

@@ -26,7 +26,7 @@ npm start
 
 取消尚未提交的误建审批可在本机调用 `POST /api/local/vm-downloads/jobs/:id/cancel-unsubmitted`，请求体为 `{}`，并带 `x-taskboard-client: web`。仅 `queued`、提交次数为零、没有申请号或采集证据且无有效租约的项目可取消；状态和取消原因保留在队列中，不会请求 VM，也不能取消已提交的审批。
 
-飞书 Bridge 接入的 `vm_pmo_review_video` 包包含独立的初稿与审核修改流程：初稿通过正常 VM 审批队列获取源视频，审核修改复用 Taskboard 已确认交付的上一轮 MP4。每轮通过 `plan/render` 生成唯一 MP4，上传并读回 PMO 附件后完成阶段。可选的最终归档 worker 会校验 SHA 并以无覆盖方式发布成片。启用要求本机 Python、包白名单、自动剪辑开关及完整学科配置；保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。各失败状态能否补救、补救次数与看板上的对应按钮见 [剪辑任务出错后的补救规则](../docs/vm-recovery-rules.zh-CN.md)。
+飞书 Bridge 接入的 `vm_pmo_review_video` 包包含独立的初稿与审核修改流程：初稿通过正常 VM 审批队列获取源视频，审核修改复用 Taskboard 已确认交付的上一轮 MP4。每轮通过 `plan/render` 生成唯一 MP4，上传并读回 PMO 附件后完成阶段。包声明 v3 driver 时，每轮先由一次无人值守 Codex 会话理解修改意见、写出剪辑意图，经包校验后再 `plan/render`，并做成片内容质检；质检未通过不上传，AI 阶段的阻断可在任务详情“重新 AI 规划”。可选的最终归档 worker 会校验 SHA 并以无覆盖方式发布成片。启用要求本机 Python、包白名单、自动剪辑开关及完整学科配置；保存或启用不补跑历史记录。配置与真实测试步骤见 [VM 初稿接入说明](../docs/vm-pmo-offline-integration.md)。各失败状态能否补救、补救次数与看板上的对应按钮见 [剪辑任务出错后的补救规则](../docs/vm-recovery-rules.zh-CN.md)。
 
 初稿可选配置“素材已就绪”和“下载失败”两个进度选项：VM 视频下载成功后回写素材已就绪并接着剪辑；下载失败时回写下载失败，并通过飞书消息和任务详情说明原因。已审批通过的任务可人工把视频命名为 `VMID.mp4` 放进 VM 下载目录下的“人工素材”文件夹，再把进度从“下载失败”改为“素材已就绪”，沿用原任务和原审批继续；未审批通过的只能改回初稿触发状态重新开始。
 

@@ -95,9 +95,14 @@ function stageFor(task, evidence) {
     "ready",
     "preparing",
     "prepared",
+    "analyzing",
+    "analyzed",
+    "ai_planning",
+    "intent_ready",
     "planning",
     "planned",
     "rendering",
+    "qa_checking",
   ].includes(evidence.state)
     ? "editing"
     : "todo";
