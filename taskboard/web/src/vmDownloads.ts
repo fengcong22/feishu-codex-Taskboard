@@ -25,6 +25,19 @@ export interface VmDownloadSession {
   errorCode: string | null;
   automaticRefreshSupported: false;
   crossDeviceAuthorizationSupported: false;
+  /** True when this computer keeps the sign-in encrypted and restores it after a restart. */
+  credentialSaved?: boolean;
+}
+
+/** Plain-language time left on a sign-in, or null when the server gives no expiry. */
+export function vmSessionTimeLeft(session: VmDownloadSession, now: number, text: (zh: string, en: string) => string): string | null {
+  if (session.expirySource !== "token" || session.expiresAt === null) return null;
+  const minutes = Math.floor((session.expiresAt - now) / 60_000);
+  if (minutes <= 0) return text("登录已到期", "Sign-in has expired");
+  if (minutes < 60) return text(`登录还剩 ${minutes} 分钟`, `${minutes} min left`);
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return text(`登录还剩 ${hours} 小时${minutes % 60 ? ` ${minutes % 60} 分钟` : ""}`, `${hours} h ${minutes % 60} min left`);
+  return text(`登录还剩 ${Math.floor(hours / 24)} 天`, `${Math.floor(hours / 24)} days left`);
 }
 
 export interface VmDownloadSettings {
@@ -88,7 +101,8 @@ function validSession(value: unknown): value is VmDownloadSession {
     && (value.lastAuthorizedAt === undefined || value.lastAuthorizedAt === null
       || (typeof value.lastAuthorizedAt === "number" && Number.isFinite(value.lastAuthorizedAt) && value.lastAuthorizedAt > 0))
     && (value.errorCode === null || typeof value.errorCode === "string")
-    && value.automaticRefreshSupported === false && value.crossDeviceAuthorizationSupported === false;
+    && value.automaticRefreshSupported === false && value.crossDeviceAuthorizationSupported === false
+    && (value.credentialSaved === undefined || typeof value.credentialSaved === "boolean");
 }
 
 export async function getVmDownloads(signal?: AbortSignal): Promise<VmDownloadsSnapshot> {

@@ -69,6 +69,8 @@ import { createVmApprovalStore } from "./vm-approval-store.mjs";
 import { createVmDownloadService } from "./vm-download-service.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-download-notifier.mjs";
 import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
+import { createVmCredentialStore } from "./vm-credential-store.mjs";
+import { openVmLoginPage } from "./vm-login-page.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { describeBlockedFeishuTask } from "./blocked-notification.mjs";
@@ -2900,6 +2902,12 @@ export function createTaskboardServer(options = {}) {
         metadata: createVmDownloadMetadata({ database: database.database }),
         notifier: options.vmDownloadNotifier ?? createVmDownloadNotifier({ appId: config.appId, appSecret: config.appSecret }),
         session: options.vmDownloadSession,
+        // The saved Shadow login is DPAPI ciphertext for the current Windows user, kept beside local data.
+        sessionOptions: {
+          credentialStore: options.vmCredentialStore
+            ?? createVmCredentialStore({ file: path.join(resolved.dataDirectory, "vm-shadow-session.bin") }),
+          openLoginPage: options.vmOpenLoginPage ?? openVmLoginPage,
+        },
         defaultOutputRoot: path.join(PROJECT_ROOT, "input"),
         privateEndpoints: config.privateEndpoints,
       });

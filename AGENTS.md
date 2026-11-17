@@ -45,6 +45,7 @@ npm test
 
 - 真实 Bridge 配置只放在被 Git 忽略的 `config/bridge.local.json`；示例结构维护在 `config/bridge.example.json`。Auto-Cut 包定义单独放在被 Git 忽略的 `config/taskboard-feishu-packages.json`，示例结构维护在 `config/autocut-packages.example.json`。
 - `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 只放在 `.env.local` 或团队批准的密钥管理工具中，不写入飞书单元格、日志、任务描述或 Git。
+- Taskboard 的 Shadow 登录凭据只能以 Windows DPAPI（当前 Windows 用户范围）加密后保存在本机数据目录的 `vm-shadow-session.bin`，不得以明文写入磁盘、日志、飞书或 Git；无 DPAPI 的平台不保存。重启恢复时必须重新验证身份且账号一致，断开账号或认证失效时删除。登录失效时只允许在本机默认浏览器打开固定 Shadow 登录页，每次失效最多自动打开一次。
 - `CODEX_FEISHU_BRIDGE_SECRET` 只用于本机 Bridge/Taskboard 互认，放在 `.env.local` 或由 `start-local.ps1` 临时生成；不要写入飞书单元格、日志、任务描述、共享配置或 Git。
 - 飞书单元格只能提供受控字段值和项目包别名；不能提供工作区路径、shell 命令、Codex 参数或 prompt。
 - Bridge 只解析配置白名单中的项目包别名，并使用配置中的绝对工作区路径和固定 prompt。
