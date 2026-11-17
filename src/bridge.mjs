@@ -693,7 +693,7 @@ export function createBridge({
     const decision = persistedSnapshot
       ? decisionFromPhasedSnapshot(record, persistedSnapshot)
       : decideVmInitialRecordChange(subject, record.event);
-    if (!decision || !["register", "archive_waiting", "final_archive", "ignored", "blocked"].includes(decision.kind)) {
+    if (!decision || !["register", "archive_waiting", "final_archive", "manual_source_ready", "ignored", "blocked"].includes(decision.kind)) {
       throw Object.assign(new Error("VM decision snapshot is invalid"), { code: "DECISION_SNAPSHOT_INVALID" });
     }
     if (decision.kind === "ignored") {
@@ -730,6 +730,28 @@ export function createBridge({
       return completePhased(record, "final_archive", {
         kind: "final_archive", archiveJobId: job.id, archiveState: job.state,
         subjectKey: decision.subjectKey, configVersion: decision.configVersion,
+      }, heartbeat, { requireTaskIdentifier: false });
+    }
+    if (decision.kind === "manual_source_ready") {
+      const submit = taskboard?.submitFeishuVmManualSource;
+      if (typeof submit !== "function") {
+        throw Object.assign(new Error("Taskboard VM manual source route is unavailable"), {
+          code: "TASKBOARD_VM_MANUAL_SOURCE_UNAVAILABLE", status: 503,
+        });
+      }
+      const event = record.event;
+      await heartbeat.ensureActive();
+      const result = await submit.call(taskboard, {
+        event: {
+          eventId: event.eventId, baseToken: event.baseToken, tableId: event.tableId,
+          recordId: event.recordId, statusFieldId: event.statusFieldId,
+          beforeOptionId: event.beforeOptionId, afterOptionId: event.afterOptionId,
+        },
+        binding: { subjectKey: decision.subjectKey, configVersion: decision.configVersion },
+      }, { bridgeSecret });
+      return completePhased(record, "manual_source_ready", {
+        kind: "manual_source_ready", reason: result.state,
+        subjectKey: decision.subjectKey, ...(result.taskId ? { taskId: result.taskId } : {}),
       }, heartbeat, { requireTaskIdentifier: false });
     }
     if (decision.kind === "archive_waiting") {

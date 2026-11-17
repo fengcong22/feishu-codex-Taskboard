@@ -161,7 +161,7 @@ describe("VM downloads panel", () => {
   it("uses token expiry metadata only when the server actually supplies it", async () => {
     current.session = { ...current.session, status: "connected", account: { name: "测试用户", userId: "fixture-user" }, expiresAt: 1_792_600_000_000, expirySource: "token" };
     mount(); await screen.findByText(/测试用户/);
-    expect(screen.getByText(/凭据提示到期时间/)).toBeTruthy();
+    expect(screen.getByText(/凭据到期时间/)).toBeTruthy();
     expect(screen.queryByText(/有效期未知/)).toBeNull();
   });
 
@@ -173,9 +173,8 @@ describe("VM downloads panel", () => {
       lastSentAt: 1_792_400_000_000, pendingCount: 1, failedCount: 3 };
     mount();
 
-    await screen.findByText("暂时无法验证账号");
-    expect(screen.getByText("上次验证账号: 测试用户")).toBeTruthy();
-    expect(screen.getByText(/上次凭据提示到期时间/)).toBeTruthy();
+    await screen.findByText("暂时无法验证账号 · 测试用户");
+    expect(screen.getByText(/上次凭据到期时间/)).toBeTruthy();
     expect(screen.getByText(/VM_API_TRANSPORT_FAILED/)).toBeTruthy();
     expect(screen.getByText(/有 1 条飞书通知待重试/)).toBeTruthy();
     expect(screen.getByText(/3 条历史通知达到重试上限/)).toBeTruthy();
@@ -195,7 +194,7 @@ describe("VM downloads panel", () => {
     mount();
     await screen.findByText(/测试用户/);
     expect(screen.getByText(/有效期未知/)).toBeTruthy();
-    expect(screen.getByText(/服务端可能在检查时更新凭据/)).toBeTruthy();
+    expect(screen.getByText(/服务端续期后会同步更新/)).toBeTruthy();
     expect(screen.getByText(/跨设备直接授权/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "断开账号" }));
     await screen.findByText("尚未连接");
@@ -207,7 +206,7 @@ describe("VM downloads panel", () => {
       lastAuthorizedAt: 1_792_400_000_000, lastCheckedAt: 1_792_500_000_000 };
     current.notifications = { ...current.notifications, failedCount: 7, lastFailureCode: "VM_NOTIFY_FEISHU_99991672" };
     mount();
-    await screen.findByText("已连接");
+    await screen.findByText("已连接 · 测试用户");
     expect(screen.getByText(/^上次本人登录授权：/)).toBeTruthy();
     expect(screen.getByText(/^最近后台检查：/)).toBeTruthy();
     expect(screen.getByText(/发送失败，尚无成功记录/)).toBeTruthy();
@@ -230,13 +229,13 @@ describe("VM downloads panel", () => {
     const alert = await screen.findByRole("alert", { name: "Shadow 登录已失效" });
     expect(alert.textContent).toContain("下载队列已暂停");
     fireEvent.click(screen.getByRole("button", { name: "从提示重新连接" }));
-    await screen.findByText("等待登录完成");
+    await screen.findByText("等待登录完成 · 测试用户");
     expect(writes[0]).toMatchObject({ path: `${ROOT}/login`, method: "POST" });
 
     cleanup();
     current.session = { ...current.session, status: "unavailable" };
     mount();
-    await screen.findByText("暂时无法验证账号");
+    await screen.findByText("暂时无法验证账号 · 测试用户");
     expect(screen.queryByRole("alert", { name: "Shadow 登录已失效" })).toBeNull();
   });
 

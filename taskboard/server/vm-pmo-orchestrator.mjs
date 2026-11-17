@@ -15,7 +15,14 @@ const MAX_PLAN_ATTEMPTS = 3;
 const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepared", "planStartedAt",
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
   "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
-  "manualRevision", "aiRetryHistory"]);
+  "manualRevision", "downloadFailure", "manualSource", "materialsReadyNotified", "authRequiredSince", "aiRetryHistory"]);
+const CODE = /^[A-Z][A-Z0-9_]{1,100}$/u;
+const EVENT = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
+const APPROVAL_REF = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
+const approvalRef = (value) => typeof value === "string" && APPROVAL_REF.test(value);
+// A paused Shadow login resumes on reconnect; only a long unattended pause counts as a failed download.
+const AUTH_FAILURE_MS = 2 * 60 * 60 * 1000;
+const MANUAL_SOURCE_STATES = new Set(["pending", "accepted", "failed"]);
 // v3 AI intent step: blocks a human may rerun in the same attempt directory (no automatic retry).
 const AI_INTENT_BLOCKS = new Set(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"]);
 const MAX_AI_RETRIES = 2;
@@ -41,6 +48,42 @@ function json(value) {
 function timestamp(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value))
     && new Date(Date.parse(value)).toISOString() === value;
+}
+
+/** Maps a stopped approval job to the reason recorded on the run, or null while it can still continue. */
+function downloadFailureFor(status, at, authRequiredSince) {
+  const evidence = status.approvalEvidence;
+  const approved = approvalRef(evidence?.applicationId) && approvalRef(evidence?.instanceCode)
+    ? { approved: true, applicationId: evidence.applicationId, instanceCode: evidence.instanceCode }
+    : { approved: false };
+  const code = CODE.test(status.error?.code ?? "") ? status.error.code : null;
+  const failedAt = new Date(at).toISOString();
+  if (status.status === "rejected") return { reason: "VM_APPROVAL_REJECTED", approved: false, failedAt };
+  if (status.status === "canceled") return { reason: code ?? "VM_APPROVAL_CANCELED", approved: false, failedAt };
+  if (status.status === "needs_attention" || status.status === "dead_letter")
+    return { reason: code ?? "VM_DOWNLOAD_FAILED", ...approved, failedAt };
+  if (status.status === "auth_required" && timestamp(authRequiredSince)
+    && at - Date.parse(authRequiredSince) >= AUTH_FAILURE_MS) return { reason: "VM_AUTH_EXPIRED", ...approved, failedAt };
+  return null;
+}
+function downloadFailureValue(value) {
+  return object(value) && CODE.test(value.reason ?? "") && typeof value.approved === "boolean"
+    && timestamp(value.failedAt)
+    && (value.approved ? approvalRef(value.applicationId) && approvalRef(value.instanceCode)
+      : value.applicationId === undefined && value.instanceCode === undefined)
+    && Object.keys(value).every((key) => ["reason", "approved", "applicationId", "instanceCode", "failedAt"].includes(key));
+}
+function manualSourceValue(value) {
+  return object(value) && typeof value.eventId === "string" && EVENT.test(value.eventId)
+    && MANUAL_SOURCE_STATES.has(value.state) && timestamp(value.requestedAt)
+    && (value.state === "failed" ? CODE.test(value.reason ?? "") : value.reason === undefined)
+    && Object.keys(value).every((key) => ["eventId", "state", "requestedAt", "reason"].includes(key));
+}
+function operatorAcquisition(value, vmid) {
+  return object(value) && value.vmid_binding === "operator_asserted" && value.vmid === vmid
+    && HASH.test(value.sha256) && Number.isSafeInteger(value.bytes) && value.bytes > 0
+    && Number.isSafeInteger(value.duration_ms) && value.duration_ms > 0
+    && [value.path, value.receipt_path].every((file) => typeof file === "string" && path.isAbsolute(file));
 }
 
 function frozenIdentity(database, taskId, started = false) {
@@ -121,13 +164,16 @@ function checkedResult(result, mode, previousPlanSha256) {
 export function createVmPmoOrchestrator({ database, bindings, canExecute, acquireSlot, prepareInput,
   runOffline, recoverOffline, registerArtifact, delivery, verifyRetryInput, validateSavedPlan,
   onRunStarted = async () => {},
-  onCompleted = async () => {}, onAttention = async () => {}, now = Date.now, tickMs = 5_000 } = {}) {
+  onCompleted = async () => {}, onAttention = async () => {},
+  materialEdges = async () => ({}), onMaterialsReady = async () => {}, onDownloadFailed = async () => {},
+  now = Date.now, tickMs = 5_000 } = {}) {
   const db = database?.database;
   if (!db || [database?.getTask, database?.getFeishuTaskOrigin, database?.getFeishuTaskPackageSnapshot,
     bindings?.reserve, bindings?.reconcile, bindings?.status, canExecute, acquireSlot, prepareInput,
     runOffline, recoverOffline, registerArtifact, delivery?.enqueue, delivery?.get, verifyRetryInput,
     validateSavedPlan, onRunStarted,
-    onCompleted, onAttention, now].some((callback) => typeof callback !== "function")
+    onCompleted, onAttention, materialEdges, onMaterialsReady, onDownloadFailed, now]
+    .some((callback) => typeof callback !== "function")
     || !Number.isSafeInteger(tickMs) || tickMs < 100)
     throw failure("VM_PMO_SERVICE_INVALID");
   db.exec(`CREATE TABLE IF NOT EXISTS vm_pmo_runs (
@@ -171,6 +217,11 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
         && checkedResult(payload.renderResult, "render", payload.planSha256).status !== "rendered")
         throw failure("VM_PMO_STATE_INVALID");
       if (payload.manualRevision !== undefined) validateVmPmoManualRevision(payload.manualRevision);
+      if (payload.downloadFailure !== undefined && !downloadFailureValue(payload.downloadFailure)
+        || payload.manualSource !== undefined && !manualSourceValue(payload.manualSource)
+        || payload.materialsReadyNotified !== undefined && payload.materialsReadyNotified !== true
+        || payload.authRequiredSince !== undefined && !timestamp(payload.authRequiredSince))
+        throw failure("VM_PMO_STATE_INVALID");
       if (payload.planAttempt !== undefined && (!Number.isSafeInteger(payload.planAttempt)
         || payload.planAttempt < 1 || payload.planAttempt > MAX_PLAN_ATTEMPTS)
         || payload.retryHistory !== undefined && (!Array.isArray(payload.retryHistory)
@@ -512,6 +563,61 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       .run(owner, now() + LEASE_MS, runId, now(), now());
     return changed.changes === 1 ? owner : null;
   }
+  async function notifyDownloadFailed(run, slot) {
+    try { await onDownloadFailed({ run, slot }); } catch { /* The runtime re-enqueues on its next start. */ }
+  }
+  function manualSourceEligible(run) {
+    return run?.state === "blocked" && run.errorCode === "VM_DOWNLOAD_FAILED"
+      && run.identity.origin.stageId === "initial" && run.downloadFailure?.approved === true
+      && !run.acquisition && !run.prepared && !run.planStartedAt && !run.runnerStartedAt && !run.planSha256
+      && !run.renderResult && !run.artifactId && !run.deliveredFileToken && !run.completedAt && !run.leaseToken;
+  }
+  function changeBlockedRun(run, row, state, payload, errorCode) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = ?, payload_json = ?, error_code = ?,
+        attempt_count = 0, next_attempt_at = ?, updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'blocked' AND error_code = 'VM_DOWNLOAD_FAILED' AND payload_json = ? AND lease_token IS NULL`)
+        .run(state, json(payload), errorCode, now(), now(), run.runId, run.taskId, row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_MANUAL_SOURCE_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return get(run.runId);
+  }
+  /** Records an operator source request for an approved run whose automatic download stopped. */
+  function requestManualSource(runId, { eventId } = {}) {
+    if (typeof eventId !== "string" || !EVENT.test(eventId)) throw failure("VM_PMO_INPUT_INVALID");
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run) throw failure("VM_PMO_RUN_NOT_FOUND");
+    if (run.manualSource?.eventId === eventId) return run;
+    if (!manualSourceEligible(run) || run.manualSource?.state === "pending")
+      throw failure("VM_PMO_MANUAL_SOURCE_NOT_ALLOWED");
+    assertCurrent(run);
+    const payload = { ...JSON.parse(row.payload_json),
+      manualSource: { eventId, state: "pending", requestedAt: new Date(now()).toISOString() } };
+    return changeBlockedRun(run, row, "blocked", payload, "VM_DOWNLOAD_FAILED");
+  }
+  /** Completes a pending request: binds the verified operator source, or records why it was refused. */
+  function completeManualSource(runId, { eventId, acquisition, failureCode } = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run || run.manualSource?.eventId !== eventId || run.manualSource.state !== "pending"
+      || !manualSourceEligible(run)) throw failure("VM_PMO_MANUAL_SOURCE_NOT_ALLOWED");
+    assertCurrent(run);
+    const payload = JSON.parse(row.payload_json);
+    if (acquisition !== undefined) {
+      if (!operatorAcquisition(acquisition, run.binding.vmid)) throw failure("VM_PMO_ACQUISITION_INVALID");
+      payload.acquisition = structuredClone(acquisition);
+      payload.manualSource = { ...run.manualSource, state: "accepted" };
+      // The operator already moved the status to the ready option.
+      payload.materialsReadyNotified = true;
+      return changeBlockedRun(run, row, "ready", payload, null);
+    }
+    payload.manualSource = { ...run.manualSource, state: "failed",
+      reason: CODE.test(failureCode ?? "") ? failureCode : "VM_MANUAL_SOURCE_FAILED" };
+    return changeBlockedRun(run, row, "blocked", payload, "VM_DOWNLOAD_FAILED");
+  }
   async function notifyStarted(run, owner) {
     if (run.runnerStartedAt && !run.processingNotified) {
       await onRunStarted({ run });
@@ -580,7 +686,17 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       checkedBinding(status, run.taskId, binding);
       if (!APPROVAL_STATES.has(status.status)) throw failure("VM_PMO_APPROVAL_STATE_INVALID");
       assertCurrent(run);
-      run = update(runId, owner, "waiting_materials", { binding, approvalStatus: status.status });
+      // The login pause is timed on the run: the approval job refreshes its own timestamps while paused.
+      const authRequiredSince = status.status === "auth_required"
+        ? run.authRequiredSince ?? new Date(now()).toISOString() : undefined;
+      run = update(runId, owner, "waiting_materials", { binding, approvalStatus: status.status, authRequiredSince });
+      const edges = run.identity.origin.stageId === "initial" ? await materialEdges({ run }) : {};
+      const failed = edges.downloadFailed ? downloadFailureFor(status, now(), run.authRequiredSince) : null;
+      if (failed) {
+        run = update(runId, owner, "blocked", { downloadFailure: failed }, "VM_DOWNLOAD_FAILED");
+        await notifyDownloadFailed(run, "auto");
+        return run;
+      }
       if (["rejected", "canceled"].includes(status.status))
         return update(runId, owner, "blocked", {}, `VM_PMO_APPROVAL_${status.status.toUpperCase()}`);
       if (status.status !== "ready") return run;
@@ -591,6 +707,14 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
         || ![acquired.path, acquired.receipt_path].every((file) => typeof file === "string" && path.isAbsolute(file)))
         throw failure("VM_PMO_ACQUISITION_INVALID");
       run = update(runId, owner, "ready", { acquisition: structuredClone(acquired) });
+    }
+    if (run.state === "ready" && run.identity.origin.stageId === "initial" && run.acquisition
+      && run.materialsReadyNotified !== true && (await materialEdges({ run })).materialsReady) {
+      // Writeback intents are idempotent by run; the flag only avoids repeating the enqueue.
+      // A progress write must never hold back editing, so a failed enqueue is not retried here.
+      let queued = false;
+      try { await onMaterialsReady({ run }); queued = true; } catch {}
+      if (queued) run = update(runId, owner, "ready", { materialsReadyNotified: true });
     }
     if (run.identity.origin.stageId === "review") {
       const parent = run.identity.stageSnapshot.reviewParent;
@@ -731,6 +855,8 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     retryPlan, retryValidatedPlan, retryAiIntent,
     retryFailedRender,
     recoverBindingConflicts,
+    requestManualSource,
+    completeManualSource,
     start() { if (closed || timer) return; timer = setInterval(() => { void wake().catch(() => {}); }, tickMs);
       timer.unref?.(); void wake().catch(() => {}); },
     async close() { closed = true; clearInterval(timer); await Promise.allSettled([...active.values(), draining]); },

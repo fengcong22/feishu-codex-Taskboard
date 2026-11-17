@@ -262,6 +262,12 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
         if (!field || field.options.filter((option) => option.id === target.optionId).length !== 1) return "请检查阶段状态回写字段和选项。";
       }
     }
+    const materialOptions = [stage.writeback?.materialsReady, stage.writeback?.downloadFailed]
+      .filter((target) => target?.optionId);
+    if (materialOptions.some((target) => target?.fieldId !== stage.statusFieldId || target?.optionId === stage.triggerOptionId)
+      || (materialOptions.length === 2 && materialOptions[0]?.optionId === materialOptions[1]?.optionId)) {
+      return "素材已就绪和下载失败必须是初稿进度字段里两个不同的选项，且不能与初稿触发状态相同。";
+    }
     const archive = draft.finalArchive;
     if (archive?.enabled) {
       if (!hasTrigger(archive.statusFieldId, archive.triggerOptionId)) return "请补齐成片归档的进度字段和触发状态。";
@@ -386,7 +392,12 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
             <h4><label className="feishu-vm-stage-toggle"><input type="checkbox" aria-label={`启用 VM ${label}`} checked={stage.enabled} onChange={(event) => setStage({ enabled: event.target.checked })} />{label}</label></h4>
             <p>{id === "initial" ? "读取初稿意见，首次编辑当前记录的原始 VM 视频。" : "读取审核意见，修改上一轮成片。完成后再次进入触发状态，开始下一轮审核修改。"}</p>
             <div className="feishu-settings-grid">
-              {fieldSelect(`VM ${label}进度触发字段`, stage.statusFieldId, uniqueFields.filter(progressField), (value) => setStage({ statusFieldId: value, triggerOptionId: null }))}
+              {fieldSelect(`VM ${label}进度触发字段`, stage.statusFieldId, uniqueFields.filter(progressField), (value) => {
+                // Source-result options belong to the previous field; drop them with it.
+                const { materialsReady: _ready, downloadFailed: _failed, ...writeback } = stage.writeback ?? {} as NonNullable<typeof stage.writeback>;
+                setStage({ statusFieldId: value, triggerOptionId: null,
+                  ...(stage.writeback ? { writeback: writeback as NonNullable<typeof stage.writeback> } : {}) });
+              })}
               {optionSelect(`VM ${label}触发状态`, stage.triggerOptionId, statusField, (value) => setStage({ triggerOptionId: value }))}
               {fieldSelect(id === "initial" ? "初稿意见字段" : "审核意见字段", stage.instructionFieldId, uniqueFields.filter(textField), (value) => setStage({ instructionFieldId: value }))}
               {id === "review" && fieldSelect("审核意见附件字段", config.stages.review.instructionAttachmentsFieldId, uniqueFields.filter(isAttachmentField), (value) => update({ ...config, stages: { ...config.stages, review: { ...config.stages.review, instructionAttachmentsFieldId: value } } }))}
@@ -438,6 +449,24 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
                 </div>
               </section>;
             })}
+            {id === "initial" && (() => {
+              const statusField = uniqueFields.find((field) => field.fieldId === stage.statusFieldId && isSingleSelectField(field));
+              // Both options live on the initial status field; an empty choice removes the binding.
+              const setMaterial = (targetId: "materialsReady" | "downloadFailed", optionId: string | null) => {
+                const next = { ...writeback };
+                if (optionId) next[targetId] = { fieldId: stage.statusFieldId, optionId };
+                else delete next[targetId];
+                update({ ...config, stages: { ...config.stages, initial: { ...stage, writeback: next } } });
+              };
+              return <section aria-label="VM 初稿素材下载回写">
+                <h5>素材下载结果回写（可选）</h5>
+                <p className="feishu-execution-help">在初稿进度字段上选择两个选项。VM 视频下载成功后回写“素材已就绪”并接着剪辑；下载失败时回写“下载失败”并发消息说明原因。已审批通过的任务，可人工把视频命名为 VMID.mp4 放进 VM 下载目录下的“人工素材”文件夹，再把进度从“下载失败”改为“素材已就绪”继续。</p>
+                <div className="feishu-settings-grid">
+                  {optionSelect("VM 素材已就绪选项", writeback.materialsReady?.optionId ?? null, statusField, (value) => setMaterial("materialsReady", value))}
+                  {optionSelect("VM 下载失败选项", writeback.downloadFailed?.optionId ?? null, statusField, (value) => setMaterial("downloadFailed", value))}
+                </div>
+              </section>;
+            })()}
           </section>;
         })}
       </fieldset>}

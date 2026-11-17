@@ -27,6 +27,8 @@ Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LA
 
 审核意见截图字段为空时允许文字审核流程；非空时必须由执行协议显式支持后才可继续。当前 v2 未定义图片资产输入，有图必须返回 `VM_REVIEW_IMAGES_UNSUPPORTED`，不得静默忽略图片生成交付。
 
+VM 初稿阶段可选在初稿进度字段上绑定“素材已就绪”和“下载失败”两个回写选项；两者均未绑定时行为不变。获批采集回执校验通过后回写素材已就绪并继续同一 run。审批驳回或撤销、审批或制作等待超时、下载重试耗尽或其他需处理状态、Shadow 登录连续失效超过 2 小时，统一将 run 置为 `blocked/VM_DOWNLOAD_FAILED`，回写下载失败并通知原因；此后该 run 不再自动领取原申请素材。Bridge 对从触发选项进入这两个选项的回写回声既不归档也不登记。只有真实飞书事件中“下载失败 → 素材已就绪”的边沿，经认证的 `/api/local/feishu/vm/manual-source` 接口提交人工素材，且仅限 VM 已确认审批通过（有 application_id、instance_code 和审批后等待证据）、尚无 plan/render/制品证据的同一初稿 task/run。Taskboard 只按冻结 VMID 读取本机 VM 下载目录下“人工素材”文件夹中的 `VMID.mp4`，复制到 run 自有目录并按获批视频同等规则校验（完整解码、分辨率不低于 1280x720、大小上限），记录为 `operator_asserted` 及其 SHA 后沿用原 task/run 和原审批继续；不重新申请、不领取其他申请的素材，后续重试按该回执重新校验 SHA。文件缺失、同名歧义或校验失败时保持阻断并再次回写下载失败。未获批的失败只能把进度改回初稿触发选项，登记新任务并重新审批。表格单元格不能提供路径。渲染前复核记录时，状态为触发选项或已回写的素材已就绪均视为未变化。
+
 ## 标准命令
 
 在仓库根目录执行：
@@ -47,6 +49,7 @@ npm test
 
 - 真实 Bridge 配置只放在被 Git 忽略的 `config/bridge.local.json`；示例结构维护在 `config/bridge.example.json`。Auto-Cut 包定义单独放在被 Git 忽略的 `config/taskboard-feishu-packages.json`，示例结构维护在 `config/autocut-packages.example.json`。
 - `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 只放在 `.env.local` 或团队批准的密钥管理工具中，不写入飞书单元格、日志、任务描述或 Git。
+- Taskboard 的 Shadow 登录凭据只能以 Windows DPAPI（当前 Windows 用户范围）加密后保存在本机数据目录的 `vm-shadow-session.bin`，不得以明文写入磁盘、日志、飞书或 Git；无 DPAPI 的平台不保存。重启恢复时必须重新验证身份且账号一致，断开账号或认证失效时删除。登录失效时只允许在本机默认浏览器打开固定 Shadow 登录页，每次失效最多自动打开一次。
 - `CODEX_FEISHU_BRIDGE_SECRET` 只用于本机 Bridge/Taskboard 互认，放在 `.env.local` 或由 `start-local.ps1` 临时生成；不要写入飞书单元格、日志、任务描述、共享配置或 Git。
 - 飞书单元格只能提供受控字段值和项目包别名；不能提供工作区路径、shell 命令、Codex 参数或 prompt。
 - Bridge 只解析配置白名单中的项目包别名，并使用配置中的绝对工作区路径和固定 prompt。

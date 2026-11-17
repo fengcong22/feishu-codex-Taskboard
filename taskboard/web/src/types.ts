@@ -421,6 +421,9 @@ export interface FeishuVmPmoStageConfig {
   writeback?: {
     processing: FeishuVmPmoWritebackTarget;
     completed: FeishuVmPmoWritebackTarget;
+    /** Initial stage only: optional options on the initial status field for the VM source result. */
+    materialsReady?: FeishuVmPmoWritebackTarget;
+    downloadFailed?: FeishuVmPmoWritebackTarget;
   };
 }
 
@@ -635,7 +638,23 @@ export interface VmPmoRunSummary {
   aiRetryLimit?: number;
   aiRetryHistory?: Array<{ errorCode: string; failedAt: string }>;
   review?: VmPmoRunReview | null;
+  canRetryValidatedPlan?: boolean;
+  canRetryFailedRender?: boolean;
+  canRetryManualRevision?: boolean;
+  canRetryApproval?: boolean;
+  sourceSha256?: string | null;
+  sourceDurationMs?: number | null;
   canRetryWriteback?: boolean;
+  /** "vm" for a VM API download, "manual" for an operator-supplied VMID.mp4. */
+  materialSource?: "vm" | "manual" | null;
+  downloadFailure?: {
+    reason: string;
+    approved: boolean;
+    manualSourceState: "pending" | "accepted" | "failed" | null;
+    message: string | null;
+    /** Relative to the VM download folder; null when only a restart can continue. */
+    manualSourceFile: string | null;
+  };
   writeback?: {
     processing: { state: string; errorCode: string | null; attemptCount: number } | null;
     completed: { state: string; errorCode: string | null; attemptCount: number } | null;

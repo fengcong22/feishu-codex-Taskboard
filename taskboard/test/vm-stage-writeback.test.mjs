@@ -149,3 +149,57 @@ test("delayed processing dispatch preserves actual render start after a failed o
     await assert.rejects(service.enqueue({ runId: "run_vm", moment: "processing" }), { code: "VM_WRITEBACK_UNTRUSTED" });
   }
 });
+
+function materialFixture() {
+  const x = fixture();
+  for (const options of [x.values.subject.metadata.fields[0].options, x.values.liveFields[0].property.options]) {
+    options.push({ id: "opt_source", name: "素材已就绪" }, { id: "opt_failed", name: "下载失败" });
+  }
+  Object.assign(x.values.subject.vmWorkflow.stages.initial.writeback, {
+    materialsReady: { fieldId: "fld_status", optionId: "opt_source" },
+    downloadFailed: { fieldId: "fld_status", optionId: "opt_failed" },
+  });
+  Object.assign(x.values.run, { state: "ready", runnerStartedAt: undefined,
+    acquisition: { sha256: "a".repeat(64) } });
+  return x;
+}
+
+test("materials ready is written before render evidence and only from the trigger", async () => {
+  const { service, enqueued } = materialFixture();
+  await service.enqueue({ runId: "run_vm", moment: "materials_ready" });
+  assert.deepEqual(enqueued[0], { idempotencyKey: "vm:run_vm:materials_ready", taskId: "task_vm",
+    runId: "run_vm", courseBindingId: null, operation: { type: "single_select", fieldId: "fld_status",
+      optionId: "opt_source", guard: { fieldId: "fld_status", optionIds: ["opt_ready", "opt_source"] } } });
+  const waiting = materialFixture();
+  Object.assign(waiting.values.run, { state: "waiting_materials", acquisition: undefined });
+  await assert.rejects(() => waiting.service.enqueue({ runId: "run_vm", moment: "materials_ready" }),
+    { code: "VM_WRITEBACK_UNTRUSTED" });
+});
+
+test("download failed requires the failed run and is keyed by its cause", async () => {
+  const x = materialFixture();
+  Object.assign(x.values.run, { state: "blocked", errorCode: "VM_DOWNLOAD_FAILED", acquisition: undefined });
+  await x.service.enqueue({ runId: "run_vm", moment: "download_failed", slot: "auto" });
+  await x.service.enqueue({ runId: "run_vm", moment: "download_failed", slot: `e${"b".repeat(32)}` });
+  assert.deepEqual(x.enqueued.map((entry) => entry.idempotencyKey),
+    ["vm:run_vm:download_failed:auto", `vm:run_vm:download_failed:e${"b".repeat(32)}`]);
+  assert.deepEqual(x.enqueued[0].operation.guard,
+    { fieldId: "fld_status", optionIds: ["opt_ready", "opt_source", "opt_failed"] });
+  await assert.rejects(() => x.service.enqueue({ runId: "run_vm", moment: "download_failed", slot: "../x" }),
+    { code: "VM_WRITEBACK_INPUT_INVALID" });
+  x.values.run.errorCode = "VM_PMO_CONFIG_CHANGED";
+  await assert.rejects(() => x.service.enqueue({ runId: "run_vm", moment: "download_failed", slot: "auto" }),
+    { code: "VM_WRITEBACK_UNTRUSTED" });
+});
+
+test("processing also accepts the materials-ready status and unbound source options fail closed", async () => {
+  const x = materialFixture();
+  Object.assign(x.values.run, { state: "running", runnerStartedAt: "2026-10-14T10:00:00.000Z" });
+  await x.service.enqueue({ runId: "run_vm", moment: "processing" });
+  assert.deepEqual(x.enqueued[0].operation.guard,
+    { fieldId: "fld_status", optionIds: ["opt_ready", "opt_source", "opt_processing"] });
+  const unbound = fixture();
+  Object.assign(unbound.values.run, { state: "ready", runnerStartedAt: undefined, acquisition: {} });
+  await assert.rejects(() => unbound.service.enqueue({ runId: "run_vm", moment: "materials_ready" }),
+    { code: "VM_WRITEBACK_BINDING_MISSING" });
+});

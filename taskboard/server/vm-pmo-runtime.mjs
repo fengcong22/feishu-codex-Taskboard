@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { ApiError } from "./database.mjs";
@@ -15,13 +15,15 @@ import { runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
 import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
 import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
-import { createVmStageWriteback } from "./vm-stage-writeback.mjs";
+import { createVmStageWriteback, parseVmWritebackIdempotencyKey } from "./vm-stage-writeback.mjs";
 import { createVmWritebackStore } from "./vm-writeback-store.mjs";
 import { createFeishuWritebackWorker } from "./feishu-writeback-worker.mjs";
 import { createVmFinalArchiveService } from "./vm-pmo-final-archive.mjs";
 import { isVmFinalArchiveTransition, planVmFinalArchive } from "./feishu-vm-delivery-plan.mjs";
 import { readVmPackageBoard } from "./vm-package-board.mjs";
-import { describeVmPmoAttention } from "./blocked-notification.mjs";
+import { describeVmPmoAttention, describeVmDownloadFailure } from "./blocked-notification.mjs";
+import { verifyVmAcquisitionReceipt } from "./vm-approval-workflow.mjs";
+import { prepareVmSource } from "./vm-source-adapter.mjs";
 
 const TEMPLATE = Object.freeze({id: "vm_pmo_review_video",version: 1});
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -31,6 +33,10 @@ const TERMINAL = new Set(["completed","blocked","needs_attention"]);
 const MAX_PLAN_ATTEMPTS = 3;
 const AI_INTENT_BLOCKS = ["AI_INTENT_TIMEOUT","AI_INTENT_MISSING","AI_INTENT_FAILED"];
 const MAX_AI_RETRIES = 2;
+const MATERIAL_MOMENTS = new Set(["materials_ready","download_failed"]);
+// Operator-supplied sources live in a fixed folder beside the configured VM download output.
+const MANUAL_SOURCE_FOLDER = "人工素材";
+const MANUAL_SOURCE_RESOLUTION = Object.freeze({width: 1280,height: 720});
 const ACTOR = Object.freeze({type: "agent",id: "vm-pmo-runtime",name: "VM 初稿剪辑",avatarUrl: null});
 const digest = bytes => createHash("sha256").update(bytes).digest("hex");
 const same = (a,b) => canonicalJson(a) === canonicalJson(b);
@@ -170,6 +176,14 @@ async function canonicalLocation(target, {directory = false,missing = false} = {
   }
 }
 
+/** The initial stage may bind optional status options for the source acquisition result. */
+function materialEdgesFor(subject) {
+  const stage = subject?.vmWorkflow?.stages?.initial;
+  const bound = key => object(stage?.writeback?.[key]) && stage.writeback[key].fieldId === stage.statusFieldId
+    && typeof stage.writeback[key].optionId === "string" && ID.test(stage.writeback[key].optionId);
+  return {materialsReady: bound("materialsReady"),downloadFailed: bound("downloadFailed")};
+}
+
 function initialProfile(subject, config) {
   const fields = subject?.metadata?.fields;
   const stages = config?.stages;
@@ -209,6 +223,13 @@ function initialProfile(subject, config) {
     for (const moment of ["processing","completed"]) {
       const binding = stage.writeback?.[moment];
       if (!binding || !ID.test(binding.fieldId ?? "") || !ID.test(binding.optionId ?? "")) throw fail("VM_WORKFLOW_NOT_READY");
+      option(binding.fieldId,binding.optionId);
+    }
+    for (const moment of stageId === "initial" ? ["materialsReady","downloadFailed"] : []) {
+      const binding = stage.writeback?.[moment];
+      if (binding === undefined) continue;
+      if (binding?.fieldId !== stage.statusFieldId || !ID.test(binding.optionId ?? "")
+        || binding.optionId === stage.triggerOptionId) throw fail("VM_WORKFLOW_NOT_READY");
       option(binding.fieldId,binding.optionId);
     }
   }
@@ -365,9 +386,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         workflowTemplate: {...subject.workflowTemplate}};
     }
 
-    function trustedRun(runId) {
+    function trustedRun(runId, {requireStarted = true} = {}) {
       const run = orchestrator.get(runId);
-      if (!run || !run.runnerStartedAt) throw fail("VM_PMO_RUN_NOT_STARTED");
+      if (!run || requireStarted && !run.runnerStartedAt) throw fail("VM_PMO_RUN_NOT_STARTED");
       const task = database.getTask(run.taskId), origin = database.getFeishuTaskOrigin(run.taskId);
       const snapshot = database.getFeishuTaskPackageSnapshot(run.taskId);
       if (!task || task.archivedAt !== null || !task.labels?.includes("feishu") || origin?.deliverySource !== undefined
@@ -508,9 +529,12 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         throw fail("VM_ARCHIVE_SOURCE_SUPERSEDED");
     }});
     // Each run has its own frozen subject. A task from a later version must never redirect an earlier run.
-    async function planWriteback(runId,moment) {
-      const run = trustedRun(runId), frozen = metadata(run.taskId).subject;
-      const planner = createVmStageWriteback({resolveTrustedRun: () => trustedRun(runId),getActiveSubject: () => structuredClone(frozen),
+    async function planWriteback(runId,moment,slot = null) {
+      // Source moments are written before any render evidence exists.
+      const requireStarted = !MATERIAL_MOMENTS.has(moment);
+      const run = trustedRun(runId,{requireStarted}), frozen = metadata(run.taskId).subject;
+      const planner = createVmStageWriteback({resolveTrustedRun: () => trustedRun(runId,{requireStarted}),
+        getActiveSubject: () => structuredClone(frozen),
         listFields: localAdapter.listFields,getDelivery: () => delivery.get(runId),
         isLatestStageRun: async ({run: candidate}) => {
           const latest = latestStageOrigin({...candidate.target,subjectKey:candidate.subjectKey,
@@ -518,17 +542,19 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
           return latest?.taskId === candidate.taskId;
         },
         enqueueWritebackIntent: input => writebackStore.enqueueWritebackIntent(input)});
-      return planner.plan({runId,moment});
+      return planner.plan({runId,moment,slot});
     }
     writebackStore = createVmWritebackStore({database,now,validateIntent: async input => {
-      const moment = input.idempotencyKey === `vm:${input.runId}:processing` ? "processing" : "completed";
-      const expected = await planWriteback(input.runId,moment);
+      const key = parseVmWritebackIdempotencyKey(input.idempotencyKey,input.runId);
+      if (!key) throw fail("WRITEBACK_REFERENCE_INVALID");
+      const expected = await planWriteback(input.runId,key.moment,key.slot);
       if (!same(expected,input)) throw fail("WRITEBACK_REFERENCE_INVALID");
-      return {target: trustedRun(input.runId).target,operation: expected.operation};
+      return {target: trustedRun(input.runId,{requireStarted: !MATERIAL_MOMENTS.has(key.moment)}).target,
+        operation: expected.operation};
     }});
     writebackWorker = createFeishuWritebackWorker({store: writebackStore,dispatch: dispatchWriteback,now});
-    async function enqueueWriteback(run,moment) {
-      await writebackStore.enqueueWritebackIntent(await planWriteback(run.runId,moment));
+    async function enqueueWriteback(run,moment,slot = null) {
+      await writebackStore.enqueueWritebackIntent(await planWriteback(run.runId,moment,slot));
       void writebackWorker.wake().catch(() => {});
     }
     function taskStatus(run,status) {
@@ -575,13 +601,19 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const origin = database.getFeishuTaskOrigin(run.taskId), local = metadata(run.taskId);
         const packageIdentity = await inspectPackage(await getPackage(origin.packageAlias));
         if (!samePackageIdentity(packageIdentity,local.packageIdentity)) throw fail("VM_PMO_PACKAGE_CHANGED");
-        const record = normalizeVmRecordContext(await readCurrentRecord({subject: local.subject,event: origin,
-          stageId: origin.stageId}),
-          {expectedStatusOptionId: origin.afterOptionId});
+        const rawRecord = await readCurrentRecord({subject: local.subject,event: origin,stageId: origin.stageId});
+        // Taskboard's own "materials ready" write is the only other status this run may see before render.
+        const readyOption = origin.stageId === "initial" && materialEdgesFor(local.subject).materialsReady
+          ? local.subject.vmWorkflow.stages.initial.writeback.materialsReady.optionId : null;
+        const record = normalizeVmRecordContext(rawRecord,
+          {expectedStatusOptionId: readyOption && rawRecord?.statusOptionId === readyOption
+            ? readyOption : origin.afterOptionId});
         const frozenContext=origin.stageSnapshot?.vmContext;
+        const comparable = readyOption && record.statusOptionId === readyOption
+          ? {...record,statusOptionId: frozenContext?.statusOptionId} : record;
         const instructionOnlyDrift=run.manualRevision !== undefined
-          && origin.stageId === "initial" && same({...record,instruction:frozenContext?.instruction},frozenContext);
-        if (!same(record,frozenContext) && !instructionOnlyDrift) throw fail("VM_PMO_RECORD_CHANGED");
+          && origin.stageId === "initial" && same({...comparable,instruction:frozenContext?.instruction},frozenContext);
+        if (!same(comparable,frozenContext) && !instructionOnlyDrift) throw fail("VM_PMO_RECORD_CHANGED");
         const prepared = await prepareVmPmoRunInput({runRoot,runId: run.runId,taskId: run.taskId,origin,
           profile: local.subject.vmWorkflow,packageSnapshot: database.getFeishuTaskPackageSnapshot(run.taskId),
           packageIdentity,acquisition,pythonPath,planAttempt,manualRevision:run.manualRevision,
@@ -619,12 +651,26 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         if (status?.taskId !== run.taskId || status.runId !== run.runId
           || status.vmid !== run.binding.vmid || status.approvalJobId !== run.binding.approvalJobId)
           throw fail("VM_PMO_RETRY_BINDING_CHANGED");
-        if (run.approvalStatus !== "ready" || status.status !== "ready"
-          || status.acquisition?.vmid_binding !== "vm_api_verified")
-          throw fail("VM_PMO_RETRY_APPROVAL_NOT_READY");
-        const keys = ["receipt_path","path","sha256","bytes","duration_ms","vmid_binding","vmid"];
-        if (!run.acquisition || keys.some(key => status.acquisition[key] !== run.acquisition[key]))
-          throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
+        if (run.acquisition?.vmid_binding === "operator_asserted") {
+          // The VM application stays approved; the operator copy is re-hashed against its own receipt.
+          if (run.manualSource?.state !== "accepted" || run.downloadFailure?.approved !== true)
+            throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
+          let verified;
+          try {
+            verified = await verifyVmAcquisitionReceipt(run.acquisition.receipt_path,{vmid: run.binding.vmid,
+              applicationId: run.downloadFailure.applicationId,instanceCode: run.downloadFailure.instanceCode,
+              allowOperatorReceipt: true});
+          } catch {throw fail("VM_PMO_RETRY_SOURCE_CHANGED");}
+          if (["receipt_path","path","sha256","bytes","duration_ms","vmid_binding"]
+            .some(key => verified[key] !== run.acquisition[key])) throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
+        } else {
+          if (run.approvalStatus !== "ready" || status.status !== "ready"
+            || status.acquisition?.vmid_binding !== "vm_api_verified")
+            throw fail("VM_PMO_RETRY_APPROVAL_NOT_READY");
+          const keys = ["receipt_path","path","sha256","bytes","duration_ms","vmid_binding","vmid"];
+          if (!run.acquisition || keys.some(key => status.acquisition[key] !== run.acquisition[key]))
+            throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
+        }
         if (run.prepared) {
           try {await boundFor(run.prepared.runnerOptions,{runId:run.runId,taskId:run.taskId,
             planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256});}
@@ -682,8 +728,11 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       onRunStarted: async ({run}) => {taskStatus(run,"in_progress");await enqueueWriteback(run,"processing");},
       onCompleted: async ({run}) => {await enqueueWriteback(run,"completed");taskStatus(run,"in_review");},
       onAttention: notifyAttention,
+      materialEdges: async ({run}) => materialEdgesFor(metadata(run.taskId).subject),
+      onMaterialsReady: async ({run}) => enqueueWriteback(run,"materials_ready"),
+      onDownloadFailed: async ({run,slot}) => enqueueWriteback(run,"download_failed",slot),
     });
-    services = {orchestrator,delivery,finalArchive,writebackStore,writebackWorker,metadata,
+    services = {orchestrator,delivery,finalArchive,writebackStore,writebackWorker,metadata,enqueueWriteback,latestStageOrigin,
       registration: createVmTaskRegistration({database,getPackage,getActiveSubject,readCurrentRecord,
         resolveReviewParent,
         prepareCommit: async ({subject,packageRecord,origin}) => {
@@ -758,8 +807,22 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
       && !run.renderRetryHistory?.length && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    // 只读摘要，供看板填写人工修改方案时绑定原视频；不含路径、回执等敏感字段。
+    const sourceSha256 = /^[a-f0-9]{64}$/u.test(run.acquisition?.sha256 ?? "") ? run.acquisition.sha256 : null;
+    const sourceDurationMs = Number.isSafeInteger(run.acquisition?.duration_ms) && run.acquisition.duration_ms > 0
+      ? run.acquisition.duration_ms : null;
     return {runId:run.runId,taskId:run.taskId,state:run.state,errorCode:run.errorCode,
       approvalStatus:run.approvalStatus,planAttempt,retryLimit:MAX_PLAN_ATTEMPTS,
+      sourceSha256,sourceDurationMs,
+      materialSource: run.acquisition?.vmid_binding === "operator_asserted" ? "manual"
+        : run.acquisition ? "vm" : null,
+      ...(run.errorCode === "VM_DOWNLOAD_FAILED" && run.downloadFailure ? {downloadFailure: {
+        reason: run.manualSource?.state === "failed" ? run.manualSource.reason : run.downloadFailure.reason,
+        approved: run.downloadFailure.approved,
+        manualSourceState: run.manualSource?.state ?? null,
+        message: describeVmDownloadFailure(run),
+        manualSourceFile: run.downloadFailure.approved ? `${MANUAL_SOURCE_FOLDER}/${run.binding.vmid}.mp4` : null,
+      }} : {}),
       canRetryApproval,canRetryManualRevision,
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
         failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,
@@ -932,6 +995,134 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     return queued;
   }
 
+  const manualSourceWork = new Map();
+  const manualSlot = eventId => `e${digest(eventId).slice(0,32)}`;
+  function manualFailureCode(error) {
+    return typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{1,100}$/u.test(error.code)
+      ? error.code : "VM_MANUAL_SOURCE_FAILED";
+  }
+  async function writeDownloadFailed(run,slot,{notify = false} = {}) {
+    const service = initialize();
+    try {await enqueueWritebackFor(run,"download_failed",slot);} catch {}
+    if (!notify) return;
+    const current = service.orchestrator.get(run.runId) ?? run;
+    const task = database.getTask(current.taskId), origin = database.getFeishuTaskOrigin(current.taskId);
+    const subject = origin && database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
+    const notification = describeVmPmoAttention({run: current,task,origin,subject});
+    if (notification) {
+      try {await (await getDownloads()).notifyWorkflowBlocked({...notification,eventKey: `${notification.eventKey}:${slot}`});}
+      catch {}
+    }
+  }
+  function enqueueWritebackFor(run,moment,slot) {
+    return initialize().enqueueWriteback(run,moment,slot);
+  }
+
+  /** Copies the operator's VMID.mp4 into run-owned storage and verifies it like a VM download. */
+  async function acquireManualSource(run) {
+    const downloads = await getDownloads();
+    const outputRoot = downloads?.snapshot?.()?.settings?.outputRoot;
+    if (typeof outputRoot !== "string" || !path.isAbsolute(outputRoot)) throw fail("VM_MANUAL_SOURCE_UNAVAILABLE");
+    const folder = path.join(outputRoot,MANUAL_SOURCE_FOLDER);
+    let entries;
+    try {entries = await readdir(folder,{withFileTypes: true});}
+    catch {throw fail("VM_MANUAL_SOURCE_MISSING");}
+    const expected = `${run.binding.vmid}.mp4`;
+    const matches = entries.filter(entry => entry.name.toLowerCase() === expected);
+    if (matches.length > 1) throw fail("VM_MANUAL_SOURCE_AMBIGUOUS");
+    if (matches.length !== 1 || !matches[0].isFile()) throw fail("VM_MANUAL_SOURCE_MISSING");
+    const {applicationId,instanceCode} = run.downloadFailure;
+    const result = await prepareVmSource({schema_version: 1,vmid: run.binding.vmid,source: {
+      kind: "approved_file",approval_ref: applicationId,video_variant: "approved_rendition",
+      expected_resolution: {...MANUAL_SOURCE_RESOLUTION},file: path.join(folder,matches[0].name)}},
+    {outputRoot: path.join(runRoot,"manual-sources",run.runId),ffprobePath,ffmpegPath});
+    if (result?.status !== "ready" || typeof result.receipt_path !== "string") throw fail("MEDIA_VALIDATION_FAILED");
+    const verified = await verifyVmAcquisitionReceipt(result.receipt_path,{vmid: run.binding.vmid,
+      applicationId,instanceCode,allowOperatorReceipt: true});
+    return {...verified,vmid: run.binding.vmid};
+  }
+
+  async function processManualSource(runId) {
+    if (manualSourceWork.has(runId)) return manualSourceWork.get(runId);
+    const work = (async () => {
+      const service = initialize();
+      const run = service.orchestrator.get(runId);
+      if (run?.manualSource?.state !== "pending") return;
+      const {eventId} = run.manualSource;
+      let acquisition;
+      try {acquisition = await acquireManualSource(run);}
+      catch (error) {
+        const failed = service.orchestrator.completeManualSource(runId,{eventId,failureCode: manualFailureCode(error)});
+        await writeDownloadFailed(failed,manualSlot(eventId),{notify: true});
+        return;
+      }
+      service.orchestrator.completeManualSource(runId,{eventId,acquisition});
+      void service.orchestrator.pump(runId).finally(releaseTerminalSlots).catch(() => {});
+    })().finally(() => manualSourceWork.delete(runId));
+    manualSourceWork.set(runId,work);
+    return work;
+  }
+
+  /** Bridge delivers "下载失败 → 素材已就绪" here; the source itself is verified in the background. */
+  async function submitManualSource(body) {
+    await ready();
+    const event = body?.event, binding = body?.binding;
+    const keys = ["eventId","baseToken","tableId","recordId","statusFieldId","beforeOptionId","afterOptionId"];
+    if (!object(body) || Object.keys(body).length !== 2 || !object(event) || !object(binding)
+      || Object.keys(event).length !== keys.length || keys.some(key => typeof event[key] !== "string")
+      || !EVENT_ID.test(event.eventId) || keys.slice(1).some(key => !ID.test(event[key]))
+      || Object.keys(binding).length !== 2 || binding.subjectKey !== `${event.baseToken}:${event.tableId}`
+      || !Number.isSafeInteger(binding.configVersion) || binding.configVersion < 1)
+      throw fail("VM_MANUAL_SOURCE_INPUT_INVALID",400);
+    const service = initialize();
+    const sameRecord = run => run.identity.origin.stageId === "initial"
+      && run.identity.origin.baseToken === event.baseToken && run.identity.origin.tableId === event.tableId
+      && run.identity.origin.recordId === event.recordId && run.identity.origin.subjectKey === binding.subjectKey;
+    const runs = service.orchestrator.list().filter(sameRecord);
+    const replay = runs.find(run => run.manualSource?.eventId === event.eventId);
+    if (replay) return {state: replay.manualSource.state === "failed" ? "rejected" : "accepted",taskId: replay.taskId};
+    const run = runs.filter(entry => entry.state === "blocked" && entry.errorCode === "VM_DOWNLOAD_FAILED")
+      .sort((left,right) => right.createdAt - left.createdAt)[0];
+    const task = run && database.getTask(run.taskId);
+    if (!run || !task || task.archivedAt !== null) return {state: "ignored"};
+    const subject = service.metadata(run.taskId).subject, edges = materialEdgesFor(subject);
+    const stage = subject.vmWorkflow.stages.initial;
+    const latest = service.latestStageOrigin({baseToken: event.baseToken,tableId: event.tableId,recordId: event.recordId,
+      subjectKey: binding.subjectKey,fieldId: run.identity.outputAttachmentFieldId,
+      packageAlias: run.identity.origin.packageAlias});
+    if (!edges.materialsReady || !edges.downloadFailed || stage.statusFieldId !== event.statusFieldId
+      || stage.writeback.downloadFailed.optionId !== event.beforeOptionId
+      || stage.writeback.materialsReady.optionId !== event.afterOptionId || latest?.taskId !== run.taskId)
+      return {state: "ignored"};
+    if (run.manualSource?.state === "pending") return {state: "ignored",taskId: run.taskId};
+    if (run.downloadFailure?.approved !== true) {
+      // The status moved without an approved application: restore "下载失败" and explain why.
+      await writeDownloadFailed(run,manualSlot(event.eventId),{notify: true});
+      return {state: "rejected",taskId: run.taskId};
+    }
+    service.orchestrator.requestManualSource(run.runId,{eventId: event.eventId});
+    void processManualSource(run.runId).catch(() => {});
+    return {state: "accepted",taskId: run.taskId};
+  }
+
+  /** Restores material writebacks and pending operator sources that a restart interrupted. */
+  async function recoverMaterialWork() {
+    const service = initialize();
+    for (const run of service.orchestrator.list()) {
+      if (run.identity.origin.stageId !== "initial") continue;
+      let edges;
+      try {edges = materialEdgesFor(service.metadata(run.taskId).subject);} catch {continue;}
+      if (run.state === "blocked" && run.errorCode === "VM_DOWNLOAD_FAILED") {
+        if (run.manualSource?.state === "pending") void processManualSource(run.runId).catch(() => {});
+        else if (edges.downloadFailed) await writeDownloadFailed(run,
+          run.manualSource?.state === "failed" ? manualSlot(run.manualSource.eventId) : "auto");
+      } else if (edges.materialsReady && run.acquisition?.vmid_binding === "vm_api_verified"
+        && ["ready","preparing","prepared","planning","planned"].includes(run.state)) {
+        try {await enqueueWritebackFor(run,"materials_ready",null);} catch {}
+      }
+    }
+  }
+
   async function register(body,actor) {
     await ready();
     const service = initialize(), result = await service.registration.register(body,actor);
@@ -1043,6 +1234,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
     getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,retryWriteback,
     retryAiIntent,
+    submitManualSource,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),
     list: () => services?.orchestrator.list() ?? [],
     enqueueFinalArchive,
@@ -1056,6 +1248,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         timer = setInterval(() => {void wake().catch(() => {});},tickMs);timer.unref?.();
         void (async () => {
           await initialize().orchestrator.recoverBindingConflicts();
+          await recoverMaterialWork().catch(() => {});
           await wake();
         })().catch(() => {});
       }

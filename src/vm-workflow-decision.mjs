@@ -198,6 +198,24 @@ export function decideVmWorkflowRecordChange(subject, event) {
       ...(leaving && leaving.stageId !== entered.stageId
         ? { archiveWaiting: true, previousStageId: leaving.stageId } : {}) };
   }
+  const initialWriteback = subject.vmWorkflow.stages?.initial?.writeback ?? {};
+  const materialsReady = initialWriteback.materialsReady;
+  const downloadFailed = initialWriteback.downloadFailed;
+  const initialEnabled = matching.some(({ stageId }) => stageId === "initial");
+  // Taskboard writes these options itself; leaving the trigger for one of them is
+  // progress, not a cancellation, so it must not archive the waiting task.
+  const materialOptionIds = [materialsReady, downloadFailed]
+    .filter((binding) => binding?.fieldId === expectedFieldId).map((binding) => binding.optionId);
+  if (initialEnabled && materialsReady?.fieldId === expectedFieldId && downloadFailed?.fieldId === expectedFieldId
+    && hasPreviousOption && event.beforeOptionId === downloadFailed.optionId
+    && event.afterOptionId === materialsReady.optionId) {
+    return { kind: "manual_source_ready", subject, event, subjectKey: subject.subjectKey,
+      configVersion: subject.configVersion, stageId: "initial",
+      stage: subject.vmWorkflow.stages.initial, packageAlias: subject.packageRoute.packageAlias };
+  }
+  if (initialEnabled && materialOptionIds.includes(event.afterOptionId)) {
+    return { kind: "ignored", reason: "material_writeback_option", subject, event };
+  }
   if (leaving) {
     const common = {
     subject,

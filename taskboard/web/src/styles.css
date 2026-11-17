@@ -1652,6 +1652,58 @@ kbd {
   text-decoration: underline;
 }
 
+.header-vm-status-expiry {
+  color: var(--warning, var(--text-secondary));
+  font-size: 11px;
+}
+
+.header-vm-status-details {
+  border-top: var(--border-hairline) solid var(--border);
+  padding: 4px 7px 2px;
+  font-size: 11px;
+}
+
+.header-vm-status-details > summary {
+  cursor: pointer;
+  padding: 4px 0;
+  color: var(--text-secondary);
+}
+
+.header-vm-status-details[open] {
+  display: grid;
+  gap: 3px;
+}
+
+.header-vm-status-details > small {
+  color: var(--text-secondary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.header-vm-status-details .header-vm-status-notifications,
+.header-vm-status-details .header-vm-status-refresh {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.header-vm-status-detail-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.header-vm-status-detail-button svg {
+  width: 14px;
+  height: 14px;
+}
+
 @media (max-width: 560px) {
   .header-vm-status-state { display: none; }
   .header-vm-status-menu { right: -56px; }
@@ -6564,6 +6616,11 @@ kbd {
 .vm-downloads-heading p, .vm-downloads-panel .vm-downloads-help { color: var(--text-secondary); }
 .vm-downloads-session { margin-top: 16px; padding: 14px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); }
 .vm-downloads-session-heading { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; }
+.vm-downloads-session-heading > span { color: var(--text-secondary); font-size: 12px; }
+.vm-downloads-session-details, .vm-downloads-job-details { margin-top: 8px; font-size: 11px; color: var(--text-secondary); }
+.vm-downloads-session-details > summary, .vm-downloads-job-details > summary,
+.vm-downloads-notifications > summary { cursor: pointer; }
+.vm-downloads-session-details > p { margin: 6px 0 0; }
 .vm-downloads-notifications { margin-top: 14px; padding: 10px 0; border-top: 1px solid var(--border); }
 .vm-downloads-notifications > strong { font-size: 12px; }
 .vm-downloads-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
@@ -13849,6 +13906,10 @@ kbd {
 .vm-pmo-review-list { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: 10px; }
 .vm-pmo-review-list li > * + * { margin-left: 6px; }
 .vm-pmo-review-list code { overflow-wrap: anywhere; }
+.vm-pmo-material-source { margin: 0; color: var(--text-secondary); font-size: 11px; }
+.vm-pmo-download-failure { display: grid; gap: 4px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.vm-pmo-download-failure p { margin: 0; }
+.vm-pmo-download-failure code { overflow-wrap: anywhere; }
 
 @media (max-width: 1000px) {
   .feishu-workflow-panel {

@@ -254,15 +254,23 @@ function exactKeys(value, names, name) {
   return input;
 }
 
-function normalizeVmWriteback(value, name) {
-  const input = exactKeys(value, ["processing", "completed"], name);
-  return Object.fromEntries(["processing", "completed"].map((state) => {
+function normalizeVmWriteback(value, name, { allowMaterialEdges = false } = {}) {
+  const optional = allowMaterialEdges ? ["materialsReady", "downloadFailed"] : [];
+  const input = plainObject(value, name);
+  assertKnownKeys(input, new Set(["processing", "completed", ...optional]), name);
+  for (const key of ["processing", "completed"]) {
+    if (!Object.hasOwn(input, key)) fail(`${name}.${key} is required`);
+  }
+  // Material edges are optional and omitted when unbound, so existing frozen
+  // configuration snapshots keep their exact canonical form.
+  const states = ["processing", "completed", ...optional.filter((key) => Object.hasOwn(input, key))];
+  return Object.fromEntries(states.map((state) => {
     const binding = exactKeys(input[state], ["fieldId", "optionId"], `${name}.${state}`);
     const fieldId = nullableId(binding.fieldId, `${name}.${state}.fieldId`);
     const option = nullableId(binding.optionId, `${name}.${state}.optionId`);
     if (Boolean(fieldId) !== Boolean(option)) fail(`${name}.${state} requires a complete field and option pair`);
     return [state, { fieldId, optionId: option }];
-  }));
+  }).filter(([state, binding]) => !optional.includes(state) || binding.fieldId !== null));
 }
 
 function normalizeVmStage(value, stageId) {
@@ -275,7 +283,8 @@ function normalizeVmStage(value, stageId) {
     statusFieldId: nullableId(input.statusFieldId, `${name}.statusFieldId`),
     triggerOptionId: nullableId(input.triggerOptionId, `${name}.triggerOptionId`),
     instructionFieldId: nullableId(input.instructionFieldId, `${name}.instructionFieldId`),
-    writeback: normalizeVmWriteback(input.writeback, `${name}.writeback`),
+    writeback: normalizeVmWriteback(input.writeback, `${name}.writeback`,
+      { allowMaterialEdges: stageId === "initial" }),
   };
   if (stageId === "review") stage.instructionAttachmentsFieldId = nullableId(
     input.instructionAttachmentsFieldId, `${name}.instructionAttachmentsFieldId`);
@@ -318,6 +327,21 @@ function normalizeVmWorkflow(value, statusField) {
   if (stages.review.enabled && stages.review.triggerOptionId === stages.initial.triggerOptionId) {
     fail("vmWorkflow enabled stages must use distinct trigger options");
   }
+  const materialEdges = ["materialsReady", "downloadFailed"]
+    .map((key) => [key, stages.initial.writeback[key]]).filter(([, binding]) => binding);
+  for (const [key, binding] of materialEdges) {
+    if (binding.fieldId !== statusField.fieldId
+      || statusField.options.filter((option) => option.optionId === binding.optionId).length !== 1) {
+      fail(`vmWorkflow.stages.initial.writeback.${key} must use an initial status field option`);
+    }
+    const editingTriggers = Object.values(stages).filter((stage) => stage.enabled).map((stage) => stage.triggerOptionId);
+    if (editingTriggers.includes(binding.optionId)) {
+      fail(`vmWorkflow.stages.initial.writeback.${key} must differ from editing triggers`);
+    }
+  }
+  if (materialEdges.length === 2 && materialEdges[0][1].optionId === materialEdges[1][1].optionId) {
+    fail("vmWorkflow material writeback options must be distinct");
+  }
   const rawArchive = exactKeys(input.finalArchive,
     ["enabled", "statusFieldId", "triggerOptionId", "pathSource", "directoryPath", "pathFieldId"],
     "vmWorkflow.finalArchive");
@@ -343,6 +367,10 @@ function normalizeVmWorkflow(value, statusField) {
       .map((stage) => JSON.stringify([stage.statusFieldId, stage.triggerOptionId]));
     if (stageTriggers.includes(JSON.stringify([finalArchive.statusFieldId, finalArchive.triggerOptionId]))) {
       fail("vmWorkflow.finalArchive must use a different trigger from editing stages");
+    }
+    if (finalArchive.statusFieldId === statusField.fieldId
+      && materialEdges.some(([, binding]) => binding.optionId === finalArchive.triggerOptionId)) {
+      fail("vmWorkflow.finalArchive must use a different trigger from material writeback options");
     }
   }
   return { fields, approval, stages, finalArchive };

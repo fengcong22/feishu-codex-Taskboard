@@ -367,3 +367,52 @@ test("active VM workflow normalizes SDK events and routes the option edge", asyn
   assert.equal((await bridge.handle(events[0])).kind, "register");
   assert.equal(requests, 1);
 });
+
+function materialSubject() {
+  const configured = subject();
+  configured.statusField.options.push({ optionId: "opt_source", value: "素材已就绪" },
+    { optionId: "opt_failed", value: "下载失败" });
+  configured.vmWorkflow.stages.initial.writeback.materialsReady = { fieldId: "fld_status", optionId: "opt_source" };
+  configured.vmWorkflow.stages.initial.writeback.downloadFailed = { fieldId: "fld_status", optionId: "opt_failed" };
+  return validateSubjectConfig(configured);
+}
+
+test("VM download failed to materials ready submits one operator source request", async (t) => {
+  const calls = [];
+  const configured = materialSubject();
+  const { bridge, store } = await fixture(t, {
+    submitFeishuVmManualSource: async (payload) => { calls.push(payload); return { state: "accepted", taskId: "task_vm" }; },
+    registerFeishuVmTask: assert.fail, archiveFeishuTask: assert.fail,
+  }, { config: { tables: [configured] }, workflowStore: { resolveSubjectVersionAt: async () => configured } });
+  const result = await bridge.handle(edge("opt_failed", "opt_source", { eventId: "evt_manual" }));
+  assert.equal(result.kind, "manual_source_ready", JSON.stringify(result));
+  assert.deepEqual(calls, [{
+    event: { eventId: "evt_manual", baseToken: "bas_vm", tableId: "tbl_vm", recordId: "rec_vm",
+      statusFieldId: "fld_status", beforeOptionId: "opt_failed", afterOptionId: "opt_source" },
+    binding: { subjectKey: "bas_vm:tbl_vm", configVersion: 2 },
+  }]);
+  assert.equal((await bridge.handle(edge("opt_failed", "opt_source", { eventId: "evt_manual" }))).duplicate, true);
+  assert.equal(calls.length, 1);
+  assert.equal((await store.get("evt_manual")).deliveryState, "succeeded");
+});
+
+test("VM source writeback echoes neither archive nor register the waiting initial task", async (t) => {
+  const configured = materialSubject();
+  const { bridge } = await fixture(t, {
+    registerFeishuVmTask: assert.fail, archiveFeishuTask: assert.fail, listFeishuTasks: assert.fail,
+    submitFeishuVmManualSource: assert.fail,
+  }, { config: { tables: [configured] }, workflowStore: { resolveSubjectVersionAt: async () => configured } });
+  for (const [index, after] of ["opt_source", "opt_failed"].entries()) {
+    const result = await bridge.handle(edge("opt_ready", after, { eventId: `evt_echo_${index}` }));
+    assert.equal(result.kind, "ignored", JSON.stringify(result));
+  }
+});
+
+test("VM manual source request is retried while Taskboard is unavailable", async (t) => {
+  const configured = materialSubject();
+  const { bridge, store } = await fixture(t, {
+    submitFeishuVmManualSource: async () => { throw Object.assign(new Error("offline"), { status: 503 }); },
+  }, { config: { tables: [configured] }, workflowStore: { resolveSubjectVersionAt: async () => configured } });
+  await bridge.handle(edge("opt_failed", "opt_source", { eventId: "evt_manual_retry" })).catch(() => {});
+  assert.equal((await store.get("evt_manual_retry")).deliveryState, "retry_wait");
+});

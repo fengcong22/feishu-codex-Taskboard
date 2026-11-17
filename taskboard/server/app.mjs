@@ -69,6 +69,8 @@ import { createVmApprovalStore } from "./vm-approval-store.mjs";
 import { createVmDownloadService } from "./vm-download-service.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-download-notifier.mjs";
 import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
+import { createVmCredentialStore } from "./vm-credential-store.mjs";
+import { openVmLoginPage } from "./vm-login-page.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
 import { createVmPmoAiIntentRunner, validVmPmoAiModel } from "./vm-pmo-ai-intent.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
@@ -2910,6 +2912,12 @@ export function createTaskboardServer(options = {}) {
         metadata: createVmDownloadMetadata({ database: database.database }),
         notifier: options.vmDownloadNotifier ?? createVmDownloadNotifier({ appId: config.appId, appSecret: config.appSecret }),
         session: options.vmDownloadSession,
+        // The saved Shadow login is DPAPI ciphertext for the current Windows user, kept beside local data.
+        sessionOptions: {
+          credentialStore: options.vmCredentialStore
+            ?? createVmCredentialStore({ file: path.join(resolved.dataDirectory, "vm-shadow-session.bin") }),
+          openLoginPage: options.vmOpenLoginPage ?? openVmLoginPage,
+        },
         defaultOutputRoot: path.join(PROJECT_ROOT, "input"),
         privateEndpoints: config.privateEndpoints,
       });
@@ -7089,6 +7097,14 @@ export function createTaskboardServer(options = {}) {
         const result = await getVmRuntime().register(await readJson(request), actorFromRequest(request));
         events.emit(result.created ? "task.created" : "task.updated", {task: result.task});
         return sendJson(response, result.created ? 201 : 200, {task: result.task});
+      }
+
+      if (pathname === "/api/local/feishu/vm/manual-source") {
+        assertFeishuBridgeRequest(request, resolved.feishuBridgeSecret);
+        assertNoQuery(url.searchParams, "POST /api/local/feishu/vm/manual-source");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const result = await getVmRuntime().submitManualSource(await readJson(request));
+        return sendJson(response, result.state === "accepted" ? 202 : 200, {result});
       }
 
       if (pathname === "/api/local/feishu/vm/final-archive") {
