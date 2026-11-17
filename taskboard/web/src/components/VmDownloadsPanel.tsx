@@ -3,7 +3,7 @@ import { ApiError } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import {
   enqueueVmDownloads, extendVmDownload, getVmDownloads, loginVmDownloads, logoutVmDownloads, sendVmDownloadNotificationTest,
-  getVmDownloadRefreshInterval, recoverVmDownload, removeVmDownload, removeVmDownloads, resumeVmDownload, saveVmDownloadSettings,
+  getVmDownloadRefreshInterval, recoverVmDownload, removeVmDownload, removeVmDownloads, revealVmDownload, resumeVmDownload, saveVmDownloadSettings,
   VM_DOWNLOAD_REFRESH_CHANGE_EVENT, VM_DOWNLOAD_REFRESH_INTERVAL_KEY, vmSessionTimeLeft,
   type VmDownloadJob, type VmDownloadSettings, type VmDownloadsSnapshot,
 } from "../vmDownloads";
@@ -329,8 +329,17 @@ export function VmDownloadsPanel() {
         })}>{text("确认并用当前审批重试", "Confirm and retry with this approval")}</button>}
         {job.status === "dead_letter" && <button className="button secondary" type="button" disabled={busy} onClick={() => void action(async (signal) => { await resumeVmDownload(job.id, signal); })}>{text("重试任务", "Retry job")}</button>}
       </div>}
-      {REMOVABLE_STATUSES.has(job.status) && <div className="vm-downloads-actions">
-        <button className="button secondary" type="button" disabled={busy} onClick={() => removeJob(job.id)}>{text("从队列删除", "Remove from queue")}</button>
+      {(REMOVABLE_STATUSES.has(job.status) || (job.status === "ready" && job.acquisition?.path)) && <div className="vm-downloads-actions">
+        {job.status === "ready" && job.acquisition?.path && <button className="button secondary" type="button" disabled={busy}
+          title={job.acquisition.path}
+          onClick={() => void action(async (signal) => {
+            try { await revealVmDownload(job.id, signal); }
+            catch (failure) {
+              if (!(failure instanceof ApiError) || failure.code !== "VM_DOWNLOAD_FILE_MISSING") throw failure;
+              setActionError(text("视频文件已不在原位置，可能被移动或删除了。", "The video is no longer at its saved location; it may have been moved or deleted."));
+            }
+          })}>{text("打开所在文件夹", "Show in folder")}</button>}
+        {REMOVABLE_STATUSES.has(job.status) && <button className="button secondary" type="button" disabled={busy} onClick={() => removeJob(job.id)}>{text("从队列删除", "Remove from queue")}</button>}
       </div>}
     </li>;
   }

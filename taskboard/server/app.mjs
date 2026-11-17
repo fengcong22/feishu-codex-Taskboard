@@ -6201,12 +6201,13 @@ export function createTaskboardServer(options = {}) {
               if (pathname.endsWith("/login")) return sendJson(response, 200, await downloads.beginLogin());
               return sendJson(response, 200, await downloads.logout());
             }
-            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|remove|cancel-unsubmitted)$/u.exec(pathname);
+            const action = /^\/api\/local\/vm-downloads\/jobs\/([A-Za-z0-9_.:-]{1,128})\/(resume|extend|recover|remove|cancel-unsubmitted|reveal)$/u.exec(pathname);
             if (action) {
               if (action[2] === "recover") {
                 assertAllowedKeys(input, new Set(["confirmRepeatableResource"]));
                 if (input.confirmRepeatableResource !== true) throw new ApiError(400, "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED", "VM_DOWNLOAD_RECOVERY_CONFIRMATION_REQUIRED");
               } else assertAllowedKeys(input, new Set());
+              if (action[2] === "reveal") return sendJson(response, 200, await downloads.revealFile(action[1]));
               const result = action[2] === "remove"
                 ? downloads.remove(action[1])
                 : action[2] === "cancel-unsubmitted" ? downloads.cancelUnsubmitted(action[1])
@@ -6221,7 +6222,8 @@ export function createTaskboardServer(options = {}) {
           const code = /^VM_[A-Z0-9_]{1,100}$/u.test(error?.code) ? error.code : "VM_DOWNLOAD_FAILED";
           const status = code === "VM_APPROVAL_JOB_NOT_FOUND" ? 404
               : ["VM_AUTH_REQUIRED", "VM_APPLICANT_CHANGED", "VM_APPROVAL_JOB_BUSY", "VM_APPROVAL_QUEUE_ITEM_NOT_CLEARABLE", "VM_APPROVAL_NOT_RESUMABLE", "VM_APPROVAL_NOT_EXTENDABLE",
-              "VM_DOWNLOAD_RECOVERY_NOT_ALLOWED", "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT", "VM_DOWNLOAD_RECOVERY_PATH_INVALID", "VM_RESOURCE_ALREADY_CLAIMED", "VM_APPROVAL_CANCEL_NOT_ALLOWED"].includes(code) ? 409
+              "VM_DOWNLOAD_RECOVERY_NOT_ALLOWED", "VM_DOWNLOAD_RECOVERY_ARTIFACT_PRESENT", "VM_DOWNLOAD_RECOVERY_PATH_INVALID", "VM_RESOURCE_ALREADY_CLAIMED", "VM_APPROVAL_CANCEL_NOT_ALLOWED",
+              "VM_DOWNLOAD_FILE_UNAVAILABLE", "VM_DOWNLOAD_FILE_MISSING"].includes(code) ? 409
               : ["VM_DOWNLOAD_INPUT_INVALID", "VM_DOWNLOAD_BATCH_INVALID", "VM_APPROVAL_REQUEST_INVALID", "VM_APPROVAL_STORE_INPUT_INVALID"].includes(code) ? 400 : 503;
           throw new ApiError(status, code, code);
         }

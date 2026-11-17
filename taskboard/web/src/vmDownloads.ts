@@ -149,6 +149,8 @@ export async function loginVmDownloads(signal?: AbortSignal): Promise<{ loginUrl
 export const logoutVmDownloads = (signal?: AbortSignal) => write("/logout", {}, "POST", signal);
 export const enqueueVmDownloads = (input: Omit<VmDownloadSettings, "notificationsEnabled"> & { vmids: string[] }, signal?: AbortSignal) => write<{ jobs: VmDownloadJob[] }>("/jobs", input, "POST", signal);
 export const removeVmDownloads = (jobIds: string[], signal?: AbortSignal) => write<{ removedCount: number }>("/jobs/cleanup", { jobIds }, "POST", signal);
+/** Asks the local service to select this job's downloaded video in the file manager; no path is sent. */
+export const revealVmDownload = (id: string, signal?: AbortSignal) => write<{ revealed: boolean }>(`/jobs/${encodeURIComponent(id)}/reveal`, {}, "POST", signal);
 export const removeVmDownload = (id: string, signal?: AbortSignal) => write<{ removed: boolean }>(`/jobs/${encodeURIComponent(id)}/remove`, {}, "POST", signal);
 export const resumeVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/resume`, {}, "POST", signal);
 export const recoverVmDownload = (id: string, signal?: AbortSignal) => write(`/jobs/${encodeURIComponent(id)}/recover`, { confirmRepeatableResource: true }, "POST", signal);

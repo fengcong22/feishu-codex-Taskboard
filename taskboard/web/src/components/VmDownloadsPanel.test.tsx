@@ -84,6 +84,10 @@ beforeEach(() => {
       current.jobs = current.jobs.filter((candidate) => !ids.includes(candidate.id));
       return response({ removedCount: ids.length });
     }
+    if (path.endsWith("/reveal")) {
+      if (path.includes("/jobs/moved/")) return response({ error: { code: "VM_DOWNLOAD_FILE_MISSING", message: "x" } }, 409);
+      return response({ revealed: true });
+    }
     if (path.endsWith("/remove")) {
       const id = path.split("/").at(-2);
       current.jobs = current.jobs.filter((candidate) => candidate.id !== id);
@@ -481,5 +485,23 @@ describe("VM downloads panel", () => {
     expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
     view.unmount();
     for (const call of fetchMock.mock.calls) expect((call[1] as RequestInit).signal?.aborted).toBe(true);
+  });
+
+  it("opens a finished download's folder through the local service without sending a path", async () => {
+    current.jobs = [job("ready", "ready", undefined, VM1), job("pending", "waiting_approval", undefined, VM2)];
+    mount();
+    const buttons = await screen.findAllByRole("button", { name: "打开所在文件夹" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(writes.some((write) => write.path === `${ROOT}/jobs/ready/reveal`)).toBe(true));
+    expect(writes.find((write) => write.path.endsWith("/reveal"))).toMatchObject({ method: "POST", body: {} });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("explains when a finished download was moved away", async () => {
+    current.jobs = [job("moved", "ready", undefined, VM1)];
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "打开所在文件夹" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("视频文件已不在原位置");
   });
 });
