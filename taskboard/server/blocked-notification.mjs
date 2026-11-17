@@ -18,6 +18,43 @@ const SAFE_REASONS = Object.freeze({
   autocut_process_failed: "剪辑程序执行失败，请查看任务运行记录。",
 });
 
+const DOWNLOAD_FAILURE_REASONS = Object.freeze({
+  VM_APPROVAL_REJECTED: "VM 下载申请被驳回。",
+  VM_APPROVAL_CANCELED: "VM 下载申请已撤销。",
+  VM_APPROVAL_CANCELED_LOCALLY: "VM 下载申请已在本机撤销。",
+  VM_APPROVAL_WAIT_EXPIRED: "等待 VM 审批超时。",
+  VM_APPROVAL_QUEUE_EXPIRED: "下载申请排队超时，尚未提交审批。",
+  VM_MEDIA_WAIT_EXPIRED: "审批已通过，但等待 VM 视频制作完成超时。",
+  VM_AUTH_EXPIRED: "Shadow 登录失效超过 2 小时，自动下载已停止。",
+  VM_RESOURCE_ALREADY_CLAIMED: "这次审批的视频已被其他任务领取。",
+  VM_DOWNLOAD_OUTCOME_UNKNOWN: "下载结果无法确认。",
+  VM_MANUAL_SOURCE_MISSING: "人工素材文件夹里没有找到对应的 VMID.mp4。",
+  VM_MANUAL_SOURCE_AMBIGUOUS: "人工素材文件夹里有多个同名视频，无法确定使用哪一个。",
+  VM_MANUAL_SOURCE_NOT_APPROVED: "这条任务的 VM 申请没有审批通过，不能人工补素材。",
+  VM_MANUAL_SOURCE_UNAVAILABLE: "无法读取 VM 下载目录，请检查 VM 下载面板中的保存位置。",
+  VM_SOURCE_TOO_LARGE: "人工素材超过大小上限。",
+  VM_SOURCE_EMPTY: "人工素材是空文件。",
+  MEDIA_VALIDATION_FAILED: "人工素材不是可完整解码的视频。",
+  SOURCE_RESOLUTION_MISMATCH: "人工素材分辨率低于 1280x720。",
+});
+
+/** Explains why the VM source could not be obtained and what the operator can do next. */
+export function describeVmDownloadFailure(run) {
+  const failure = run?.downloadFailure;
+  if (!failure || typeof failure !== "object") return null;
+  const manual = run.manualSource?.state === "failed" ? run.manualSource.reason : null;
+  const code = manual ?? failure.reason;
+  const known = typeof code === "string" && code.startsWith("SOURCE_RESOLUTION_MISMATCH")
+    ? DOWNLOAD_FAILURE_REASONS.SOURCE_RESOLUTION_MISMATCH : DOWNLOAD_FAILURE_REASONS[code];
+  const cause = known ?? (typeof code === "string" && CODE.test(code)
+    ? `VM 视频下载出错（${code}）。` : "VM 视频下载出错。");
+  const vmid = typeof run.binding?.vmid === "string" ? run.binding.vmid : "VMID";
+  const next = failure.approved === true
+    ? `审批已通过，可以人工从 VM 下载视频，命名为 ${vmid}.mp4，放进 VM 下载目录下的“人工素材”文件夹，再把进度从“下载失败”改为“素材已就绪”。`
+    : "审批没有通过，处理后把进度改回初稿触发状态重新开始，系统会重新提交一次 VM 审批。";
+  return `${cause}${next}`;
+}
+
 function fallbackSubject(origin) {
   return typeof origin?.subjectKey === "string" ? origin.subjectKey : "未命名学科";
 }
@@ -53,6 +90,7 @@ export function describeBlockedFeishuTask({ task, transition, origin, subject, l
 export function describeVmPmoAttention({ run, task, origin, subject } = {}) {
   if (!run || !["blocked", "needs_attention"].includes(run.state) || !task
     || !trustedOrigin(origin) || !Number.isSafeInteger(run.updatedAt)) return null;
+  const downloadReason = run.errorCode === "VM_DOWNLOAD_FAILED" ? describeVmDownloadFailure(run) : null;
   return {
     eventKey: `vm-pmo:${run.runId}:${run.state}:${run.updatedAt}`,
     subject: typeof subject?.tableName === "string" && subject.tableName.trim() ? subject.tableName.trim() : fallbackSubject(origin),
@@ -62,7 +100,7 @@ export function describeVmPmoAttention({ run, task, origin, subject } = {}) {
     stage: origin.stageId ?? "workflow",
     status: run.state,
     occurredAt: new Date(run.updatedAt).toISOString(),
-    reason: reasonFor(run.errorCode) ?? (typeof run.errorCode === "string" && CODE.test(run.errorCode)
+    reason: downloadReason ?? reasonFor(run.errorCode) ?? (typeof run.errorCode === "string" && CODE.test(run.errorCode)
       ? `流程错误码 ${run.errorCode}，请在 Taskboard 任务详情查看处理建议。`
       : "流程进入需要处理状态，请在 Taskboard 任务详情查看处理建议。"),
   };

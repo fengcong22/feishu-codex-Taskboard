@@ -470,6 +470,38 @@ describe("VM package draft editing boundaries", () => {
     expect(document.activeElement).toBe(source);
   });
 
+  it("saves the optional source-result options on the initial status field and drops them with that field", async () => {
+    const fields: FeishuFieldMetadata[] = [
+      { fieldId: "progress", fieldName: "剪辑进度", type: 3, uiType: "SingleSelect", options: [{ id: "ready", name: "待剪辑" },
+        { id: "source", name: "素材已就绪" }, { id: "failed", name: "下载失败" }] },
+      { fieldId: "other", fieldName: "其他进度", type: 3, uiType: "SingleSelect", options: [{ id: "x", name: "待处理" }] },
+    ];
+    vi.mocked(getFeishuPackageWorkflowDraft).mockResolvedValue(profile());
+    render(<FeishuVmPmoWorkflowEditor subjectKey="subject-a" packageAlias="vm-a" fields={fields} cache={new Map()} />);
+    await screen.findByRole("group", { name: "视频来源" });
+    selectTab("素材与阶段");
+    fireEvent.change(screen.getByRole("combobox", { name: "VM 初稿进度触发字段" }), { target: { value: "progress" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "VM 初稿触发状态" }), { target: { value: "ready" } });
+    selectTab("飞书回写");
+    expect(screen.getByRole("region", { name: "VM 初稿素材下载回写" }).textContent).toMatch(/人工素材/u);
+    fireEvent.change(screen.getByRole("combobox", { name: "VM 素材已就绪选项" }), { target: { value: "source" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "VM 下载失败选项" }), { target: { value: "failed" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存流程草稿" }));
+    await screen.findByText("流程草稿已保存。");
+    const submitted = vi.mocked(saveFeishuPackageWorkflowDraft).mock.calls[0][3];
+    if (!("fields" in submitted)) throw new Error("Expected a VM workflow draft");
+    expect(submitted.stages.initial.writeback?.materialsReady).toEqual({ fieldId: "progress", optionId: "source" });
+    expect(submitted.stages.initial.writeback?.downloadFailed).toEqual({ fieldId: "progress", optionId: "failed" });
+    selectTab("素材与阶段");
+    fireEvent.change(screen.getByRole("combobox", { name: "VM 初稿进度触发字段" }), { target: { value: "other" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存流程草稿" }));
+    await waitFor(() => expect(vi.mocked(saveFeishuPackageWorkflowDraft).mock.calls.length).toBe(2));
+    const changed = vi.mocked(saveFeishuPackageWorkflowDraft).mock.calls[1][3];
+    if (!("fields" in changed)) throw new Error("Expected a VM workflow draft");
+    expect(changed.stages.initial.writeback?.materialsReady).toBeUndefined();
+    expect(changed.stages.initial.writeback?.downloadFailed).toBeUndefined();
+  });
+
   it("preserves each stage's trigger, instructions and writebacks when edited on separate pages", async () => {
     const original = profile();
     const fields: FeishuFieldMetadata[] = [

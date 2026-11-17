@@ -245,4 +245,25 @@ describe("TaskDetail Auto-Cut execution", () => {
     expect(JSON.parse(request.body)).toEqual({ version: task.version });
     await waitFor(() => expect(screen.queryByRole("button", { name: "重试进度回写" })).toBeNull());
   });
+
+  it("explains a failed VM download and where an approved manual source belongs", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "blocked", errorCode: "VM_DOWNLOAD_FAILED",
+      approvalStatus: "needs_attention", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,
+      materialSource: null, downloadFailure: { reason: "VM_SOURCE_TIMEOUT", approved: true, manualSourceState: null,
+        message: "VM 视频下载出错（VM_SOURCE_TIMEOUT）。审批已通过，可以人工从 VM 下载视频。",
+        manualSourceFile: "人工素材/5dd7753a4723ba416403cbad.mp4" }, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    const region = await screen.findByLabelText("VM 视频下载失败");
+    expect(region.textContent).toMatch(/审批已通过/u);
+    expect(region.textContent).toContain("人工素材/5dd7753a4723ba416403cbad.mp4");
+    expect(region.textContent).toMatch(/VM_SOURCE_TIMEOUT/u);
+  });
+
+  it("marks a run that continued from an operator-supplied source", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "planning", errorCode: null, approvalStatus: "needs_attention",
+      planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false, materialSource: "manual", updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    expect(await screen.findByText("素材来源：人工提供")).toBeTruthy();
+    expect(screen.queryByLabelText("VM 视频下载失败")).toBeNull();
+  });
 });

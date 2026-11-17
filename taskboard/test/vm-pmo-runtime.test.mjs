@@ -22,7 +22,8 @@ let PYTHON;
 try { PYTHON = execFileSync("python",["-c","import sys; print(sys.executable)"],{encoding: "utf8"}).trim(); }
 catch { /* Python-dependent composition case skips when unavailable. */ }
 
-async function fixture(t, { enabled = true, alias = "slicing", finalArchive = false, privateEndpoints = [], contractVersion = 2 } = {}) {
+async function fixture(t, { enabled = true, alias = "slicing", finalArchive = false, privateEndpoints = [], contractVersion = 2,
+  material = false } = {}) {
   const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "vm-runtime-")));
   const archiveDirectory = path.join(directory,"archive");
   if (finalArchive) await mkdir(archiveDirectory);
@@ -38,7 +39,8 @@ async function fixture(t, { enabled = true, alias = "slicing", finalArchive = fa
   const approvals = createVmApprovalStore({ file: path.join(directory, "approvals.sqlite") });
   const options = [{id: "opt_other",name: "准备"},{id: "opt_initial",name: "待剪辑"},
     {id: "opt_processing",name: "处理中"},{id: "opt_complete",name: "完成"},
-    ...(finalArchive ? [{id: "opt_archive",name: "待归档"}] : [])];
+    ...(finalArchive ? [{id: "opt_archive",name: "待归档"}] : []),
+    ...(material ? [{id: "opt_source",name: "素材已就绪"},{id: "opt_failed",name: "下载失败"}] : [])];
   const fields = [{fieldId: "fld_status",fieldName: "制作进度",type: 3,uiType: "SingleSelect",options},
     {fieldId: "fld_vmid",fieldName: "原视频vmid",type: 1,uiType: "Text"},
     {fieldId: "fld_name",fieldName: "名称",type: 1,uiType: "Text"},
@@ -51,7 +53,9 @@ async function fixture(t, { enabled = true, alias = "slicing", finalArchive = fa
     vmWorkflow: {fields: {vmidFieldId: "fld_vmid",namingFieldId: "fld_name",outputAttachmentFieldId: "fld_output"},
       approval: {department: "动画组",reason: "切片剪辑"},stages: {initial: {enabled: true,statusFieldId: "fld_status",
         triggerOptionId: "opt_initial",instructionFieldId: "fld_instruction",writeback: {
-          processing: {fieldId: "fld_status",optionId: "opt_processing"},completed: {fieldId: "fld_status",optionId: "opt_complete"}}},
+          processing: {fieldId: "fld_status",optionId: "opt_processing"},completed: {fieldId: "fld_status",optionId: "opt_complete"},
+          ...(material ? {materialsReady: {fieldId: "fld_status",optionId: "opt_source"},
+            downloadFailed: {fieldId: "fld_status",optionId: "opt_failed"}} : {})}},
       review: {enabled: false}},finalArchive: finalArchive
         ? {enabled: true,statusFieldId: "fld_status",triggerOptionId: "opt_archive",pathSource: "manual",
           directoryPath: archiveDirectory,pathFieldId: null}
@@ -1129,4 +1133,89 @@ test("package edits after registration cannot silently change the frozen manifes
   await f.runtime.wake();
   assert.equal(f.runtime.list()[0].state,"blocked");assert.equal(f.runtime.list()[0].errorCode,"VM_PMO_PACKAGE_CHANGED");
   assert.equal(f.approvals.list().length,0);
+});
+
+async function failApprovedDownload(f) {
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  const job = f.approvals.list()[0], claim = f.approvals.claim(job.id);
+  Object.assign(claim.job,{status: "needs_attention",last_error: "VM_SOURCE_TIMEOUT",application_id: "app_vm",
+    instance_code: "instance_vm",media_wait_started_at: 1,media_deadline_at: 2});
+  f.approvals.save(job.id,claim.leaseToken,claim.job,{release: true});
+  await f.runtime.wake();
+  return f.runtime.list()[0];
+}
+function outbox(f) {
+  return f.database.database.prepare("SELECT idempotency_key,moment,operation_json FROM vm_writeback_outbox ORDER BY created_at,id").all();
+}
+async function settledManual(f,taskId) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const run = await f.runtime.getTaskRun(taskId);
+    if (run.downloadFailure?.manualSourceState !== "pending") return run;
+    await new Promise(resolve => setTimeout(resolve,50));
+  }
+  throw new Error("manual source did not settle");
+}
+const manualEdge = (eventId) => ({event: {eventId,baseToken: "bas_vm",tableId: "tbl_vm",recordId: "rec_vm",
+  statusFieldId: "fld_status",beforeOptionId: "opt_failed",afterOptionId: "opt_source"},
+binding: {subjectKey: "bas_vm:tbl_vm",configVersion: 4}});
+
+test("a stopped approved VM download writes download failed and explains the manual source", async t => {
+  const f = await fixture(t,{material: true});
+  const run = await failApprovedDownload(f);
+  assert.equal(run.state,"blocked");assert.equal(run.errorCode,"VM_DOWNLOAD_FAILED");
+  const summary = await f.runtime.getTaskRun(run.taskId);
+  assert.equal(summary.downloadFailure.approved,true);
+  assert.equal(summary.downloadFailure.reason,"VM_SOURCE_TIMEOUT");
+  assert.equal(summary.downloadFailure.manualSourceFile,`人工素材/${VMID}.mp4`);
+  assert.deepEqual(outbox(f).map(row => [row.idempotency_key,JSON.parse(row.operation_json).optionId]),
+    [[`vm:${run.runId}:download_failed:auto`,"opt_failed"]]);
+});
+
+test("an operator source that is missing is refused, rewritten as failed and can be retried", async t => {
+  const f = await fixture(t,{material: true});
+  const run = await failApprovedDownload(f);
+  assert.equal((await f.runtime.submitManualSource(manualEdge("evt_manual_1"))).state,"accepted");
+  const refused = await settledManual(f,run.taskId);
+  assert.equal(refused.state,"blocked");
+  assert.equal(refused.downloadFailure.reason,"VM_MANUAL_SOURCE_MISSING");
+  assert.equal(outbox(f).filter(row => row.moment === "download_failed").length,2);
+  assert.deepEqual(await f.runtime.submitManualSource(manualEdge("evt_manual_1")),{state: "rejected",taskId: run.taskId});
+  assert.deepEqual(await f.runtime.submitManualSource({...manualEdge("evt_other"),
+    event: {...manualEdge("evt_other").event,beforeOptionId: "opt_other"}}),{state: "ignored"});
+  await assert.rejects(() => f.runtime.submitManualSource({event: manualEdge("x").event}),{code: "VM_MANUAL_SOURCE_INPUT_INVALID"});
+});
+
+test("an unapproved failure refuses an operator source and restores download failed", async t => {
+  const f = await fixture(t,{material: true});
+  await f.runtime.register(f.body,ACTOR);await f.runtime.wake();
+  const job = f.approvals.list()[0], claim = f.approvals.claim(job.id);
+  Object.assign(claim.job,{status: "rejected",last_error: "VM_APPROVAL_REJECTED",application_id: "app_vm"});
+  f.approvals.save(job.id,claim.leaseToken,claim.job,{release: true});
+  await f.runtime.wake();
+  const run = f.runtime.list()[0];
+  assert.equal(run.downloadFailure.approved,false);
+  assert.deepEqual(await f.runtime.submitManualSource(manualEdge("evt_manual")),{state: "rejected",taskId: run.taskId});
+  assert.equal(f.runtime.list()[0].manualSource,undefined);
+  assert.equal(outbox(f).filter(row => row.moment === "download_failed").length,2);
+});
+
+test("a verified operator VMID.mp4 continues the same approved run", async t => {
+  const f = await fixture(t,{material: true});
+  const run = await failApprovedDownload(f);
+  const folder = path.join(f.directory,"人工素材");
+  await mkdir(folder,{recursive: true});
+  await runCommand("ffmpeg",["-v","error","-f","lavfi","-i","testsrc=size=1280x720:rate=25:duration=1",
+    "-f","lavfi","-i","sine=frequency=440:duration=1","-shortest","-c:v","libx264","-pix_fmt","yuv420p",
+    "-c:a","aac",path.join(folder,`${VMID.toUpperCase()}.mp4`)]);
+  assert.equal((await f.runtime.submitManualSource(manualEdge("evt_manual"))).state,"accepted");
+  const accepted = await settledManual(f,run.taskId);
+  assert.equal(accepted.materialSource,"manual");
+  assert.equal(accepted.downloadFailure,undefined);
+  const stored = f.runtime.list()[0];
+  assert.equal(stored.runId,run.runId);
+  assert.equal(stored.acquisition.vmid_binding,"operator_asserted");
+  assert.equal(stored.manualSource.state,"accepted");
+  assert.equal(f.approvals.list().length,1);
+  assert.equal(outbox(f).some(row => row.moment === "materials_ready"),false);
 });

@@ -1370,3 +1370,42 @@ test("share import dry-run reports every phased attachment mismatch from live me
   assert.equal(result.diagnosticsOk, false);
   await assert.rejects(() => readFile(filename, "utf8"), (error) => error?.code === "ENOENT");
 });
+
+function vmMaterialSubject() {
+  const base = vmSubject();
+  base.statusField.options.push({ optionId: "opt_source", value: "素材已就绪" },
+    { optionId: "opt_failed", value: "下载失败" });
+  base.vmWorkflow.stages.initial.writeback.materialsReady = { fieldId: "fld_progress", optionId: "opt_source" };
+  base.vmWorkflow.stages.initial.writeback.downloadFailed = { fieldId: "fld_progress", optionId: "opt_failed" };
+  return base;
+}
+
+test("VM initial stage accepts optional source-result options on its status field", () => {
+  const normalized = validateSubjectConfig(vmMaterialSubject());
+  assert.deepEqual(normalized.vmWorkflow.stages.initial.writeback.materialsReady,
+    { fieldId: "fld_progress", optionId: "opt_source" });
+  assert.deepEqual(normalized.vmWorkflow.stages.initial.writeback.downloadFailed,
+    { fieldId: "fld_progress", optionId: "opt_failed" });
+  assert.deepEqual(validateSubjectConfig(portableSubject(normalized)), portableSubject(normalized));
+});
+
+test("VM source-result options stay omitted when unbound so frozen snapshots keep their form", () => {
+  const base = vmSubject();
+  base.vmWorkflow.stages.initial.writeback.materialsReady = { fieldId: null, optionId: null };
+  const normalized = validateSubjectConfig(base);
+  assert.deepEqual(Object.keys(normalized.vmWorkflow.stages.initial.writeback), ["processing", "completed"]);
+});
+
+test("VM source-result options reject other fields, triggers, duplicates and the review stage", () => {
+  for (const mutate of [
+    (subject) => { subject.vmWorkflow.stages.initial.writeback.materialsReady.fieldId = "fld_other"; },
+    (subject) => { subject.vmWorkflow.stages.initial.writeback.materialsReady.optionId = "opt_ready"; },
+    (subject) => { subject.vmWorkflow.stages.initial.writeback.downloadFailed.optionId = "opt_source"; },
+    (subject) => { subject.vmWorkflow.stages.initial.writeback.downloadFailed.optionId = "opt_missing"; },
+    (subject) => { subject.vmWorkflow.stages.review.writeback.materialsReady = { fieldId: "fld_progress", optionId: "opt_source" }; },
+  ]) {
+    const subject = vmMaterialSubject();
+    mutate(subject);
+    assert.throws(() => validateSubjectConfig(subject));
+  }
+});
