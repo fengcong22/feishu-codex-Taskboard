@@ -92,6 +92,16 @@ function fakeAi(behaviour, descriptor) {
     }
     if (behaviour === 'missing') return {outcome: 'completed', threadId: 'offline-thread'};
     if (behaviour === 'failed') return {outcome: 'failed', threadId: null};
+    if (behaviour === 'tamper-context') {
+      await save(context.intent_path, await intentFor(context, descriptor));
+      await writeFile(context.intent_context_path, '{"tampered": true}\n');
+      return {outcome: 'completed', threadId: 'offline-thread'};
+    }
+    if (behaviour === 'early-plan') {
+      await save(context.intent_path, await intentFor(context, descriptor));
+      await writeFile(context.plan_result_path, '{}\n', {flag: 'wx'});
+      return {outcome: 'timeout', threadId: null};
+    }
     await save(context.intent_path, await intentFor(context, descriptor, {blocked: behaviour === 'blocked'}));
     return {outcome: 'completed', threadId: 'offline-thread'};
   }};
@@ -280,6 +290,15 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
     assert.equal(await exists(run.context.plan_result_path), false);
     checks.push(`${code} blocks without a plan and never falls back to fixed patterns`);
   }
+  // 3b. An AI session that rewrites a protected file or writes a planning output is blocked
+  // before the package plans, even when the session itself timed out.
+  for (const [name, behaviour] of [['ai-tamper', 'tamper-context'], ['ai-early-plan', 'early-plan']]) {
+    const run = await prepare(name);
+    assert.deepEqual(await runVmPmoDriver({...run.options, mode: 'plan', aiIntent: fakeAi(behaviour, descriptor)}),
+      {status: 'blocked', errorCode: 'AI_INTENT_SCOPE_VIOLATION'});
+    assert.equal(await exists(run.context.plan_path), false);
+  }
+  checks.push('AI_INTENT_SCOPE_VIOLATION blocks an AI session that edits protected files or writes planning output');
   const blocked = await prepare('ai-blocked');
   const blockedPlan = await runVmPmoDriver({...blocked.options, mode: 'plan', aiIntent: fakeAi('blocked', descriptor)});
   assert.deepEqual([blockedPlan.status, blockedPlan.errorCode], ['blocked', 'INTENT_BLOCKED']);

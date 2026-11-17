@@ -88,8 +88,10 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
   async function run({ context, packageRoot, pythonPath, sessionDir, signal, onSpawn = null } = {}) {
     if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
     const prompt = buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context });
+    // Evidence commands are local; the session's own shell never needs the network.
     const args = ["exec", "--json", "--color", "never", "--skip-git-repo-check", "-C", context.run_dir,
-      "-s", "workspace-write", "-c", 'approval_policy="never"', "-m", model, "-"];
+      "-s", "workspace-write", "-c", 'approval_policy="never"',
+      "-c", "sandbox_workspace_write.network_access=false", "-m", model, "-"];
     const startedAt = now().toISOString();
     await writeFile(path.join(sessionDir, "prompt.txt"), prompt, { flag: "wx" });
     const eventsPath = path.join(sessionDir, "events.jsonl");

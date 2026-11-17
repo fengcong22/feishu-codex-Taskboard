@@ -1,4 +1,5 @@
-import { lstat, mkdir, readdir, rename } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, readdir, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 import { runVmPmoOffline } from "./vm-pmo-offline-runner.mjs";
@@ -10,6 +11,8 @@ import { validateVmPmoAnalyze, validateVmPmoInput } from "./vm-pmo-result-valida
  * Inputs that are not schema v3 `ai_intent` (v1, v2 and v3 `rule`) run unchanged through
  * runVmPmoOffline. Start evidence is reported once, when the first process of a step spawns. */
 export const AI_INTENT_BLOCKS = Object.freeze(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"]);
+// Not rerunnable in the same attempt: the files a rerun would reuse can no longer be trusted.
+export const AI_INTENT_SCOPE_VIOLATION = "AI_INTENT_SCOPE_VIOLATION";
 const MAX_AI_SESSIONS = 9;
 
 function failure(code) {
@@ -43,6 +46,44 @@ async function nextSessionDir(context) {
   const directory = path.join(root, `${prefix}${used + 1}`);
   await mkdir(directory);
   return directory;
+}
+
+async function fileDigest(file) {
+  let info;
+  try { info = await lstat(file); } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return "unreadable";
+  }
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) return "irregular";
+  try { return createHash("sha256").update(await readFile(file)).digest("hex"); } catch { return "unreadable"; }
+}
+
+/** The AI may add evidence and write edit-intent.json. Taskboard's input and context, analyze's
+ * receipt, intent context and source-bound ASR must keep their bytes, and no planning, render or
+ * QA output may appear before the package runs those steps itself. */
+function aiBoundary(context) {
+  return {
+    protected: [path.join(context.run_dir, "input.json"), path.join(context.run_dir, "execution-context.json"),
+      context.intent_context_path, context.analyze_result_path, path.join(context.run_dir, "alignment.words.json")],
+    outputs: [context.plan_path, context.plan_result_path, context.result_path, context.output_path,
+      context.qa_path, context.qa_review_path, path.join(context.run_dir, "qa-result.json")],
+  };
+}
+
+async function snapshotBoundary(context) {
+  const boundary = aiBoundary(context);
+  const digests = await Promise.all(boundary.protected.map(fileDigest));
+  if (digests.some((value) => !/^[a-f0-9]{64}$/u.test(value ?? ""))) throw failure("VM_PMO_RUN_INPUT_INVALID");
+  for (const file of boundary.outputs) if (await present(file)) throw failure("VM_PMO_RUN_INPUT_INVALID");
+  return digests;
+}
+
+async function boundaryKept(context, before) {
+  const boundary = aiBoundary(context);
+  const after = await Promise.all(boundary.protected.map(fileDigest));
+  if (after.some((value, index) => value !== before[index])) return false;
+  for (const file of boundary.outputs) if (await fileDigest(file) !== null) return false;
+  return true;
 }
 
 export function isVmPmoAiIntentInput(input) {
@@ -93,9 +134,12 @@ async function planWithIntent(options) {
     // An intent left by an interrupted or timed-out session is evidence, not input to this session.
     await rename(context.intent_path, path.join(sessionDir, "superseded-edit-intent.json"));
   }
+  const before = await snapshotBoundary(context);
   const ai = await aiIntent.run({ context, packageRoot: step.packageRoot, pythonPath: step.pythonPath,
     sessionDir, signal, onSpawn: started ? (evidence) => started(evidence) : null });
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
+  // Checked before the outcome: a timed-out or failed session may still have overstepped.
+  if (!(await boundaryKept(context, before))) return { status: "blocked", errorCode: AI_INTENT_SCOPE_VIOLATION };
   const written = await regularFile(context.intent_path);
   if (ai.outcome === "timeout") return { status: "blocked", errorCode: "AI_INTENT_TIMEOUT" };
   if (ai.outcome !== "completed") return { status: "blocked", errorCode: "AI_INTENT_FAILED" };

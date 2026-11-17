@@ -146,6 +146,8 @@ test("AI intent session runs in the run directory with the package prompt and no
   assert.deepEqual(seen.args.slice(seen.args.indexOf("-C"), seen.args.indexOf("-C") + 4), ["-C", runDir, "-s", "workspace-write"]);
   assert.ok(seen.args.includes("gpt-test"));
   assert.ok(!seen.args.includes("danger-full-access"));
+  assert.ok(seen.args.includes('approval_policy="never"'));
+  assert.equal(seen.args[seen.args.indexOf("sandbox_workspace_write.network_access=false") - 1], "-c");
   assert.deepEqual(Object.keys(seen.env).sort(), ["PATH", "USERPROFILE"]);
   assert.match(seen.prompt, /edit-intent\.json/u);
   assert.match(seen.prompt, /不运行 render/u);
