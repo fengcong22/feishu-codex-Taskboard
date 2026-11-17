@@ -16,6 +16,8 @@ node scripts/check-vm-pmo-offline.mjs --package-root 'E:\codex\Auto-cut-slicing-
 
 脚本用合成媒体调用真实剪辑包和 Taskboard 校验器，验证 v1 范围编辑及 v2 父片删词、唯一词起点 cue、连续两轮复用、ASR 源哈希绑定、重复词歧义阻断；还独立验证 H.264/AAC、1920×1080、25 fps、全量解码、时长和哈希。被修改的输入/计划/成片、其他 run 的回执、伪装媒体和几乎空的音轨均会被拒绝。离线脚本只在 `.runtime/vm-pmo-offline` 下生成合成源、对齐、计划和成片，不调用审批、飞书上传、PMO 回写或归档目标。
 
+v3 检查（`scripts/vm-pmo-offline-v3-checks.mjs`，由上面的命令一并运行）把包的 `auto_cut_slicing/`、`schemas/` 复制到本次 `run-*/package-v3/`，并改写出部署时要发布的 contract v3 / `vm_pmo_review_video_v3` manifest，再用 Taskboard 的 `prepareVmPmoRunInput` 生成 schema v3 输入。合成源视频带确定性词时间戳（预写 `alignment.words.json`，不调用 ASR），AI 步骤由预写的意图文件代替（不启动 Codex），反向 ASR 用预写的 `output.words.json` 代替。覆盖：analyze → AI → plan 顺序和只报告一次启动证据；无 `qa.json` 不可交付；`--reverse-asr` 绑定成片；QA failed 阻断、伪造或绑定其他成片的 QA 被拒绝；AI 超时/未写意图/会话失败阻断且无计划回执；重跑复用 analyze 并保留半成品意图；AI 自行阻断时审批摘要带出 blockers；v3 rule（人工返修）不启动 AI 和 QA；运行目录外的 context 路径被拒绝。这些只验证 Taskboard 的确定性机制，不代表真实识别、AI 判断、Codex 无界面沙箱在本机的表现、试听或飞书交付。
+
 ## 接口与边界
 
 入口固定为 `python -m auto_cut_slicing.vm_pmo plan --input ... --context ...` 和 `render --input ... --context ... --plan ...`。当前包身份为 `auto-cut-slicing` `0.3.0`。可执行包在初稿和审核阶段均须显式声明 `vm_pmo_review_video` contract v2 与固定 `vm_pmo_review_video_v2` driver，并发送 schema v2。历史 schema v1 输入与回执仍可读取和离线校验，但不再授权新的 v1 自动执行。字段、计划与错误码分别见剪辑包的 [v1 契约](../../Auto-cut-slicing-src/docs/vm-pmo-offline-contract-v1.md) 和 [v2 契约](../../Auto-cut-slicing-src/docs/vm-pmo-offline-contract-v2.md)。

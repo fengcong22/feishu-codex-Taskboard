@@ -70,6 +70,7 @@ import { createVmDownloadService } from "./vm-download-service.mjs";
 import { createVmDownloadMetadata, createVmDownloadNotifier } from "./vm-download-notifier.mjs";
 import { resolveVmDownloadConfig } from "./vm-download-config.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
+import { createVmPmoAiIntentRunner, validVmPmoAiModel } from "./vm-pmo-ai-intent.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { describeBlockedFeishuTask } from "./blocked-notification.mjs";
 import { createFeishuVmMp4Adapter } from "./vm-mp4-feishu-adapter.mjs";
@@ -2863,6 +2864,11 @@ export function createTaskboardServer(options = {}) {
     }
     return vmAdapter;
   }
+  /** v3 driver step 2. Without CODEX_VM_PMO_AI_MODEL a v3 package cannot be activated. */
+  function vmPmoAiIntentRunner(model) {
+    if (!validVmPmoAiModel(model) || !resolved.codexExecutable) return null;
+    return createVmPmoAiIntentRunner({codexExecutable: resolved.codexExecutable, model, environment: serviceEnvironment});
+  }
   function getVmRuntime() {
     if (vmRuntime) return vmRuntime;
     let config = {};
@@ -2880,6 +2886,7 @@ export function createTaskboardServer(options = {}) {
       onTaskUpdated: task => events.emit("task.updated", {task}),
       runRoot: options.vmPmoRunRoot ?? config.vmPmoRunRoot ?? path.join(resolved.dataDirectory, "vm-pmo-runs"),
       pythonPath: options.vmPmoPythonPath ?? config.vmPmoPythonPath ?? null,
+      aiIntent: options.vmPmoAiIntent ?? vmPmoAiIntentRunner(options.vmPmoAiModel ?? config.vmPmoAiModel),
       coursePathResolver,
     });
     return vmRuntime;
@@ -7628,6 +7635,31 @@ export function createTaskboardServer(options = {}) {
           if (error instanceof ApiError) throw error;
           if (typeof error?.code === "string"
             && /^(?:VM_[A-Z0-9_]+|SOURCE_HASH_MISMATCH|RUN_BINDING_MISMATCH|PLAN_INVALID)$/u.test(error.code))
+            throw new ApiError(409, error.code, error.code);
+          throw error;
+        }
+        return sendJson(response, 202, {run});
+      }
+      const vmPmoAiIntentRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-ai-intent-retry$/);
+      if (vmPmoAiIntentRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-ai-intent-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoAiIntentRetryRoute[1], "Task id");
+        const body = await readJson(request);
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body?.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        let run;
+        try {run = await getVmRuntime().retryAiIntent(taskId, body);}
+        catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (typeof error?.code === "string" && /^(?:VM_[A-Z0-9_]+|SOURCE_HASH_MISMATCH|RUN_BINDING_MISMATCH)$/u.test(error.code))
             throw new ApiError(409, error.code, error.code);
           throw error;
         }

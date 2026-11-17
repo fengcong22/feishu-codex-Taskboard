@@ -659,3 +659,51 @@ test("corrupted persisted render evidence is rejected before artifact registrati
     .run(JSON.stringify(payload), "run_vm");
   assert.throws(() => x.f.get("run_vm"), { code: "VM_PMO_STATE_INVALID" });
 });
+
+test("an AI intent timeout reruns only the AI step in the same attempt, at most twice", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  const outcomes = ["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"];
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    x.calls.push([mode]);
+    await onStarted({ mode, pid: 42, startedAt: new Date(x.f.get("run_vm").updatedAt).toISOString() });
+    if (mode === "plan" && outcomes.length) return { status: "blocked", errorCode: outcomes.shift() };
+    return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) }
+      : { status: "rendered", planSha256: "d".repeat(64), artifact: x.artifact };
+  };
+  await x.restart();
+
+  assert.equal((await x.f.pump("run_vm")).errorCode, "AI_INTENT_TIMEOUT");
+  await assert.rejects(x.f.retryPlan("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+  const first = await x.f.retryAiIntent("run_vm");
+  assert.equal(first.state, "prepared");
+  assert.equal(first.planAttempt ?? 1, 1);
+  assert.deepEqual(first.aiRetryHistory.map(entry => entry.errorCode), ["AI_INTENT_TIMEOUT"]);
+  assert.equal((await x.f.pump("run_vm")).errorCode, "AI_INTENT_MISSING");
+  assert.equal((await x.f.retryAiIntent("run_vm")).aiRetryHistory.length, 2);
+  assert.equal((await x.f.pump("run_vm")).errorCode, "AI_INTENT_FAILED");
+  await assert.rejects(x.f.retryAiIntent("run_vm"), { code: "VM_PMO_RETRY_LIMIT" });
+  assert.equal(x.calls.filter(([kind]) => kind === "prepare").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "plan").length, 3);
+  assert.equal(x.calls.filter(([kind]) => kind === "verifyRetryInput").length, 2);
+  assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
+});
+
+test("AI intent rerun is refused for package plan blocks and unready approval", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.setPlanResult({ status: "blocked", errorCode: "INTENT_BLOCKED" });
+  assert.equal((await x.f.pump("run_vm")).errorCode, "INTENT_BLOCKED");
+  await assert.rejects(x.f.retryAiIntent("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+
+  const y = await fixture(t);
+  await y.f.register({ taskId: "task_vm" });
+  y.setApproval("ready");
+  y.setPlanResult({ status: "blocked", errorCode: "AI_INTENT_TIMEOUT" });
+  assert.equal((await y.f.pump("run_vm")).errorCode, "AI_INTENT_TIMEOUT");
+  y.setApproval("waiting_approval");
+  await assert.rejects(y.f.retryAiIntent("run_vm"), { code: "VM_PMO_RETRY_APPROVAL_NOT_READY" });
+  assert.equal(y.f.get("run_vm").state, "blocked");
+});

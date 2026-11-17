@@ -14,6 +14,18 @@ const MAX_JSON_BYTES = 1024 * 1024;
 const IDENTITY = ["package", "binding", "record", "review_round", "delivery_target"];
 const CONTEXT_KEYS = ["protocol", "schema_version", "input_sha256", "run_dir", "source_path",
   "plan_path", "plan_result_path", "result_path", "output_path"];
+// Schema v3 (AI edit intent) adds these run-local paths; JSON files stay outside evidence_dir.
+const V3_CONTEXT_KEYS = ["evidence_dir", "intent_context_path", "intent_path", "analyze_result_path",
+  "qa_path", "qa_review_path"];
+const V3_JSON_KEYS = V3_CONTEXT_KEYS.filter((key) => key !== "evidence_dir");
+const V3_FIXED_FILES = ["alignment.words.json", "output.words.json", ".plan.lock"];
+const QA_KINDS = new Set(["coverage_complete", "operation_compiled", "phrase_absent", "phrase_present",
+  "cue_first_word", "must_keep_present", "duration_match", "cut_not_inside_word", "sentence_complete",
+  "seam_gap", "seam_discontinuity", "opening_frame", "seam_frames", "seam_pause_picture", "freeze_frames",
+  "mute_silence", "unlisted_change", "listening", "pacing"]);
+const QA_STATUSES = new Set(["passed", "failed", "ai_reviewed", "needs_human", "not_run"]);
+const QA_METHODS = new Set(["automatic", "ai_visual", "ai_reading", "human"]);
+const QA_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u;
 
 function fail(code) {
   const error = new Error(code);
@@ -118,32 +130,41 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
   const { value: context, sha256: contextSha256 } = await jsonFile(contextPath, "RUN_BINDING_MISMATCH");
   if (expectedBound && (contextSha256 !== expectedBound.contextSha256
     || !same(context, expectedBound.context))) fail("RUN_BINDING_MISMATCH");
-  if (!exactKeys(context, CONTEXT_KEYS) || context.protocol !== PROTOCOL
-    || ![1, 2].includes(context.schema_version) || !digest(context.input_sha256)
+  const v3Context = object(context) && context.schema_version === 3;
+  const v3Paths = v3Context ? V3_CONTEXT_KEYS.map((key) => context[key]) : [];
+  if (!exactKeys(context, v3Context ? [...CONTEXT_KEYS, ...V3_CONTEXT_KEYS] : CONTEXT_KEYS)
+    || context.protocol !== PROTOCOL
+    || ![1, 2, 3].includes(context.schema_version) || !digest(context.input_sha256)
     || context.run_dir !== path.dirname(contextPath) || !absoluteCanonical(context.run_dir)
     || !absoluteCanonical(context.source_path)
     || ![context.plan_path, context.plan_result_path, context.result_path,
-      context.output_path].every((file) => absoluteCanonical(file) && inside(context.run_dir, file))
+      context.output_path, ...v3Paths].every((file) => absoluteCanonical(file) && inside(context.run_dir, file))
     || new Set([contextPath, path.join(context.run_dir, "input.json"), context.source_path,
       context.plan_path, context.plan_result_path, context.result_path,
-      context.output_path].map(pathIdentity)).size !== 7
+      context.output_path, ...v3Paths].map(pathIdentity)).size !== 7 + v3Paths.length
     || !context.output_path.toLowerCase().endsWith(".mp4")
-    || ![context.plan_path, context.plan_result_path, context.result_path]
-      .every((file) => file.toLowerCase().endsWith(".json"))) fail("RUN_BINDING_MISMATCH");
+    || ![context.plan_path, context.plan_result_path, context.result_path,
+      ...(v3Context ? V3_JSON_KEYS.map((key) => context[key]) : [])]
+      .every((file) => file.toLowerCase().endsWith(".json"))
+    || v3Context && (V3_JSON_KEYS.some((key) => !inside(context.run_dir, context[key])
+      || inside(context.evidence_dir, context[key]))
+      || V3_FIXED_FILES.some((name) => v3Paths.map(pathIdentity)
+        .includes(pathIdentity(path.join(context.run_dir, name)))))) fail("RUN_BINDING_MISMATCH");
   try {
     if (await realpath(context.run_dir) !== context.run_dir) fail("RUN_BINDING_MISMATCH");
   } catch { fail("RUN_BINDING_MISMATCH"); }
   for (const file of [contextPath, path.join(context.run_dir, "input.json"),
     ...(verifyOriginalMedia ? [context.source_path] : []), context.plan_path, context.plan_result_path,
-    context.result_path, context.output_path]) await assertCanonicalLocation(file, "RUN_BINDING_MISMATCH");
+    context.result_path, context.output_path, ...v3Paths]) await assertCanonicalLocation(file, "RUN_BINDING_MISMATCH");
   const inputPath = path.join(context.run_dir, "input.json");
   const { value: input, sha256: inputSha256 } = await jsonFile(inputPath, "RUN_BINDING_MISMATCH");
   if (expectedBound && (!same(input, expectedBound.input)
     || inputSha256 !== expectedBound.context.input_sha256)) fail("RUN_BINDING_MISMATCH");
   const version = input?.schema_version;
-  if (!exactKeys(input, ["protocol", "schema_version", ...IDENTITY, "source", "instructions", "output_profile"],
-    version === 2 ? ["manual_revision"] : [])
-    || input.protocol !== PROTOCOL || ![1, 2].includes(version) || version !== context.schema_version
+  if (!exactKeys(input, ["protocol", "schema_version", ...IDENTITY, "source", "instructions", "output_profile",
+    ...(version === 3 ? ["planning_mode"] : [])],
+    version === 2 ? ["manual_revision"] : version === 3 ? ["manual_revision", "prior_rounds", "ai_session"] : [])
+    || input.protocol !== PROTOCOL || ![1, 2, 3].includes(version) || version !== context.schema_version
     || inputSha256 !== context.input_sha256
     || !object(input.package) || !object(input.binding) || !object(input.record)
     || !object(input.review_round) || !object(input.source) || !object(input.output_profile)
@@ -165,19 +186,20 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
     || !Array.isArray(input.instructions) || input.instructions.length < 1
     || input.instructions.some((item) => !exactKeys(item, ["instruction_id",
       "source_field_id", "raw_text", "timeline_basis", "applicability"],
-      version === 2 ? ["must_keep", "visual_evidence"] : [])
+      version >= 2 ? ["must_keep", "visual_evidence"] : [])
       || ![item.instruction_id, item.source_field_id, item.timeline_basis, item.applicability].every(identifier)
       || typeof item.raw_text !== "string" || !item.raw_text.trim()
-      || version === 2 && item.must_keep !== undefined && (!Array.isArray(item.must_keep)
+      || version >= 2 && item.must_keep !== undefined && (!Array.isArray(item.must_keep)
         || item.must_keep.some((phrase) => typeof phrase !== "string" || !phrase.trim() || phrase.includes("\0")))
-      || version === 2 && item.visual_evidence !== undefined && (!exactKeys(item.visual_evidence,
+      || version >= 2 && item.visual_evidence !== undefined && (!exactKeys(item.visual_evidence,
         ["source_sha256", "frame_time", "end"]) || item.visual_evidence.source_sha256 !== input.source.sha256))
     || new Set(input.instructions.map((item) => item.instruction_id)).size !== input.instructions.length
     || !digest(input.source.sha256)
     || !Number.isSafeInteger(input.source.bytes) || input.source.bytes < 1
     || !Number.isSafeInteger(input.source.duration_ms) || input.source.duration_ms < 1)
     fail("RUN_BINDING_MISMATCH");
-  if (version === 2) {
+  if (version === 3 && !validV3Planning(input)) fail("RUN_BINDING_MISMATCH");
+  if (version >= 2) {
     if (input.manual_revision !== undefined) {
       try { validateVmPmoInputManualRevision(input.manual_revision,
         {sourceSha256:input.source.sha256,durationMs:input.source.duration_ms}); }
@@ -186,9 +208,11 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
     const stageId = input.binding.stage_id;
     const timeline = stageId === "review" ? "previous_review_video"
       : stageId === "initial" ? "vm_original" : null;
-    if (!timeline || input.source.timeline_basis !== timeline || input.instructions.length !== 1
-      || input.instructions[0].timeline_basis !== timeline
-      || input.instructions[0].applicability !== "current_round") fail("RUN_BINDING_MISMATCH");
+    // Only AI intent planning may carry several instructions; each one belongs to this round.
+    if (!timeline || input.source.timeline_basis !== timeline
+      || input.instructions.length !== 1 && input.planning_mode !== "ai_intent"
+      || input.instructions.some((item) => item.timeline_basis !== timeline
+        || item.applicability !== "current_round")) fail("RUN_BINDING_MISMATCH");
     if (stageId === "review") {
       const parent = input.review_round.parent;
       if (!exactKeys(parent, ["kind", "run_id", "artifact_id", "delivery_id", "sha256", "bytes", "duration_ms"])
@@ -205,6 +229,20 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
   if (source.sha256 !== input.source.sha256 || source.bytes !== input.source.bytes)
     fail("SOURCE_HASH_MISMATCH");
   return { context, contextSha256, input, sourceSha256: source.sha256 };
+}
+
+function validV3Planning(input) {
+  const session = input.ai_session;
+  if (input.planning_mode === "ai_intent") {
+    if (input.manual_revision !== undefined || !exactKeys(session, ["agent", "model", "session_id"])
+      || !Object.values(session).every(identifier)) return false;
+  } else if (input.planning_mode !== "rule" || session !== undefined) return false;
+  const rounds = input.prior_rounds;
+  return rounds === undefined || Array.isArray(rounds) && rounds.every((round) =>
+    exactKeys(round, ["round_id", "instructions"]) && identifier(round.round_id)
+    && Array.isArray(round.instructions) && round.instructions.every((item) =>
+      exactKeys(item, ["instruction_id", "raw_text"]) && identifier(item.instruction_id)
+      && typeof item.raw_text === "string" && !item.raw_text.includes("\0")));
 }
 
 export async function validateVmPmoInput({ contextPath, signal, expectedBound } = {}) {
@@ -240,13 +278,18 @@ function instructionResultsMatch(items, instructions, status) {
       && (status !== "blocked" || item.segments.length === 0));
 }
 
+async function exists(filename) {
+  try { await lstat(filename); return true; }
+  catch (error) { if (error?.code === "ENOENT") return false; throw error; }
+}
+
 async function assertAbsent(filename, code) {
   try { await lstat(filename); fail(code); }
   catch (error) { if (error?.code !== "ENOENT") fail(code); }
 }
 
 function validateReadyPlan(plan, input, context, sourceSha256) {
-  if (input.schema_version === 2) return validateReadyV2Plan(plan, input, context, sourceSha256);
+  if (input.schema_version >= 2) return validateReadyV2Plan(plan, input, context, sourceSha256);
   if (input.binding.stage_id !== "initial" || input.review_round.parent !== null
     || input.source.timeline_basis !== "vm_original"
     || !same(input.output_profile, { id: "review_mp4_v1", width: 1920, height: 1080,
@@ -284,6 +327,34 @@ function validateReadyPlan(plan, input, context, sourceSha256) {
     || !Number.isSafeInteger(duration) || duration !== plan.expected_duration_ms) fail("PLAN_INVALID");
 }
 
+const V3_RECEIPT_KEYS = ["planning_mode", "intent_sha256", "coverage", "blockers"];
+const V3_PLAN_KEYS = ["planning_mode", "output_id", "ai_session", "intent_sha256",
+  "evidence_manifest_sha256", "coverage", "rule_cross_check"];
+
+function validV3PlanFields(plan, input) {
+  if (plan.planning_mode !== input.planning_mode || !QA_ID.test(plan.output_id)) return false;
+  if (input.planning_mode === "rule") {
+    return plan.output_id === "review" && plan.ai_session === null && plan.intent_sha256 === null
+      && plan.evidence_manifest_sha256 === null && plan.coverage === null && plan.rule_cross_check === null;
+  }
+  return same(plan.ai_session, input.ai_session) && digest(plan.intent_sha256)
+    && digest(plan.evidence_manifest_sha256) && validCoverage(plan.coverage, input)
+    && ["agreed", "not_applicable"].includes(plan.rule_cross_check);
+}
+
+const DISPOSITIONS = new Set(["operation", "constraint", "context", "unsupported", "needs_evidence", "ambiguous"]);
+
+function validCoverage(coverage, input) {
+  const ids = new Set(input.instructions.map((item) => item.instruction_id));
+  return Array.isArray(coverage) && coverage.length > 0 && coverage.every((row) => object(row)
+    && object(row.span) && ids.has(row.span.instruction_id)
+    && Number.isSafeInteger(row.span.start) && Number.isSafeInteger(row.span.end)
+    && row.span.start >= 0 && row.span.end > row.span.start
+    && typeof row.quote === "string" && DISPOSITIONS.has(row.disposition)
+    && (row.intent_ids === undefined || Array.isArray(row.intent_ids)
+      && row.intent_ids.every((value) => typeof value === "string")));
+}
+
 function validateReadyV2Plan(plan, input, context, sourceSha256) {
   const stageId = input.binding.stage_id;
   const timeline = stageId === "review" ? "previous_review_video"
@@ -292,25 +363,32 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
     || stageId === "review" && input.review_round.parent?.kind !== "managed_run"
     || stageId === "initial" && input.review_round.parent !== null
     || !same(input.output_profile, { id: "review_mp4_v1", width: 1920, height: 1080,
-      fps: 25, audio: "preserve" }) || input.instructions.length !== 1
-    || input.instructions[0].timeline_basis !== timeline
-    || input.instructions[0].applicability !== "current_round") fail("PLAN_INVALID");
+      fps: 25, audio: "preserve" })
+    || input.instructions.length !== 1 && input.planning_mode !== "ai_intent"
+    || input.instructions.some((item) => item.timeline_basis !== timeline
+      || item.applicability !== "current_round")) fail("PLAN_INVALID");
+  const v3 = input.schema_version === 3, aiIntent = v3 && input.planning_mode === "ai_intent";
   if (!exactKeys(plan, ["protocol", "schema_version", ...IDENTITY, "source", "input_sha256",
     "source_sha256", "instruction_results", "segments", "operations", "expected_duration_ms",
-    "engine_plan_sha256", "alignment_sha256"])) fail("PLAN_INVALID");
+    "engine_plan_sha256", "alignment_sha256", ...(v3 ? V3_PLAN_KEYS : [])])) fail("PLAN_INVALID");
   assertIdentity(plan, input, context, sourceSha256, "RUN_BINDING_MISMATCH");
   if (!same(plan.source, input.source) || !digest(plan.engine_plan_sha256)
     || plan.alignment_sha256 !== null && !digest(plan.alignment_sha256)
-    || !Array.isArray(plan.instruction_results) || plan.instruction_results.length !== 1
+    || !Array.isArray(plan.instruction_results)
+    || plan.instruction_results.length !== input.instructions.length
     || !Array.isArray(plan.segments) || !plan.segments.length
     || !Array.isArray(plan.operations)) fail("PLAN_INVALID");
-  const instruction = input.instructions[0], disposition = plan.instruction_results[0];
-  if (!exactKeys(disposition, ["instruction_id", "source_field_id", "raw_text", "status", "segments"])
-    || disposition.instruction_id !== instruction.instruction_id
-    || disposition.source_field_id !== instruction.source_field_id
-    || disposition.raw_text !== instruction.raw_text || disposition.status !== "resolved"
-    || !Array.isArray(disposition.segments) || !disposition.segments.length
-    || disposition.segments.some((segmentId) => !identifier(segmentId))) fail("PLAN_INVALID");
+  if (v3 && !validV3PlanFields(plan, input)) fail("PLAN_INVALID");
+  plan.instruction_results.forEach((disposition, index) => {
+    const instruction = input.instructions[index];
+    // AI intent may cover an instruction only with context/constraint spans, leaving no segment.
+    if (!exactKeys(disposition, ["instruction_id", "source_field_id", "raw_text", "status", "segments"])
+      || disposition.instruction_id !== instruction.instruction_id
+      || disposition.source_field_id !== instruction.source_field_id
+      || disposition.raw_text !== instruction.raw_text || disposition.status !== "resolved"
+      || !Array.isArray(disposition.segments) || !aiIntent && !disposition.segments.length
+      || disposition.segments.some((segmentId) => !identifier(segmentId))) fail("PLAN_INVALID");
+  });
   let targetOffset = 0;
   const seen = new Set();
   let totalDurationUs = 0;
@@ -328,8 +406,13 @@ function validateReadyV2Plan(plan, input, context, sourceSha256) {
   }
   if (Math.round(totalDurationUs / 1000) !== plan.expected_duration_ms
     || !Number.isSafeInteger(plan.expected_duration_ms) || plan.expected_duration_ms < 1
-    || disposition.segments.some((segmentId) => !seen.has(segmentId))) fail("PLAN_INVALID");
-  for (const operation of plan.operations) {
+    || plan.instruction_results.some((disposition) => disposition.segments
+      .some((segmentId) => !seen.has(segmentId)))) fail("PLAN_INVALID");
+  for (const tagged of plan.operations) {
+    // AI intent operations carry the intent_id they were compiled from; rule plans never do.
+    if (!object(tagged) || aiIntent !== Object.hasOwn(tagged, "intent_id")
+      || aiIntent && !QA_ID.test(tagged.intent_id)) fail("PLAN_INVALID");
+    const { intent_id: _intentId, ...operation } = tagged;
     if (!object(operation) || !identifier(operation.operation_id)
       || !Number.isSafeInteger(operation.source_start_us) || operation.source_start_us < 0
       || !Number.isSafeInteger(operation.source_end_us) || operation.source_end_us <= operation.source_start_us
@@ -388,14 +471,20 @@ export async function validateVmPmoPlan({ contextPath, signal, ffprobePath = "ff
   const bound = await loadBoundInput(contextPath, signal, expectedBound);
   const { context, input, sourceSha256 } = bound;
   const { value: receipt } = await jsonFile(context.plan_result_path, "PLAN_RESULT_INVALID");
+  const v3 = input.schema_version === 3;
   if (!exactKeys(receipt, ["protocol", "schema_version", "status", ...IDENTITY,
-    "input_sha256", "source_sha256", "plan_sha256", "instruction_results", "error"]))
+    "input_sha256", "source_sha256", "plan_sha256", "instruction_results", "error",
+    ...(v3 ? V3_RECEIPT_KEYS : [])]))
     fail("PLAN_RESULT_INVALID");
   assertIdentity(receipt, input, context, sourceSha256, "RUN_BINDING_MISMATCH");
-  if (!Array.isArray(receipt.instruction_results)) fail("PLAN_RESULT_INVALID");
+  if (!Array.isArray(receipt.instruction_results)
+    || v3 && (receipt.planning_mode !== input.planning_mode || !Array.isArray(receipt.blockers)
+      || receipt.intent_sha256 !== null && !digest(receipt.intent_sha256))) fail("PLAN_RESULT_INVALID");
   if (receipt.status === "blocked") {
     if (receipt.plan_sha256 !== null || !safeError(receipt.error)
-      || !instructionResultsMatch(receipt.instruction_results, input.instructions, "blocked"))
+      || !instructionResultsMatch(receipt.instruction_results, input.instructions, "blocked")
+      || v3 && (receipt.coverage !== null || !receipt.blockers.length
+        || receipt.blockers.some((item) => !object(item))))
       fail("PLAN_RESULT_INVALID");
     await assertAbsent(context.plan_path, "PLAN_RESULT_INVALID");
     await assertAbsent(context.output_path, "PLAN_RESULT_INVALID");
@@ -406,7 +495,9 @@ export async function validateVmPmoPlan({ contextPath, signal, ffprobePath = "ff
   const { value: plan, sha256: planSha256 } = await jsonFile(context.plan_path, "PLAN_INVALID");
   if (planSha256 !== receipt.plan_sha256) fail("PLAN_BINDING_MISMATCH");
   validateReadyPlan(plan, input, context, sourceSha256);
-  if (!same(receipt.instruction_results, plan.instruction_results)) fail("PLAN_RESULT_INVALID");
+  if (!same(receipt.instruction_results, plan.instruction_results)
+    || v3 && (receipt.blockers.length || !same(receipt.coverage, plan.coverage)
+      || receipt.intent_sha256 !== plan.intent_sha256)) fail("PLAN_RESULT_INVALID");
   if (expectedPlan && (planSha256 !== expectedPlan.planSha256 || !same(plan, expectedPlan.plan)
     || !same(receipt, expectedPlan.receipt))) fail("PLAN_BINDING_MISMATCH");
   const sourceMedia = await probeMov(context.source_path, { ffprobePath, timeoutMs, signal }, "SOURCE_MEDIA_INVALID");
@@ -472,8 +563,10 @@ async function probeMedia(file, { ffprobePath, ffmpegPath, timeoutMs, signal, ex
   return { durationMs, video: { codec: "h264", width: 1920, height: 1080, fps }, audio: { codec: "aac" } };
 }
 
+/** For schema v3 AI intent runs a rendered MP4 is only deliverable with a passing qa.json;
+ * `qa: "skip"` is reserved for the driver's check between render and qa. */
 export async function validateVmPmoRender({ contextPath, ffprobePath = "ffprobe",
-  ffmpegPath = "ffmpeg", timeoutMs = 120_000, signal, expectedBound, expectedPlan } = {}) {
+  ffmpegPath = "ffmpeg", timeoutMs = 120_000, signal, expectedBound, expectedPlan, qa = "require" } = {}) {
   interrupted(signal);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647)
     fail("MEDIA_VALIDATION_FAILED");
@@ -514,5 +607,85 @@ export async function validateVmPmoRender({ contextPath, ffprobePath = "ffprobe"
     || Math.abs(media.durationMs - plan.plan.expected_duration_ms) > 80) fail("MEDIA_VALIDATION_FAILED");
   const after = await hashMedia(context.output_path, "MEDIA_VALIDATION_FAILED", signal);
   if (!sameInfo(actual.info, after.info) || actual.sha256 !== after.sha256) fail("MEDIA_VALIDATION_FAILED");
+  if (input.schema_version === 3 && input.planning_mode === "ai_intent" && qa !== "skip") {
+    let checked;
+    try { checked = await validateVmPmoQa({ contextPath, signal, expectedBound: plan, plan: plan.plan, artifact }); }
+    catch (error) {
+      if (error?.code === "QA_REPORT_INVALID" && !await exists(context.qa_path)) fail("QA_REQUIRED");
+      throw error;
+    }
+    if (checked.overall === "failed") return { status: "failed", errorCode: "VM_PMO_QA_FAILED", context, input, qa: checked };
+    return { ...plan, status: "rendered", artifact, media, result, qa: checked };
+  }
   return { ...plan, status: "rendered", artifact, media, result };
+}
+
+/** Schema v3 AI intent only: the analyze receipt that binds ASR, intent context and evidence. */
+export async function validateVmPmoAnalyze({ contextPath, signal, expectedBound } = {}) {
+  const bound = await loadBoundInput(contextPath, signal, expectedBound);
+  const { context, input, sourceSha256 } = bound;
+  if (input.schema_version !== 3 || input.planning_mode !== "ai_intent") fail("ANALYZE_RESULT_INVALID");
+  const { value: result, sha256 } = await jsonFile(context.analyze_result_path, "ANALYZE_RESULT_INVALID");
+  if (!exactKeys(result, ["protocol", "schema_version", "status", ...IDENTITY, "input_sha256", "source_sha256",
+    "planning_mode", "alignment_sha256", "intent_context_sha256", "evidence_manifest_sha256",
+    "evidence_ids", "error"]) || result.planning_mode !== "ai_intent" || !Array.isArray(result.evidence_ids))
+    fail("ANALYZE_RESULT_INVALID");
+  assertIdentity(result, input, context, sourceSha256, "RUN_BINDING_MISMATCH");
+  if (result.status === "blocked") {
+    if (!safeError(result.error) || result.alignment_sha256 !== null || result.intent_context_sha256 !== null
+      || result.evidence_manifest_sha256 !== null || result.evidence_ids.length) fail("ANALYZE_RESULT_INVALID");
+    return { status: "blocked", errorCode: result.error.code, resultSha256: sha256, ...bound };
+  }
+  if (result.status !== "ready" || result.error !== null
+    || ![result.alignment_sha256, result.intent_context_sha256, result.evidence_manifest_sha256].every(digest)
+    || !result.evidence_ids.includes("transcript-full")) fail("ANALYZE_RESULT_INVALID");
+  const intentContext = await bytesAndHash(context.intent_context_path, "ANALYZE_RESULT_INVALID", MAX_JSON_BYTES);
+  const alignment = await bytesAndHash(path.join(context.run_dir, "alignment.words.json"),
+    "ANALYZE_RESULT_INVALID", 64 * 1024 * 1024);
+  if (intentContext.sha256 !== result.intent_context_sha256 || alignment.sha256 !== result.alignment_sha256)
+    fail("ANALYZE_RESULT_INVALID");
+  return { status: "ready", resultSha256: sha256, analyze: result, ...bound };
+}
+
+function qaCheck(row) {
+  return exactKeys(row, ["check_id", "intent_id", "kind", "status", "method", "evidence_ids",
+    "target_start_us", "target_end_us", "detail"])
+    && QA_ID.test(row.check_id) && (row.intent_id === null || QA_ID.test(row.intent_id))
+    && QA_KINDS.has(row.kind) && QA_STATUSES.has(row.status) && QA_METHODS.has(row.method)
+    && Array.isArray(row.evidence_ids) && row.evidence_ids.every((value) => QA_ID.test(value))
+    && [row.target_start_us, row.target_end_us].every((value) => value === null
+      || Number.isSafeInteger(value) && value >= 0)
+    && typeof row.detail === "string" && row.detail.length > 0
+    && (!["listening", "pacing"].includes(row.kind) || ["needs_human", "not_run", "failed"].includes(row.status))
+    && (row.status !== "ai_reviewed" || ["ai_visual", "ai_reading"].includes(row.method));
+}
+
+/** Schema v3 AI intent only: qa.json must describe this run's plan and rendered MP4.
+ * `overall: failed` is returned as a result, not thrown, so callers can block delivery. */
+export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan, artifact } = {}) {
+  const bound = await loadBoundInput(contextPath, signal, expectedBound, false);
+  const { context, input } = bound;
+  if (input.schema_version !== 3 || input.planning_mode !== "ai_intent" || !object(plan) || !object(artifact))
+    fail("QA_REPORT_INVALID");
+  const { value: report, sha256 } = await jsonFile(context.qa_path, "QA_REPORT_INVALID");
+  const bindings = report.bindings;
+  if (!exactKeys(report, ["schema", "schema_version", "bindings", "overall", "checks", "limitations"])
+    || report.schema !== "auto-cut-slicing/qa-report" || report.schema_version !== 1
+    || !exactKeys(bindings, ["intent_sha256", "plan_sha256", "output_id", "output_sha256", "source_sha256s",
+      "output_alignment_sha256"])
+    || bindings.intent_sha256 !== plan.intent_sha256 || !digest(bindings.plan_sha256)
+    || bindings.output_id !== plan.output_id || bindings.output_sha256 !== artifact.sha256
+    || !Array.isArray(bindings.source_sha256s) || !bindings.source_sha256s.includes(input.source.sha256)
+    || !bindings.source_sha256s.every(digest)
+    || bindings.output_alignment_sha256 !== null && !digest(bindings.output_alignment_sha256)
+    || !["failed", "ready_for_review"].includes(report.overall)
+    || !Array.isArray(report.checks) || !report.checks.length || !report.checks.every(qaCheck)
+    || new Set(report.checks.map((row) => row.check_id)).size !== report.checks.length
+    || report.overall !== (report.checks.some((row) => row.status === "failed") ? "failed" : "ready_for_review")
+    || !Array.isArray(report.limitations) || report.limitations.some((value) => typeof value !== "string"))
+    fail("QA_REPORT_INVALID");
+  const counts = {};
+  for (const row of report.checks) counts[row.status] = (counts[row.status] ?? 0) + 1;
+  return { overall: report.overall, qaSha256: sha256, counts,
+    reverseAsr: bindings.output_alignment_sha256 !== null, report };
 }

@@ -15,7 +15,10 @@ const MAX_PLAN_ATTEMPTS = 3;
 const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepared", "planStartedAt",
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
   "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
-  "manualRevision"]);
+  "manualRevision", "aiRetryHistory"]);
+// v3 AI intent step: blocks a human may rerun in the same attempt directory (no automatic retry).
+const AI_INTENT_BLOCKS = new Set(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"]);
+const MAX_AI_RETRIES = 2;
 
 function failure(code) { const error = new Error(code); error.code = code; return error; }
 function object(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -177,6 +180,10 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
             || !["WORD_ALIGNMENT_UNRESOLVED","UNSUPPORTED_INSTRUCTION"].includes(entry.errorCode)
             || !timestamp(entry.failedAt)
             || !HASH.test(entry.inputSha256)))
+        || payload.aiRetryHistory !== undefined && (!Array.isArray(payload.aiRetryHistory)
+          || payload.aiRetryHistory.length > MAX_AI_RETRIES
+          || payload.aiRetryHistory.some((entry) => !object(entry) || Object.keys(entry).length !== 2
+            || !AI_INTENT_BLOCKS.has(entry.errorCode) || !timestamp(entry.failedAt)))
         || payload.renderRetryHistory !== undefined && (!Array.isArray(payload.renderRetryHistory)
           || payload.renderRetryHistory.length > 1
           || payload.renderRetryHistory.some(value => !timestamp(value))))
@@ -411,6 +418,34 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
         attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
         AND state = 'blocked' AND error_code = 'WORD_ALIGNMENT_UNRESOLVED' AND payload_json = ? AND lease_token IS NULL`)
         .run(nextPayload, now(), now(), runId, run.taskId, row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return get(runId);
+  }
+  /** Rerun only the AI intent step of the same attempt: same input, analyze result and evidence.
+   * The driver moves any intent left behind into the new session's evidence directory. */
+  async function retryAiIntent(runId, {beforeCommit = () => {}} = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run || run.state !== "blocked" || !AI_INTENT_BLOCKS.has(run.errorCode)
+      || !run.planStartedAt || !run.prepared || !run.acquisition || run.runnerStartedAt
+      || run.planSha256 || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt)
+      throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    if ((run.aiRetryHistory?.length ?? 0) >= MAX_AI_RETRIES) throw failure("VM_PMO_RETRY_LIMIT");
+    assertCurrent(run);
+    await verifyRetryInput({ run });
+    assertCurrent(run);
+    const payload = JSON.parse(row.payload_json);
+    payload.aiRetryHistory = [...(run.aiRetryHistory ?? []),
+      { errorCode: run.errorCode, failedAt: new Date(now()).toISOString() }];
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'prepared',payload_json = ?,error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'blocked' AND error_code = ? AND payload_json = ? AND lease_token IS NULL`)
+        .run(json(payload), now(), now(), runId, run.taskId, run.errorCode, row.payload_json);
       if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
@@ -693,7 +728,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return draining;
   }
   return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryManualRevision,
-    retryPlan, retryValidatedPlan,
+    retryPlan, retryValidatedPlan, retryAiIntent,
     retryFailedRender,
     recoverBindingConflicts,
     start() { if (closed || timer) return; timer = setInterval(() => { void wake().catch(() => {}); }, tickMs);

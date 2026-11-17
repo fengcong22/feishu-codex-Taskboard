@@ -60,12 +60,12 @@ export function packageWorkflowFromManifest(packageInterface) {
   if (hasContract) {
     const contract = packageInterface.contract;
     if (!object(contract) || Object.keys(contract).length !== 2 || contract.id !== VM.id
-      || ![1, 2].includes(contract.version)) unsupported();
+      || ![1, 2, 3].includes(contract.version)) unsupported();
     contractVersion = contract.version;
   }
   const expectedDriver = `vm_pmo_review_video_v${contractVersion}`;
   if (hasDriver && packageInterface.driverId !== expectedDriver) unsupported();
-  if (contractVersion === 2 && !hasDriver) unsupported();
+  if (contractVersion >= 2 && !hasDriver) unsupported();
   if (hasArtifact && packageInterface.artifactKind !== "review_mp4") unsupported();
   return template;
 }

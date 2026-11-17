@@ -35,6 +35,7 @@ import {
   retryTaskArtifactUpload,
   rerunTaskAutoCutCurrent,
   retryTaskVmPmoPlan,
+  retryTaskVmPmoAiIntent,
   retryTaskVmPmoWriteback,
   uploadAttachment,
   uploadCommentAttachment,
@@ -123,6 +124,7 @@ import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
 import { AutoCutRunSummary } from "./AutoCutRunSummary";
+import { VmPmoRunReview } from "./VmPmoRunReview";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -479,6 +481,9 @@ export function TaskDetail({
   const [vmPmoRun, setVmPmoRun] = useState<VmPmoRunSummary | null>(null);
   const [vmPmoRunError, setVmPmoRunError] = useState<TaskDetailError | null>(null);
   const [retryingVmPmoPlan, setRetryingVmPmoPlan] = useState(false);
+  const [retryingVmPmoAi, setRetryingVmPmoAi] = useState(false);
+  const [showVmPmoAiConsent, setShowVmPmoAiConsent] = useState(false);
+  const [allowVmPmoAiSession, setAllowVmPmoAiSession] = useState(false);
   const [retryingVmPmoWriteback, setRetryingVmPmoWriteback] = useState(false);
   const [showVmPmoRetryConsent, setShowVmPmoRetryConsent] = useState(false);
   const [allowVmPmoAsr, setAllowVmPmoAsr] = useState(false);
@@ -596,6 +601,9 @@ export function TaskDetail({
       setAllowVmPmoAsr(false);
       setAllowVmPmoLocalWrite(false);
       setRetryingVmPmoPlan(false);
+      setShowVmPmoAiConsent(false);
+      setAllowVmPmoAiSession(false);
+      setRetryingVmPmoAi(false);
     }
   }, [task]);
 
@@ -1336,6 +1344,24 @@ export function TaskDetail({
     }
   }
 
+  async function retryVmPmoAiIntent() {
+    if (!vmPmoRun?.canRetryAiIntent || !allowVmPmoAiSession || retryingVmPmoAi) return;
+    const taskId = currentTask.id;
+    setRetryingVmPmoAi(true);
+    setVmPmoRunError(null);
+    try {
+      const run = await retryTaskVmPmoAiIntent(taskId, currentTask.version);
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRun(run);
+      setShowVmPmoAiConsent(false);
+      setAllowVmPmoAiSession(false);
+    } catch (error) {
+      if (currentTaskIdRef.current === taskId) setVmPmoRunError(messageFor(error));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setRetryingVmPmoAi(false);
+    }
+  }
+
   async function retryVmPmoWriteback() {
     if (!vmPmoRun?.canRetryWriteback || retryingVmPmoWriteback) return;
     const taskId = currentTask.id;
@@ -1819,6 +1845,42 @@ export function TaskDetail({
                           </li>
                         ))}
                       </ul>
+                    )}
+                    {vmPmoRun.review && <VmPmoRunReview review={vmPmoRun.review} />}
+                    {(vmPmoRun.aiRetryHistory?.length ?? 0) > 0 && (
+                      <ul className="vm-pmo-retry-history">
+                        {vmPmoRun.aiRetryHistory!.map((entry, index) => (
+                          <li key={`${entry.failedAt}-${index}`}>
+                            {text(`第 ${index + 1} 次 AI 规划会话`, `AI planning session ${index + 1}`)}
+                            <code>{entry.errorCode}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {vmPmoRun.canRetryAiIntent && !showVmPmoAiConsent && (
+                      <button type="button" disabled={retryingVmPmoAi} onClick={() => setShowVmPmoAiConsent(true)}>
+                        {text("重新运行 AI 规划", "Rerun AI planning")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryAiIntent && showVmPmoAiConsent && (
+                      <div className="vm-pmo-retry-consent">
+                        <label>
+                          <input type="checkbox" checked={allowVmPmoAiSession}
+                            onChange={(event) => setAllowVmPmoAiSession(event.target.checked)} />
+                          {text("允许再启动一次无人值守 AI 会话（最长 15 分钟），复用本次的识别结果和证据",
+                            "Allow one more unattended AI session (up to 15 minutes) reusing this attempt's transcript and evidence")}
+                        </label>
+                        <div className="vm-pmo-retry-actions">
+                          <button type="button" disabled={retryingVmPmoAi || !allowVmPmoAiSession}
+                            onClick={() => void retryVmPmoAiIntent()}>
+                            {retryingVmPmoAi ? text("正在重试…", "Retrying…") : text("确认重跑", "Confirm rerun")}
+                          </button>
+                          <button type="button" disabled={retryingVmPmoAi} onClick={() => {
+                            setShowVmPmoAiConsent(false);
+                            setAllowVmPmoAiSession(false);
+                          }}>{text("取消", "Cancel")}</button>
+                        </div>
+                      </div>
                     )}
                     {vmPmoRun.canRetryPlan && !showVmPmoRetryConsent && (
                       <button type="button" disabled={retryingVmPmoPlan}
