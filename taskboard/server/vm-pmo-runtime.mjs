@@ -11,7 +11,7 @@ import { createVmTaskDownloadBindings } from "./vm-task-download-bindings.mjs";
 import { createVmPmoOrchestrator } from "./vm-pmo-orchestrator.mjs";
 import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
-import { runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
+import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
 import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
 import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
@@ -842,7 +842,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
 
   /** v3 approval details (coverage, blockers, QA items for a human) from the frozen run context. */
   async function runReview(run) {
-    if (!run?.prepared) return null;
+    // Plan and QA files in a run the AI overstepped may be its own forgeries, not package output.
+    if (!run?.prepared || run.errorCode === AI_INTENT_SCOPE_VIOLATION) return null;
     const row = db.prepare("SELECT bound_json FROM vm_pmo_attempt_inputs WHERE run_id = ? AND context_path = ?")
       .get(run.runId,run.prepared.contextPath);
     let context;

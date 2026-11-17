@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, realpath, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readdir, readFile, writeFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { prepareVmPmoRunInput } from "../server/vm-pmo-run-input.mjs";
 import { validateVmPmoInput } from "../server/vm-pmo-result-validator.mjs";
 import { createVmPmoAiIntentRunner, vmPmoAiEnvironment } from "../server/vm-pmo-ai-intent.mjs";
 import { packageWorkflowFromManifest } from "../shared/feishu-package-workflow.mjs";
+import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "../server/vm-pmo-v3-driver.mjs";
 
 const sha = value => createHash("sha256").update(value).digest("hex");
 const V3_INTERFACE = { workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
@@ -183,4 +184,61 @@ test("AI intent session can put a sandbox-readable FFmpeg directory first on PAT
   assert.equal(env.Path.split(path.delimiter)[0], "E:\tools\ffmpeg");
   assert.throws(() => createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "gpt-test", toolDir: "tools" }),
     { code: "VM_PMO_AI_NOT_CONFIGURED" });
+});
+
+// Drives the driver's AI step with a ready analyze receipt and a scripted session; no package needed.
+async function analyzedRun(t) {
+  const args = await fixture(t);
+  const prepared = await prepareVmPmoRunInput(args);
+  const { context, input } = await validateVmPmoInput({ contextPath: prepared.contextPath });
+  const put = async (file, text) => { await writeFile(file, text); return sha(text); };
+  const alignmentSha256 = await put(path.join(context.run_dir, "alignment.words.json"), "{\"words\":[]}\n");
+  const intentContextSha256 = await put(context.intent_context_path, "{\"schema\":\"intent-context\"}\n");
+  await mkdir(context.evidence_dir);
+  const manifestSha256 = await put(path.join(context.evidence_dir, "manifest.json"), "{\"entries\":[]}\n");
+  await writeFile(context.analyze_result_path, JSON.stringify({ protocol: input.protocol, schema_version: 3,
+    status: "ready", package: input.package, binding: input.binding, record: input.record,
+    review_round: input.review_round, delivery_target: input.delivery_target, input_sha256: context.input_sha256,
+    source_sha256: input.source.sha256, planning_mode: "ai_intent", alignment_sha256: alignmentSha256,
+    intent_context_sha256: intentContextSha256, evidence_manifest_sha256: manifestSha256,
+    evidence_ids: ["transcript-full"], error: null }));
+  const session = (write) => ({ session: { agent: "codex", model: "gpt-test" }, async run() { await write(); return { outcome: "completed", threadId: "t" }; } });
+  const plan = (aiIntent) => runVmPmoDriver({ mode: "plan", contextPath: prepared.contextPath,
+    packageRoot: args.packageSnapshot.workspacePath, pythonPath: args.pythonPath, aiIntent });
+  const sessions = path.join(path.dirname(context.run_dir), "ai-sessions");
+  return { context, session, plan, sessions };
+}
+
+test("an AI session that only adds evidence passes the boundary", async t => {
+  const { context, session, plan } = await analyzedRun(t);
+  const result = await plan(session(() => writeFile(path.join(context.evidence_dir, "extra.json"), "{}\n")));
+  assert.deepEqual(result, { status: "blocked", errorCode: "AI_INTENT_MISSING" });
+});
+
+test("an AI session that edits a protected file or writes a plan output is blocked and recorded", async t => {
+  for (const [name, write, expected] of [
+    ["tamper", (context) => writeFile(context.intent_context_path, "{\"tampered\":true}\n"),
+      { changed_protected_files: ["intent-context.json"], unexpected_outputs: [] }],
+    ["early-plan", (context) => writeFile(context.plan_result_path, "{}\n"),
+      { changed_protected_files: [], unexpected_outputs: ["plan-result.json"] }],
+  ]) {
+    const { context, session, plan, sessions } = await analyzedRun(t);
+    const result = await plan(session(async () => {
+      await writeFile(context.intent_path, "{}\n");
+      await write(context);
+    }));
+    assert.deepEqual(result, { status: "blocked", errorCode: AI_INTENT_SCOPE_VIOLATION }, name);
+    const [directory] = await readdir(sessions);
+    const record = JSON.parse(await readFile(path.join(sessions, directory, "scope-violation.json"), "utf8"));
+    assert.deepEqual({ changed_protected_files: record.changed_protected_files,
+      unexpected_outputs: record.unexpected_outputs }, expected, name);
+  }
+});
+
+test("a broken attempt is refused before it uses an AI session slot", async t => {
+  const { context, session, plan, sessions } = await analyzedRun(t);
+  await writeFile(context.plan_path, "{}\n");
+  await assert.rejects(plan(session(() => assert.fail("AI must not start"))), { code: "VM_PMO_RUN_INPUT_INVALID" });
+  const used = await readdir(sessions).catch((error) => (error.code === "ENOENT" ? [] : Promise.reject(error)));
+  assert.deepEqual(used, []);
 });

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, rename } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { runVmPmoOffline } from "./vm-pmo-offline-runner.mjs";
@@ -26,11 +26,10 @@ async function present(file) {
   catch (error) { if (error?.code === "ENOENT") return false; throw failure("VM_PMO_RUN_INPUT_INVALID"); }
 }
 
+function regularInfo(info) { return info.isFile() && !info.isSymbolicLink() && info.nlink === 1; }
+
 async function regularFile(file) {
-  try {
-    const info = await lstat(file);
-    return info.isFile() && !info.isSymbolicLink() && info.nlink === 1;
-  } catch { return false; }
+  try { return regularInfo(await lstat(file)); } catch { return false; }
 }
 
 /** AI sessions live beside the attempt directories (`<runRoot>/<runId>/ai-sessions/`), outside the
@@ -54,7 +53,7 @@ async function fileDigest(file) {
     if (error?.code === "ENOENT") return null;
     return "unreadable";
   }
-  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) return "irregular";
+  if (!regularInfo(info)) return "irregular";
   try { return createHash("sha256").update(await readFile(file)).digest("hex"); } catch { return "unreadable"; }
 }
 
@@ -78,12 +77,15 @@ async function snapshotBoundary(context) {
   return digests;
 }
 
-async function boundaryKept(context, before) {
+/** Names (relative to the run directory) of protected files that changed and outputs that appeared. */
+async function boundaryBreaches(context, before) {
   const boundary = aiBoundary(context);
   const after = await Promise.all(boundary.protected.map(fileDigest));
-  if (after.some((value, index) => value !== before[index])) return false;
-  for (const file of boundary.outputs) if (await fileDigest(file) !== null) return false;
-  return true;
+  const changed = boundary.protected.filter((_, index) => after[index] !== before[index]);
+  const outputs = [];
+  for (const file of boundary.outputs) if (await fileDigest(file) !== null) outputs.push(file);
+  const name = (file) => path.relative(context.run_dir, file);
+  return { changed: changed.map(name), outputs: outputs.map(name) };
 }
 
 export function isVmPmoAiIntentInput(input) {
@@ -129,17 +131,24 @@ async function planWithIntent(options) {
   }
   if (analyzed.status !== "ready") return { status: "blocked", errorCode: analyzed.errorCode };
 
+  // Checked before a session slot is used, so a broken attempt never consumes one.
+  const before = await snapshotBoundary(context);
   const sessionDir = await nextSessionDir(context);
   if (await present(context.intent_path)) {
     // An intent left by an interrupted or timed-out session is evidence, not input to this session.
     await rename(context.intent_path, path.join(sessionDir, "superseded-edit-intent.json"));
   }
-  const before = await snapshotBoundary(context);
   const ai = await aiIntent.run({ context, packageRoot: step.packageRoot, pythonPath: step.pythonPath,
     sessionDir, signal, onSpawn: started ? (evidence) => started(evidence) : null });
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
   // Checked before the outcome: a timed-out or failed session may still have overstepped.
-  if (!(await boundaryKept(context, before))) return { status: "blocked", errorCode: AI_INTENT_SCOPE_VIOLATION };
+  const breaches = await boundaryBreaches(context, before);
+  if (breaches.changed.length || breaches.outputs.length) {
+    // The operator is told to inspect the run; this names exactly what the session touched.
+    await writeFile(path.join(sessionDir, "scope-violation.json"), JSON.stringify({ outcome: ai.outcome,
+      changed_protected_files: breaches.changed, unexpected_outputs: breaches.outputs }, null, 2) + "\n", { flag: "wx" });
+    return { status: "blocked", errorCode: AI_INTENT_SCOPE_VIOLATION };
+  }
   const written = await regularFile(context.intent_path);
   if (ai.outcome === "timeout") return { status: "blocked", errorCode: "AI_INTENT_TIMEOUT" };
   if (ai.outcome !== "completed") return { status: "blocked", errorCode: "AI_INTENT_FAILED" };
