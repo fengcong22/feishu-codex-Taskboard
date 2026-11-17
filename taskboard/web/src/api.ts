@@ -1510,6 +1510,18 @@ export async function retryTaskVmPmoPlan(
   return data.run;
 }
 
+export async function retryTaskVmPmoAiIntent(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-ai-intent-retry`,
+    { method: "POST", body: JSON.stringify({ version,
+      runConsent: { allowAiSession: true, allowLocalPlanning: true } }) },
+  );
+  return data.run;
+}
+
 export async function retryTaskVmPmoWriteback(
   taskId: string,
   version: number,

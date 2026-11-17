@@ -11,7 +11,8 @@ import { createVmTaskDownloadBindings } from "./vm-task-download-bindings.mjs";
 import { createVmPmoOrchestrator } from "./vm-pmo-orchestrator.mjs";
 import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
-import { runVmPmoOffline } from "./vm-pmo-offline-runner.mjs";
+import { runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
+import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
 import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
 import { createVmStageWriteback, parseVmWritebackIdempotencyKey } from "./vm-stage-writeback.mjs";
@@ -30,6 +31,8 @@ const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
 const HASH = /^[a-f0-9]{64}$/u;
 const TERMINAL = new Set(["completed","blocked","needs_attention"]);
 const MAX_PLAN_ATTEMPTS = 3;
+const AI_INTENT_BLOCKS = ["AI_INTENT_TIMEOUT","AI_INTENT_MISSING","AI_INTENT_FAILED"];
+const MAX_AI_RETRIES = 2;
 const MATERIAL_MOMENTS = new Set(["materials_ready","download_failed"]);
 // Operator-supplied sources live in a fixed folder beside the configured VM download output.
 const MANUAL_SOURCE_FOLDER = "人工素材";
@@ -237,7 +240,7 @@ function initialProfile(subject, config) {
  * Neither the registration body nor PMO record may choose an executable or a workspace.
  * Local readiness never initializes the approval queue, a remote adapter, or run directories. */
 export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubjectVersion,getDownloads,getAdapter,getPolicy,
-  scheduler,dispatchWriteback,onTaskUpdated = () => {},runRoot,pythonPath,
+  scheduler,dispatchWriteback,onTaskUpdated = () => {},runRoot,pythonPath,aiIntent = null,
   ffprobePath = "ffprobe",ffmpegPath = "ffmpeg",coursePathResolver = {},tickMs = 5_000,now = Date.now} = {}) {
   const db = database?.database;
   let services, closed = false, timer, archiveTimer, draining, archiveDraining;
@@ -273,9 +276,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       const filename = path.join(record.workspacePath,"PACKAGE-MANIFEST.json");
       await canonicalLocation(filename);
       const bytes = await readFile(filename), manifest = JSON.parse(bytes.toString("utf8"));
+      const contract = manifest.interface?.contract?.version;
       if (!template(packageWorkflowFromManifest(manifest.interface))
-        || manifest.interface?.contract?.id !== TEMPLATE.id || manifest.interface?.contract?.version !== 2
-        || manifest.interface?.driverId !== "vm_pmo_review_video_v2"
+        || manifest.interface?.contract?.id !== TEMPLATE.id || ![2, 3].includes(contract)
+        || manifest.interface?.driverId !== `vm_pmo_review_video_v${contract}`
         || typeof manifest.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(manifest.name)
         || typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(manifest.version))
         throw new Error("manifest invalid");
@@ -305,8 +309,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     if (record?.state !== "enabled" || record.alias !== packageAlias) throw fail("PACKAGE_DISABLED");
     const identity = await inspectPackage(record);
     initialProfile(subject,config);
-    if (config.stages.review.enabled && (identity.contractVersion !== 2
-      || identity.driverId !== "vm_pmo_review_video_v2")) throw fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
+    if (config.stages.review.enabled && (![2, 3].includes(identity.contractVersion)
+      || identity.driverId !== `vm_pmo_review_video_v${identity.contractVersion}`)) throw fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
+    // v3 plans every instruction through an unattended AI session; without one it cannot run.
+    if (identity.contractVersion === 3 && typeof aiIntent?.run !== "function") throw fail("VM_PMO_AI_NOT_CONFIGURED");
     return true;
   }
   const localAdapter = Object.freeze(Object.fromEntries(["listFields","getRecord","updateRecord","uploadMedia"].map(method => [method,
@@ -610,7 +616,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         if (!same(comparable,frozenContext) && !instructionOnlyDrift) throw fail("VM_PMO_RECORD_CHANGED");
         const prepared = await prepareVmPmoRunInput({runRoot,runId: run.runId,taskId: run.taskId,origin,
           profile: local.subject.vmWorkflow,packageSnapshot: database.getFeishuTaskPackageSnapshot(run.taskId),
-          packageIdentity,acquisition,pythonPath,planAttempt,manualRevision:run.manualRevision});
+          packageIdentity,acquisition,pythonPath,planAttempt,manualRevision:run.manualRevision,
+          aiSession:aiIntent?.session});
         const bound = await validateVmPmoInput({contextPath: prepared.contextPath});
         const value = canonicalJson(bound);
         db.prepare(`INSERT INTO vm_pmo_attempt_inputs(run_id,task_id,plan_attempt,context_path,input_sha256,
@@ -688,7 +695,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       runOffline: async options => {
         const bound = await boundFor(options,{runId:options.runId,taskId:options.taskId,
           planAttempt:options.planAttempt,inputSha256:options.inputSha256});
-        const result = await runVmPmoOffline({...options,ffprobePath,ffmpegPath,expectedBound: bound});
+        // Reverse ASR on the finished MP4 is on by default for v3 (decided 2026-11-17).
+        const result = await runVmPmoDriver({...options,ffprobePath,ffmpegPath,expectedBound: bound,
+          aiIntent,reverseAsr: true});
         await validateVmPmoInput({...options,expectedBound: bound});
         return result;
       },
@@ -788,6 +797,11 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    const aiRetryCount = run.aiRetryHistory?.length ?? 0;
+    const canRetryAiIntent = run.state === "blocked" && AI_INTENT_BLOCKS.includes(run.errorCode)
+      && aiRetryCount < MAX_AI_RETRIES && Boolean(run.planStartedAt && run.prepared && run.acquisition)
+      && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
+      && !run.deliveredFileToken && !run.completedAt;
     const canRetryFailedRender = run.state === "needs_attention"
       && run.errorCode === "VM_PMO_START_EVIDENCE_FAILED"
       && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
@@ -812,6 +826,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       canRetryApproval,canRetryManualRevision,
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
         failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,
+      canRetryAiIntent,aiRetryLimit:MAX_AI_RETRIES,
+      aiRetryHistory:(run.aiRetryHistory ?? []).map(entry => ({errorCode:entry.errorCode,failedAt:entry.failedAt})),
       canRetryWriteback,writeback,
       updatedAt:new Date(run.updatedAt).toISOString()};
   }
@@ -819,7 +835,40 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   async function getTaskRun(taskId) {
     await ready();
     const run = initialize().orchestrator.getForTask(taskId);
-    return publicRun(run);
+    const value = publicRun(run);
+    if (value) value.review = await runReview(run);
+    return value;
+  }
+
+  /** v3 approval details (coverage, blockers, QA items for a human) from the frozen run context. */
+  async function runReview(run) {
+    if (!run?.prepared) return null;
+    const row = db.prepare("SELECT bound_json FROM vm_pmo_attempt_inputs WHERE run_id = ? AND context_path = ?")
+      .get(run.runId,run.prepared.contextPath);
+    let context;
+    try {context = JSON.parse(row.bound_json).context;} catch {return null;}
+    return readVmPmoRunReview(context);
+  }
+
+  async function retryAiIntent(taskId,request) {
+    await ready();
+    if (!object(request) || Object.keys(request).length !== 2
+      || !Number.isSafeInteger(request.version) || request.version < 1
+      || !object(request.runConsent) || Object.keys(request.runConsent).length !== 2
+      || request.runConsent.allowAiSession !== true
+      || request.runConsent.allowLocalPlanning !== true) throw fail("VM_PMO_RETRY_CONSENT_REQUIRED",400);
+    const assertTaskVersion = () => {
+      if (database.getTask(taskId)?.version !== request.version) throw fail("VERSION_CONFLICT",409);
+    };
+    assertTaskVersion();
+    const service = initialize(), run = service.orchestrator.getForTask(taskId);
+    if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
+      || run.identity.packageSnapshot.workflowTemplate.version !== TEMPLATE.version)
+      throw fail("VM_PMO_RUN_NOT_FOUND",404);
+    if (typeof aiIntent?.run !== "function") throw fail("VM_PMO_AI_NOT_CONFIGURED",503);
+    const queued = await service.orchestrator.retryAiIntent(run.runId,{beforeCommit:assertTaskVersion});
+    void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
+    return publicRun(queued);
   }
 
   async function retryApproval(taskId,request) {
@@ -1184,6 +1233,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   }
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
     getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,retryWriteback,
+    retryAiIntent,
     submitManualSource,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),
     list: () => services?.orchestrator.list() ?? [],

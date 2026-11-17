@@ -634,6 +634,10 @@ export interface VmPmoRunSummary {
   retryLimit: number;
   retryHistory: Array<{ planAttempt: number; errorCode: string; failedAt: string }>;
   canRetryPlan: boolean;
+  canRetryAiIntent?: boolean;
+  aiRetryLimit?: number;
+  aiRetryHistory?: Array<{ errorCode: string; failedAt: string }>;
+  review?: VmPmoRunReview | null;
   canRetryValidatedPlan?: boolean;
   canRetryFailedRender?: boolean;
   canRetryManualRevision?: boolean;
@@ -656,6 +660,36 @@ export interface VmPmoRunSummary {
     completed: { state: string; errorCode: string | null; attemptCount: number } | null;
   };
   updatedAt: string;
+}
+
+export interface VmPmoQaItem {
+  checkId: string | null;
+  kind: string | null;
+  status: string | null;
+  method: string | null;
+  detail: string | null;
+  targetStartUs: number | null;
+  targetEndUs: number | null;
+  evidenceIds: string[];
+}
+
+/** v3 approval details read from plan-result.json and qa.json; display only. */
+export interface VmPmoRunReview {
+  planningMode: string | null;
+  planStatus: string | null;
+  coverage: Array<{ instructionId: string | null; quote: string | null; disposition: string | null;
+    reason: string | null; intentIds: string[] }>;
+  blockers: Array<{ code: string | null; rule: string | null; message: string | null; path: string | null;
+    quotes: string[]; missingEvidence: string[]; candidateCount: number }>;
+  qa: {
+    overall: string | null;
+    counts: Record<string, number>;
+    reverseAsr: boolean;
+    needsHuman: VmPmoQaItem[];
+    failed: VmPmoQaItem[];
+    limitations: string[];
+  } | null;
+  qaError?: { code: string | null; message: string | null } | null;
 }
 
 export type PackageBoardStage = UnifiedWorkflowStage | "materials" | "editing" | "feishu_delivery"

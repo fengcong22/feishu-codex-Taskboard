@@ -7,6 +7,7 @@ import { promisify, parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { runVmPmoOffline } from '../taskboard/server/vm-pmo-offline-runner.mjs';
 import { validateVmPmoPlan, validateVmPmoRender } from '../taskboard/server/vm-pmo-result-validator.mjs';
+import { runV3Checks } from './vm-pmo-offline-v3-checks.mjs';
 
 const exec = promisify(execFile);
 const { values } = parseArgs({ options: {
@@ -308,9 +309,14 @@ await writeFile(happy.context.output_path, outputBytes);
 await validateVmPmoRender({contextPath: happy.contextPath});
 checks.push('changed output bytes rejected');
 
-const report = {checked_at: new Date().toISOString(), scope: 'offline synthetic media only',
+const v3 = await runV3Checks({root, packageRoot, pythonPath, safeEnv, checks});
+
+const report = {checked_at: new Date().toISOString(),
+  scope: 'offline synthetic media only; v3 AI sessions and ASR replaced by pre-written intents and word timing',
   package: {name: 'auto-cut-slicing', version: '0.3.0', manifest_sha256: manifestSha256},
+  v3_preview_manifest_sha256: v3.manifest_sha256,
   source_duration_ms: durationMs, output_duration_ms: rendered.media.durationMs,
+  v3_output_duration_ms: v3.output_duration_ms,
   checks, production_enabled: false};
 await save(path.join(root, 'verification.json'), report);
 console.log(JSON.stringify({root, ...report}, null, 2));

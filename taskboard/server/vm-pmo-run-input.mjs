@@ -50,7 +50,7 @@ async function immutableJson(target, value) {
 /** All descriptors must come from registered origin, frozen profile, and verified acquisition. */
 export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, profile,
   packageSnapshot, packageIdentity, acquisition, pythonPath, planAttempt = 1,
-  manualRevision } = {}) {
+  manualRevision, aiSession } = {}) {
   const contextValue = origin?.stageSnapshot?.vmContext;
   const stageId = origin?.stageId;
   const review = stageId === "review";
@@ -110,24 +110,31 @@ export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, pro
     || typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(manifest.version)) fail("VM_PMO_PACKAGE_INVALID");
   const manifestSha256 = sha(manifestBytes);
   const contractVersion = packageIdentity?.contractVersion ?? 1;
-  if (![1, 2].includes(contractVersion)
-    || contractVersion === 2 && (packageIdentity?.driverId !== "vm_pmo_review_video_v2"
+  if (![1, 2, 3].includes(contractVersion)
+    || contractVersion >= 2 && (packageIdentity?.driverId !== `vm_pmo_review_video_v${contractVersion}`
       || manifest.interface?.contract?.id !== "vm_pmo_review_video"
-      || manifest.interface?.contract?.version !== 2
-      || manifest.interface?.driverId !== "vm_pmo_review_video_v2")
-    || review && contractVersion !== 2) fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
+      || manifest.interface?.contract?.version !== contractVersion
+      || manifest.interface?.driverId !== `vm_pmo_review_video_v${contractVersion}`)
+    || review && contractVersion < 2) fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
   if (packageIdentity !== undefined) {
     if (!packageIdentity || packageIdentity.name !== manifest.name || packageIdentity.version !== manifest.version
       || packageIdentity.manifestSha256 !== manifestSha256) fail("VM_PMO_PACKAGE_CHANGED");
   }
   const revision = manualRevision === undefined ? undefined : toVmPmoInputManualRevision(
     manualRevision,{sourceSha256:acquisition.sha256,durationMs:acquisition.duration_ms});
-  if (revision && contractVersion !== 2) fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
+  if (revision && contractVersion < 2) fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
+  // v3: a structured manual revision keeps the deterministic rule path; everything else is planned
+  // from an AI edit intent. The session id is fixed before the AI starts because input.json is
+  // immutable; reruns of the AI step in this attempt share it and are told apart by their logs.
+  const planningMode = contractVersion === 3 ? (revision ? "rule" : "ai_intent") : null;
+  if (planningMode === "ai_intent" && (!aiSession || typeof aiSession.agent !== "string" || !ID.test(aiSession.agent)
+    || typeof aiSession.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(aiSession.model)))
+    fail("VM_PMO_AI_NOT_CONFIGURED");
   const outputFilename = resolveVmStageFilename({config: profile,stageId,
     metadata: {fields: [{fieldId: profile.fields.namingFieldId,type: 1,uiType: "Text"}]},
     fields: {[profile.fields.namingFieldId]: contextValue.title},
     ...(review ? {reviewRound: origin.stageSnapshot.reviewRound} : {})});
-  const schemaVersion = contractVersion === 2 ? 2 : 1;
+  const schemaVersion = contractVersion;
   if (typeof runRoot !== "string" || !path.isAbsolute(runRoot) || path.normalize(runRoot) !== runRoot)
     fail("VM_PMO_INPUT_PATH_INVALID");
   await canonicalParent(runRoot);
@@ -141,6 +148,9 @@ export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, pro
   await canonical(runDir, true);
   const input = {
     protocol: "vm_pmo_review_video",schema_version: schemaVersion,
+    ...(planningMode ? {planning_mode: planningMode} : {}),
+    ...(planningMode === "ai_intent" ? {ai_session: {agent: aiSession.agent,model: aiSession.model,
+      session_id: `taskboard-${runId}-p${planAttempt}`}} : {}),
     package: {alias: packageSnapshot.packageAlias,name: manifest.name,version: manifest.version,manifest_sha256: manifestSha256},
     binding: {task_id: taskId,run_id: runId,subject_key: origin.subjectKey,config_version: String(origin.configVersion),
       stage_id: stageId,event_id: origin.eventId},
@@ -162,6 +172,11 @@ export async function prepareVmPmoRunInput({ runRoot, runId, taskId, origin, pro
   await immutableJson(contextPath, {protocol: input.protocol,schema_version: input.schema_version,input_sha256: inputSha256,
     run_dir: runDir,source_path: acquisition.path,plan_path: path.join(runDir, "plan.json"),
     plan_result_path: path.join(runDir, "plan-result.json"),result_path: path.join(runDir, "result.json"),
-    output_path: path.join(runDir, outputFilename)});
+    output_path: path.join(runDir, outputFilename),
+    ...(schemaVersion === 3 ? {evidence_dir: path.join(runDir, "evidence"),
+      intent_context_path: path.join(runDir, "intent-context.json"),
+      intent_path: path.join(runDir, "edit-intent.json"),
+      analyze_result_path: path.join(runDir, "analyze-result.json"),
+      qa_path: path.join(runDir, "qa.json"),qa_review_path: path.join(runDir, "qa-review.json")} : {})});
   return {contextPath,inputSha256,outputFilename,runnerOptions: {pythonPath,packageRoot,contextPath}};
 }
