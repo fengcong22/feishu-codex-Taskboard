@@ -1075,3 +1075,17 @@ test("VM drafts keep optional source-result options on the initial status field 
     await assert.rejects(() => f.put(draft, saved.revision), (error) => error.status === 400);
   }
 });
+
+test("an optional AI notes text field is saved only when bound and must be a field of its own", async (t) => {
+  const f = await fixture(t);
+  await f.put((await f.get()).body.config);
+  const valid = await populatedConfig(f);
+  const saved = await f.put({ ...valid, fields: { ...valid.fields, aiNotesFieldId: "fld_instruction" } }, 1);
+  assert.equal(saved.body.config.fields.aiNotesFieldId, "fld_instruction");
+  const cleared = await f.put({ ...valid, fields: { ...valid.fields, aiNotesFieldId: null } }, 2);
+  assert.equal(Object.hasOwn(cleared.body.config.fields, "aiNotesFieldId"), false);
+  for (const fieldId of ["fld_keep", "fld_vmid", "fld_output", "fld_status"]) {
+    await assert.rejects(f.put({ ...valid, fields: { ...valid.fields, aiNotesFieldId: fieldId } }, 3),
+      (error) => error.status === 400 && error.code === "INVALID_FIELD", fieldId);
+  }
+});

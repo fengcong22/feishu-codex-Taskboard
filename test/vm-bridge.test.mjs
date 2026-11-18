@@ -416,3 +416,13 @@ test("VM manual source request is retried while Taskboard is unavailable", async
   await bridge.handle(edge("opt_failed", "opt_source", { eventId: "evt_manual_retry" })).catch(() => {});
   assert.equal((await store.get("evt_manual_retry")).deliveryState, "retry_wait");
 });
+
+test("a VM subject may bind an optional AI notes text field without changing older snapshots", () => {
+  const plain = subject();
+  assert.equal(Object.hasOwn(plain.vmWorkflow.fields, "aiNotesFieldId"), false);
+  const withNotes = subject({ vmWorkflow: { ...plain.vmWorkflow,
+    fields: { ...plain.vmWorkflow.fields, aiNotesFieldId: "fld_ai_notes" } } });
+  assert.equal(withNotes.vmWorkflow.fields.aiNotesFieldId, "fld_ai_notes");
+  assert.throws(() => subject({ vmWorkflow: { ...plain.vmWorkflow,
+    fields: { ...plain.vmWorkflow.fields, unknownFieldId: "fld_x" } } }));
+});

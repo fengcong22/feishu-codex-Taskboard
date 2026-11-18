@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { open } from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 
 function failure(code) {
   const error = new Error(code);
@@ -113,5 +113,41 @@ export function createFeishuVmMp4Adapter({ client } = {}) {
     }), "VM_DELIVERY_BIND_FAILED");
   }
 
-  return Object.freeze({ uploadMedia, listFields, getRecord, updateRecord });
+  /** Streams one record attachment to a new file (never overwrites), capped at maxBytes. */
+  async function downloadMedia({ fileToken, tableId, targetPath, maxBytes }) {
+    if (typeof media.download !== "function") throw failure("VM_REVIEW_IMAGE_DOWNLOAD_UNAVAILABLE");
+    if (typeof fileToken !== "string" || !/^[A-Za-z0-9_-]{1,256}$/u.test(fileToken)
+      || typeof targetPath !== "string" || !Number.isSafeInteger(maxBytes) || maxBytes < 1)
+      throw failure("VM_REVIEW_IMAGE_INPUT_INVALID");
+    let response;
+    try { response = await media.download({ path: { file_token: fileToken } }); }
+    catch {
+      // Bases with advanced permissions require the table in the download context.
+      try { response = await media.download({ path: { file_token: fileToken },
+        params: { extra: JSON.stringify({ bitablePerm: { tableId } }) } }); }
+      catch { throw failure("VM_REVIEW_IMAGE_DOWNLOAD_FAILED"); }
+    }
+    const stream = response?.getReadableStream?.();
+    if (!stream) throw failure("VM_REVIEW_IMAGE_DOWNLOAD_FAILED");
+    const handle = await open(targetPath, "wx");
+    const hash = createHash("sha256");
+    let bytes = 0;
+    try {
+      for await (const chunk of stream) {
+        bytes += chunk.length;
+        if (bytes > maxBytes) throw failure("VM_REVIEW_IMAGE_TOO_LARGE");
+        hash.update(chunk);
+        await handle.write(chunk);
+      }
+    } catch (error) {
+      await handle.close().catch(() => {});
+      await rm(targetPath, { force: true }).catch(() => {});
+      throw error?.code?.startsWith?.("VM_REVIEW_IMAGE_") ? error : failure("VM_REVIEW_IMAGE_DOWNLOAD_FAILED");
+    }
+    await handle.close();
+    if (bytes < 1) { await rm(targetPath, { force: true }); throw failure("VM_REVIEW_IMAGE_DOWNLOAD_FAILED"); }
+    return { bytes, sha256: hash.digest("hex") };
+  }
+
+  return Object.freeze({ uploadMedia, listFields, getRecord, updateRecord, downloadMedia });
 }

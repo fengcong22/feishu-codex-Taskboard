@@ -12,6 +12,7 @@ export const AI_INTENT_AGENT = "codex";
 const EVENT_LOG_LIMIT = 8 * 1024 * 1024;
 const REPORT_LIMIT = 64 * 1024;
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const THREAD = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/u;
 // The session reads the package and writes one run directory; it never needs Feishu, VM approval,
 // bridge or Jira credentials, so those are removed before Codex starts.
 const PRIVATE_ENVIRONMENT = /^(?:FEISHU|LARK|CODEX_FEISHU|CODEX_TASKBOARD|CODEX_AUTOCUT|VM_|JIRA)|SECRET|PASSWORD/iu;
@@ -28,10 +29,26 @@ export function validVmPmoAiModel(value) {
 
 /** The package's Taskboard prompt (docs/prompts/taskboard-ai-editing.md) with absolute locations.
  * Rules stay in the package documents; this text only points to them and states the boundary. */
-export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context }) {
+export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context, history = null, resumed = false }) {
   const doc = (name) => path.join(packageRoot, ...name.split("/"));
+  const previous = history?.parentRunDir ? [
+    "",
+    "上一轮（只读参考，不要写入）：",
+    `- 上一轮运行目录：${history.parentRunDir}`,
+    `- 上一轮剪辑意图：${path.join(history.parentRunDir, "edit-intent.json")}`,
+    `- 上一轮计划与质检：${path.join(history.parentRunDir, "plan.json")}、${path.join(history.parentRunDir, "qa.json")}`,
+    "- 本轮的源视频就是上一轮交付的成片，时间以本轮源视频为准；input.json 的 prior_rounds 里有以往各轮的原意见。",
+  ] : [];
+  const images = history?.imagePaths?.length ? [
+    "",
+    "审核截图（已作为图片附在本条消息里，文件也在运行目录中，供对照意见理解画面位置）：",
+    ...history.imagePaths.map((file) => `- ${file}`),
+    "截图只用来理解意见指的是哪里；时间和画面仍须用证据命令取证，不能凭截图估计时间。",
+  ] : [];
   return [
-    "你在为 auto-cut-slicing 执行一次 VM/PMO 剪辑规划。",
+    resumed
+      ? "这是同一条记录的新一轮审核修改。你在上一轮写过这条视频的剪辑意图；请沿用你对素材和规则的理解，按新的意见在本轮运行目录重新完成规划。"
+      : "你在为 auto-cut-slicing 执行一次 VM/PMO 剪辑规划。",
     "",
     `包仓库：${packageRoot}（只读；下面提到的文档都在这里）`,
     `运行目录：${context.run_dir}（你的工作目录，唯一可写的位置）`,
@@ -52,13 +69,17 @@ export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context }) {
     `运行证据命令：包没有安装到 Python 环境，\`${pythonPath} -m auto_cut_slicing ...\` 必须在包仓库目录下执行`,
     `（先 \`Set-Location ${packageRoot}\`，再执行命令），`,
     `\`--context\` 写意图上下文的绝对路径 ${context.intent_context_path}。证据文件会写进 ${context.evidence_dir}${path.sep}。`,
+    ...previous,
+    ...images,
     "",
     "边界：",
     "- 只在运行目录内写文件，不修改仓库文件，不运行 render，不上传或回写任何系统。",
-    "- 这是无人值守运行，不能向用户提问。需要用户决定、证据不足或能力不支持时，",
-    "  写出 status 为 blocked 的意图文件并说明原因。",
+    "- 这是无人值守运行，不能向用户提问，要把工作做到底：能用证据和剪辑准则确定的就直接处理；",
+    "  反复运行 intent validate 直到没有问题。只有准则要求阻断时（做不到、缺证据、多处候选没有区分依据）",
+    "  才写 status 为 blocked 的意图文件，并写清人工需要补充什么。",
     "- 时间只能引用 docs/intent-schema.md“时间来源”中的来源。",
-    "- 结束时输出一段简短报告：每条意见的处理方式、阻断原因、仍需人工复核的项目。",
+    "- 结束时输出一段给审核人看的中文报告（会回写到飞书表格）：每条意见怎么处理、选了哪一处及依据、",
+    "  阻断原因和需要人工补充的说明、仍需人工复核的项目。",
     "",
   ].join("\n");
 }
@@ -85,13 +106,21 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof spawnTurn !== "function")
     throw failure("VM_PMO_AI_NOT_CONFIGURED");
   const session = Object.freeze({ agent: AI_INTENT_AGENT, model });
-  async function run({ context, packageRoot, pythonPath, sessionDir, signal, onSpawn = null } = {}) {
+  async function run({ context, packageRoot, pythonPath, sessionDir, signal, onSpawn = null,
+    resumeThreadId = null, history = null } = {}) {
     if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
-    const prompt = buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context });
+    if (resumeThreadId !== null && (typeof resumeThreadId !== "string" || !THREAD.test(resumeThreadId)))
+      throw failure("VM_PMO_RUN_INPUT_INVALID");
+    const images = Array.isArray(history?.imagePaths) ? history.imagePaths : [];
+    if (images.some((file) => typeof file !== "string" || !path.isAbsolute(file))) throw failure("VM_PMO_RUN_INPUT_INVALID");
+    const prompt = buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context, history, resumed: Boolean(resumeThreadId) });
     // Evidence commands are local; the session's own shell never needs the network.
     const args = ["exec", "--json", "--color", "never", "--skip-git-repo-check", "-C", context.run_dir,
       "-s", "workspace-write", "-c", 'approval_policy="never"',
-      "-c", "sandbox_workspace_write.network_access=false", "-m", model, "-"];
+      "-c", "sandbox_workspace_write.network_access=false", "-m", model,
+      // Review rounds continue the previous round's conversation; images ride along as attachments.
+      ...(resumeThreadId ? ["resume"] : []), ...images.flatMap((file) => ["-i", file]),
+      ...(resumeThreadId ? [resumeThreadId] : []), "-"];
     const startedAt = now().toISOString();
     await writeFile(path.join(sessionDir, "prompt.txt"), prompt, { flag: "wx" });
     const eventsPath = path.join(sessionDir, "events.jsonl");
@@ -132,10 +161,11 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
     if (!outcome) outcome = exit?.exitCode === 0 && !turnFailed ? "completed" : "failed";
     await writeFile(path.join(sessionDir, "report.txt"), report, { flag: "wx" });
     await writeFile(path.join(sessionDir, "outcome.json"), JSON.stringify({ agent: session.agent,
-      model: session.model, thread_id: threadId, started_at: startedAt, finished_at: now().toISOString(),
+      model: session.model, thread_id: threadId, resumed_from: resumeThreadId, images: images.length,
+      started_at: startedAt, finished_at: now().toISOString(),
       timeout_ms: timeoutMs, outcome, exit_code: exit?.exitCode ?? null }, null, 2) + "\n", { flag: "wx" });
     if (outcome === "interrupted") throw failure("VM_PMO_RUN_INTERRUPTED");
-    return { outcome, threadId };
+    return { outcome, threadId, report };
   }
   return Object.freeze({ session, run });
 }

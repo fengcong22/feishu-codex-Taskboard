@@ -296,8 +296,13 @@ function normalizeVmStage(value, stageId) {
 
 function normalizeVmWorkflow(value, statusField) {
   const input = exactKeys(value, ["fields", "approval", "stages", "finalArchive"], "vmWorkflow");
-  const rawFields = exactKeys(input.fields,
-    ["vmidFieldId", "outputAttachmentFieldId", "namingFieldId"], "vmWorkflow.fields");
+  // aiNotesFieldId is optional: older snapshots stay byte-identical without it.
+  const rawFields = plainObject(input.fields, "vmWorkflow.fields");
+  assertKnownKeys(rawFields, new Set(["vmidFieldId", "outputAttachmentFieldId", "namingFieldId", "aiNotesFieldId"]),
+    "vmWorkflow.fields");
+  for (const key of ["vmidFieldId", "outputAttachmentFieldId", "namingFieldId"]) {
+    if (!Object.hasOwn(rawFields, key)) fail(`vmWorkflow.fields.${key} is required`);
+  }
   const fields = Object.fromEntries(Object.keys(rawFields).map((key) => [key,
     idString(rawFields[key], `vmWorkflow.fields.${key}`)]));
   const rawApproval = exactKeys(input.approval, ["department", "reason"], "vmWorkflow.approval");

@@ -411,6 +411,14 @@ export function FeishuVmPmoWorkflowEditor({ subjectKey, packageAlias, fields, ca
         <legend>成片交付</legend>
         <div className="feishu-settings-grid">{fieldSelect("成品视频附件字段", config.fields.outputAttachmentFieldId, uniqueFields.filter(isAttachmentField), (value) => update({ ...config, fields: { ...config.fields, outputAttachmentFieldId: value } }))}</div>
         <p className="feishu-execution-help">各阶段生成的 MP4 上传到当前 PMO 记录的指定附件字段，上传、绑定并读回确认后才视为交付完成。</p>
+        <div className="feishu-settings-grid">{fieldSelect("AI 处理说明字段（可选）", config.fields.aiNotesFieldId ?? null,
+          uniqueFields.filter(textField).filter((field) => ![config.fields.vmidFieldId, config.fields.namingFieldId,
+            config.stages.initial.instructionFieldId, config.stages.review.instructionFieldId].includes(field.fieldId)),
+          (value) => {
+            const { aiNotesFieldId: _previous, ...rest } = config.fields;
+            update({ ...config, fields: value ? { ...rest, aiNotesFieldId: value } : rest });
+          }, "不回写")}</div>
+        <p className="feishu-execution-help">AI 剪辑时，每轮结束（交付成片或停止）都把 AI 的处理说明写进这个多行文本字段：怎么理解意见、选了哪一处、哪里需要人工补充。审核人在审核意见里补充说明后，下一轮会接着改。</p>
       </fieldset>
       <fieldset className="feishu-config-card">
         <legend>成片归档</legend>

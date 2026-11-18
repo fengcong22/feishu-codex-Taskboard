@@ -241,6 +241,8 @@ function validateConfigMetadata(config, metadata) {
   validateMetadataField(metadata, config.fields.vmidFieldId, isTextField, "config.fields.vmidFieldId");
   validateMetadataField(metadata, config.fields.outputAttachmentFieldId, isAttachmentMetadataField, "config.fields.outputAttachmentFieldId");
   validateMetadataField(metadata, config.fields.namingFieldId, isNamingField, "config.fields.namingFieldId");
+  if (Object.hasOwn(config.fields, "aiNotesFieldId"))
+    validateMetadataField(metadata, config.fields.aiNotesFieldId, isTextField, "config.fields.aiNotesFieldId");
   for (const stageId of STAGE_IDS) {
     const stage = config.stages[stageId];
     const name = `config.stages.${stageId}`;
@@ -267,7 +269,7 @@ function normalizeConfig(value, metadata = undefined, { allowLegacyArchive = fal
     && LEGACY_STAGE_IDS.slice(1).some((stageId) => Object.hasOwn(value.stages, stageId)));
   const fieldKeys = legacy ? LEGACY_FIELD_KEYS : FIELD_KEYS.filter((key) => key !== "namingFieldId");
   const stageIds = legacy ? LEGACY_STAGE_IDS : STAGE_IDS;
-  assertShape(value.fields, fieldKeys, "config.fields", ["namingFieldId"]);
+  assertShape(value.fields, fieldKeys, "config.fields", legacy ? ["namingFieldId"] : ["namingFieldId", "aiNotesFieldId"]);
   const sharedNaming = Object.hasOwn(value.fields, "namingFieldId");
   assertShape(value.approval, ["department", "reason"], "config.approval");
   assertShape(value.stages, stageIds, "config.stages");
@@ -275,6 +277,16 @@ function normalizeConfig(value, metadata = undefined, { allowLegacyArchive = fal
   const fields = Object.fromEntries(fieldKeys.map((key) => [key, optionalIdentifier(value.fields[key], `config.fields.${key}`)]));
   fields.namingFieldId = sharedNaming ? optionalIdentifier(value.fields.namingFieldId, "config.fields.namingFieldId") : null;
   const stages = Object.fromEntries(stageIds.map((stageId) => [stageId, normalizeStage(value.stages[stageId], stageId, legacy, sharedNaming)]));
+  // Optional AI notes field; kept out of the canonical shape when unset so older drafts stay identical.
+  const aiNotesFieldId = !legacy && Object.hasOwn(value.fields, "aiNotesFieldId")
+    ? optionalIdentifier(value.fields.aiNotesFieldId, "config.fields.aiNotesFieldId") : null;
+  if (aiNotesFieldId !== null) {
+    const reserved = [fields.vmidFieldId, fields.namingFieldId, fields.outputAttachmentFieldId,
+      ...Object.values(stages).flatMap((stage) => [stage.instructionFieldId, stage.statusFieldId])];
+    if (reserved.includes(aiNotesFieldId))
+      throw new ApiError(400, "INVALID_FIELD", "config.fields.aiNotesFieldId must be a field of its own");
+    fields.aiNotesFieldId = aiNotesFieldId;
+  }
   const approval = {
     department: draftText(value.approval.department, "config.approval.department", 200),
     reason: draftText(value.approval.reason, "config.approval.reason", 2000),

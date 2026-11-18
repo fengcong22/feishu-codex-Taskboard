@@ -6,7 +6,8 @@ import test from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
-import { createVmTaskRegistration, createVmRegistrationRecordReader } from "../server/vm-task-registration.mjs";
+import { createVmTaskRegistration, createVmRegistrationRecordReader, normalizeVmRecordContext } from "../server/vm-task-registration.mjs";
+import { createFeishuVmMp4Adapter } from "../server/vm-mp4-feishu-adapter.mjs";
 
 const TEMPLATE = { id: "vm_pmo_review_video", version: 1 };
 const ACTOR = { type: "agent", id: "bridge", name: "Feishu Bridge", avatarUrl: null };
@@ -463,4 +464,49 @@ test("review screenshots are optional but nonempty images cannot be silently ign
   delete fields.fld_review_images;
   liveFields.find(field => field.fieldId === "fld_review_images").type = 1;
   await assert.rejects(reader(request),{code:"VM_FIELD_BINDING_CHANGED"});
+});
+
+test("a package that declares review_images receives frozen screenshot references", async () => {
+  const snapshot = subject();
+  snapshot.vmWorkflow.stages.review = {enabled:true,statusFieldId:"fld_status",triggerOptionId:"opt_initial",
+    instructionFieldId:"fld_instruction",instructionAttachmentsFieldId:"fld_review_images"};
+  snapshot.metadata.fields.push({fieldId:"fld_review_images",fieldName:"审核意见截图说明",type:17,uiType:"Attachment"});
+  const fields = {fld_status:"待剪辑",fld_vmid:VMID,fld_name:"测试",fld_instruction:"把这一页的残留盖掉",
+    fld_review_images:[{file_token:"boxcn_shot_1",name:"修改截图.png",type:"image/png",size:100,url:"https://x"}]};
+  const reader = createVmRegistrationRecordReader({listFields:async () => structuredClone(snapshot.metadata.fields),
+    getRecord:async () => ({fields})});
+  const context = normalizeVmRecordContext(await reader({subject:snapshot,event:registration().event,stageId:"review",
+    allowReviewImages:true}));
+  assert.deepEqual(context.reviewImages,[{fileToken:"boxcn_shot_1",name:"修改截图.png",size:100,mimeType:"image/png"}]);
+  // Without screenshots the context keeps its older exact shape.
+  delete fields.fld_review_images;
+  assert.equal(Object.hasOwn(normalizeVmRecordContext(await reader({subject:snapshot,event:registration().event,
+    stageId:"review",allowReviewImages:true})),"reviewImages"),false);
+  // Non-image attachments are never passed on as screenshots.
+  fields.fld_review_images = [{file_token:"boxcn_doc",name:"说明.pdf",type:"application/pdf",size:100}];
+  await assert.rejects(async () => normalizeVmRecordContext(await reader({subject:snapshot,event:registration().event,
+    stageId:"review",allowReviewImages:true})),{code:"VM_REVIEW_IMAGES_UNSUPPORTED"});
+});
+
+test("screenshot download streams to a new file, hashes it and refuses oversize files", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "vm-image-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const calls = [];
+  const media = { uploadPrepare() {}, uploadPart() {}, uploadFinish() {},
+    async download(request) {
+      calls.push(request);
+      if (!request.params) throw new Error("needs bitable extra");
+      return { getReadableStream: () => (async function* () { yield Buffer.from("png-"); yield Buffer.from("bytes"); })() };
+    } };
+  const adapter = createFeishuVmMp4Adapter({ client: { drive: { v1: { media } },
+    bitable: { v1: { appTableField: { list() {} }, appTableRecord: { get() {}, update() {} } } } } });
+  const target = path.join(directory, "01.png");
+  const result = await adapter.downloadMedia({ fileToken: "boxcn_shot_1", tableId: "tbl_vm", targetPath: target, maxBytes: 100 });
+  assert.equal(result.bytes, 9);
+  assert.match(result.sha256, /^[a-f0-9]{64}$/u);
+  assert.equal(JSON.parse(calls[1].params.extra).bitablePerm.tableId, "tbl_vm");
+  await assert.rejects(adapter.downloadMedia({ fileToken: "boxcn_shot_1", tableId: "tbl_vm", targetPath: target, maxBytes: 100 }));
+  await assert.rejects(adapter.downloadMedia({ fileToken: "boxcn_shot_1", tableId: "tbl_vm",
+    targetPath: path.join(directory, "02.png"), maxBytes: 4 }), { code: "VM_REVIEW_IMAGE_TOO_LARGE" });
+  await assert.rejects(import("node:fs/promises").then(({ lstat }) => lstat(path.join(directory, "02.png"))), { code: "ENOENT" });
 });

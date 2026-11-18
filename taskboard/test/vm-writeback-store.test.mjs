@@ -299,3 +299,39 @@ test("VM source moments dispatch before processing and repeated failures keep th
     await assert.rejects(() => f.store.enqueueWritebackIntent(materialIntent(key, "opt_failed")), { code: "WRITEBACK_INVALID" });
   }
 });
+
+test("AI notes queue as text after the run's progress writes and dispatch unchanged", async (t) => {
+  const f = await fixture(t);
+  const notes = { idempotencyKey: `vm:run_vm:ai_notes:n${"b".repeat(32)}`, taskId: "task_vm", runId: "run_vm",
+    courseBindingId: null, operation: { type: "text", fieldId: "fld_notes", value: "AI 处理说明" } };
+  await f.store.enqueueWritebackIntent(intent());
+  const queued = await f.store.enqueueWritebackIntent(notes);
+  assert.equal(queued.moment, "ai_notes");
+  assert.equal(f.store.claimNextWritebackIntent().moment, "processing");
+  await assert.rejects(() => f.store.enqueueWritebackIntent({ ...notes,
+    operation: { type: "single_select", fieldId: "fld_status", optionId: "opt_processing" } }), { code: "WRITEBACK_INVALID" });
+  await assert.rejects(() => f.store.enqueueWritebackIntent({ ...notes,
+    operation: { ...notes.operation, value: "x".repeat(4097) } }), { code: "WRITEBACK_INVALID" });
+});
+
+test("an outbox from before AI notes is rebuilt in place with every row kept", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "vm-writeback-legacy-"));
+  const db = new DatabaseSync(path.join(directory, "state.sqlite"));
+  t.after(async () => { db.close(); await rm(directory, { recursive: true, force: true }); });
+  db.exec(`CREATE TABLE vm_writeback_outbox (id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL, run_id TEXT NOT NULL,
+    moment TEXT NOT NULL CHECK(moment IN ('processing','completed','materials_ready','download_failed')),
+    target_json TEXT NOT NULL, operation_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','processing','retry_wait','succeeded','conflict','dead_letter')),
+    version INTEGER NOT NULL, attempt_count INTEGER NOT NULL, next_attempt_at TEXT, claim_token TEXT,
+    lease_until TEXT, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+  db.prepare(`INSERT INTO vm_writeback_outbox VALUES ('vm-old', 'vm:run_vm:processing', 'task_vm', 'run_vm',
+    'processing', ?, ?, 'succeeded', 2, 1, NULL, NULL, NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
+    .run(JSON.stringify(target), JSON.stringify(intent().operation));
+  const store = createVmWritebackStore({ database: db, validateIntent: async (input) => ({ target, operation: input.operation }) });
+  assert.equal(store.getWritebackIntent("vm-old").state, "succeeded");
+  assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'vm_writeback_outbox'").get().sql, /'ai_notes'/u);
+  await store.enqueueWritebackIntent({ idempotencyKey: `vm:run_vm:ai_notes:n${"c".repeat(32)}`, taskId: "task_vm",
+    runId: "run_vm", courseBindingId: null, operation: { type: "text", fieldId: "fld_notes", value: "说明" } });
+  assert.equal(store.listWritebackIntents({ runId: "run_vm" }).length, 2);
+});
