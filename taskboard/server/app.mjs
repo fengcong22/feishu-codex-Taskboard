@@ -32,6 +32,7 @@ import { PackageWorkflowError, normalizePackageWorkflowTemplate, workflowTemplat
 import { createFeishuPackageWorkflowDrafts } from "./feishu-package-workflow-drafts.mjs";
 import { createPackageBoardSettings } from "./package-board-settings.mjs";
 import { readVmOverview } from "./vm-overview.mjs";
+import { createLinkHealthMonitor } from "./link-health.mjs";
 import { createFeishuSubjectShareApi } from "./feishu-subject-share.mjs";
 import {
   CloudProxyError,
@@ -3479,6 +3480,16 @@ export function createTaskboardServer(options = {}) {
   const automaticExecutionDefault = options.allowAutomaticExecution === undefined
     ? resolveAutomaticExecution()
     : options.allowAutomaticExecution === true;
+  // Sampled in the background so a dashboard read never touches the network.
+  // Every probe here is a read: nothing starts, wakes or re-authenticates.
+  const linkHealth = options.linkHealthMonitor ?? createLinkHealthMonitor({
+    bridgeUrl: () => {
+      const url = new URL(resolved.feishuBridgeUrl);
+      return url.protocol === "http:" && url.hostname === "127.0.0.1" ? url : null;
+    },
+    vmSession: () => (vmDownloads ? vmDownloads.snapshot().session : null),
+    automaticExecution: () => database.getAutomaticExecutionSetting(automaticExecutionDefault),
+  });
   function automaticExecutionEnabled() {
     try { return database.getAutomaticExecutionSetting(automaticExecutionDefault).enabled; }
     catch { return false; }
@@ -6197,9 +6208,10 @@ export function createTaskboardServer(options = {}) {
         if (requested !== null && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(requested)) {
           throw new ApiError(400, "INVALID_QUERY_PARAMETER", "VM overview projectId is invalid");
         }
-        return sendJson(response, 200, readVmOverview({
-          database, scheduler: resourceScheduler, projectId: requested,
-        }));
+        return sendJson(response, 200, {
+          ...readVmOverview({ database, scheduler: resourceScheduler, projectId: requested }),
+          linkHealth: linkHealth.snapshot(),
+        });
       }
       if (/^\/api\/local\/feishu\/subjects\/[^/]+\/package-workflow-drafts\/[^/]+(?:\/enable)?$/u.test(pathname)) {
         assertNoQuery(url.searchParams, pathname);
@@ -8780,6 +8792,9 @@ export function createTaskboardServer(options = {}) {
       startUploadWorker();
       startWritebackWorker();
       try { getVmDownloads().start(); } catch { /* Fail closed for downloads while keeping other local tools available. */ }
+      // Opt-in: a probe must never run in a test or an injected server that
+      // stands up a fake Bridge and asserts on the exact requests it receives.
+      if (options.sampleLinkHealth === true) linkHealth.start();
       const runtime = getVmRuntime();
       if (await vmPmoAvailable()) await runtime.start();
       else await runtime.startFinalArchive();
@@ -8787,6 +8802,7 @@ export function createTaskboardServer(options = {}) {
     },
     async close() {
       closing = true;
+      await linkHealth.close();
       await vmRuntime?.close();
       vmDownloadsClosing = true;
       const vmDownloadsClosed = vmDownloads?.close();

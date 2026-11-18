@@ -132,3 +132,75 @@ describe("VmOverviewDashboard", () => {
     await waitFor(() => expect(screen.getAllByText("VM_SOMETHING_NEW").length).toBeGreaterThan(0));
   });
 });
+
+function health(overrides: Partial<NonNullable<VmOverview["linkHealth"]>> = {}): NonNullable<VmOverview["linkHealth"]> {
+  return {
+    bridge: {
+      state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+      listener: { state: "sdk_managed", lastEventAt: new Date(Date.now() - 60_000).toISOString(), lastError: null },
+      queue: { pending: 2, processing: 0, retryWait: 1, deadLetter: 0 },
+    },
+    vmSession: { status: "connected", accountName: "张三", expiresAt: Date.now() + 3_600_000, errorCode: null },
+    automaticExecution: { enabled: false, version: 2 },
+    intervalMs: 30_000,
+    ...overrides,
+  };
+}
+
+describe("VmOverviewDashboard link health", () => {
+  it("reports a healthy bridge with how long since the last event", async () => {
+    body = overview({ linkHealth: health() });
+    renderDashboard();
+    expect(await screen.findByText("飞书 Bridge")).toBeTruthy();
+    expect(screen.getByText(/长连接已接管/)).toBeTruthy();
+    expect(screen.getByText("3 条待处理")).toBeTruthy();
+  });
+
+  it("marks an unreachable bridge as bad instead of quietly showing zeros", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "down", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false,
+          detail: null, listener: null, queue: null,
+        },
+      }),
+    });
+    renderDashboard();
+    expect(await screen.findByText("连不上 Bridge 进程")).toBeTruthy();
+    expect(screen.getByText("—")).toBeTruthy();
+  });
+
+  it("surfaces dead letters and a stale sample", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "up", checkedAt: new Date().toISOString(), ageMs: 600_000, stale: true,
+          detail: null, listener: null,
+          queue: { pending: 0, processing: 0, retryWait: 0, deadLetter: 3 },
+        },
+      }),
+    });
+    renderDashboard();
+    expect(await screen.findByText("采样已过期，状态未知")).toBeTruthy();
+  });
+
+  it("shows a disconnected sign-in and a switched-off automation", async () => {
+    body = overview({
+      linkHealth: health({
+        vmSession: { status: "auth_required", accountName: "张三", expiresAt: null, errorCode: "VM_AUTH_REQUIRED" },
+        automaticExecution: { enabled: false, version: 2 },
+      }),
+    });
+    renderDashboard();
+    expect(await screen.findByText("需要重连")).toBeTruthy();
+    expect(screen.getByText("已关闭")).toBeTruthy();
+    expect(screen.getByText(/新任务不会自动开始/)).toBeTruthy();
+  });
+
+  it("renders nothing extra when the server sends no link health", async () => {
+    body = overview();
+    renderDashboard();
+    await waitFor(() => expect(screen.getAllByText("剪辑中").length).toBeGreaterThan(0));
+    expect(screen.queryByText("链路健康")).toBeNull();
+  });
+});

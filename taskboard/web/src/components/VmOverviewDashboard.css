@@ -322,3 +322,38 @@
   .vm-overview-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .vm-quality-body { grid-template-columns: 1fr; }
 }
+
+/* Link health: three lines that answer "will the next round move". */
+.vm-overview-health { grid-column: span 1; }
+.vm-health-body { display: flex; flex-direction: column; }
+.vm-health-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px 16px;
+  border-bottom: .5px solid var(--border);
+}
+.vm-health-row:last-child { border-bottom: 0; }
+.vm-health-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+.vm-health-row.tone-ok .vm-health-dot { background: var(--status-review); }
+.vm-health-row.tone-warn .vm-health-dot { background: var(--priority-high); }
+.vm-health-row.tone-bad .vm-health-dot { background: var(--status-blocked); }
+.vm-health-copy { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; gap: 2px; }
+.vm-health-copy strong { color: var(--text-primary); font-size: 12px; font-weight: 550; }
+.vm-health-copy small {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vm-health-row b { flex: 0 0 auto; color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+.vm-health-row.tone-bad b { color: var(--status-blocked); }
+.vm-health-row.tone-warn b { color: var(--priority-high); }
