@@ -126,6 +126,12 @@ const rows = [
     delivered: true, deliveredAt: now - 30 * HOUR, deadLetter: true,
     payload: { planStartedAt: iso(now - 2 * DAY + HOUR), runnerStartedAt: iso(now - 2 * DAY + 2 * HOUR),
       completedAt: iso(now - 30 * HOUR - HOUR) } },
+  // Archived rows: the collapsed "已归档" section is how a wrongly archived
+  // round is recovered, so the demo shows one of each.
+  { title: "VM 010 阶段复习 · 第七讲 剪辑", recordId: "rec_010", state: "waiting_materials",
+    createdAt: now - 4 * HOUR, archived: true },
+  { title: "VM 011 阶段复习 · 第八讲 剪辑", recordId: "rec_011", state: "blocked",
+    errorCode: "VM_DOWNLOAD_FAILED", createdAt: now - 2 * DAY, archived: true },
 ];
 
 // createTask opens its own transaction, so each row commits on its own.
@@ -140,6 +146,7 @@ for (const row of rows) {
       .run(`wb_${randomUUID()}`, `wb_${randomUUID()}`, task.id, runId, "completed",
         "{}", "{}", "dead_letter", 1, 5, iso(now - 29 * HOUR), iso(now - 28 * HOUR));
   }
+  if (row.archived) database.archiveTask(task.id, task.version, null, null, ACTOR);
 }
 
 console.log(`Seeded ${rows.length} demo rows into ${dataDirectory}`);

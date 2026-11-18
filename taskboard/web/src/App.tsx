@@ -5264,6 +5264,7 @@ export function App() {
                 onOpenTask={openTaskDetail}
                 onUpdate={updateTaskProperties}
                 onArchiveTask={(task) => void archiveTask(task)}
+                onRestoreTask={(task) => void restoreArchivedTask(task)}
                 onDeleteTask={requestArchivedTaskDelete}
                 onCreateLabel={persistProjectLabel}
                 onOpenConversation={openTaskConversation}

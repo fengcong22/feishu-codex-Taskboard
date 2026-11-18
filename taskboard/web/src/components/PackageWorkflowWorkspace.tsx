@@ -30,17 +30,21 @@ import { TaskCard } from "./TaskCard";
 import { PackageWorkflowControls } from "./PackageWorkflowControls";
 import { PackageWorkflowCardActions } from "./PackageWorkflowCardActions";
 import {
-  matchesTaskFilters,
+  matchesTaskFilters as matchFilters,
   matchesTaskSearch,
   type TaskFilters,
 } from "../taskFilters";
 // @ts-expect-error Pure projection is covered by node:test.
 import { packageBoardChoices, projectVmPackageBoard, scopedPackageTasks, VM_PACKAGE_COLUMNS } from "../packageWorkflowBoard.mjs";
+// @ts-expect-error Pure projection is covered by node:test.
+import { archivedPackageTasks } from "../archivedPackageTasks.mjs";
 
 type Choice = {
   alias: string;
   name: string;
   historical: boolean;
+  /** Only an enabled package can take a restored task back. */
+  enabled?: boolean;
   workflowTemplate: { id: string; version: number } | null;
 };
 type Item = {
@@ -75,6 +79,7 @@ type Props = {
   onCreateLabel: (label: string) => Promise<void>;
   onOpenConversation: (conversation: TaskConversationItem) => void;
   onArchiveTask: (task: Task) => void;
+  onRestoreTask?: (task: Task) => void;
   onDeleteTask: (task: Task) => void;
   onScopeChange?: (scope: PackageBoardScope | null) => void;
   renderZipBoard: (scope: {
@@ -115,6 +120,9 @@ function errorText(error: unknown) {
 export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
   const { text, language } = useTaskboardI18n();
   const [packages, setPackages] = useState<FeishuPackageSummary[]>([]);
+  // Until the registry arrives every alias looks historical, so a restore
+  // warning must wait: telling someone their package is gone would be wrong.
+  const [packagesLoaded, setPackagesLoaded] = useState(false);
   const [selected, setSelected] = useState<{
     subjectKey: string;
     alias: string | null;
@@ -127,6 +135,7 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
   const [loading, setLoading] = useState(false);
   const [reload, setReload] = useState(0);
   const [showHistory, setShowHistory] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const choices = useMemo(
     () =>
       packageBoardChoices(
@@ -170,7 +179,7 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
     const controller = new AbortController();
     void listFeishuPackages(controller.signal)
       .then((value) => {
-        if (!controller.signal.aborted) setPackages(value);
+        if (!controller.signal.aborted) { setPackages(value); setPackagesLoaded(true); }
       })
       .catch((error) => {
         if (!controller.signal.aborted) setError(errorText(error));
@@ -198,6 +207,7 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
   ]);
   useEffect(() => {
     setShowHistory(false);
+    setShowArchived(false);
     setError(null);
     setLoading(Boolean(enabled && selectedAlias));
     if (!enabled || !selectedAlias) return;
@@ -274,11 +284,22 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
     packageAlias: selectedAlias,
   }) as { groups: Record<string, Item[]>; history: Item[] };
   const matches = (item: Item) =>
-    (!props.filters || matchesTaskFilters(item.task, props.filters)) &&
+    (!props.filters || matchFilters(item.task, props.filters)) &&
     matchesTaskSearch(item.task, props.search ?? "", language);
   for (const stage of Object.keys(projection.groups))
     projection.groups[stage] = projection.groups[stage].filter(matches);
   projection.history = projection.history.filter(matches);
+  const archived = archivedPackageTasks(
+    props.historicalTasks ?? [],
+    { subjectKey: props.subjectKey, packageAlias: selectedAlias },
+    {
+      search: props.search ?? "",
+      filters: props.filters ?? null,
+      matchFilters,
+      matchSearch: (task: Task, query: string) =>
+        matchesTaskSearch(task, query, language),
+    },
+  ) as { total: number; visible: Task[] };
   function columnName(id: PackageBoardStage) {
     const defaults = columns.find((column) => column.id === id);
     const override = currentBoard?.settings.stageDisplays.find(
@@ -470,6 +491,74 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
               ))}
             </div>
           </div>
+          {archived.total > 0 && (
+            <div className="package-workflow-history package-workflow-archived">
+              <button
+                type="button"
+                aria-expanded={showArchived}
+                onClick={() => setShowArchived((value) => !value)}
+              >
+                {text(
+                  `已归档 (${archived.total})`,
+                  `Archived (${archived.total})`,
+                )}
+              </button>
+              {showArchived && packagesLoaded && choice?.historical && (
+                <p className="package-workflow-archived-note">
+                  {text(
+                    "该剪辑包已从 Auto-Cut 包中删除，恢复会被拒绝；请先重新配置并启用原包。",
+                    "This package was removed from Auto-Cut packages, so restoring would be refused. Configure and enable it again first.",
+                  )}
+                </p>
+              )}
+              {showArchived && packagesLoaded && !choice?.historical && choice?.enabled === false && (
+                <p className="package-workflow-archived-note">
+                  {text(
+                    "该剪辑包当前未启用，恢复会被拒绝；请先在 Auto-Cut 包中启用它。",
+                    "This package is disabled, so restoring would be refused. Enable it under Auto-Cut packages first.",
+                  )}
+                </p>
+              )}
+              {showArchived &&
+                archived.visible.map((task) => (
+                  <div className="package-workflow-archived-row" key={task.id}>
+                    <button
+                      type="button"
+                      className="package-workflow-archived-open"
+                      onClick={() => props.onOpenTask(task)}
+                    >
+                      {task.externalKey ?? task.identifier} · {task.title}
+                    </button>
+                    {props.onRestoreTask && task.source !== "jira" && (
+                      <button
+                        type="button"
+                        className="package-workflow-archived-restore"
+                        disabled={packagesLoaded && (choice?.enabled === false || choice?.historical === true)}
+                        title={packagesLoaded && choice?.historical
+                          ? text("该剪辑包已删除，无法恢复", "The package was removed, so it cannot be restored")
+                          : packagesLoaded && choice?.enabled === false
+                            ? text("该剪辑包未启用，无法恢复", "The package is disabled, so it cannot be restored")
+                            : text(
+                              "把它恢复到看板上。适用于被迟到事件误归档的任务",
+                              "Put it back on the board, for tasks a late event archived by mistake",
+                            )}
+                        onClick={() => props.onRestoreTask?.(task)}
+                      >
+                        {text("恢复", "Restore")}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              {showArchived && archived.total > archived.visible.length && (
+                <p className="package-workflow-archived-note">
+                  {text(
+                    `另有 ${archived.total - archived.visible.length} 条较早的已归档任务，可用搜索缩小范围。`,
+                    `${archived.total - archived.visible.length} older archived tasks are not shown; narrow the search to find them.`,
+                  )}
+                </p>
+              )}
+            </div>
+          )}
           {projection.history.length > 0 && (
             <div className="package-workflow-history">
               <button
