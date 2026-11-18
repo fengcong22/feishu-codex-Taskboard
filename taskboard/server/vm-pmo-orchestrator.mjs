@@ -289,11 +289,14 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       : await bindings.reserve(taskId), taskId);
     if (json(frozenIdentity(database, taskId)) !== json(identity)) throw failure("VM_PMO_TASK_IDENTITY_CHANGED");
     const value = json(identity);
-    const payload = reviewParent ? { binding, approvalStatus: "ready", acquisition: {
-      path: reviewParent.localPath, sha256: reviewParent.sha256, bytes: reviewParent.bytes,
-      duration_ms: reviewParent.durationMs, vmid_binding: "managed_review_parent",
-      vmid: identity.stageSnapshot.vmContext.vmid,
-    }, planAttempt: 1, retryHistory: [] } : { binding, approvalStatus: "reserved", planAttempt: 1, retryHistory: [] };
+    // A rebased review cuts the original VM source verified for the root initial run; otherwise the parent MP4.
+    const reviewSource = reviewParent ? identity.stageSnapshot.reviewSource : undefined;
+    const payload = reviewParent ? { binding, approvalStatus: "ready", acquisition: reviewSource
+      ? structuredClone(reviewSource.acquisition) : {
+        path: reviewParent.localPath, sha256: reviewParent.sha256, bytes: reviewParent.bytes,
+        duration_ms: reviewParent.durationMs, vmid_binding: "managed_review_parent",
+        vmid: identity.stageSnapshot.vmContext.vmid,
+      }, planAttempt: 1, retryHistory: [] } : { binding, approvalStatus: "reserved", planAttempt: 1, retryHistory: [] };
     db.prepare(`INSERT INTO vm_pmo_runs (run_id, task_id, identity_json, identity_sha256,
       state, payload_json, next_attempt_at, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
@@ -716,7 +719,12 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       try { await onMaterialsReady({ run }); queued = true; } catch {}
       if (queued) run = update(runId, owner, "ready", { materialsReadyNotified: true });
     }
-    if (run.identity.origin.stageId === "review") {
+    const reviewSource = run.identity.origin.stageId === "review" ? run.identity.stageSnapshot.reviewSource : undefined;
+    if (reviewSource !== undefined) {
+      const acquired = run.acquisition;
+      if (!object(acquired) || reviewSource?.basis !== "vm_original" || !object(reviewSource.acquisition)
+        || json(acquired) !== json(reviewSource.acquisition)) throw failure("VM_PMO_REVIEW_SOURCE_INVALID");
+    } else if (run.identity.origin.stageId === "review") {
       const parent = run.identity.stageSnapshot.reviewParent;
       const acquired = run.acquisition;
       if (!object(acquired) || acquired.vmid_binding !== "managed_review_parent"

@@ -138,7 +138,8 @@ async function planWithIntent(options) {
     // An intent left by an interrupted or timed-out session is evidence, not input to this session.
     await rename(context.intent_path, path.join(sessionDir, "superseded-edit-intent.json"));
   }
-  const history = aiHistory ? { parentRunDir: aiHistory.parentRunDir ?? null, imagePaths: aiHistory.imagePaths ?? [] } : null;
+  const history = aiHistory ? { parentRunDir: aiHistory.parentRunDir ?? null, imagePaths: aiHistory.imagePaths ?? [],
+    rebased: aiHistory.rebased === true } : null;
   const runSession = (directory, resumeThreadId) => aiIntent.run({ context, packageRoot: step.packageRoot,
     pythonPath: step.pythonPath, sessionDir: directory, signal, resumeThreadId, history,
     onSpawn: started ? (evidence) => started(evidence) : null });

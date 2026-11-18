@@ -138,20 +138,25 @@ export async function createV3Fixture({root, packageRoot, pythonPath, safeEnv, m
     contractVersion: 3, driverId: 'vm_pmo_review_video_v3'};
   const environment = {...safeEnv, FEISHU_APP_SECRET: 'synthetic-must-be-stripped'};
 
-  async function prepare(name, {manualRevision, instruction = RAW} = {}) {
+  async function prepare(name, {manualRevision, instruction = RAW, review = null} = {}) {
+    const acquisition = {path: sourcePath, sha256: descriptor.sha256, bytes: sourceBytes.length,
+      duration_ms: Math.round(descriptor.duration_us / 1000), vmid_binding: 'vm_api_verified', vmid: 'offline-vmid'};
     const prepared = await prepareVmPmoRunInput({runRoot: path.join(root, 'v3-runs'), runId: `offline-v3-${name}`,
       taskId: `offline-v3-task-${name}`, pythonPath,
       origin: {source: 'feishu-base', packageSource: 'subject-config', eventId: `offline-v3-event-${name}`,
         baseToken: 'offline-base', tableId: 'offline-table', recordId: `offline-record-${name}`,
-        subjectKey: 'offline-base:offline-table', configVersion: 1, stageId: 'initial', packageAlias: 'slicing-offline',
-        stageSnapshot: {vmContext: {vmid: 'offline-vmid', title: `offline ${name}`, instruction}}},
+        subjectKey: 'offline-base:offline-table', configVersion: 1, stageId: review ? 'review' : 'initial',
+        packageAlias: 'slicing-offline',
+        stageSnapshot: {vmContext: {vmid: 'offline-vmid', title: `offline ${name}`, instruction},
+          ...(review ? {reviewRound: 1, reviewParent: review.parent,
+            reviewSource: {basis: 'vm_original', rootRunId: review.parent.runId, acquisition}} : {})}},
+      ...(review ? {rebase: review.rebase} : {}),
       profile: {fields: {namingFieldId: 'fld-name', outputAttachmentFieldId: 'fld-output'},
-        stages: {initial: {instructionFieldId: 'fld-instruction'}}},
+        stages: {initial: {instructionFieldId: 'fld-instruction'}, review: {instructionFieldId: 'fld-review'}}},
       packageSnapshot: {packageAlias: 'slicing-offline', workspacePath: v3Root,
         workflowTemplate: {id: 'vm_pmo_review_video', version: 1}},
       packageIdentity: identity, manualRevision,
-      acquisition: {path: sourcePath, sha256: descriptor.sha256, bytes: sourceBytes.length,
-        duration_ms: Math.round(descriptor.duration_us / 1000), vmid_binding: 'vm_api_verified', vmid: 'offline-vmid'},
+      acquisition,
       aiSession: manualRevision ? undefined : {agent: 'codex', model}});
     const bound = await validateVmPmoInput({contextPath: prepared.contextPath});
     const {context, input} = bound;
@@ -318,6 +323,42 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
   assert.equal(ruleRendered.status, 'rendered');
   assert.equal(await exists(rule.context.qa_path), false);
   checks.push('v3 rule planning with a manual revision runs without AI and without QA, like v2');
+
+  // 4b. A review on the original source: the reviewer's time on the draft maps back through the
+  // draft's own plan, earlier feedback is re-applied, and content the draft dropped is reachable again.
+  const draftPlan = JSON.parse(await readFile(happy.context.plan_path, 'utf8'));
+  const REVIEW = '结尾截到0:04.40';
+  const rebasedRun = await prepare('rebased-review', {instruction: REVIEW, review: {
+    parent: {runId: 'offline-v3-ai-intent', artifactId: 'offline-artifact', deliveryId: 'offline-delivery',
+      localPath: delivered.artifact?.path ?? happy.context.output_path, sha256: delivered.artifact?.sha256 ?? 'e'.repeat(64),
+      bytes: delivered.artifact?.bytes ?? 1, durationMs: draftPlan.expected_duration_ms, reviewRound: 0},
+    rebase: {rounds: [{instructionId: 'round-0', sourceFieldId: 'fld-instruction', rawText: RAW}],
+      timeMaps: [{time_map_id: 'cut-0', plan_sha256: sha256(await readFile(happy.context.plan_path)),
+        segments: draftPlan.segments.map(({source_start_us, duration_us, target_start_us}) =>
+          ({source_start_us, duration_us, target_start_us}))}]}}});
+  assert.equal(rebasedRun.input.source.timeline_basis, 'vm_original');
+  assert.deepEqual(rebasedRun.input.instructions.map(item => item.instruction_id), ['round-0', 'round-1']);
+  const rebasedAi = {session: {agent: 'codex', model: MODEL}, async run({context, onSpawn}) {
+    if (onSpawn) await onSpawn({pid: process.pid, startedAt: new Date().toISOString()});
+    const value = JSON.parse(JSON.stringify(await intentFor(context, descriptor)).replaceAll('"instruction-1"', '"round-0"'));
+    const reviewSpan = {instruction_id: 'round-1', start: REVIEW.indexOf('0:04.40'), end: REVIEW.indexOf('0:04.40') + 7};
+    value.instructions.push({instruction_id: 'round-1', raw_text: REVIEW, raw_text_sha256: sha256(Buffer.from(REVIEW))});
+    const clip = value.outputs[0].clips[0];
+    clip.covers.push(reviewSpan);
+    // 0:04.40 on the draft (kept 0-3.3 s and 4.0-5.6 s) is 5.1 s in the original.
+    clip.end = {mode: 'time', at: {ref: 'user_anchor', value_us: 5_100_000, span: reviewSpan}};
+    clip.operations[0].phrase.selection.scope_end_us = 5_100_000;
+    value.coverage[0].reason = '起点保留；终点由第 2 轮意见取代';
+    value.coverage.push({span: {instruction_id: 'round-1', start: 0, end: REVIEW.length}, quote: REVIEW,
+      disposition: 'operation', intent_ids: ['clip-1'], reason: '审核稿 0:04.40 换算到原片 5.10s'});
+    await save(context.intent_path, value);
+    return {outcome: 'completed', threadId: 'offline-thread'};
+  }};
+  const rebasedPlan = await runVmPmoDriver({...rebasedRun.options, mode: 'plan', aiIntent: rebasedAi});
+  assert.equal(rebasedPlan.status, 'ready', JSON.stringify(rebasedPlan.blockers ?? rebasedPlan.errorCode));
+  assert.equal(rebasedPlan.plan.expected_duration_ms, 4_400);
+  assert.equal(rebasedPlan.plan.rule_cross_check, 'not_applicable');
+  checks.push('a review on the original source maps the draft time back, re-applies earlier feedback and plans on the original');
 
   // 5. Tampered v3 bindings are refused before any package launch.
   const tampered = path.join(root, 'v3-tampered');

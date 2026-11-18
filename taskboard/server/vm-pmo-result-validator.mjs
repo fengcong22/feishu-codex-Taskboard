@@ -165,7 +165,7 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
   const version = input?.schema_version;
   if (!exactKeys(input, ["protocol", "schema_version", ...IDENTITY, "source", "instructions", "output_profile",
     ...(version === 3 ? ["planning_mode"] : [])],
-    version === 2 ? ["manual_revision"] : version === 3 ? ["manual_revision", "prior_rounds", "ai_session"] : [])
+    version === 2 ? ["manual_revision"] : version === 3 ? ["manual_revision", "prior_rounds", "ai_session", "time_maps"] : [])
     || input.protocol !== PROTOCOL || ![1, 2, 3].includes(version) || version !== context.schema_version
     || inputSha256 !== context.input_sha256
     || !object(input.package) || !object(input.binding) || !object(input.record)
@@ -178,7 +178,7 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
     || !Object.values(input.binding).every(identifier)
     || !exactKeys(input.record, ["base_token", "table_id", "record_id"])
     || !Object.values(input.record).every(identifier)
-    || !exactKeys(input.review_round, ["round_id", "input_snapshot_id", "parent"])
+    || !exactKeys(input.review_round, ["round_id", "input_snapshot_id", "parent"], version === 3 ? ["source_basis"] : [])
     || ![input.review_round.round_id, input.review_round.input_snapshot_id].every(identifier)
     || !exactKeys(input.delivery_target, ["attachment_field_id"])
     || !identifier(input.delivery_target.attachment_field_id)
@@ -188,7 +188,7 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
     || !Array.isArray(input.instructions) || input.instructions.length < 1
     || input.instructions.some((item) => !exactKeys(item, ["instruction_id",
       "source_field_id", "raw_text", "timeline_basis", "applicability"],
-      version >= 2 ? ["must_keep", "visual_evidence"] : [])
+      version === 3 ? ["must_keep", "visual_evidence", "time_map_id"] : version >= 2 ? ["must_keep", "visual_evidence"] : [])
       || ![item.instruction_id, item.source_field_id, item.timeline_basis, item.applicability].every(identifier)
       || typeof item.raw_text !== "string" || !item.raw_text.trim()
       || version >= 2 && item.must_keep !== undefined && (!Array.isArray(item.must_keep)
@@ -208,20 +208,17 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
       catch { fail("RUN_BINDING_MISMATCH"); }
     }
     const stageId = input.binding.stage_id;
-    const timeline = stageId === "review" ? "previous_review_video"
-      : stageId === "initial" ? "vm_original" : null;
-    // Only AI intent planning may carry several instructions; each one belongs to this round.
-    if (!timeline || input.source.timeline_basis !== timeline
-      || input.instructions.length !== 1 && input.planning_mode !== "ai_intent"
-      || input.instructions.some((item) => item.timeline_basis !== timeline
-        || item.applicability !== "current_round")) fail("RUN_BINDING_MISMATCH");
+    if (!roundTimelinesValid(input)) fail("RUN_BINDING_MISMATCH");
     if (stageId === "review") {
       const parent = input.review_round.parent;
+      // A rebased review cuts the original, so only the parent's own identity is checked here.
       if (!exactKeys(parent, ["kind", "run_id", "artifact_id", "delivery_id", "sha256", "bytes", "duration_ms"])
         || parent.kind !== "managed_run" || ![parent.run_id, parent.artifact_id, parent.delivery_id].every(identifier)
         || parent.run_id === input.binding.run_id || !digest(parent.sha256)
-        || parent.sha256 !== input.source.sha256 || parent.bytes !== input.source.bytes
-        || parent.duration_ms !== input.source.duration_ms) fail("RUN_BINDING_MISMATCH");
+        || !Number.isSafeInteger(parent.bytes) || parent.bytes < 1
+        || !Number.isSafeInteger(parent.duration_ms) || parent.duration_ms < 1
+        || !rebasedReview(input) && (parent.sha256 !== input.source.sha256 || parent.bytes !== input.source.bytes
+          || parent.duration_ms !== input.source.duration_ms)) fail("RUN_BINDING_MISMATCH");
     } else if (input.review_round.parent !== null) fail("RUN_BINDING_MISMATCH");
   }
   // Completed deliveries are verified against their own MP4. Their frozen input
@@ -231,6 +228,54 @@ async function loadBoundInput(contextPath, signal, expectedBound, verifyOriginal
   if (source.sha256 !== input.source.sha256 || source.bytes !== input.source.bytes)
     fail("SOURCE_HASH_MISMATCH");
   return { context, contextSha256, input, sourceSha256: source.sha256 };
+}
+
+/** A v3 AI review that re-plans the whole video on the original VM source (package review_original_source). */
+export function rebasedReview(input) {
+  return input?.schema_version === 3 && input.review_round?.source_basis === "vm_original";
+}
+
+function timeMapsValid(input) {
+  const maps = input.time_maps;
+  if (!Array.isArray(maps) || maps.length < 1 || maps.length > 20) return false;
+  const ids = new Set();
+  const limit = input.source.duration_ms * 1000;
+  for (const map of maps) {
+    if (!exactKeys(map, ["time_map_id", "plan_sha256", "segments"]) || !identifier(map.time_map_id)
+      || ids.has(map.time_map_id) || !digest(map.plan_sha256) || !Array.isArray(map.segments)
+      || map.segments.length < 1 || map.segments.length > 500) return false;
+    ids.add(map.time_map_id);
+    let offset = 0;
+    for (const segment of map.segments) {
+      if (!exactKeys(segment, ["source_start_us", "duration_us", "target_start_us"])
+        || !Number.isSafeInteger(segment.source_start_us) || segment.source_start_us < 0
+        || !Number.isSafeInteger(segment.duration_us) || segment.duration_us < 1
+        || segment.source_start_us + segment.duration_us > limit || segment.target_start_us !== offset) return false;
+      offset += segment.duration_us;
+    }
+  }
+  return true;
+}
+
+/** Every instruction must sit on the timeline of its round; a rebased review mixes the original and reviewed cuts. */
+function roundTimelinesValid(input) {
+  const stageId = input.binding.stage_id;
+  if (rebasedReview(input)) {
+    if (stageId !== "review" || input.planning_mode !== "ai_intent" || input.source.timeline_basis !== "vm_original"
+      || input.prior_rounds !== undefined || !timeMapsValid(input)) return false;
+    const maps = new Set(input.time_maps.map((map) => map.time_map_id));
+    return input.instructions.at(-1).applicability === "current_round"
+      && input.instructions.every((item) => ["current_round", "carried_over"].includes(item.applicability)
+        && (item.timeline_basis === "vm_original" ? item.time_map_id === undefined
+          : item.timeline_basis === "previous_review_video" && maps.has(item.time_map_id)));
+  }
+  const timeline = stageId === "review" ? "previous_review_video" : stageId === "initial" ? "vm_original" : null;
+  // Only AI intent planning may carry several instructions; each one belongs to this round.
+  return Boolean(timeline) && input.source.timeline_basis === timeline && input.time_maps === undefined
+    && input.review_round.source_basis === undefined
+    && (input.instructions.length === 1 || input.planning_mode === "ai_intent")
+    && input.instructions.every((item) => item.timeline_basis === timeline && item.applicability === "current_round"
+      && item.time_map_id === undefined);
 }
 
 function validV3Planning(input) {
@@ -359,16 +404,11 @@ function validCoverage(coverage, input) {
 
 function validateReadyV2Plan(plan, input, context, sourceSha256) {
   const stageId = input.binding.stage_id;
-  const timeline = stageId === "review" ? "previous_review_video"
-    : stageId === "initial" ? "vm_original" : null;
-  if (!timeline || input.source.timeline_basis !== timeline
+  if (!roundTimelinesValid(input)
     || stageId === "review" && input.review_round.parent?.kind !== "managed_run"
     || stageId === "initial" && input.review_round.parent !== null
     || !same(input.output_profile, { id: "review_mp4_v1", width: 1920, height: 1080,
-      fps: 25, audio: "preserve" })
-    || input.instructions.length !== 1 && input.planning_mode !== "ai_intent"
-    || input.instructions.some((item) => item.timeline_basis !== timeline
-      || item.applicability !== "current_round")) fail("PLAN_INVALID");
+      fps: 25, audio: "preserve" })) fail("PLAN_INVALID");
   const v3 = input.schema_version === 3, aiIntent = v3 && input.planning_mode === "ai_intent";
   if (!exactKeys(plan, ["protocol", "schema_version", ...IDENTITY, "source", "input_sha256",
     "source_sha256", "instruction_results", "segments", "operations", "expected_duration_ms",

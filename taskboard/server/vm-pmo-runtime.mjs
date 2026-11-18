@@ -271,14 +271,16 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   }
 
   /** Screenshots are accepted only when the package's v3 contract declares the review_images input. */
-  async function reviewImagesSupported(record) {
+  /** v3 package inputs declared in the manifest (review_images, review_original_source). */
+  async function packageInputs(record) {
     try {
       await canonicalLocation(record.workspacePath,{directory: true});
       const manifest = JSON.parse(await readFile(path.join(record.workspacePath,"PACKAGE-MANIFEST.json"),"utf8"));
       return manifest.interface?.contract?.version === 3 && Array.isArray(manifest.interface?.inputs)
-        && manifest.interface.inputs.includes("review_images");
-    } catch {return false;}
+        ? manifest.interface.inputs.filter(value => typeof value === "string") : [];
+    } catch {return [];}
   }
+  async function reviewImagesSupported(record) {return (await packageInputs(record)).includes("review_images");}
   async function inspectPackage(record) {
     if (!object(record) || !template(record.workflowTemplate)) throw fail("PACKAGE_WORKFLOW_MISMATCH");
     try {
@@ -398,6 +400,67 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         workflowTemplate: {...subject.workflowTemplate}};
     }
 
+    /** A review goes back to the original source only when the package supports it and every earlier
+     * round was planned on that original (the initial round, or reviews that were themselves rebased). */
+    async function resolveReviewSource({parent,packageRecord}) {
+      if (!(await packageInputs(packageRecord)).includes("review_original_source")) return null;
+      const parentRun = orchestrator.get(parent.runId);
+      if (!parentRun || parentRun.state !== "completed") return null;
+      const parentStage = parentRun.identity.origin.stageId;
+      if (parentStage === "review") {
+        const inherited = parentRun.identity.stageSnapshot?.reviewSource;
+        return inherited?.basis === "vm_original" ? structuredClone(inherited) : null;
+      }
+      const acquired = parentRun.acquisition;
+      if (parentStage !== "initial" || !["vm_api_verified","operator_asserted"].includes(acquired?.vmid_binding)
+        || !HASH.test(parentRun.planSha256 ?? "")) return null;
+      try {
+        // Only v2/v3 plans have the microsecond segment table a time map needs.
+        const bound = JSON.parse(db.prepare("SELECT bound_json FROM vm_pmo_attempt_inputs WHERE run_id = ? AND context_path = ?")
+          .get(parentRun.runId,parentRun.prepared.contextPath).bound_json);
+        if (!(bound.input.schema_version >= 2)) return null;
+        // A retired original keeps the review on the parent MP4 instead of failing later.
+        if (!(await lstat(acquired.path)).isFile()) return null;
+      } catch {return null;}
+      const acquisition = Object.fromEntries(["path","sha256","bytes","duration_ms","vmid_binding","vmid","receipt_path"]
+        .filter(key => acquired[key] !== undefined).map(key => [key,acquired[key]]));
+      return {basis: "vm_original",rootRunId: parentRun.runId,acquisition};
+    }
+    /** Every earlier round of a rebased review (oldest first) and the segment table of each delivered cut. */
+    async function rebaseFor(run) {
+      const chain = [];
+      let parentId = run.identity.stageSnapshot.reviewParent.runId;
+      while (parentId && chain.length < 20) {
+        const parentRun = orchestrator.get(parentId);
+        if (!parentRun || parentRun.state !== "completed" || !HASH.test(parentRun.planSha256 ?? ""))
+          throw fail("VM_PMO_REVIEW_SOURCE_INVALID");
+        chain.unshift(parentRun);
+        parentId = parentRun.identity.origin.stageId === "review" ? parentRun.identity.stageSnapshot.reviewParent.runId : null;
+      }
+      if (chain[0]?.runId !== run.identity.stageSnapshot.reviewSource.rootRunId) throw fail("VM_PMO_REVIEW_SOURCE_INVALID");
+      const rounds = [], timeMaps = [];
+      for (const [index,round] of chain.entries()) {
+        const text = round.identity.stageSnapshot.vmContext?.instruction;
+        const fieldId = round.identity.stageSnapshot.instructionFieldId;
+        if (typeof text !== "string" || !text.trim() || typeof fieldId !== "string") throw fail("VM_PMO_REVIEW_SOURCE_INVALID");
+        rounds.push({instructionId: `round-${index}`,sourceFieldId: fieldId,rawText: text,
+          ...(index ? {timeMapId: `cut-${index - 1}`} : {})});
+        // The cut a reviewer watched: its own plan, re-hashed against the plan the run rendered.
+        const row = db.prepare("SELECT bound_json FROM vm_pmo_attempt_inputs WHERE run_id = ? AND context_path = ?")
+          .get(round.runId,round.prepared.contextPath);
+        let plan;
+        try {
+          const planPath = JSON.parse(row.bound_json).context.plan_path;
+          const bytes = await readFile(planPath);
+          if (digest(bytes) !== round.planSha256) throw new Error("plan changed");
+          plan = JSON.parse(bytes.toString("utf8"));
+        } catch {throw fail("VM_PMO_REVIEW_SOURCE_INVALID");}
+        if (!Array.isArray(plan.segments) || !plan.segments.length) throw fail("VM_PMO_REVIEW_SOURCE_INVALID");
+        timeMaps.push({time_map_id: `cut-${index}`,plan_sha256: round.planSha256,segments: plan.segments.map(segment => ({
+          source_start_us: segment.source_start_us,duration_us: segment.duration_us,target_start_us: segment.target_start_us}))});
+      }
+      return {rounds,timeMaps};
+    }
     /** Earlier rounds of a review chain, oldest first, read from trusted task origins only. */
     function priorRoundsFor(origin) {
       const rounds = [], seen = new Set();
@@ -431,7 +494,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
             && (!latest || String(outcome.finished_at) > String(latest.finished_at))) latest = outcome;
         } catch {}
       }
-      return {parentRunDir, resumeThreadId: latest?.thread_id ?? null, imagePaths: await reviewImagesFor(run)};
+      return {parentRunDir, resumeThreadId: latest?.thread_id ?? null, imagePaths: await reviewImagesFor(run),
+        rebased: Boolean(run.identity.stageSnapshot?.reviewSource)};
     }
     /** Downloads the frozen review screenshots once per run, beside (not inside) the AI-writable attempt
      * directory, and re-verifies their recorded SHA-256 on every later use. */
@@ -749,7 +813,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const prepared = await prepareVmPmoRunInput({runRoot,runId: run.runId,taskId: run.taskId,origin,
           profile: local.subject.vmWorkflow,packageSnapshot: database.getFeishuTaskPackageSnapshot(run.taskId),
           packageIdentity,acquisition,pythonPath,planAttempt,manualRevision:run.manualRevision,
-          aiSession:aiIntent?.session,priorRounds:priorRoundsFor(origin)});
+          aiSession:aiIntent?.session,priorRounds:priorRoundsFor(origin),
+          ...(origin.stageSnapshot?.reviewSource ? {rebase: await rebaseFor(run)} : {})});
         const bound = await validateVmPmoInput({contextPath: prepared.contextPath});
         const value = canonicalJson(bound);
         db.prepare(`INSERT INTO vm_pmo_attempt_inputs(run_id,task_id,plan_attempt,context_path,input_sha256,
@@ -768,11 +833,15 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
           const frozenParent = origin.stageSnapshot?.reviewParent;
           const parent = await resolveReviewParent({subject:local.subject,
             event:{recordId:origin.recordId,occurredAt:origin.eventOccurredAt},excludeTaskId:run.taskId});
-          if (!parent || !same(parent,frozenParent) || run.approvalStatus !== "ready"
+          const reviewSource = origin.stageSnapshot?.reviewSource;
+          if (reviewSource && (!parent || !same(parent,frozenParent) || run.approvalStatus !== "ready"
+            || run.binding.approvalJobId !== null || !same(run.acquisition,reviewSource.acquisition)))
+            throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
+          if (!reviewSource && (!parent || !same(parent,frozenParent) || run.approvalStatus !== "ready"
             || run.binding.approvalJobId !== null || run.acquisition?.vmid_binding !== "managed_review_parent"
             || run.acquisition.path !== parent.localPath || run.acquisition.sha256 !== parent.sha256
             || run.acquisition.bytes !== parent.bytes || run.acquisition.duration_ms !== parent.durationMs
-            || run.acquisition.vmid !== origin.stageSnapshot.vmContext?.vmid)
+            || run.acquisition.vmid !== origin.stageSnapshot.vmContext?.vmid))
             throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
           try {await boundFor(run.prepared.runnerOptions,{runId:run.runId,taskId:run.taskId,
             planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256});}
@@ -870,7 +939,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     });
     services = {orchestrator,delivery,finalArchive,writebackStore,writebackWorker,metadata,enqueueWriteback,enqueueAiNotes,latestStageOrigin,
       registration: createVmTaskRegistration({database,getPackage,getActiveSubject,readCurrentRecord,
-        resolveReviewParent,reviewImagesSupported,
+        resolveReviewParent,reviewImagesSupported,resolveReviewSource,
         prepareCommit: async ({subject,packageRecord,origin}) => {
           const assertParent = ({taskId}) => {
             if (origin.stageId !== "review") return;
