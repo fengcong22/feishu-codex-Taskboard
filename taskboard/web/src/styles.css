@@ -16288,3 +16288,26 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
 .ai-provider-form label { display: grid; gap: 4px; font-size: 13px; }
 .ai-provider-test { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; }
 .ai-provider-test-ok { color: #15803d; }
+
+/* Archived tasks of one package: a late event can archive a fresh round by
+   mistake, and those tasks leave the columns entirely. Keep them behind a
+   collapsed section so a human can put one back without touching the database. */
+.package-workflow-archived { flex-direction: column; align-items: stretch; gap: 4px; }
+.package-workflow-archived > button[aria-expanded] { align-self: flex-start; }
+.package-workflow-archived-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.package-workflow-archived-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.package-workflow-archived-restore { flex: 0 0 auto; }
+.package-workflow-archived-note { margin: 2px 0 0; color: var(--text-tertiary); font-size: 11px; }

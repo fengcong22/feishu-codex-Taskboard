@@ -29,6 +29,9 @@ export function packageBoardChoices(packages, tasks, activeAlias) {
       ...item,
       name: item.identity?.displayName || item.name,
       historical: false,
+      // Restoring an archived task requires its package to still be enabled;
+      // surfacing that here lets the board explain it before a click fails.
+      enabled: item.state === "enabled",
       workflowTemplate: item.workflowTemplate ?? {
         id: "document_draft_zip",
         version: 1,

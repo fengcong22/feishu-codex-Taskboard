@@ -119,7 +119,14 @@ function response(alias = "slicing"): PackageBoardResponse {
     },
   };
 }
-function mount(actions = { onArchiveTask: vi.fn(), onDeleteTask: vi.fn() }) {
+type MountActions = {
+  onArchiveTask: (task: Task) => void;
+  onDeleteTask: (task: Task) => void;
+  onRestoreTask?: (task: Task) => void;
+  historicalTasks?: Task[];
+};
+
+function mount(actions: MountActions = { onArchiveTask: vi.fn(), onDeleteTask: vi.fn() }) {
   return render(
     <TaskboardLanguageProvider language="zh">
       <PackageWorkflowWorkspace
@@ -159,7 +166,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.resetAllMocks();
   vi.mocked(api.listFeishuPackages).mockResolvedValue([
-    { alias: "slicing", name: "Slicing", workflowTemplate: template },
+    { alias: "slicing", name: "Slicing", state: "enabled", workflowTemplate: template },
     {
       alias: "lite",
       name: "Lite",
@@ -270,4 +277,82 @@ it("saves labels and custom views only in the selected package settings", async 
   expect(
     await screen.findByRole("region", { name: "待飞书反馈" }),
   ).toBeTruthy();
+});
+
+it("keeps a wrongly archived task recoverable behind a collapsed section", async () => {
+  const archivedTask = {
+    id: "archived-task",
+    identifier: "VM-7",
+    title: "误归档的第七轮",
+    status: "todo",
+    archivedAt: "2026-11-18T02:00:00Z",
+    feishuOrigin: { source: "feishu-base", subjectKey, packageAlias: "slicing", recordId: "record-7" },
+    feishuPackageSnapshot: { workflowTemplate: template },
+  } as Task;
+  const onRestoreTask = vi.fn();
+  mount({
+    onArchiveTask: vi.fn(),
+    onDeleteTask: vi.fn(),
+    onRestoreTask,
+    historicalTasks: [archivedTask],
+  });
+  const toggle = await screen.findByRole("button", { name: "已归档 (1)" });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  // Collapsed by default: the board itself stays about live work.
+  expect(screen.queryByText(/误归档的第七轮/)).toBeNull();
+
+  fireEvent.click(toggle);
+  const restore = await screen.findByRole("button", { name: "恢复" });
+  fireEvent.click(restore);
+  expect(onRestoreTask).toHaveBeenCalledExactlyOnceWith(archivedTask);
+});
+
+it("does not list archived tasks belonging to another package", async () => {
+  const otherPackage = {
+    id: "other-archived",
+    identifier: "VM-8",
+    title: "别的包的历史",
+    status: "todo",
+    archivedAt: "2026-11-18T02:00:00Z",
+    feishuOrigin: { source: "feishu-base", subjectKey, packageAlias: "lite", recordId: "record-8" },
+    feishuPackageSnapshot: { workflowTemplate: { id: "document_draft_zip", version: 1 } },
+  } as Task;
+  mount({
+    onArchiveTask: vi.fn(),
+    onDeleteTask: vi.fn(),
+    onRestoreTask: vi.fn(),
+    historicalTasks: [otherPackage],
+  });
+  await screen.findByText("VM video");
+  // Restoring must never reach another package's history, so there is no entry.
+  expect(screen.queryByRole("button", { name: /已归档/ })).toBeNull();
+  expect(screen.queryByText(/别的包的历史/)).toBeNull();
+});
+
+it("explains a disabled package instead of letting a restore fail after the click", async () => {
+  vi.mocked(api.listFeishuPackages).mockResolvedValue([
+    { alias: "slicing", name: "Slicing", state: "disabled", workflowTemplate: template },
+  ] as Awaited<ReturnType<typeof api.listFeishuPackages>>);
+  const archivedTask = {
+    id: "archived-task",
+    identifier: "VM-7",
+    title: "误归档的第七轮",
+    status: "todo",
+    archivedAt: "2026-11-18T02:00:00Z",
+    feishuOrigin: { source: "feishu-base", subjectKey, packageAlias: "slicing", recordId: "record-7" },
+    feishuPackageSnapshot: { workflowTemplate: template },
+  } as Task;
+  const onRestoreTask = vi.fn();
+  mount({
+    onArchiveTask: vi.fn(),
+    onDeleteTask: vi.fn(),
+    onRestoreTask,
+    historicalTasks: [archivedTask],
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "已归档 (1)" }));
+  const restore = await screen.findByRole("button", { name: "恢复" });
+  expect((restore as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText(/该剪辑包当前未启用，恢复会被拒绝/)).toBeTruthy();
+  fireEvent.click(restore);
+  expect(onRestoreTask).not.toHaveBeenCalled();
 });
