@@ -829,3 +829,25 @@ test("a refused operator source stays blocked and a later status edge may try ag
   await x.restart();
   assert.equal(x.f.get("run_vm").manualSource.state, "pending");
 });
+
+test("a review on the original source cuts the root's verified original, not the parent MP4", async (t) => {
+  const x = await fixture(t);
+  x.origin.stageId = "review";
+  x.origin.stageSnapshot.reviewRound = 1;
+  x.origin.stageSnapshot.reviewParent = { runId: "run_parent", artifactId: "artifact_parent",
+    deliveryId: "delivery_parent", localPath: path.join(path.dirname(x.prepared.contextPath), "parent.mp4"),
+    sha256: "e".repeat(64), bytes: 256, durationMs: 1_000, reviewRound: 0 };
+  const original = { path: path.join(path.dirname(x.prepared.contextPath), "original.mp4"), sha256: "a".repeat(64),
+    bytes: 100, duration_ms: 1000, vmid_binding: "vm_api_verified",
+    receipt_path: path.join(path.dirname(x.prepared.contextPath), "receipt.json") };
+  x.origin.stageSnapshot.reviewSource = { basis: "vm_original", rootRunId: "run_parent", acquisition: original };
+  x.origin.stageSnapshot.vmWorkflow.stages = { review: { enabled: true } };
+  x.origin.stageSnapshot.vmContext = { vmid: "5dd7753a4723ba416403cbad", title: "课程",
+    instruction: "结尾那句话没说完", statusOptionId: "opt_review" };
+
+  const registered = await x.f.register({ taskId: "task_vm" });
+  assert.deepEqual([registered.state, registered.acquisition], ["ready", original]);
+  assert.equal((await x.f.pump(registered.runId)).state, "delivery_pending");
+  assert.equal(x.calls.find(([name]) => name === "prepare")[1].acquisition.path, original.path);
+  assert.equal(x.calls.some(([name]) => ["reserve", "reconcile", "status"].includes(name)), false);
+});

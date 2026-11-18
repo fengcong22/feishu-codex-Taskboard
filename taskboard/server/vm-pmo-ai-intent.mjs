@@ -37,7 +37,16 @@ export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context, his
     `- 上一轮运行目录：${history.parentRunDir}`,
     `- 上一轮剪辑意图：${path.join(history.parentRunDir, "edit-intent.json")}`,
     `- 上一轮计划与质检：${path.join(history.parentRunDir, "plan.json")}、${path.join(history.parentRunDir, "qa.json")}`,
-    "- 本轮的源视频就是上一轮交付的成片，时间以本轮源视频为准；input.json 的 prior_rounds 里有以往各轮的原意见。",
+    ...(history.rebased ? [
+      "- 本轮在原视频上重新剪整条视频（不是在上一轮成片上改）。上一轮的 edit-intent.json 就在原视频时间轴上，",
+      "  可以以它为起点修改：保留仍然有效的处理，按新意见调整，被上一轮剪掉、现在要加回的内容可以直接从原视频取。",
+      "- input.json 的 instructions 包含全部轮次的意见，每条都要在覆盖表里处理；后一轮与前一轮冲突时以后一轮为准，",
+      "  被取代的部分写 context 并说明。",
+      "- 审核意见里写的时间是审核人看的那一稿上的时间。intent-context 里这些意见带 time_map（那一稿的片段表）：",
+      "  引用这类时间（user_anchor）时，value_us 写按片段表换算后的原视频时间，validator 会按同一张表复核。",
+    ] : [
+      "- 本轮的源视频就是上一轮交付的成片，时间以本轮源视频为准；input.json 的 prior_rounds 里有以往各轮的原意见。",
+    ]),
   ] : [];
   const images = history?.imagePaths?.length ? [
     "",

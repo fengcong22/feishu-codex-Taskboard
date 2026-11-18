@@ -290,3 +290,51 @@ test("review input carries earlier rounds as read-only prior_rounds", async t =>
   // Only review rounds have earlier rounds to show.
   assert.equal(input.prior_rounds, undefined);
 });
+
+const CUT = [{ source_start_us: 0, duration_us: 3_300_000, target_start_us: 0 },
+  { source_start_us: 4_000_000, duration_us: 1_600_000, target_start_us: 3_300_000 }];
+
+async function rebasedArgs(t) {
+  const args = await fixture(t);
+  args.origin.stageId = "review";
+  args.origin.stageSnapshot = { ...args.origin.stageSnapshot, reviewRound: 1,
+    vmContext: { ...args.origin.stageSnapshot.vmContext, instruction: "结尾那句话没说完，补完整" },
+    reviewParent: { runId: "parent-run", artifactId: "parent-artifact", deliveryId: "delivery-1",
+      localPath: "E:/parent.mp4", sha256: "e".repeat(64), bytes: 10, durationMs: 4_900, reviewRound: 0 },
+    reviewSource: { basis: "vm_original", rootRunId: "parent-run", acquisition: structuredClone(args.acquisition) } };
+  args.profile.stages.review = { instructionFieldId: "fld-review" };
+  args.rebase = { rounds: [{ instructionId: "round-0", sourceFieldId: "fld-instruction", rawText: "0:00-0:05.60" }],
+    timeMaps: [{ time_map_id: "cut-0", plan_sha256: "f".repeat(64), segments: CUT }] };
+  return args;
+}
+
+test("a review on the original source re-applies every round and maps the reviewed cut", async t => {
+  const args = await rebasedArgs(t);
+  const prepared = await prepareVmPmoRunInput(args);
+  const { input } = await validateVmPmoInput({ contextPath: prepared.contextPath });
+  assert.equal(input.source.timeline_basis, "vm_original");
+  assert.equal(input.source.sha256, args.acquisition.sha256);
+  assert.equal(input.review_round.source_basis, "vm_original");
+  assert.equal(input.review_round.parent.sha256, "e".repeat(64));
+  assert.deepEqual(input.instructions.map((item) => [item.instruction_id, item.timeline_basis, item.applicability, item.time_map_id]),
+    [["round-0", "vm_original", "carried_over", undefined],
+      ["round-1", "previous_review_video", "current_round", "cut-0"]]);
+  assert.deepEqual(input.time_maps[0].segments, CUT);
+  assert.equal(input.prior_rounds, undefined);
+});
+
+test("a review on the original source refuses another source, rule planning or a broken chain", async t => {
+  for (const [name, change] of [
+    ["other file", (args) => { args.origin.stageSnapshot.reviewSource.acquisition.sha256 = "0".repeat(64); }],
+    ["missing round", (args) => { args.rebase.rounds = []; }],
+    ["wrong map", (args) => { args.rebase.timeMaps[0].time_map_id = "cut-x"; args.rebase.rounds.push({
+      instructionId: "round-1", sourceFieldId: "fld-review", rawText: "x", timeMapId: "cut-0" }); }],
+    ["rule planning", (args) => { args.manualRevision = { sourceSha256: args.acquisition.sha256, note: "x",
+      clips: [{ startMs: 0, endMs: 1000 }] }; }],
+  ]) {
+    const args = await rebasedArgs(t);
+    args.runId = `run-${name.replace(/ /gu, "-")}`;
+    change(args);
+    await assert.rejects(prepareVmPmoRunInput(args), { code: "VM_PMO_REVIEW_SOURCE_INVALID" }, name);
+  }
+});
