@@ -1219,3 +1219,78 @@ export interface AiProviderInput {
 
 export type AiProviderTestResult = { ok: true; models: string[] }
   | { ok: false; errorCode: string; status?: number; detail?: string };
+
+/** One VM/PMO task as the dashboard needs it: pipeline position plus why it stopped. */
+export interface VmOverviewTask {
+  taskId: string;
+  projectId: string;
+  title: string;
+  subjectKey: string;
+  packageAlias: string | null;
+  baseToken: string;
+  tableId: string;
+  recordId: string;
+  stage: "initial" | "review";
+  reviewRound: number;
+  taskStatus: TaskStatus;
+  archived: boolean;
+  createdAt: string | null;
+  runId: string | null;
+  state: VmPmoRunSummary["state"] | null;
+  /** Board column, projected the same way the package board projects it. */
+  column: "todo" | "materials" | "queued" | "editing" | "feishu_delivery"
+    | "awaiting_feishu_review" | "nas_upload" | "completed" | "needs_attention";
+  errorCode: string | null;
+  /** The single reason a human must act, derived like the board's column. */
+  reasonCode: string | null;
+  approvalStatus: string | null;
+  waitingForSlot: boolean;
+  planAttempt: number;
+  retried: boolean;
+  plannedAt: string | null;
+  runnerStartedAt: string | null;
+  completedAt: string | null;
+  updatedAt: string | null;
+  delivered: boolean;
+  deliveredAt: string | null;
+  writeback: Record<"processing" | "completed",
+    { state: string; errorCode: string | null; attemptCount: number } | null>;
+  archive: { state: string; errorCode: string | null; updatedAt: string | null } | null;
+  materialSource: "vm" | "manual" | null;
+  /** Milliseconds the pipeline has been unable to move this item. */
+  stuckMs?: number | null;
+}
+
+export interface VmOverviewDurations {
+  median: number | null;
+  p90: number | null;
+  samples: number;
+}
+
+export interface VmOverview {
+  projectId: string | null;
+  generatedAt: string;
+  slot: {
+    activeCount: number | null;
+    pendingCount: number | null;
+    maxConcurrent: number | null;
+    groupName: string | null;
+  } | null;
+  kpis: {
+    editing: number;
+    waitingApproval: number;
+    oldestApprovalWaitMs: number | null;
+    needsAttention: number;
+    deliveredLast7Days: number;
+    publishedLast7Days: number;
+    firstPassRate: number | null;
+    activeRuns: number;
+  };
+  attention: VmOverviewTask[];
+  funnel: Array<{ id: VmOverviewTask["column"]; count: number }>;
+  failures: Array<{ errorCode: string; count: number; taskIds: string[] }>;
+  rounds: { one: number; two: number; threeOrMore: number };
+  durations: { plan: VmOverviewDurations; render: VmOverviewDurations; delivery: VmOverviewDurations };
+  writebackDeadLetters: number;
+  archiveFailures: number;
+}

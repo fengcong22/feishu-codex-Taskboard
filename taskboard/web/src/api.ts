@@ -1518,6 +1518,11 @@ export function getPackageWorkflowBoard(subjectKey: string, packageAlias: string
   return request(`/api/local/feishu/package-board?${new URLSearchParams({subjectKey,packageAlias})}`, {signal});
 }
 
+export function getVmOverview(projectId: string | null, signal?: AbortSignal): Promise<import("./types").VmOverview> {
+  const query = projectId === null ? "" : `?${new URLSearchParams({ projectId })}`;
+  return request(`/api/local/feishu/vm-overview${query}`, { signal });
+}
+
 export function savePackageWorkflowBoard(settings: import("./types").PackageBoardSettings): Promise<{settings: import("./types").PackageBoardSettings}> {
   const {subjectKey,packageAlias,revision,views,activeViewId,defaultViewId,stageDisplays}=settings;
   return request("/api/local/feishu/package-board", {method:"PATCH",body:JSON.stringify({subjectKey,packageAlias,revision,views,activeViewId,defaultViewId,stageDisplays})});

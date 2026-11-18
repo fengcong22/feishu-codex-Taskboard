@@ -64,6 +64,7 @@ import {
 import { BoardColumn } from "./components/BoardColumn";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
 import { DashboardView } from "./components/DashboardView";
+import { VmOverviewDashboard } from "./components/VmOverviewDashboard";
 import { ArtifactUploadView } from "./components/ArtifactUploadView";
 import {
   UnifiedWorkflowBoard,
@@ -5217,6 +5218,13 @@ export function App() {
             revision={readmeRevision}
             onOpenTask={openTaskDetail}
             onError={setActionError}
+          />
+        ) : boardView === "dashboard" && isSelectedFeishuProject ? (
+          <VmOverviewDashboard
+            key={selectedProjectId}
+            projectId={selectedProjectId}
+            tasks={tasks}
+            onOpenTask={openTaskDetail}
           />
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
           <DashboardView

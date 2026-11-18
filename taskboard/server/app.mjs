@@ -31,6 +31,7 @@ import { assertExecutablePackageWorkflow } from "./feishu-package-identity.mjs";
 import { PackageWorkflowError, normalizePackageWorkflowTemplate, workflowTemplatesEqual } from "../shared/feishu-package-workflow.mjs";
 import { createFeishuPackageWorkflowDrafts } from "./feishu-package-workflow-drafts.mjs";
 import { createPackageBoardSettings } from "./package-board-settings.mjs";
+import { readVmOverview } from "./vm-overview.mjs";
 import { createFeishuSubjectShareApi } from "./feishu-subject-share.mjs";
 import {
   CloudProxyError,
@@ -6185,6 +6186,20 @@ export function createTaskboardServer(options = {}) {
           body: request.method === "PATCH" ? await readJson(request) : null,
         });
         return sendJson(response, result.status, result.body);
+      }
+      if (pathname === "/api/local/feishu/vm-overview") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const params = [...url.searchParams.keys()];
+        if (params.some(key => key !== "projectId") || url.searchParams.getAll("projectId").length > 1) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Unsupported VM overview query parameter");
+        }
+        const requested = url.searchParams.get("projectId");
+        if (requested !== null && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(requested)) {
+          throw new ApiError(400, "INVALID_QUERY_PARAMETER", "VM overview projectId is invalid");
+        }
+        return sendJson(response, 200, readVmOverview({
+          database, scheduler: resourceScheduler, projectId: requested,
+        }));
       }
       if (/^\/api\/local\/feishu\/subjects\/[^/]+\/package-workflow-drafts\/[^/]+(?:\/enable)?$/u.test(pathname)) {
         assertNoQuery(url.searchParams, pathname);
