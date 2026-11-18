@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, getAutomaticExecutionSettings, updateAutomaticExecutionSettings } from "../api";
 import { useTaskboardI18n } from "../i18n";
+import { AiProviderSettings } from "./AiProviderSettings";
 import type { AutomaticExecutionSettings } from "../types";
 
 interface LocalSettingsDialogProps {
@@ -159,6 +160,7 @@ export function LocalSettingsDialog({ revision, onSettingsChange, onClose }: Loc
               : text("已保存", "Saved")}
         </p>}
         {error && <p role="alert" className="project-dialog-error">{error}</p>}
+        <AiProviderSettings />
         <div>
           {!settings && !loading && <button className="button secondary" type="button" onClick={() => void loadSettings()}>{text("重试", "Retry")}</button>}
           <button className="button secondary" type="button" disabled={saving} onClick={onClose}>{text("关闭", "Close")}</button>

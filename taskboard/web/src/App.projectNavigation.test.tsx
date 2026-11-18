@@ -23,6 +23,7 @@ vi.mock("./api", async (importOriginal) => ({
   getTaskboardMetadata: vi.fn(),
   getAutomaticExecutionSettings: vi.fn(),
   updateAutomaticExecutionSettings: vi.fn(),
+  getAiProviders: vi.fn(),
   listDeviceWorkspaces: vi.fn(),
   getBoardStageLabels: vi.fn(),
   getJiraConnection: vi.fn(),
@@ -284,6 +285,8 @@ describe("App project navigation", () => {
     vi.mocked(api.getTaskboardMetadata).mockResolvedValue({ capabilities: { localAiChat: false, automaticExecution: false } });
     vi.mocked(api.getAutomaticExecutionSettings).mockResolvedValue({ enabled: false, version: 1 });
     vi.mocked(api.updateAutomaticExecutionSettings).mockResolvedValue({ enabled: true, version: 2 });
+    vi.mocked(api.getAiProviders).mockResolvedValue({ available: true, version: 0, activeId: null, profiles: [],
+      codex: { providerId: null, name: null, baseUrl: null, wireApi: null, model: null, managedByTaskboard: false } });
     vi.mocked(api.listDeviceWorkspaces).mockResolvedValue({});
     const labels = {
       backlog: "Backlog", todo: "Ready", queued: "Queued", in_progress: "Processing",

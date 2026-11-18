@@ -10,22 +10,22 @@ const USER_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const ENTROPY = "codex-taskboard:vm-shadow-session:v1";
 const POWERSHELL_TIMEOUT_MS = 15_000;
 
-function dpapiScript(operation) {
+function dpapiScript(operation, entropy = ENTROPY) {
   return [
     "$ErrorActionPreference = 'Stop'",
     "Add-Type -AssemblyName System.Security",
     "$data = [Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())",
-    `$entropy = [Text.Encoding]::UTF8.GetBytes('${ENTROPY}')`,
+    `$entropy = [Text.Encoding]::UTF8.GetBytes('${entropy}')`,
     `$result = [System.Security.Cryptography.ProtectedData]::${operation}($data, $entropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)`,
     "[Console]::Out.Write([Convert]::ToBase64String($result))",
   ].join("; ");
 }
 
 /** Runs Windows DPAPI for the current Windows user. Secrets travel only on stdin/stdout, never argv. */
-function runDpapi(operation, base64) {
+function runDpapi(operation, base64, entropy = ENTROPY) {
   return new Promise((resolve, reject) => {
     const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-      "-Command", dpapiScript(operation)], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+      "-Command", dpapiScript(operation, entropy)], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
     let output = "";
     const timer = setTimeout(() => { child.kill(); reject(new Error("VM_CREDENTIAL_TIMEOUT")); }, POWERSHELL_TIMEOUT_MS);
     child.stdout.setEncoding("utf8");
@@ -40,11 +40,17 @@ function runDpapi(operation, base64) {
   });
 }
 
-export const windowsDpapi = Object.freeze({
-  available: () => process.platform === "win32",
-  protect: (bytes) => runDpapi("Protect", bytes.toString("base64")).then((value) => Buffer.from(value, "base64")),
-  unprotect: (bytes) => runDpapi("Unprotect", bytes.toString("base64")).then((value) => Buffer.from(value, "base64")),
-});
+/** DPAPI bound to one purpose label; a blob protected for one purpose does not decrypt for another. */
+export function createWindowsDpapi(entropy) {
+  if (typeof entropy !== "string" || !/^[A-Za-z0-9:._-]{1,128}$/u.test(entropy)) throw new Error("DPAPI_ENTROPY_INVALID");
+  return Object.freeze({
+    available: () => process.platform === "win32",
+    protect: (bytes) => runDpapi("Protect", bytes.toString("base64"), entropy).then((value) => Buffer.from(value, "base64")),
+    unprotect: (bytes) => runDpapi("Unprotect", bytes.toString("base64"), entropy).then((value) => Buffer.from(value, "base64")),
+  });
+}
+
+export const windowsDpapi = createWindowsDpapi(ENTROPY);
 
 function validPayload(value) {
   return value && typeof value === "object" && !Array.isArray(value)

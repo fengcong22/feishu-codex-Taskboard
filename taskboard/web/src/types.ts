@@ -1181,3 +1181,39 @@ export interface TaskEvent {
   project?: Project;
   at: string;
 }
+
+/** One saved AI provider for Codex. The API key is never sent back; keyHint shows its last characters. */
+export interface AiProviderProfile {
+  id: string;
+  name: string;
+  baseUrl: string;
+  wireApi: "responses" | "chat";
+  model: string;
+  /** Model for VM AI editing; null means the daily model is used. */
+  vmModel: string | null;
+  keyHint: string;
+  updatedAt: string;
+}
+
+export interface AiProviderSettings {
+  available: boolean;
+  version: number;
+  activeId: string | null;
+  profiles: AiProviderProfile[];
+  /** What Codex's config.toml points at right now (no key). */
+  codex: { providerId: string | null; name: string | null; baseUrl: string | null; wireApi: string | null;
+    model: string | null; managedByTaskboard: boolean };
+}
+
+export interface AiProviderInput {
+  name: string;
+  baseUrl: string;
+  wireApi: "responses" | "chat";
+  /** Blank on update keeps the saved key. */
+  apiKey: string;
+  model: string;
+  vmModel: string | null;
+}
+
+export type AiProviderTestResult = { ok: true; models: string[] }
+  | { ok: false; errorCode: string; status?: number; detail?: string };

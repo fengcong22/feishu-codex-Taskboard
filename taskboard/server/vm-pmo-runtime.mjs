@@ -312,7 +312,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     if (config.stages.review.enabled && (![2, 3].includes(identity.contractVersion)
       || identity.driverId !== `vm_pmo_review_video_v${identity.contractVersion}`)) throw fail("VM_PMO_REVIEW_PROTOCOL_REQUIRED");
     // v3 plans every instruction through an unattended AI session; without one it cannot run.
-    if (identity.contractVersion === 3 && typeof aiIntent?.run !== "function") throw fail("VM_PMO_AI_NOT_CONFIGURED");
+    if (identity.contractVersion === 3 && (typeof aiIntent?.run !== "function" || !aiIntent.session)) throw fail("VM_PMO_AI_NOT_CONFIGURED");
     return true;
   }
   const localAdapter = Object.freeze(Object.fromEntries(["listFields","getRecord","updateRecord","uploadMedia"].map(method => [method,
@@ -866,7 +866,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
       || run.identity.packageSnapshot.workflowTemplate.version !== TEMPLATE.version)
       throw fail("VM_PMO_RUN_NOT_FOUND",404);
-    if (typeof aiIntent?.run !== "function") throw fail("VM_PMO_AI_NOT_CONFIGURED",503);
+    if (typeof aiIntent?.run !== "function" || !aiIntent.session) throw fail("VM_PMO_AI_NOT_CONFIGURED",503);
     const queued = await service.orchestrator.retryAiIntent(run.runId,{beforeCommit:assertTaskVersion});
     void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
     return publicRun(queued);
