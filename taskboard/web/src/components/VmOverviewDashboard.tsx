@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import "./VmOverviewDashboard.css";
 import { getVmOverview } from "../api";
 import { useTaskboardI18n } from "../i18n";
-import type { Task, VmOverview, VmOverviewTask } from "../types";
+import type { LinkHealth, Task, VmOverview, VmOverviewTask } from "../types";
 
 type Props = {
   projectId: string | null;
@@ -64,6 +64,102 @@ function duration(value: number | null | undefined, text: (zh: string, en: strin
   const days = Math.floor(hours / 24);
   const rest = hours % 24;
   return text(`${days} 天${rest ? ` ${rest} 小时` : ""}`, `${days} d${rest ? ` ${rest} h` : ""}`);
+}
+
+type HealthRow = { key: string; label: string; detail: string; value: string; tone: "ok" | "warn" | "bad" | "idle" };
+
+const LISTENER_LABELS: Record<string, [string, string]> = {
+  sdk_managed: ["长连接已接管", "Long connection managed"],
+  starting: ["正在启动", "Starting"],
+  disabled: ["监听器未启用", "Listener disabled"],
+  error: ["连接出错", "Connection error"],
+  stopping: ["正在停止", "Stopping"],
+};
+
+/** The Bridge row answers "is Feishu still reaching us, and how far behind". */
+function bridgeRow(health: LinkHealth, text: (zh: string, en: string) => string): HealthRow {
+  const { bridge } = health;
+  const listener = bridge.listener;
+  const queued = (bridge.queue?.pending ?? 0) + (bridge.queue?.retryWait ?? 0);
+  const dead = bridge.queue?.deadLetter ?? 0;
+  const detail = (() => {
+    if (bridge.state === "unconfigured") return text("未配置 Bridge 地址", "No Bridge address is configured");
+    if (bridge.state === "down") return text("连不上 Bridge 进程", "The Bridge process is unreachable");
+    if (bridge.state === "error") return text("Bridge 健康检查失败", "The Bridge health check failed");
+    if (bridge.state === "unknown") return text("尚未采样", "Not sampled yet");
+    if (bridge.stale) return text("采样已过期，状态未知", "The sample is stale, so the state is unknown");
+    const parts: string[] = [];
+    if (listener) {
+      const label = LISTENER_LABELS[listener.state ?? ""];
+      parts.push(label ? text(label[0], label[1]) : (listener.state ?? text("状态未知", "Unknown state")));
+      parts.push(listener.lastEventAt
+        ? text(`最后事件 ${duration(Date.now() - Date.parse(listener.lastEventAt), text)}前`,
+          `last event ${duration(Date.now() - Date.parse(listener.lastEventAt), text)} ago`)
+        : text("暂无事件", "no events yet"));
+    }
+    return parts.join(" · ");
+  })();
+  const value = bridge.state !== "up" || bridge.stale
+    ? "—"
+    : dead > 0 ? text(`${dead} 条死信`, `${dead} dead`) : text(`${queued} 条待处理`, `${queued} queued`);
+  return {
+    key: "bridge",
+    label: text("飞书 Bridge", "Feishu Bridge"),
+    detail: listener?.lastError ? `${detail} · ${listener.lastError}` : detail,
+    value,
+    tone: bridge.state === "up" && !bridge.stale
+      ? (dead > 0 || listener?.state === "error" ? "bad" : "ok")
+      : bridge.state === "unknown" ? "idle" : "bad",
+  };
+}
+
+/** The VM row answers "can the next round download its material". */
+function vmRow(health: LinkHealth, text: (zh: string, en: string) => string): HealthRow {
+  const session = health.vmSession;
+  if (!session) {
+    return {
+      key: "vm", label: text("VM 登录", "VM sign-in"),
+      detail: text("尚未打开过 VM 队列，状态未知", "The VM queue has not been opened yet"),
+      value: "—", tone: "idle",
+    };
+  }
+  const states: Record<string, { value: string; tone: HealthRow["tone"] }> = {
+    connected: { value: text("已连接", "Connected"), tone: "ok" },
+    connecting: { value: text("等待登录", "Signing in"), tone: "warn" },
+    disconnected: { value: text("未连接", "Not connected"), tone: "warn" },
+    auth_required: { value: text("需要重连", "Reconnect"), tone: "bad" },
+    unavailable: { value: text("暂时无法验证", "Cannot verify"), tone: "warn" },
+  };
+  const state = states[session.status ?? ""] ?? { value: text("状态未知", "Unknown"), tone: "idle" as const };
+  const left = session.expiresAt === null
+    ? null
+    : Math.max(0, session.expiresAt - Date.now());
+  const detail = [
+    session.accountName ?? text("未识别账号", "No account"),
+    left === null ? null : text(`登录还剩 ${duration(left, text)}`, `${duration(left, text)} left`),
+    session.status === "auth_required" ? session.errorCode : null,
+  ].filter(Boolean).join(" · ");
+  return { key: "vm", label: text("VM 登录", "VM sign-in"), detail, value: state.value, tone: state.tone };
+}
+
+/** The automation row answers "will anything start by itself". */
+function automationRow(health: LinkHealth, text: (zh: string, en: string) => string): HealthRow {
+  const automation = health.automaticExecution;
+  if (!automation) {
+    return {
+      key: "automation", label: text("本机自动剪辑", "Automatic editing"),
+      detail: text("状态未知", "Unknown"), value: "—", tone: "idle",
+    };
+  }
+  return {
+    key: "automation",
+    label: text("本机自动剪辑", "Automatic editing"),
+    detail: automation.enabled
+      ? text("新任务会自动开始，待启动的恢复也会执行", "New tasks start by themselves, and pending recoveries run")
+      : text("关闭：新任务不会自动开始，待启动的恢复也不会执行", "Off: nothing starts by itself and pending recoveries wait"),
+    value: automation.enabled ? text("已开启", "On") : text("已关闭", "Off"),
+    tone: automation.enabled ? "ok" : "warn",
+  };
 }
 
 export function VmOverviewDashboard({ projectId, tasks, onOpenTask }: Props) {
@@ -301,6 +397,28 @@ export function VmOverviewDashboard({ projectId, tasks, onOpenTask }: Props) {
           </div>
         </div>
       </section>
+
+      {overview.linkHealth && (
+        <section className="vm-overview-panel vm-overview-health">
+          <header><span>{text("链路健康", "Link health")}</span></header>
+          <div className="vm-health-body">
+            {[
+              bridgeRow(overview.linkHealth, text),
+              vmRow(overview.linkHealth, text),
+              automationRow(overview.linkHealth, text),
+            ].map(row => (
+              <div className={`vm-health-row tone-${row.tone}`} key={row.key}>
+                <span className="vm-health-dot" aria-hidden="true" />
+                <span className="vm-health-copy">
+                  <strong>{row.label}</strong>
+                  <small>{row.detail}</small>
+                </span>
+                <b>{row.value}</b>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div className="vm-overview-footer">
         <span>{text(`更新于 ${new Date(overview.generatedAt).toLocaleTimeString()}`, `Updated ${new Date(overview.generatedAt).toLocaleTimeString()}`)}</span>

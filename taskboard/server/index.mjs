@@ -12,7 +12,9 @@ export {
 } from "./app.mjs";
 
 async function main() {
-  const app = createTaskboardServer();
+  // The real process is the only place that samples the Bridge: tests must
+  // never reach a live or fake Bridge from a background probe.
+  const app = createTaskboardServer({ sampleLinkHealth: true });
   const host = resolveHost();
   const listenFd = process.env.CODEX_TASKBOARD_LISTEN_FD === undefined
     ? null

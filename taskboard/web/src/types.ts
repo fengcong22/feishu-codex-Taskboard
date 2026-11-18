@@ -1293,4 +1293,27 @@ export interface VmOverview {
   durations: { plan: VmOverviewDurations; render: VmOverviewDurations; delivery: VmOverviewDurations };
   writebackDeadLetters: number;
   archiveFailures: number;
+  /** Present on the HTTP response; absent from older cached payloads. */
+  linkHealth?: LinkHealth;
+}
+
+/** Sampled in the background by the server; a board read never touches the network. */
+export interface LinkHealth {
+  bridge: {
+    state: "unknown" | "unconfigured" | "up" | "down" | "error";
+    checkedAt: string | null;
+    ageMs: number | null;
+    stale: boolean;
+    detail: string | null;
+    listener: { state: string | null; lastEventAt: string | null; lastError: string | null } | null;
+    queue: { pending: number | null; processing: number | null; retryWait: number | null; deadLetter: number | null } | null;
+  };
+  vmSession: {
+    status: string | null;
+    accountName: string | null;
+    expiresAt: number | null;
+    errorCode: string | null;
+  } | null;
+  automaticExecution: { enabled: boolean; version: number | null } | null;
+  intervalMs: number;
 }
