@@ -114,7 +114,7 @@ function startOnce(onStarted, mode) {
 }
 
 async function planWithIntent(options) {
-  const { aiIntent, reverseAsr: _reverseAsr, onStarted = null, expectedBound, signal, ...step } = options;
+  const { aiIntent, aiHistory = null, reverseAsr: _reverseAsr, onStarted = null, expectedBound, signal, ...step } = options;
   if (typeof aiIntent?.run !== "function") throw failure("VM_PMO_AI_NOT_CONFIGURED");
   const { context, input } = expectedBound;
   const session = input.ai_session;
@@ -138,9 +138,20 @@ async function planWithIntent(options) {
     // An intent left by an interrupted or timed-out session is evidence, not input to this session.
     await rename(context.intent_path, path.join(sessionDir, "superseded-edit-intent.json"));
   }
-  const ai = await aiIntent.run({ context, packageRoot: step.packageRoot, pythonPath: step.pythonPath,
-    sessionDir, signal, onSpawn: started ? (evidence) => started(evidence) : null });
+  const history = aiHistory ? { parentRunDir: aiHistory.parentRunDir ?? null, imagePaths: aiHistory.imagePaths ?? [] } : null;
+  const runSession = (directory, resumeThreadId) => aiIntent.run({ context, packageRoot: step.packageRoot,
+    pythonPath: step.pythonPath, sessionDir: directory, signal, resumeThreadId, history,
+    onSpawn: started ? (evidence) => started(evidence) : null });
+  let ai = await runSession(sessionDir, aiHistory?.resumeThreadId ?? null);
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
+  if (aiHistory?.resumeThreadId && ai.outcome === "failed" && !ai.threadId) {
+    // The earlier conversation could not be reopened (never started a thread); start a fresh one
+    // that is pointed at the previous round's files instead.
+    await writeFile(path.join(sessionDir, "resume-failed.json"), JSON.stringify({
+      resume_thread_id: aiHistory.resumeThreadId }, null, 2) + "\n", { flag: "wx" });
+    ai = await runSession(await nextSessionDir(context), null);
+    if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
+  }
   // Checked before the outcome: a timed-out or failed session may still have overstepped.
   const breaches = await boundaryBreaches(context, before);
   if (breaches.changed.length || breaches.outputs.length) {

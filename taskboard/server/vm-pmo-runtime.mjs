@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readdir, readFile, realpath } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ApiError } from "./database.mjs";
@@ -15,7 +15,7 @@ import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "./vm-pmo-v3-driver.mj
 import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
 import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
-import { createVmStageWriteback, parseVmWritebackIdempotencyKey } from "./vm-stage-writeback.mjs";
+import { createVmStageWriteback, parseVmWritebackIdempotencyKey, VM_AI_NOTES_MAX_LENGTH } from "./vm-stage-writeback.mjs";
 import { createVmWritebackStore } from "./vm-writeback-store.mjs";
 import { createFeishuWritebackWorker } from "./feishu-writeback-worker.mjs";
 import { createVmFinalArchiveService } from "./vm-pmo-final-archive.mjs";
@@ -33,7 +33,8 @@ const TERMINAL = new Set(["completed","blocked","needs_attention"]);
 const MAX_PLAN_ATTEMPTS = 3;
 const AI_INTENT_BLOCKS = ["AI_INTENT_TIMEOUT","AI_INTENT_MISSING","AI_INTENT_FAILED"];
 const MAX_AI_RETRIES = 2;
-const MATERIAL_MOMENTS = new Set(["materials_ready","download_failed"]);
+// Moments written without render start evidence: source acquisition and AI notes (which may explain a block).
+const MATERIAL_MOMENTS = new Set(["materials_ready","download_failed","ai_notes"]);
 // Operator-supplied sources live in a fixed folder beside the configured VM download output.
 const MANUAL_SOURCE_FOLDER = "人工素材";
 const MANUAL_SOURCE_RESOLUTION = Object.freeze({width: 1280,height: 720});
@@ -269,6 +270,15 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     return {available: true,workflowTemplate: {...TEMPLATE}};
   }
 
+  /** Screenshots are accepted only when the package's v3 contract declares the review_images input. */
+  async function reviewImagesSupported(record) {
+    try {
+      await canonicalLocation(record.workspacePath,{directory: true});
+      const manifest = JSON.parse(await readFile(path.join(record.workspacePath,"PACKAGE-MANIFEST.json"),"utf8"));
+      return manifest.interface?.contract?.version === 3 && Array.isArray(manifest.interface?.inputs)
+        && manifest.interface.inputs.includes("review_images");
+    } catch {return false;}
+  }
   async function inspectPackage(record) {
     if (!object(record) || !template(record.workflowTemplate)) throw fail("PACKAGE_WORKFLOW_MISMATCH");
     try {
@@ -315,7 +325,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     if (identity.contractVersion === 3 && (typeof aiIntent?.run !== "function" || !aiIntent.session)) throw fail("VM_PMO_AI_NOT_CONFIGURED");
     return true;
   }
-  const localAdapter = Object.freeze(Object.fromEntries(["listFields","getRecord","updateRecord","uploadMedia"].map(method => [method,
+  const localAdapter = Object.freeze(Object.fromEntries(["listFields","getRecord","updateRecord","uploadMedia","downloadMedia"].map(method => [method,
     async input => {
       const adapter = await getAdapter();
       if (typeof adapter?.[method] !== "function") throw fail("VM_PMO_ADAPTER_UNAVAILABLE",503);
@@ -324,6 +334,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   const readCurrentRecord = createVmRegistrationRecordReader(localAdapter);
 
   async function notifyAttention({run}) {
+    // The AI's own explanation of a block goes to the record's notes field, when one is configured.
+    if (services) void services.enqueueAiNotes(run).catch(() => {});
     const task = database.getTask(run.taskId), origin = database.getFeishuTaskOrigin(run.taskId);
     const subject = origin && database.getFeishuSubjectVersion(origin.subjectKey, origin.configVersion);
     const notification = describeVmPmoAttention({run, task, origin, subject});
@@ -386,6 +398,74 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         workflowTemplate: {...subject.workflowTemplate}};
     }
 
+    /** Earlier rounds of a review chain, oldest first, read from trusted task origins only. */
+    function priorRoundsFor(origin) {
+      const rounds = [], seen = new Set();
+      let parent = origin?.stageId === "review" ? origin.stageSnapshot?.reviewParent : null;
+      while (parent?.runId && !seen.has(parent.runId) && rounds.length < 20) {
+        seen.add(parent.runId);
+        const row = db.prepare("SELECT task_id FROM vm_pmo_runs WHERE run_id = ?").get(parent.runId);
+        const parentOrigin = row ? database.getFeishuTaskOrigin(row.task_id) : null;
+        const text = parentOrigin?.stageSnapshot?.vmContext?.instruction;
+        if (typeof text !== "string" || !text.trim()) break;
+        rounds.unshift({round_id: parentOrigin.stageId === "review"
+          ? `review-${parentOrigin.stageSnapshot.reviewRound}` : "initial",
+        instructions: [{instruction_id: "instruction-1",raw_text: text}]});
+        parent = parentOrigin.stageId === "review" ? parentOrigin.stageSnapshot?.reviewParent : null;
+      }
+      return rounds;
+    }
+    /** A review round continues the AI conversation of the round it revises, and can read its files. */
+    async function aiHistoryFor(run) {
+      const parent = run?.identity?.origin?.stageId === "review" ? run.identity.stageSnapshot?.reviewParent : null;
+      if (!parent?.runId) return null;
+      const parentRun = orchestrator.get(parent.runId);
+      if (!parentRun?.prepared?.contextPath) return null;
+      const parentRunDir = path.dirname(parentRun.prepared.contextPath);
+      const sessions = path.join(path.dirname(parentRunDir), "ai-sessions");
+      let latest = null;
+      for (const name of await readdir(sessions).catch(() => [])) {
+        try {
+          const outcome = JSON.parse(await readFile(path.join(sessions, name, "outcome.json"), "utf8"));
+          if (outcome?.outcome === "completed" && typeof outcome.thread_id === "string"
+            && (!latest || String(outcome.finished_at) > String(latest.finished_at))) latest = outcome;
+        } catch {}
+      }
+      return {parentRunDir, resumeThreadId: latest?.thread_id ?? null, imagePaths: await reviewImagesFor(run)};
+    }
+    /** Downloads the frozen review screenshots once per run, beside (not inside) the AI-writable attempt
+     * directory, and re-verifies their recorded SHA-256 on every later use. */
+    async function reviewImagesFor(run) {
+      const refs = run?.identity?.stageSnapshot?.vmContext?.reviewImages;
+      if (!Array.isArray(refs) || !refs.length || !run.prepared?.contextPath) return [];
+      const directory = path.join(path.dirname(path.dirname(run.prepared.contextPath)),"review-images");
+      const manifestPath = path.join(directory,"review-images.json");
+      await mkdir(directory,{recursive: true});
+      await canonicalLocation(directory,{directory: true});
+      let saved = null;
+      try {saved = JSON.parse(await readFile(manifestPath,"utf8"));} catch {}
+      const extension = mime => ({"image/png":"png","image/jpeg":"jpg","image/jpg":"jpg","image/webp":"webp",
+        "image/gif":"gif","image/bmp":"bmp"})[mime] ?? "img";
+      const entries = [];
+      for (const [index,ref] of refs.entries()) {
+        const file = path.join(directory,`${String(index + 1).padStart(2,"0")}.${extension(ref.mimeType)}`);
+        const known = saved?.images?.[index];
+        if (known && known.fileToken === ref.fileToken) {
+          let bytes;
+          try {bytes = await readFile(file);} catch {throw fail("VM_REVIEW_IMAGE_CHANGED");}
+          if (digest(bytes) !== known.sha256 || bytes.length !== known.bytes) throw fail("VM_REVIEW_IMAGE_CHANGED");
+          entries.push({...known,path: file});
+          continue;
+        }
+        if (saved) throw fail("VM_REVIEW_IMAGE_CHANGED");
+        const fetched = await localAdapter.downloadMedia({fileToken: ref.fileToken,
+          tableId: run.identity.origin.tableId,targetPath: file,maxBytes: 20 * 1024 * 1024});
+        entries.push({fileToken: ref.fileToken,name: ref.name,mimeType: ref.mimeType,...fetched,path: file});
+      }
+      if (!saved) await writeFile(manifestPath,JSON.stringify({images: entries.map(({path: _file,...rest}) => rest)},null,2)+"\n",
+        {flag: "wx"});
+      return entries.map(entry => entry.path);
+    }
     function trustedRun(runId, {requireStarted = true} = {}) {
       const run = orchestrator.get(runId);
       if (!run || requireStarted && !run.runnerStartedAt) throw fail("VM_PMO_RUN_NOT_STARTED");
@@ -528,6 +608,56 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         || current.artifactId !== plan.source.artifactId || current.artifact.sha256 !== plan.source.sha256)
         throw fail("VM_ARCHIVE_SOURCE_SUPERSEDED");
     }});
+    /** The latest AI session report of the run's current attempt; null when no AI session ran. */
+    async function latestAiReport(run) {
+      if (!run?.prepared?.contextPath) return null;
+      const attemptDir = path.dirname(run.prepared.contextPath);
+      const sessions = path.join(path.dirname(attemptDir), "ai-sessions");
+      const prefix = `${path.basename(attemptDir)}-session-`;
+      let latest = null;
+      for (const name of await readdir(sessions).catch(() => [])) {
+        if (!name.startsWith(prefix)) continue;
+        try {
+          const outcome = JSON.parse(await readFile(path.join(sessions, name, "outcome.json"), "utf8"));
+          if (!latest || String(outcome.finished_at) > String(latest.outcome.finished_at)) latest = {name, outcome};
+        } catch {}
+      }
+      if (!latest) return null;
+      let report = "";
+      try {report = (await readFile(path.join(sessions, latest.name, "report.txt"), "utf8")).trim();} catch {}
+      return {report, outcome: latest.outcome.outcome};
+    }
+    /** Rebuilt from run evidence only, so validating a queued note recomputes exactly the same text. */
+    async function aiNotesText({run: candidate}) {
+      const run = orchestrator.get(candidate.runId);
+      const ai = await latestAiReport(run);
+      if (!run || !ai) return null;
+      const review = await runReview(run);
+      const origin = run.identity.origin, round = origin.stageId === "review"
+        ? `第 ${run.identity.stageSnapshot?.reviewRound ?? "?"} 轮修改` : "初稿";
+      const lines = [`【AI 处理说明 · ${round}】`];
+      if (run.state === "completed") lines.push("结果：已生成并上传成片，请审核。需要调整时在审核意见里补充说明，下一轮会接着这次的处理继续改。");
+      else lines.push(`结果：已停止，没有生成成片（${run.errorCode ?? run.state}）。请在剪辑要求或审核意见里补充说明后重新触发。`);
+      if (ai.report) lines.push("", ai.report);
+      if (review?.blockers?.length) {
+        lines.push("", "阻断明细：");
+        for (const row of review.blockers.slice(0, 10)) lines.push(`- ${row.code ?? "BLOCKED"}：${row.message ?? ""}`);
+      }
+      if (review?.qa?.counts) {
+        const counts = review.qa.counts;
+        lines.push("", `质检：通过 ${counts.passed ?? 0} 项，需人工复核 ${counts.needs_human ?? 0} 项，未通过 ${counts.failed ?? 0} 项。`);
+      }
+      const text = lines.join("\n");
+      return text.length > VM_AI_NOTES_MAX_LENGTH ? `${text.slice(0, VM_AI_NOTES_MAX_LENGTH - 2)}…` : text;
+    }
+    const notesSlot = text => typeof text === "string" ? `n${digest(text).slice(0, 32)}` : null;
+    async function enqueueAiNotes(run) {
+      const current = orchestrator.get(run.runId);
+      if (!current || !metadata(current.taskId).subject?.vmWorkflow?.fields?.aiNotesFieldId) return;
+      const text = await aiNotesText({run: current});
+      if (!text) return;
+      await enqueueWriteback(current,"ai_notes",notesSlot(text));
+    }
     // Each run has its own frozen subject. A task from a later version must never redirect an earlier run.
     async function planWriteback(runId,moment,slot = null) {
       // Source moments are written before any render evidence exists.
@@ -541,7 +671,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
             fieldId:candidate.identity.outputAttachmentFieldId,packageAlias:candidate.identity.origin.packageAlias});
           return latest?.taskId === candidate.taskId;
         },
-        enqueueWritebackIntent: input => writebackStore.enqueueWritebackIntent(input)});
+        enqueueWritebackIntent: input => writebackStore.enqueueWritebackIntent(input),
+        aiNotesText,notesSlot});
       return planner.plan({runId,moment,slot});
     }
     writebackStore = createVmWritebackStore({database,now,validateIntent: async input => {
@@ -601,7 +732,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const origin = database.getFeishuTaskOrigin(run.taskId), local = metadata(run.taskId);
         const packageIdentity = await inspectPackage(await getPackage(origin.packageAlias));
         if (!samePackageIdentity(packageIdentity,local.packageIdentity)) throw fail("VM_PMO_PACKAGE_CHANGED");
-        const rawRecord = await readCurrentRecord({subject: local.subject,event: origin,stageId: origin.stageId});
+        const rawRecord = await readCurrentRecord({subject: local.subject,event: origin,stageId: origin.stageId,
+          allowReviewImages: await reviewImagesSupported(await getPackage(origin.packageAlias))});
         // Taskboard's own "materials ready" write is the only other status this run may see before render.
         const readyOption = origin.stageId === "initial" && materialEdgesFor(local.subject).materialsReady
           ? local.subject.vmWorkflow.stages.initial.writeback.materialsReady.optionId : null;
@@ -617,7 +749,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const prepared = await prepareVmPmoRunInput({runRoot,runId: run.runId,taskId: run.taskId,origin,
           profile: local.subject.vmWorkflow,packageSnapshot: database.getFeishuTaskPackageSnapshot(run.taskId),
           packageIdentity,acquisition,pythonPath,planAttempt,manualRevision:run.manualRevision,
-          aiSession:aiIntent?.session});
+          aiSession:aiIntent?.session,priorRounds:priorRoundsFor(origin)});
         const bound = await validateVmPmoInput({contextPath: prepared.contextPath});
         const value = canonicalJson(bound);
         db.prepare(`INSERT INTO vm_pmo_attempt_inputs(run_id,task_id,plan_attempt,context_path,input_sha256,
@@ -696,8 +828,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const bound = await boundFor(options,{runId:options.runId,taskId:options.taskId,
           planAttempt:options.planAttempt,inputSha256:options.inputSha256});
         // Reverse ASR on the finished MP4 is on by default for v3 (decided 2026-11-17).
+        const aiHistory = options.mode === "plan" ? await aiHistoryFor(orchestrator.get(options.runId)) : null;
         const result = await runVmPmoDriver({...options,ffprobePath,ffmpegPath,expectedBound: bound,
-          aiIntent,reverseAsr: true});
+          aiIntent,aiHistory,reverseAsr: true});
         await validateVmPmoInput({...options,expectedBound: bound});
         return result;
       },
@@ -726,15 +859,18 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         return {artifactId: saved.id};
       },delivery,
       onRunStarted: async ({run}) => {taskStatus(run,"in_progress");await enqueueWriteback(run,"processing");},
-      onCompleted: async ({run}) => {await enqueueWriteback(run,"completed");taskStatus(run,"in_review");},
+      onCompleted: async ({run}) => {
+        await enqueueWriteback(run,"completed");taskStatus(run,"in_review");
+        try {await enqueueAiNotes(run);} catch {/* Notes never hold back a delivered round. */}
+      },
       onAttention: notifyAttention,
       materialEdges: async ({run}) => materialEdgesFor(metadata(run.taskId).subject),
       onMaterialsReady: async ({run}) => enqueueWriteback(run,"materials_ready"),
       onDownloadFailed: async ({run,slot}) => enqueueWriteback(run,"download_failed",slot),
     });
-    services = {orchestrator,delivery,finalArchive,writebackStore,writebackWorker,metadata,enqueueWriteback,latestStageOrigin,
+    services = {orchestrator,delivery,finalArchive,writebackStore,writebackWorker,metadata,enqueueWriteback,enqueueAiNotes,latestStageOrigin,
       registration: createVmTaskRegistration({database,getPackage,getActiveSubject,readCurrentRecord,
-        resolveReviewParent,
+        resolveReviewParent,reviewImagesSupported,
         prepareCommit: async ({subject,packageRecord,origin}) => {
           const assertParent = ({taskId}) => {
             if (origin.stageId !== "review") return;

@@ -10,12 +10,14 @@ const READY_SQL = `q.state IN ('pending', 'retry_wait') AND NOT EXISTS (
   SELECT 1 FROM vm_writeback_outbox p WHERE p.run_id = q.run_id
   AND ((q.moment = 'completed' AND p.moment = 'processing')
     OR (q.moment = 'processing' AND p.moment = 'materials_ready')
-    OR (q.moment = 'download_failed' AND p.moment = 'download_failed' AND p.created_at < q.created_at))
+    OR (q.moment = 'download_failed' AND p.moment = 'download_failed' AND p.created_at < q.created_at)
+    OR (q.moment = 'ai_notes' AND (p.moment IN ('processing', 'completed')
+      OR p.moment = 'ai_notes' AND p.created_at < q.created_at)))
   AND p.state IN ('pending', 'processing', 'retry_wait'))`;
 const OUTBOX_SQL = `CREATE TABLE IF NOT EXISTS vm_writeback_outbox (
     id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
     task_id TEXT NOT NULL, run_id TEXT NOT NULL,
-    moment TEXT NOT NULL CHECK(moment IN ('processing','completed','materials_ready','download_failed')),
+    moment TEXT NOT NULL CHECK(moment IN ('processing','completed','materials_ready','download_failed','ai_notes')),
     target_json TEXT NOT NULL, operation_json TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending','processing','retry_wait','succeeded','conflict','dead_letter')),
     version INTEGER NOT NULL, attempt_count INTEGER NOT NULL,
@@ -26,11 +28,11 @@ const OUTBOX_INDEXES = `CREATE INDEX IF NOT EXISTS vm_writeback_due ON vm_writeb
   CREATE UNIQUE INDEX IF NOT EXISTS vm_writeback_run_moment ON vm_writeback_outbox(run_id, moment)
     WHERE moment IN ('processing','completed','materials_ready');`;
 
-/** Rebuilds the pre-material outbox in place; every existing row and identifier is preserved. */
+/** Rebuilds an older outbox (before material or AI-notes moments) in place; every row and identifier is kept. */
 function migrateOutbox(db) {
   const current = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vm_writeback_outbox'").get();
   if (!current) { db.exec(OUTBOX_SQL); db.exec(OUTBOX_INDEXES); return; }
-  if (current.sql.includes("download_failed")) { db.exec(OUTBOX_INDEXES); return; }
+  if (current.sql.includes("'ai_notes'")) { db.exec(OUTBOX_INDEXES); return; }
   db.exec("BEGIN IMMEDIATE");
   try {
     db.exec(`ALTER TABLE vm_writeback_outbox RENAME TO vm_writeback_outbox_legacy;
@@ -61,7 +63,14 @@ function statusGuard(value) {
     || !value.optionIds.every(id) || new Set(value.optionIds).size !== value.optionIds.length) throw fail();
   return { fieldId: value.fieldId, optionIds: [...value.optionIds] };
 }
+const MAX_TEXT_LENGTH = 4096;
 function operation(value) {
+  if (object(value) && value.type === "text") {
+    // AI notes: plain text written to a configured text field, no status guard.
+    if (!exactKeys(value, ["type", "fieldId", "value"]) || !id(value.fieldId) || typeof value.value !== "string"
+      || value.value.includes("\0") || value.value.length > MAX_TEXT_LENGTH) throw fail();
+    return { type: "text", fieldId: value.fieldId, value: value.value };
+  }
   if (!object(value) || Object.keys(value).some((key) => !["type", "fieldId", "optionId", "guard"].includes(key))
     || !["type", "fieldId", "optionId"].every((key) => Object.hasOwn(value, key))
     || value.type !== "single_select" || !id(value.fieldId) || !id(value.optionId)) throw fail();
@@ -71,9 +80,13 @@ function operation(value) {
 function intent(value) {
   if (!exactKeys(value, ["idempotencyKey", "taskId", "runId", "courseBindingId", "operation"])
     || !id(value.taskId) || !id(value.runId) || value.courseBindingId !== null) throw fail();
-  if (!parseVmWritebackIdempotencyKey(value.idempotencyKey, value.runId)) throw fail();
+  const key = parseVmWritebackIdempotencyKey(value.idempotencyKey, value.runId);
+  if (!key) throw fail();
+  const checked = operation(value.operation);
+  // Text is only ever the AI notes moment, and AI notes are only ever text.
+  if ((key.moment === "ai_notes") !== (checked.type === "text")) throw fail();
   return { idempotencyKey: value.idempotencyKey, taskId: value.taskId, runId: value.runId,
-    courseBindingId: null, operation: operation(value.operation) };
+    courseBindingId: null, operation: checked };
 }
 function resolution(value) {
   if (!exactKeys(value, ["target", "operation"])

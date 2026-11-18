@@ -442,6 +442,8 @@ export interface FeishuVmPmoWorkflowConfig {
     outputAttachmentFieldId: string | null;
     /** Common video name for all outputs; absent in older draft responses. */
     namingFieldId?: string | null;
+    /** Optional text field that receives the AI's notes for each round. */
+    aiNotesFieldId?: string | null;
   };
   approval: { department: string; reason: string };
   stages: {

@@ -142,7 +142,7 @@ test("AI intent session runs in the run directory with the package prompt and no
   const spawned = [];
   const result = await runner.run({ context, packageRoot: "E:\\pkg", pythonPath: "C:\\py.exe", sessionDir,
     onSpawn: evidence => { spawned.push(evidence); } });
-  assert.deepEqual(result, { outcome: "completed", threadId: "thread-1" });
+  assert.deepEqual(result, { outcome: "completed", threadId: "thread-1", report: "报告" });
   assert.equal(spawned.length, 1);
   assert.deepEqual(seen.args.slice(seen.args.indexOf("-C"), seen.args.indexOf("-C") + 4), ["-C", runDir, "-s", "workspace-write"]);
   assert.ok(seen.args.includes("gpt-test"));
@@ -203,8 +203,8 @@ async function analyzedRun(t) {
     intent_context_sha256: intentContextSha256, evidence_manifest_sha256: manifestSha256,
     evidence_ids: ["transcript-full"], error: null }));
   const session = (write) => ({ session: { agent: "codex", model: "gpt-test" }, async run() { await write(); return { outcome: "completed", threadId: "t" }; } });
-  const plan = (aiIntent) => runVmPmoDriver({ mode: "plan", contextPath: prepared.contextPath,
-    packageRoot: args.packageSnapshot.workspacePath, pythonPath: args.pythonPath, aiIntent });
+  const plan = (aiIntent, aiHistory = null) => runVmPmoDriver({ mode: "plan", contextPath: prepared.contextPath,
+    packageRoot: args.packageSnapshot.workspacePath, pythonPath: args.pythonPath, aiIntent, aiHistory });
   const sessions = path.join(path.dirname(context.run_dir), "ai-sessions");
   return { context, session, plan, sessions };
 }
@@ -241,4 +241,52 @@ test("a broken attempt is refused before it uses an AI session slot", async t =>
   await assert.rejects(plan(session(() => assert.fail("AI must not start"))), { code: "VM_PMO_RUN_INPUT_INVALID" });
   const used = await readdir(sessions).catch((error) => (error.code === "ENOENT" ? [] : Promise.reject(error)));
   assert.deepEqual(used, []);
+});
+
+test("a review round resumes the previous AI conversation with the new run directory and images", async t => {
+  const { sessionDir, context } = await sessionFixture(t);
+  const { seen, spawnTurn } = fakeTurn({ events: [{ type: "thread.started", thread_id: "thread-old" }] });
+  const runner = createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "gpt-test", spawnTurn });
+  const result = await runner.run({ context, packageRoot: "E:/pkg", pythonPath: "C:/py.exe", sessionDir,
+    resumeThreadId: "thread-old", history: { parentRunDir: "E:/runs/parent/attempt-1", imagePaths: ["E:/shots/1.png"] } });
+  assert.equal(result.outcome, "completed");
+  const tail = seen.args.slice(seen.args.indexOf("resume"));
+  assert.deepEqual(tail, ["resume", "-i", "E:/shots/1.png", "thread-old", "-"]);
+  assert.equal(seen.args[seen.args.indexOf("-C") + 1], context.run_dir);
+  assert.match(seen.prompt, /新一轮审核修改/u);
+  assert.ok(seen.prompt.includes("E:/runs/parent/attempt-1"));
+  assert.match(seen.prompt, /审核截图/u);
+  assert.match(seen.prompt, /要把工作做到底/u);
+  const outcome = JSON.parse(await readFile(path.join(sessionDir, "outcome.json"), "utf8"));
+  assert.deepEqual([outcome.resumed_from, outcome.images], ["thread-old", 1]);
+  await assert.rejects(runner.run({ context, packageRoot: "E:/pkg", pythonPath: "C:/py.exe", sessionDir,
+    resumeThreadId: "bad id;" }), { code: "VM_PMO_RUN_INPUT_INVALID" });
+});
+
+test("a review round falls back to a fresh session when the old conversation cannot be reopened", async t => {
+  const { context, plan, sessions } = await analyzedRun(t);
+  const calls = [];
+  const aiIntent = { session: { agent: "codex", model: "gpt-test" }, async run({ resumeThreadId, history }) {
+    calls.push({ resumeThreadId, parentRunDir: history?.parentRunDir });
+    return resumeThreadId ? { outcome: "failed", threadId: null } : { outcome: "completed", threadId: "fresh" };
+  } };
+  const result = await plan(aiIntent, { resumeThreadId: "thread-old", parentRunDir: "E:/runs/p/attempt-1" });
+  assert.deepEqual(result, { status: "blocked", errorCode: "AI_INTENT_MISSING" });
+  assert.deepEqual(calls, [{ resumeThreadId: "thread-old", parentRunDir: "E:/runs/p/attempt-1" },
+    { resumeThreadId: null, parentRunDir: "E:/runs/p/attempt-1" }]);
+  const names = (await readdir(sessions)).sort();
+  assert.equal(names.length, 2);
+  assert.ok(JSON.parse(await readFile(path.join(sessions, names[0], "resume-failed.json"), "utf8")).resume_thread_id);
+  void context;
+});
+
+test("review input carries earlier rounds as read-only prior_rounds", async t => {
+  const args = await fixture(t);
+  await assert.rejects(prepareVmPmoRunInput({ ...args, priorRounds: [{ round_id: "x", instructions: "no" }] }),
+    { code: "VM_PMO_INPUT_UNTRUSTED" });
+  const initial = await prepareVmPmoRunInput({ ...args, priorRounds: [{ round_id: "initial",
+    instructions: [{ instruction_id: "instruction-1", raw_text: "旧意见" }] }] });
+  const input = JSON.parse(await readFile(path.join(path.dirname(initial.contextPath), "input.json"), "utf8"));
+  // Only review rounds have earlier rounds to show.
+  assert.equal(input.prior_rounds, undefined);
 });

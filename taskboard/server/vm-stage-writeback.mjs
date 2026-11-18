@@ -4,12 +4,16 @@ const STARTED_STATES = new Set(["running", "reported", "completed", "rendering",
 // Material moments describe the source acquisition, so they precede any render evidence.
 const MATERIAL_MOMENTS = Object.freeze({ materials_ready: "materialsReady", download_failed: "downloadFailed" });
 const MATERIAL_READY_STATES = new Set(["ready", "preparing", "prepared", "planning", "planned", "blocked", "needs_attention"]);
-const MOMENTS = new Set(["processing", "completed", ...Object.keys(MATERIAL_MOMENTS)]);
+const MOMENTS = new Set(["processing", "completed", "ai_notes", ...Object.keys(MATERIAL_MOMENTS)]);
 const FAILURE_SLOT = /^(?:auto|e[a-f0-9]{32})$/u;
+// AI notes are keyed by their content, so a later round or a rerun writes a new note once.
+const NOTES_SLOT = /^n[a-f0-9]{32}$/u;
+const NOTES_STATES = new Set(["completed", "blocked", "needs_attention"]);
+export const VM_AI_NOTES_MAX_LENGTH = 4096;
 
 /** One idempotency key per run and moment; repeated download failures are keyed by their cause. */
 export function vmWritebackIdempotencyKey(runId, moment, slot) {
-  if (moment === "download_failed") return `vm:${runId}:download_failed:${slot}`;
+  if (moment === "download_failed" || moment === "ai_notes") return `vm:${runId}:${moment}:${slot}`;
   return `vm:${runId}:${moment}`;
 }
 
@@ -17,6 +21,8 @@ export function parseVmWritebackIdempotencyKey(key, runId) {
   if (typeof key !== "string" || !key.startsWith(`vm:${runId}:`)) return null;
   const rest = key.slice(`vm:${runId}:`.length);
   if (["processing", "completed", "materials_ready"].includes(rest)) return { moment: rest, slot: null };
+  const notes = /^ai_notes:(.+)$/u.exec(rest);
+  if (notes) return NOTES_SLOT.test(notes[1]) ? { moment: "ai_notes", slot: notes[1] } : null;
   const failed = /^download_failed:(.+)$/u.exec(rest);
   return failed && FAILURE_SLOT.test(failed[1]) ? { moment: "download_failed", slot: failed[1] } : null;
 }
@@ -34,8 +40,10 @@ function object(value) { return value !== null && typeof value === "object" && !
 function trustedRun(run, runId, moment) {
   const target = run?.target;
   const startedAt = typeof run?.runnerStartedAt === "string" ? Date.parse(run.runnerStartedAt) : NaN;
-  const material = Object.hasOwn(MATERIAL_MOMENTS, moment);
-  const stateAllowed = moment === "materials_ready"
+  // AI notes may describe a block before any render, so they need no render start evidence.
+  const material = Object.hasOwn(MATERIAL_MOMENTS, moment) || moment === "ai_notes";
+  const stateAllowed = moment === "ai_notes" ? NOTES_STATES.has(run?.state)
+    : moment === "materials_ready"
     ? run?.stageId === "initial" && object(run?.acquisition)
       && (MATERIAL_READY_STATES.has(run.state) || STARTED_STATES.has(run.state))
     : moment === "download_failed"
@@ -168,6 +176,27 @@ function materialOperation(subject, liveFields, moment, stage) {
     guard: { fieldId: stage.statusFieldId, optionIds: statusOptions } };
 }
 
+function textField(field) {
+  const type = field?.type, uiType = fieldUiType(field);
+  return (type === 1 || type === "1" || type === "text")
+    && (uiType === undefined || uiType === null || typeof uiType === "string" && uiType.toLowerCase() === "text");
+}
+
+/** The configured AI-notes field must still be the same plain text field in the snapshot and live metadata. */
+function notesOperation(subject, liveFields, text) {
+  const id = subject.vmWorkflow.fields?.aiNotesFieldId;
+  if (!validId(id)) throw fail("VM_WRITEBACK_BINDING_MISSING");
+  const snapshot = (subject.metadata?.fields ?? []).filter((field) => fieldId(field) === id);
+  if (snapshot.length !== 1 || !textField(snapshot[0]) || typeof fieldName(snapshot[0]) !== "string")
+    throw fail("VM_WRITEBACK_CONFIG_CHANGED");
+  const live = Array.isArray(liveFields) ? liveFields.filter((field) => fieldId(field) === id) : [];
+  if (live.length !== 1 || !textField(live[0]) || fieldName(live[0]) !== fieldName(snapshot[0]))
+    throw fail("VM_WRITEBACK_FIELD_CHANGED");
+  if (typeof text !== "string" || !text.trim() || text.length > VM_AI_NOTES_MAX_LENGTH || text.includes("\0"))
+    throw fail("VM_WRITEBACK_INPUT_INVALID");
+  return { type: "text", fieldId: id, value: text };
+}
+
 function confirmedDelivery(delivery, run, subject) {
   const target = delivery?.target;
   if (!object(delivery) || delivery.state !== "delivered"
@@ -181,14 +210,16 @@ function confirmedDelivery(delivery, run, subject) {
 
 /** The dependencies must resolve server-owned state; callers supply only a run ID and moment. */
 export function createVmStageWriteback({ resolveTrustedRun, getActiveSubject, listFields,
-  getDelivery, isLatestStageRun, enqueueWritebackIntent } = {}) {
+  getDelivery, isLatestStageRun, enqueueWritebackIntent, aiNotesText = async () => null,
+  notesSlot = () => null } = {}) {
   if ([resolveTrustedRun, getActiveSubject, listFields, getDelivery, isLatestStageRun,
     enqueueWritebackIntent].some((callback) => typeof callback !== "function"))
     throw fail("VM_WRITEBACK_SERVICE_INVALID");
 
   async function plan({ runId, moment, slot = null } = {}) {
     if (!validId(runId) || !MOMENTS.has(moment)
-      || (moment === "download_failed" ? !FAILURE_SLOT.test(slot ?? "") : slot !== null))
+      || (moment === "download_failed" ? !FAILURE_SLOT.test(slot ?? "")
+        : moment === "ai_notes" ? !NOTES_SLOT.test(slot ?? "") : slot !== null))
       throw fail("VM_WRITEBACK_INPUT_INVALID");
     const run = trustedRun(await resolveTrustedRun({ runId }), runId, moment);
     if (await isLatestStageRun({ run: structuredClone(run) }) !== true)
@@ -197,7 +228,13 @@ export function createVmStageWriteback({ resolveTrustedRun, getActiveSubject, li
     if (moment === "completed") confirmedDelivery(await getDelivery({ runId }), run, subject);
     const liveFields = await listFields({ baseToken: run.target.baseToken,
       tableId: run.target.tableId });
-    const operation = validatedOperation(subject, liveFields, moment, run.stageId);
+    let operation;
+    if (moment === "ai_notes") {
+      // The text is rebuilt from server-owned run evidence; the slot names exactly that text.
+      const text = await aiNotesText({ run: structuredClone(run) });
+      if (notesSlot(text) !== slot) throw fail("VM_WRITEBACK_STAGE_ADVANCED");
+      operation = notesOperation(subject, liveFields, text);
+    } else operation = validatedOperation(subject, liveFields, moment, run.stageId);
     return Object.freeze({ idempotencyKey: vmWritebackIdempotencyKey(runId, moment, slot),
       taskId: run.taskId, runId, courseBindingId: null, operation });
   }

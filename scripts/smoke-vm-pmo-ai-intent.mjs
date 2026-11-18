@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +18,8 @@ const { values } = parseArgs({ options: {
   'package-root': { type: 'string' }, python: { type: 'string' }, model: { type: 'string' },
   'timeout-minutes': { type: 'string', default: '15' }, render: { type: 'boolean', default: false },
   'tool-dir': { type: 'string' },
+  // Also runs a second round that resumes round 1's conversation with a new instruction and a screenshot.
+  'second-round': { type: 'boolean', default: false },
 } });
 if (![values['package-root'], values.python].every(value => typeof value === 'string' && path.isAbsolute(value))
   || typeof values.model !== 'string') {
@@ -63,10 +67,38 @@ async function changedSince(directory, since) {
   }
   return changed;
 }
+let second = null;
+if (values['second-round'] && planned.status === 'ready' && outcome?.thread_id) {
+  // A frame of the source stands in for a reviewer's screenshot; it lives outside both run directories.
+  const shots = path.join(root, 'review-images');
+  await mkdir(shots);
+  const shot = path.join(shots, '01.png');
+  await promisify(execFile)('ffmpeg', ['-nostdin', '-v', 'error', '-ss', '0.3', '-i', run.context.source_path,
+    '-frames:v', '1', shot], {env: safeEnv, windowsHide: true, timeout: 60000});
+  const next = await fixture.prepare('ai-smoke-round-2', {instruction:
+    '0:00-0:05.60，删掉第二遍的“我们再看一下”，另外开头的“我们开始”也删掉（截图是开头这一页）'});
+  const t2 = Date.now();
+  let result;
+  try {
+    result = await runVmPmoDriver({...next.options, mode: 'plan', aiIntent, aiHistory: {resumeThreadId: outcome.thread_id,
+      parentRunDir: run.context.run_dir, imagePaths: [shot]}});
+  } catch (error) { result = {status: 'error', errorCode: error?.code ?? String(error)}; }
+  const secondSessions = path.join(path.dirname(next.context.run_dir), 'ai-sessions');
+  const names = await readdir(secondSessions).catch(() => []);
+  const secondOutcome = names.length ? JSON.parse(await readFile(path.join(secondSessions, names.at(-1), 'outcome.json'), 'utf8')) : null;
+  const secondReview = await readVmPmoRunReview(next.context);
+  const secondEvents = names.length ? (await readFile(path.join(secondSessions, names.at(-1), 'events.jsonl'), 'utf8'))
+    .split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+  second = {seconds: Math.round((Date.now() - t2) / 1000), plan: {status: result.status, error_code: result.errorCode ?? null},
+    ai: secondOutcome, same_thread: secondOutcome?.thread_id === outcome.thread_id,
+    coverage: secondReview?.coverage ?? [], blockers: secondReview?.blockers ?? [],
+    usage: secondEvents.filter(event => event.type === 'turn.completed').map(event => event.usage ?? null),
+    report: names.length ? await readFile(path.join(secondSessions, names.at(-1), 'report.txt'), 'utf8') : null};
+}
 const packageChanges = await changedSince(fixture.v3Root, startedAt);
 console.log(JSON.stringify({root, run_dir: run.context.run_dir, session_dir: session, seconds,
   plan: {status: planned.status, error_code: planned.errorCode ?? null},
   ai: outcome, rendered: rendered && {status: rendered.status, error_code: rendered.errorCode ?? null,
     qa: rendered.qa ? {overall: rendered.qa.overall, counts: rendered.qa.counts} : null},
   coverage: review?.coverage ?? [], blockers: review?.blockers ?? [], commands, usage,
-  package_copy_changes: packageChanges}, null, 2));
+  package_copy_changes: packageChanges, ...(second ? {second_round: second} : {})}, null, 2));

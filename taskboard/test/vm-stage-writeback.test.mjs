@@ -203,3 +203,48 @@ test("processing also accepts the materials-ready status and unbound source opti
   await assert.rejects(() => unbound.service.enqueue({ runId: "run_vm", moment: "materials_ready" }),
     { code: "VM_WRITEBACK_BINDING_MISSING" });
 });
+
+function notesFixture(text = "【AI 处理说明 · 初稿】\n结果：已停止") {
+  const x = fixture();
+  x.values.run = { ...x.values.run, state: "blocked", errorCode: "AI_INTENT_MISSING" };
+  delete x.values.run.runnerStartedAt;
+  x.values.subject.vmWorkflow.fields.aiNotesFieldId = "fld_notes";
+  x.values.subject.metadata.fields.push({ fieldId: "fld_notes", fieldName: "AI 处理说明", type: 1, uiType: "Text" });
+  x.values.liveFields.push({ field_id: "fld_notes", field_name: "AI 处理说明", type: 1, ui_type: "Text" });
+  const service = createVmStageWriteback({
+    resolveTrustedRun: async () => x.values.run, getActiveSubject: async () => x.values.subject,
+    listFields: async () => x.values.liveFields, getDelivery: async () => x.values.delivery,
+    isLatestStageRun: async () => true, enqueueWritebackIntent: async (intent) => intent,
+    aiNotesText: async () => x.values.text, notesSlot: (value) => value ? `n${"a".repeat(31)}${value.length % 10}` : null,
+  });
+  x.values.text = text;
+  return { ...x, service, slot: `n${"a".repeat(31)}${text.length % 10}` };
+}
+
+test("AI notes are written as text before render evidence and keyed by their content", async () => {
+  const x = notesFixture();
+  const intent = await x.service.plan({ runId: "run_vm", moment: "ai_notes", slot: x.slot });
+  assert.equal(intent.idempotencyKey, `vm:run_vm:ai_notes:${x.slot}`);
+  assert.deepEqual(intent.operation, { type: "text", fieldId: "fld_notes", value: x.values.text });
+  // A queued note whose run evidence changed since no longer matches its slot.
+  x.values.text = "different";
+  await assert.rejects(x.service.plan({ runId: "run_vm", moment: "ai_notes", slot: x.slot }),
+    { code: "VM_WRITEBACK_STAGE_ADVANCED" });
+});
+
+test("AI notes fail closed without a configured text field or in an unfinished run", async () => {
+  const unbound = notesFixture();
+  delete unbound.values.subject.vmWorkflow.fields.aiNotesFieldId;
+  await assert.rejects(unbound.service.plan({ runId: "run_vm", moment: "ai_notes", slot: unbound.slot }),
+    { code: "VM_WRITEBACK_BINDING_MISSING" });
+  const retyped = notesFixture();
+  retyped.values.liveFields.at(-1).type = 3;
+  await assert.rejects(retyped.service.plan({ runId: "run_vm", moment: "ai_notes", slot: retyped.slot }),
+    { code: "VM_WRITEBACK_FIELD_CHANGED" });
+  const running = notesFixture();
+  running.values.run.state = "planning";
+  await assert.rejects(running.service.plan({ runId: "run_vm", moment: "ai_notes", slot: running.slot }),
+    { code: "VM_WRITEBACK_UNTRUSTED" });
+  await assert.rejects(running.service.plan({ runId: "run_vm", moment: "ai_notes", slot: "auto" }),
+    { code: "VM_WRITEBACK_INPUT_INVALID" });
+});

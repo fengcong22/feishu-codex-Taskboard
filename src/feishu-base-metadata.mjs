@@ -781,6 +781,7 @@ function assertVmSubjectMetadata(subject, metadata) {
   vmField(table, fields?.vmidFieldId, "vmWorkflow.fields.vmidFieldId", "text");
   const naming = vmField(table, fields?.namingFieldId, "vmWorkflow.fields.namingFieldId", "naming");
   vmField(table, fields?.outputAttachmentFieldId, "vmWorkflow.fields.outputAttachmentFieldId", "attachment");
+  if (fields?.aiNotesFieldId) vmField(table, fields.aiNotesFieldId, "vmWorkflow.fields.aiNotesFieldId", "text");
   if (subject?.title?.fieldId !== naming.fieldId || subject.title.fieldName !== naming.fieldName) {
     throw phasedValidationError("VM naming field no longer matches Feishu metadata", "INVALID_FIELD", "title");
   }
