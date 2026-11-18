@@ -73,6 +73,7 @@ import { createVmCredentialStore } from "./vm-credential-store.mjs";
 import { openVmLoginPage } from "./vm-login-page.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
 import { createVmPmoAiIntentRunner, validVmPmoAiModel } from "./vm-pmo-ai-intent.mjs";
+import { createAiProviderStore } from "./ai-provider-store.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { describeBlockedFeishuTask } from "./blocked-notification.mjs";
 import { createFeishuVmMp4Adapter } from "./vm-mp4-feishu-adapter.mjs";
@@ -2782,6 +2783,7 @@ export function resolveServerOptions(options = {}) {
       ?? environment.CODEX_TASKBOARD_SKILL_PATH
       ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
     codexExecutable: resolveCodexExecutable({ explicit: options.codexExecutable }),
+    codexHome: options.codexHome ?? codexHome,
     codexStatePath: options.codexStatePath
       ?? path.join(codexHome, ".codex-global-state.json"),
     codexProcessesPath: options.codexProcessesPath
@@ -2848,6 +2850,9 @@ export function createTaskboardServer(options = {}) {
   }));
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const aiProviders = options.aiProviderStore ?? createAiProviderStore({ dataDirectory: resolved.dataDirectory,
+    codexHome: resolved.codexHome });
+  let vmAiIntentRefresh = null;
   let vmDownloads;
   let vmDownloadsClosing = false;
   let vmRuntime;
@@ -2873,6 +2878,30 @@ export function createTaskboardServer(options = {}) {
     return createVmPmoAiIntentRunner({codexExecutable: resolved.codexExecutable, model, environment: serviceEnvironment,
       toolDir: toolDir ?? null});
   }
+  /** The active AI provider's VM model overrides CODEX_VM_PMO_AI_MODEL, so switching providers in
+   * local settings also switches VM AI planning. A run keeps the model frozen into its input. */
+  function dynamicVmPmoAiIntent(fallbackModel, toolDir) {
+    let model = fallbackModel ?? null;
+    const refresh = () => aiProviders.activeVmModel().then((value) => { model = value ?? fallbackModel ?? null; }, () => {});
+    void refresh();
+    vmAiIntentRefresh = refresh;
+    const runnerFor = (value) => vmPmoAiIntentRunner(value, toolDir);
+    return {
+      refresh,
+      get session() { return runnerFor(model)?.session; },
+      async run(input) {
+        await refresh();
+        const runner = runnerFor(model);
+        const fail = (code) => { const error = new Error(code); error.code = code; return error; };
+        if (!runner) throw fail("VM_PMO_AI_NOT_CONFIGURED");
+        // The provider may have been switched after this run was prepared; never run another model.
+        let frozen = null;
+        try { frozen = JSON.parse(await readFile(path.join(input.context.run_dir, "input.json"), "utf8")).ai_session?.model; } catch {}
+        if (frozen !== runner.session.model) throw fail("VM_PMO_AI_SESSION_CHANGED");
+        return runner.run(input);
+      },
+    };
+  }
   function getVmRuntime() {
     if (vmRuntime) return vmRuntime;
     let config = {};
@@ -2890,7 +2919,7 @@ export function createTaskboardServer(options = {}) {
       onTaskUpdated: task => events.emit("task.updated", {task}),
       runRoot: options.vmPmoRunRoot ?? config.vmPmoRunRoot ?? path.join(resolved.dataDirectory, "vm-pmo-runs"),
       pythonPath: options.vmPmoPythonPath ?? config.vmPmoPythonPath ?? null,
-      aiIntent: options.vmPmoAiIntent ?? vmPmoAiIntentRunner(options.vmPmoAiModel ?? config.vmPmoAiModel,
+      aiIntent: options.vmPmoAiIntent ?? dynamicVmPmoAiIntent(options.vmPmoAiModel ?? config.vmPmoAiModel,
         options.vmPmoAiToolDir ?? config.vmPmoAiToolDir),
       coursePathResolver,
     });
@@ -6238,7 +6267,7 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(status, code, code);
         }
       }
-      if (pathname === "/api/local/settings/automatic-execution") {
+      const assertLocalSettingsRequest = () => {
         assertNoQuery(url.searchParams, pathname);
         const host = parseRequestHost(request.headers.host);
         if (!isLoopbackHostname(host.hostname)) throw new ApiError(403, "INVALID_HOST", "Local settings require a loopback Host");
@@ -6254,16 +6283,71 @@ export function createTaskboardServer(options = {}) {
         if (origin === "app://-" && !resolved.instanceToken) {
           throw new ApiError(403, "INVALID_ORIGIN", "Local settings require a verified launcher");
         }
+      };
+      const readLocalSettingsJson = async () => {
+        if (request.headers["x-taskboard-client"] !== "web") throw new ApiError(403, "LOCAL_SETTINGS_CLIENT_REQUIRED", "Local settings require an explicit web request");
+        if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+          throw new ApiError(415, "JSON_REQUIRED", "Local settings require JSON");
+        }
+        const input = await readJson(request);
+        assertPlainObject(input);
+        return input;
+      };
+      if (pathname === "/api/local/settings/ai-providers" || pathname.startsWith("/api/local/settings/ai-providers/")) {
+        assertLocalSettingsRequest();
+        const rest = pathname.slice("/api/local/settings/ai-providers".length).split("/").filter(Boolean);
+        const PROFILE = ["name", "baseUrl", "wireApi", "apiKey", "model", "vmModel", "expectedVersion"];
+        if (rest.length === 0) {
+          if (request.method === "GET") return sendJson(response, 200, await aiProviders.list());
+          if (request.method === "POST") {
+            const input = await readLocalSettingsJson();
+            assertAllowedKeys(input, new Set(PROFILE));
+            return sendJson(response, 201, await aiProviders.create(input));
+          }
+          return methodNotAllowed(response, ["GET", "POST"]);
+        }
+        if (rest.length === 1 && ["test", "import-current"].includes(rest[0])) {
+          if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+          const input = await readLocalSettingsJson();
+          if (rest[0] === "test") {
+            assertAllowedKeys(input, new Set(["id", "baseUrl", "apiKey"]));
+            return sendJson(response, 200, await aiProviders.test(input));
+          }
+          assertAllowedKeys(input, new Set(["expectedVersion", "name"]));
+          return sendJson(response, 201, await aiProviders.importCurrent(input));
+        }
+        const id = rest[0];
+        if (!/^[0-9a-f-]{36}$/u.test(id) || rest.length > 2) throw new ApiError(404, "AI_PROVIDER_NOT_FOUND", "接口不存在");
+        if (rest[1] === "activate") {
+          if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+          const input = await readLocalSettingsJson();
+          assertAllowedKeys(input, new Set(["expectedVersion"]));
+          const result = await aiProviders.activate(id, input);
+          await vmAiIntentRefresh?.();
+          return sendJson(response, 200, result);
+        }
+        if (rest.length !== 1) throw new ApiError(404, "AI_PROVIDER_NOT_FOUND", "接口不存在");
+        if (request.method === "PUT") {
+          const input = await readLocalSettingsJson();
+          assertAllowedKeys(input, new Set(PROFILE));
+          const result = await aiProviders.update(id, input);
+          await vmAiIntentRefresh?.();
+          return sendJson(response, 200, result);
+        }
+        if (request.method === "DELETE") {
+          const input = await readLocalSettingsJson();
+          assertAllowedKeys(input, new Set(["expectedVersion"]));
+          return sendJson(response, 200, await aiProviders.remove(id, input));
+        }
+        return methodNotAllowed(response, ["PUT", "DELETE"]);
+      }
+      if (pathname === "/api/local/settings/automatic-execution") {
+        assertLocalSettingsRequest();
         if (request.method === "GET") {
           return sendJson(response, 200, { setting: database.getAutomaticExecutionSetting(automaticExecutionDefault) });
         }
         if (request.method === "PUT") {
-          if (request.headers["x-taskboard-client"] !== "web") throw new ApiError(403, "LOCAL_SETTINGS_CLIENT_REQUIRED", "Local settings require an explicit web request");
-          if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
-            throw new ApiError(415, "JSON_REQUIRED", "Local settings require JSON");
-          }
-          const input = await readJson(request);
-          assertPlainObject(input);
+          const input = await readLocalSettingsJson();
           assertAllowedKeys(input, new Set(["enabled", "expectedVersion"]));
           const setting = database.saveAutomaticExecutionSetting(input.expectedVersion, input.enabled, automaticExecutionDefault);
           if (!setting.enabled) {

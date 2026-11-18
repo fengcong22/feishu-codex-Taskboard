@@ -16245,3 +16245,46 @@ body:has(.feishu-configuration-stack) .ai-chat-launcher {
     z-index: 1;
   }
 }
+
+.local-settings-dialog:has(.ai-provider-settings) {
+  width: min(720px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+}
+
+.ai-provider-settings {
+  border-top: 1px solid var(--border, #e5e7eb);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.ai-provider-settings h3 { margin: 0 0 6px; font-size: 15px; }
+.ai-provider-current { margin: 0 0 8px; font-size: 13px; }
+
+.ai-provider-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.ai-provider-list li {
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ai-provider-list li.is-active { border-color: var(--accent, #2563eb); }
+.ai-provider-row-main { display: grid; gap: 2px; min-width: 0; }
+.ai-provider-meta { font-size: 12px; opacity: 0.8; overflow-wrap: anywhere; }
+.ai-provider-badge { font-size: 12px; color: var(--accent, #2563eb); margin-left: 6px; }
+.ai-provider-row-actions, .ai-provider-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.ai-provider-form { display: grid; gap: 8px; }
+.ai-provider-form label { display: grid; gap: 4px; font-size: 13px; }
+.ai-provider-test { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+.ai-provider-test-ok { color: #15803d; }

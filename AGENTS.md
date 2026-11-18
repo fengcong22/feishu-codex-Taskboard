@@ -50,6 +50,7 @@ npm test
 - 真实 Bridge 配置只放在被 Git 忽略的 `config/bridge.local.json`；示例结构维护在 `config/bridge.example.json`。Auto-Cut 包定义单独放在被 Git 忽略的 `config/taskboard-feishu-packages.json`，示例结构维护在 `config/autocut-packages.example.json`。
 - `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 只放在 `.env.local` 或团队批准的密钥管理工具中，不写入飞书单元格、日志、任务描述或 Git。
 - Taskboard 的 Shadow 登录凭据只能以 Windows DPAPI（当前 Windows 用户范围）加密后保存在本机数据目录的 `vm-shadow-session.bin`，不得以明文写入磁盘、日志、飞书或 Git；无 DPAPI 的平台不保存。重启恢复时必须重新验证身份且账号一致，断开账号或认证失效时删除。登录失效时只允许在本机默认浏览器打开固定 Shadow 登录页，每次失效最多自动打开一次。
+- Codex 的 AI 接口（多套服务商地址、key、日常模型与 AI 剪辑模型）在“本机设置 → AI 接口”中管理，只走 loopback 本机接口且要求 `x-taskboard-client: web`。保存的 key 只能以 Windows DPAPI（当前 Windows 用户、独立用途标签）加密后存于 Taskboard 数据目录的 `ai-provider-keys.bin`，任何接口响应、日志、飞书或 Git 都不得返回或写入 key，界面只显示末 4 位；无 DPAPI 的平台不保存。“设为当前”先把原 `config.toml` 备份为 `config.toml.taskboard-backup`，再只改写其中 Taskboard 专用的 `[model_providers.taskboard]` 表及顶层 `model_provider`、`model`，其余 Codex 配置原样保留；Codex 自身要求该表中的 key 为明文。当前接口的 AI 剪辑模型优先于 `CODEX_VM_PMO_AI_MODEL`；已登记 run 的 `ai_session.model` 冻结不变，切换后与冻结模型不一致的 run 以 `VM_PMO_AI_SESSION_CHANGED` 阻断，不改用新模型。
 - `CODEX_FEISHU_BRIDGE_SECRET` 只用于本机 Bridge/Taskboard 互认，放在 `.env.local` 或由 `start-local.ps1` 临时生成；不要写入飞书单元格、日志、任务描述、共享配置或 Git。
 - 飞书单元格只能提供受控字段值和项目包别名；不能提供工作区路径、shell 命令、Codex 参数或 prompt。
 - Bridge 只解析配置白名单中的项目包别名，并使用配置中的绝对工作区路径和固定 prompt。

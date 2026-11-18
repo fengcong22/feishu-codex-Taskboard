@@ -9,6 +9,9 @@ import type {
   Attachment,
   ArtifactUpload,
   ArtifactUploadListItem,
+  AiProviderInput,
+  AiProviderSettings,
+  AiProviderTestResult,
   AutomaticExecutionSettings,
   BoardStageLabels,
   Comment,
@@ -330,6 +333,39 @@ export async function updateAutomaticExecutionSettings(input: {
     { method: "PUT", headers: { "X-Taskboard-Client": "web" }, body: JSON.stringify(input) },
   );
   return data.setting;
+}
+
+const AI_PROVIDERS = "/api/local/settings/ai-providers";
+const localSettingsWrite = (method: string, body: unknown): RequestInit => (
+  { method, headers: { "X-Taskboard-Client": "web" }, body: JSON.stringify(body) });
+
+export function getAiProviders(signal?: AbortSignal): Promise<AiProviderSettings> {
+  return request<AiProviderSettings>(AI_PROVIDERS, { signal });
+}
+
+export function createAiProvider(input: AiProviderInput & { expectedVersion: number }): Promise<AiProviderSettings> {
+  return request<AiProviderSettings>(AI_PROVIDERS, localSettingsWrite("POST", input));
+}
+
+export function updateAiProvider(id: string, input: AiProviderInput & { expectedVersion: number }): Promise<AiProviderSettings> {
+  return request<AiProviderSettings>(`${AI_PROVIDERS}/${encodeURIComponent(id)}`, localSettingsWrite("PUT", input));
+}
+
+export function deleteAiProvider(id: string, expectedVersion: number): Promise<AiProviderSettings> {
+  return request<AiProviderSettings>(`${AI_PROVIDERS}/${encodeURIComponent(id)}`, localSettingsWrite("DELETE", { expectedVersion }));
+}
+
+export function activateAiProvider(id: string, expectedVersion: number): Promise<AiProviderSettings> {
+  return request<AiProviderSettings>(`${AI_PROVIDERS}/${encodeURIComponent(id)}/activate`,
+    localSettingsWrite("POST", { expectedVersion }));
+}
+
+export function importCurrentAiProvider(expectedVersion: number): Promise<AiProviderSettings> {
+  return request<AiProviderSettings>(`${AI_PROVIDERS}/import-current`, localSettingsWrite("POST", { expectedVersion }));
+}
+
+export function testAiProvider(input: { id?: string; baseUrl: string; apiKey: string }): Promise<AiProviderTestResult> {
+  return request<AiProviderTestResult>(`${AI_PROVIDERS}/test`, localSettingsWrite("POST", input));
 }
 
 export async function getJiraConnection(signal?: AbortSignal): Promise<JiraConnection> {

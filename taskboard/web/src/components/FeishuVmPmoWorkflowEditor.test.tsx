@@ -779,7 +779,8 @@ describe("VM package draft editing boundaries", () => {
     fireEvent.click(screen.getByRole("button", { name: "重新加载流程草稿" }));
     await screen.findByRole("textbox", { name: "申请原因" });
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(onErrorClear).toHaveBeenCalledTimes(1);
+    // The clear callback runs in an effect after the reloaded form renders; slow CI can see the form first.
+    await waitFor(() => expect(onErrorClear).toHaveBeenCalledTimes(1));
     expect(onErrorClear).toHaveBeenCalledWith(onError.mock.calls[1][0]);
     expect(onError.mock.calls[1][0]).not.toBe(originalError);
   });
