@@ -968,6 +968,34 @@ test("a download that finished after an unknown outcome continues the same run w
   assert.equal(x.calls.filter(([name]) => name === "reserve").length, 1);
 });
 
+test("production shape: a run that stopped on download failed keeps the material it already adopted", async (t) => {
+  const x = await fixture(t);
+  const material = { vmid: "5dd7753a4723ba416403cbad",
+    receipt_path: path.join(path.dirname(x.prepared.contextPath), "receipt.json"),
+    path: path.join(path.dirname(x.prepared.contextPath), "source.mp4"), sha256: "a".repeat(64), bytes: 100,
+    duration_ms: 1000, width: 1920, height: 1080, vmid_binding: "vm_api_verified" };
+  const base = x.dependencies.bindings.status;
+  // The queue reported the outcome as unknown after the file was already downloaded and adopted, so
+  // the run ends blocked/VM_DOWNLOAD_FAILED while it still holds a verified acquisition.
+  x.dependencies.bindings.status = async (taskId) => ({ ...(await base(taskId)), status: "needs_attention",
+    error: { code: "VM_DOWNLOAD_OUTCOME_UNKNOWN" }, approvalEvidence: { applicationId: "app_1", instanceCode: "inst_1" } });
+  x.dependencies.materialEdges = async () => ({ downloadFailed: true });
+  await x.restart();
+  await x.f.register({ taskId: "task_vm" });
+  const blocked = await x.f.pump("run_vm");
+  assert.deepEqual([blocked.state, blocked.errorCode], ["blocked", "VM_DOWNLOAD_FAILED"]);
+  // Write the adopted material into the payload, as the production stop left it.
+  const row = x.db.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get("run_vm");
+  x.db.prepare("UPDATE vm_pmo_runs SET payload_json = ? WHERE run_id = ?").run(JSON.stringify({
+    ...JSON.parse(row.payload_json), acquisition: material }), "run_vm");
+  // The same material resumes the run; a different one is refused, because this run already adopted one.
+  await assert.rejects(x.f.resumeDownloadedSource("run_vm", { ...material, sha256: "f".repeat(64) }),
+    { code: "VM_PMO_RESUME_NOT_ALLOWED" });
+  const resumed = await x.f.resumeDownloadedSource("run_vm", material);
+  assert.deepEqual([resumed.state, resumed.errorCode], ["ready", null]);
+  assert.deepEqual(resumed.acquisition, material);
+});
+
 test("a run stopped only because the record's status option changed continues with its adopted material", async (t) => {
   const x = await fixture(t);
   // The material was adopted, then preparation refused the record because the status had moved on.

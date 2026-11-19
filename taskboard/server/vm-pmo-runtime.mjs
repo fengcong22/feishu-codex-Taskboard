@@ -1002,12 +1002,13 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && planAttempt < MAX_PLAN_ATTEMPTS && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
-    // A verified download may continue this run: either it finished after "outcome unknown", or the
-    // record's status option stopped preparation before any planning. Nothing is re-requested.
+    // A verified download may continue this run whatever stopped it before any planning: the download
+    // reported "outcome unknown" and finished later, or the record's status option moved on after the
+    // material was adopted. Only a verified file and an untouched run qualify; nothing is re-requested.
     const canResumeSource = run.state === "blocked"
       && (run.errorCode === "VM_DOWNLOAD_FAILED"
-          && run.downloadFailure?.reason === "VM_DOWNLOAD_OUTCOME_UNKNOWN" && run.downloadFailure?.approved === true
-          && !run.acquisition
+          && run.downloadFailure?.reason === "VM_DOWNLOAD_OUTCOME_UNKNOWN"
+          && (run.downloadFailure?.approved === true || run.acquisition?.vmid_binding === "vm_api_verified")
         || run.errorCode === "VM_RECORD_STATUS_CHANGED" && run.acquisition?.vmid_binding === "vm_api_verified")
       && run.identity.origin.stageId === "initial" && run.binding.approvalJobId !== null
       && !run.prepared && !run.planStartedAt && !run.runnerStartedAt && !run.planSha256

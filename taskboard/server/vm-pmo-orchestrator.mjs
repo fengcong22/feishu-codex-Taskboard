@@ -525,10 +525,9 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       || run.manualSource !== undefined
       || !object(acquisition) || acquisition.vmid_binding !== "vm_api_verified"
       || acquisition.vmid !== undefined && acquisition.vmid !== run.binding.vmid
-      // An adopted acquisition is reused as-is; a fresh one only fills the download-failure stop.
+      // A material adopted earlier is reused as-is; the verified one only fills an empty slot.
       || run.acquisition !== undefined
-        && (run.errorCode !== "VM_RECORD_STATUS_CHANGED"
-          || ACQUISITION_KEYS.some(key => run.acquisition[key] !== acquisition[key])))
+        && ACQUISITION_KEYS.some(key => run.acquisition[key] !== acquisition[key]))
       throw failure("VM_PMO_RESUME_NOT_ALLOWED");
     assertCurrent(run);
     const payload = json({ ...JSON.parse(row.payload_json), acquisition: structuredClone(acquisition) });
