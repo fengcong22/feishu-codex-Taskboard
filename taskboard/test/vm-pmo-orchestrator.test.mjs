@@ -960,8 +960,9 @@ test("a download that finished after an unknown outcome continues the same run w
     duration_ms: 1000, width: 1920, height: 1080, vmid_binding: "vm_api_verified" };
   const resumed = await x.f.resumeDownloadedSource("run_vm", material);
   assert.deepEqual([resumed.state, resumed.acquisition], ["ready", material]);
-  // The failure record stays as evidence of what happened; only the state moves on.
+  // The failure record stays as evidence of what happened; only the state and approval move on.
   assert.equal(resumed.errorCode, null);
+  assert.equal(resumed.approvalStatus, "ready");
   assert.equal(resumed.downloadFailure.reason, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
   assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
   assert.equal(x.calls.find(([name]) => name === "prepare")[1].acquisition.path, material.path);

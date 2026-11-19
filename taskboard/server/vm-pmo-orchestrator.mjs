@@ -537,7 +537,10 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
         && ACQUISITION_KEYS.some(key => run.acquisition[key] !== acquisition[key]))
       throw failure("VM_PMO_RESUME_NOT_ALLOWED");
     assertCurrent(run);
-    const payload = json({ ...JSON.parse(row.payload_json), acquisition: structuredClone(acquisition) });
+    // The receipt was verified against the approved application, so the run's approval is ready again;
+    // leaving the earlier stop recorded here would refuse its own planning retry.
+    const payload = json({ ...JSON.parse(row.payload_json), approvalStatus: "ready",
+      acquisition: structuredClone(acquisition) });
     const codes = RESUME_CODES.map(() => "?").join(", ");
     db.exec("BEGIN IMMEDIATE");
     try {
