@@ -690,6 +690,29 @@ test("an AI intent timeout reruns only the AI step in the same attempt, at most 
   assert.equal(x.calls.filter(([kind]) => kind === "reserve").length, 1);
 });
 
+test("provider refusals rerun the AI step without using the two AI retries", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  const outcomes = ["AI_PROVIDER_FAILED", "AI_PROVIDER_FAILED", "AI_INTENT_TIMEOUT", "AI_INTENT_FAILED",
+    "AI_INTENT_MISSING"];
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    await onStarted({ mode, pid: 42, startedAt: new Date(x.f.get("run_vm").updatedAt).toISOString() });
+    if (mode === "plan" && outcomes.length) return { status: "blocked", errorCode: outcomes.shift() };
+    return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) }
+      : { status: "rendered", planSha256: "d".repeat(64), artifact: x.artifact };
+  };
+  await x.restart();
+  for (const expected of ["AI_PROVIDER_FAILED", "AI_PROVIDER_FAILED", "AI_INTENT_TIMEOUT", "AI_INTENT_FAILED"]) {
+    assert.equal((await x.f.pump("run_vm")).errorCode, expected);
+    await x.f.retryAiIntent("run_vm");
+  }
+  // Two provider reruns plus the two session reruns: the session allowance is now used up.
+  assert.equal((await x.f.pump("run_vm")).errorCode, "AI_INTENT_MISSING");
+  assert.equal(x.f.get("run_vm").aiRetryHistory.length, 4);
+  await assert.rejects(x.f.retryAiIntent("run_vm"), { code: "VM_PMO_RETRY_LIMIT" });
+});
+
 test("AI intent rerun is refused for package plan blocks and unready approval", async (t) => {
   const x = await fixture(t);
   await x.f.register({ taskId: "task_vm" });

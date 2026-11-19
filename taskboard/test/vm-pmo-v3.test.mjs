@@ -8,9 +8,9 @@ import os from "node:os";
 
 import { prepareVmPmoRunInput } from "../server/vm-pmo-run-input.mjs";
 import { validateVmPmoInput } from "../server/vm-pmo-result-validator.mjs";
-import { createVmPmoAiIntentRunner, vmPmoAiEnvironment } from "../server/vm-pmo-ai-intent.mjs";
+import { createVmPmoAiIntentRunner, isVmPmoAiProviderFailure, vmPmoAiEnvironment } from "../server/vm-pmo-ai-intent.mjs";
 import { packageWorkflowFromManifest } from "../shared/feishu-package-workflow.mjs";
-import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "../server/vm-pmo-v3-driver.mjs";
+import { AI_INTENT_SCOPE_VIOLATION, AI_PROVIDER_FAILED, runVmPmoDriver } from "../server/vm-pmo-v3-driver.mjs";
 
 const sha = value => createHash("sha256").update(value).digest("hex");
 const V3_INTERFACE = { workflowTemplate: { id: "vm_pmo_review_video", version: 1 },
@@ -142,7 +142,7 @@ test("AI intent session runs in the run directory with the package prompt and no
   const spawned = [];
   const result = await runner.run({ context, packageRoot: "E:\\pkg", pythonPath: "C:\\py.exe", sessionDir,
     onSpawn: evidence => { spawned.push(evidence); } });
-  assert.deepEqual(result, { outcome: "completed", threadId: "thread-1", report: "报告" });
+  assert.deepEqual(result, { outcome: "completed", threadId: "thread-1", report: "报告", providerFailure: false });
   assert.equal(spawned.length, 1);
   assert.deepEqual(seen.args.slice(seen.args.indexOf("-C"), seen.args.indexOf("-C") + 4), ["-C", runDir, "-s", "workspace-write"]);
   assert.ok(seen.args.includes("gpt-test"));
@@ -176,6 +176,40 @@ test("AI intent session failure and unconfigured model are explicit", async t =>
   assert.equal((await runner.run({ context, packageRoot: "E:\\pkg", pythonPath: "C:\\py.exe", sessionDir })).outcome, "failed");
   assert.throws(() => createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "bad model" }),
     { code: "VM_PMO_AI_NOT_CONFIGURED" });
+});
+
+test("a provider refusal before any work is told apart from a failed session", async t => {
+  const refusal = [{ type: "thread.started", thread_id: "t" }, { type: "turn.started" },
+    { type: "error", message: "unexpected status 402 Payment Required: {\"code\":\"INSUFFICIENT_BALANCE\"}" },
+    { type: "turn.failed", error: { message: "unexpected status 402 Payment Required" } }];
+  assert.equal(isVmPmoAiProviderFailure(refusal), true);
+  assert.equal(isVmPmoAiProviderFailure([{ type: "error", message: "Reconnecting... 2/5 (unexpected status 429)" },
+    { type: "item.completed", item: { type: "error", message: "warn" } }, { type: "turn.failed", error: {} }]), true);
+  // Work done before the refusal makes it a failed session; so does an unrelated failure.
+  assert.equal(isVmPmoAiProviderFailure([{ type: "item.completed", item: { type: "command_execution" } },
+    ...refusal]), false);
+  assert.equal(isVmPmoAiProviderFailure([{ type: "turn.failed", error: { message: "model said no" } }]), false);
+  assert.equal(isVmPmoAiProviderFailure([{ type: "error", message: "unexpected status 400 Bad Request" }]), false);
+
+  const { sessionDir, context } = await sessionFixture(t);
+  const { spawnTurn } = fakeTurn({ events: refusal, exitCode: 1 });
+  const runner = createVmPmoAiIntentRunner({ codexExecutable: "codex.exe", model: "gpt-test", spawnTurn });
+  const result = await runner.run({ context, packageRoot: "E:/pkg", pythonPath: "C:/py.exe", sessionDir });
+  assert.deepEqual([result.outcome, result.providerFailure], ["failed", true]);
+  assert.equal(JSON.parse(await readFile(path.join(sessionDir, "outcome.json"), "utf8")).provider_failure, true);
+});
+
+test("a provider refusal blocks as AI_PROVIDER_FAILED and keeps the old conversation", async t => {
+  const { plan, sessions } = await analyzedRun(t);
+  const calls = [];
+  const aiIntent = { session: { agent: "codex", model: "gpt-test" }, async run({ resumeThreadId }) {
+    calls.push(resumeThreadId);
+    return { outcome: "failed", threadId: null, providerFailure: true };
+  } };
+  assert.deepEqual(await plan(aiIntent, { resumeThreadId: "thread-old" }),
+    { status: "blocked", errorCode: AI_PROVIDER_FAILED });
+  assert.deepEqual(calls, ["thread-old"]);
+  assert.equal((await readdir(sessions)).length, 1);
 });
 
 test("AI intent session can put a sandbox-readable FFmpeg directory first on PATH", () => {

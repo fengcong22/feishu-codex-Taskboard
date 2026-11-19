@@ -10,7 +10,10 @@ import { validateVmPmoAnalyze, validateVmPmoInput } from "./vm-pmo-result-valida
  *  - render: package render -> package qa (reverse ASR on by default)
  * Inputs that are not schema v3 `ai_intent` (v1, v2 and v3 `rule`) run unchanged through
  * runVmPmoOffline. Start evidence is reported once, when the first process of a step spawns. */
-export const AI_INTENT_BLOCKS = Object.freeze(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"]);
+export const AI_INTENT_BLOCKS = Object.freeze(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED",
+  "AI_PROVIDER_FAILED"]);
+/** The model provider refused the session before it did any work (auth, balance, quota, rate limit). */
+export const AI_PROVIDER_FAILED = "AI_PROVIDER_FAILED";
 // Not rerunnable in the same attempt: the files a rerun would reuse can no longer be trusted.
 export const AI_INTENT_SCOPE_VIOLATION = "AI_INTENT_SCOPE_VIOLATION";
 const MAX_AI_SESSIONS = 9;
@@ -145,7 +148,8 @@ async function planWithIntent(options) {
     onSpawn: started ? (evidence) => started(evidence) : null });
   let ai = await runSession(sessionDir, aiHistory?.resumeThreadId ?? null);
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
-  if (aiHistory?.resumeThreadId && ai.outcome === "failed" && !ai.threadId) {
+  // A provider refusal is not a lost conversation: falling back would only discard the thread.
+  if (aiHistory?.resumeThreadId && ai.outcome === "failed" && !ai.threadId && !ai.providerFailure) {
     // The earlier conversation could not be reopened (never started a thread); start a fresh one
     // that is pointed at the previous round's files instead.
     await writeFile(path.join(sessionDir, "resume-failed.json"), JSON.stringify({
@@ -163,6 +167,7 @@ async function planWithIntent(options) {
   }
   const written = await regularFile(context.intent_path);
   if (ai.outcome === "timeout") return { status: "blocked", errorCode: "AI_INTENT_TIMEOUT" };
+  if (ai.outcome === "failed" && ai.providerFailure) return { status: "blocked", errorCode: AI_PROVIDER_FAILED };
   if (ai.outcome !== "completed") return { status: "blocked", errorCode: "AI_INTENT_FAILED" };
   if (!written) return { status: "blocked", errorCode: "AI_INTENT_MISSING" };
   return runVmPmoOffline({ ...common, mode: "plan", onStarted: started });

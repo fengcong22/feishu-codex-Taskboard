@@ -26,6 +26,7 @@ const REASONS: Record<string, [string, string]> = {
   AI_INTENT_TIMEOUT: ["AI 规划超时，可重跑", "AI planning timed out"],
   AI_INTENT_MISSING: ["AI 未产出剪辑意图，可重跑", "AI produced no intent"],
   AI_INTENT_FAILED: ["AI 会话失败，可重跑", "AI session failed"],
+  AI_PROVIDER_FAILED: ["AI 服务拒绝请求（余额、额度或鉴权），处理后重跑", "AI provider refused the request"],
   VM_PMO_AI_SESSION_CHANGED: ["AI 模型已切换，与冻结模型不一致", "AI model differs from the frozen one"],
   VM_PMO_REVIEW_SOURCE_INVALID: ["审核轮原片链路不完整", "Review source chain is incomplete"],
   VM_REVIEW_IMAGES_UNSUPPORTED: ["审核意见带截图，当前版本不支持", "Review images are unsupported"],
