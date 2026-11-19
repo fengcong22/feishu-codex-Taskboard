@@ -338,9 +338,10 @@ export function createVmRegistrationRecordReader({ listFields, getRecord } = {})
     if (statusMatches.length !== 1) throw fail("VM_RECORD_INVALID");
     const selected = statusMatches[0];
     const frozenStatus = stageStatusField(subject, stageId);
+    // The option id is what a writeback carries; its display name is a label an operator may rename
+    // while a run is in flight, so a rename alone must not strand the record.
     if (frozenStatus?.fieldId !== stage.statusFieldId || !Array.isArray(frozenStatus?.options)
-      || frozenStatus.options.filter((option) => option?.optionId === optionId(selected)
-        && optionName(option) === optionName(selected)).length !== 1)
+      || frozenStatus.options.filter((option) => option?.optionId === optionId(selected)).length !== 1)
       throw fail("VM_FIELD_BINDING_CHANGED");
     return { vmid: plainText(recordValue(record, vmid)), title: plainText(recordValue(record, title)),
       instruction: plainText(recordValue(record, instruction)), statusOptionId: optionId(selected),

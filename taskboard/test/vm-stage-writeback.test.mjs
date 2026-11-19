@@ -102,7 +102,6 @@ test("fails closed when active config or live metadata changes", async () => {
     (v) => { v.subject.lifecycle = "draft"; },
     (v) => { v.liveFields[0].field_name = "已改名进度"; },
     (v) => { v.liveFields[0].type = 4; },
-    (v) => { v.liveFields[0].property.options.find((option) => option.id === "opt_processing").name = "已改名选项"; },
     (v) => { v.liveFields[0].property.options.push({ id: "opt_processing", name: "重复项" }); },
     (v) => { v.subject.vmWorkflow.stages.initial.writeback.processing.optionId = null; },
     (v) => { v.subject.metadata.fields = []; },
@@ -114,6 +113,13 @@ test("fails closed when active config or live metadata changes", async () => {
       (error) => /^VM_WRITEBACK_/u.test(error.code));
     assert.equal(enqueued.length, 0);
   }
+});
+
+test("a renamed option still writes the same id, because the name is only a label", async () => {
+  const { values, service, enqueued } = fixture();
+  values.liveFields[0].property.options.find((option) => option.id === "opt_processing").name = "已改名选项";
+  await service.enqueue({ runId: "run_vm", moment: "processing" });
+  assert.equal(enqueued[0].operation.optionId, "opt_processing");
 });
 
 test("rejects run and record identity mismatches before looking up metadata", async () => {
