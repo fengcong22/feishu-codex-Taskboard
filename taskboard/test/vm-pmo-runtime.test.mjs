@@ -1288,3 +1288,37 @@ test("resume refuses a stale task version and a run with no verified material",a
     {version: f.database.getTask(run.taskId).version}),{code:"VM_PMO_RESUME_SOURCE_CHANGED"});
   assert.deepEqual([f.runtime.list()[0].state,f.runtime.list()[0].errorCode],["blocked","VM_RECORD_STATUS_CHANGED"]);
 });
+
+test("a later subject version that only renamed options lets a stopped run finish",async t=>{
+  const f = await fixture(t,{material: true});
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  // The operator renames an option and bumps the version; the ids a run acts on are unchanged.
+  f.subject.configVersion = 5;
+  f.subject.metadata.fields[0].options.find(option => option.id === "opt_source").name = "6-素材就绪（手动下载）";
+  f.subject.statusField.options.find(option => option.optionId === "opt_source").name = "6-素材就绪（手动下载）";
+  const hold = await f.scheduler.request({requestId:"rename-hold",concurrencyGroup:"autocut:slicing",
+    maxConcurrent:1,resourceGroups:["vm-render"],queuePolicy:"per-group",fixedMaxConcurrent:true});
+  t.after(() => hold.release());
+  await f.runtime.wake();
+  const run = f.runtime.list()[0];
+  assert.equal(run.state,"prepared",run.errorCode);
+  assert.equal(f.approvals.list().length,1);
+});
+
+test("a later subject version that changed a binding still stops the run",async t=>{
+  const f = await fixture(t,{material: true});
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  // A different completion option is a real change: the run must not finish under the new version.
+  f.subject.configVersion = 5;
+  f.subject.metadata.fields[0].options.push({id: "opt_complete_2",name: "完成（新）"});
+  f.subject.vmWorkflow.stages.initial.writeback.completed.optionId = "opt_complete_2";
+  await f.runtime.wake();
+  const run = f.runtime.list()[0];
+  assert.equal(run.state,"blocked");
+  assert.equal(run.errorCode,"VM_PMO_CONFIG_CHANGED");
+  assert.equal((await f.runtime.getTaskRun(run.taskId)).canResumeSource,false);
+});

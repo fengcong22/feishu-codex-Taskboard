@@ -63,6 +63,9 @@ function trustedRun(run, runId, moment) {
   return run;
 }
 
+/** The bindings a run writes through are the frozen subject's own; `getActiveSubject` answers that
+ * snapshot, never the live record. A newer subject version may carry every binding unchanged (an
+ * operator renamed an option or added one a run does not use), and such a run must still finish. */
 function activeSubject(subject, run) {
   if (!object(subject) || subject.lifecycle !== "enabled"
     || subject.workflowTemplate?.id !== "vm_pmo_review_video"

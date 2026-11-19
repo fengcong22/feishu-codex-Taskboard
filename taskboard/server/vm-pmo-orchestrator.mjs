@@ -507,10 +507,11 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return get(runId);
   }
   /** A run whose approved download produced a verified file may continue with that file after a stop
-   * that left no work behind. Two cases qualify: the download reported "outcome unknown" (the file is
-   * adopted now), or the file was already adopted and the record's status option stopped preparation.
-   * The caller re-verifies the bound approval and the receipt; nothing is re-requested or re-approved. */
-  const RESUME_CODES = ["VM_DOWNLOAD_FAILED", "VM_RECORD_STATUS_CHANGED"];
+   * that left no work behind: the download reported "outcome unknown"; the record's status option
+   * stopped preparation; or a later subject version carries every binding unchanged and the run
+   * stopped on config drift. The caller re-verifies the bound approval and the receipt, and nothing
+   * is re-requested or re-approved. */
+  const RESUME_CODES = ["VM_DOWNLOAD_FAILED", "VM_RECORD_STATUS_CHANGED", "VM_PMO_CONFIG_CHANGED"];
   // The same fields a retry re-verifies; the receipt and bytes must be this run's own evidence.
   const ACQUISITION_KEYS = ["receipt_path", "path", "sha256", "bytes", "duration_ms", "vmid_binding"];
   async function resumeDownloadedSource(runId, acquisition, {beforeCommit = () => {}} = {}) {
@@ -519,6 +520,8 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     if (!run || run.state !== "blocked" || !RESUME_CODES.includes(run.errorCode)
       // An unknown outcome needs proof the application was approved; an adopted material already has it.
       || run.errorCode === "VM_DOWNLOAD_FAILED" && run.downloadFailure?.approved !== true
+      // Config drift is only resumable when a material was already adopted under that approval.
+      || run.errorCode === "VM_PMO_CONFIG_CHANGED" && !run.acquisition
       || run.identity.origin.stageId !== "initial" || run.prepared || run.planStartedAt
       || run.runnerStartedAt || run.planSha256 || run.renderResult || run.artifactId
       || run.deliveredFileToken || run.completedAt || run.leaseToken

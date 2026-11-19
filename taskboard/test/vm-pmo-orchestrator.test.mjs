@@ -1042,3 +1042,25 @@ test("resume refuses a run that already planned, rendered or used another reason
   await assert.rejects(x.f.resumeDownloadedSource("run_vm", { vmid_binding: "vm_api_verified", vmid: "5dd7753a4723ba416403cbad" }),
     { code: "VM_PMO_RESUME_NOT_ALLOWED" });
 });
+
+test("a run stopped on config drift resumes only while it holds the material it adopted", async (t) => {
+  const x = await fixture(t);
+  const row = () => x.db.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get("run_vm");
+  const material = { vmid: "5dd7753a4723ba416403cbad",
+    receipt_path: path.join(path.dirname(x.prepared.contextPath), "receipt.json"),
+    path: path.join(path.dirname(x.prepared.contextPath), "source.mp4"), sha256: "a".repeat(64), bytes: 100,
+    duration_ms: 1000, width: 1920, height: 1080, vmid_binding: "vm_api_verified" };
+  const stop = (payload, errorCode) => {
+    x.db.prepare("UPDATE vm_pmo_runs SET state = 'blocked', error_code = ?, payload_json = ? WHERE run_id = ?")
+      .run(errorCode, JSON.stringify(payload), "run_vm");
+  };
+  await x.f.register({ taskId: "task_vm" });
+  const payload = JSON.parse(row().payload_json);
+  // Without an adopted material the drift is not resumable: nothing proves which video this run owns.
+  stop(payload, "VM_PMO_CONFIG_CHANGED");
+  await assert.rejects(x.f.resumeDownloadedSource("run_vm", material), { code: "VM_PMO_RESUME_NOT_ALLOWED" });
+  stop({ ...payload, acquisition: material }, "VM_PMO_CONFIG_CHANGED");
+  const resumed = await x.f.resumeDownloadedSource("run_vm", material);
+  assert.deepEqual([resumed.state, resumed.errorCode], ["ready", null]);
+  assert.deepEqual(resumed.acquisition, material);
+});

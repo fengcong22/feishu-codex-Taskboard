@@ -185,6 +185,23 @@ function materialEdgesFor(subject) {
   return {materialsReady: bound("materialsReady"),downloadFailed: bound("downloadFailed")};
 }
 
+/** What a run actually acts on: the workflow bindings, the approval text, the template, the table
+ * and the package route. Field and option *names* are labels an operator may rename; ids are what
+ * reaches Feishu, so a rename alone does not change what a run would do. */
+function executableProfile(subject) {
+  return {vmWorkflow: subject?.vmWorkflow ?? null,
+    packageAlias: subject?.packageRoute?.packageAlias ?? null,
+    workflowTemplate: subject?.workflowTemplate ?? null,
+    baseToken: subject?.baseToken ?? null, tableId: subject?.tableId ?? null,
+    executionMode: subject?.execution?.mode ?? null};
+}
+
+/** A subject re-saved with only label edits keeps every binding a run depends on, so an in-flight run
+ * may finish under the newer version. Anything else is a real change and still stops it. */
+export function sameExecutableWorkflow(left, right) {
+  return same(executableProfile(left), executableProfile(right));
+}
+
 function initialProfile(subject, config) {
   const fields = subject?.metadata?.fields;
   const stages = config?.stages;
@@ -769,8 +786,12 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const origin = database.getFeishuTaskOrigin(run.taskId), snapshot = database.getFeishuTaskPackageSnapshot(run.taskId);
         if (origin?.executionMode !== "automatic") throw fail("VM_PMO_TASK_NOT_ELIGIBLE");
         const active = await getActiveSubject(origin.subjectKey);
-        if (active?.lifecycle !== "enabled" || active.configVersion !== origin.configVersion
-          || !same(active.vmWorkflow,local.subject.vmWorkflow) || active.packageRoute?.packageAlias !== origin.packageAlias)
+        // A later version that only renamed options keeps everything the run acts on, so it may finish.
+        if (active?.lifecycle !== "enabled"
+          || active.configVersion !== origin.configVersion
+            && !sameExecutableWorkflow(active,local.subject)
+          || !same(active.vmWorkflow,local.subject.vmWorkflow)
+          || active.packageRoute?.packageAlias !== origin.packageAlias)
           throw fail("VM_PMO_CONFIG_CHANGED");
         const record = await getPackage(origin.packageAlias);
         if (record?.state !== "enabled" || record.revision !== snapshot.packageRevision
@@ -1003,13 +1024,16 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
     // A verified download may continue this run whatever stopped it before any planning: the download
-    // reported "outcome unknown" and finished later, or the record's status option moved on after the
-    // material was adopted. Only a verified file and an untouched run qualify; nothing is re-requested.
+    // reported "outcome unknown" and finished later, the record's status option moved on after the
+    // material was adopted, or a newer subject version kept every binding and only the config number
+    // drifted. Only a verified file and an untouched run qualify; nothing is re-requested.
+    const verified = run.acquisition?.vmid_binding === "vm_api_verified" ? run.acquisition : null;
     const canResumeSource = run.state === "blocked"
       && (run.errorCode === "VM_DOWNLOAD_FAILED"
           && run.downloadFailure?.reason === "VM_DOWNLOAD_OUTCOME_UNKNOWN"
-          && (run.downloadFailure?.approved === true || run.acquisition?.vmid_binding === "vm_api_verified")
-        || run.errorCode === "VM_RECORD_STATUS_CHANGED" && run.acquisition?.vmid_binding === "vm_api_verified")
+          && (run.downloadFailure?.approved === true || Boolean(verified))
+        || run.errorCode === "VM_RECORD_STATUS_CHANGED" && Boolean(verified)
+        || run.errorCode === "VM_PMO_CONFIG_CHANGED" && Boolean(verified))
       && run.identity.origin.stageId === "initial" && run.binding.approvalJobId !== null
       && !run.prepared && !run.planStartedAt && !run.runnerStartedAt && !run.planSha256
       && !run.renderResult && !run.artifactId && !run.deliveredFileToken && !run.completedAt;
@@ -1099,8 +1123,16 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && run.downloadFailure?.reason === "VM_DOWNLOAD_OUTCOME_UNKNOWN";
     const stoppedOnStatus = run?.state === "blocked" && run.errorCode === "VM_RECORD_STATUS_CHANGED"
       && Boolean(run.acquisition);
+    // Config drift is resumable only when the newer subject keeps every binding this run acts on.
+    const stoppedOnConfig = run?.state === "blocked" && run.errorCode === "VM_PMO_CONFIG_CHANGED"
+      && Boolean(run.acquisition);
     if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
-      || !(unknownOutcome || stoppedOnStatus)) throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
+      || !(unknownOutcome || stoppedOnStatus || stoppedOnConfig)) throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
+    if (stoppedOnConfig) {
+      const local = metadata(run.taskId), active = await getActiveSubject(run.identity.origin.subjectKey);
+      if (active?.lifecycle !== "enabled" || !sameExecutableWorkflow(active, local.subject))
+        throw fail("VM_PMO_CONFIG_CHANGED",409);
+    }
     if (run.binding.approvalJobId === null) throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
     const downloads = await getDownloads();
     const job = downloads.lookupTaskRun?.({jobId: run.binding.approvalJobId});
