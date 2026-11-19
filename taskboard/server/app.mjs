@@ -7798,6 +7798,31 @@ export function createTaskboardServer(options = {}) {
         }
         return sendJson(response, 202, {run});
       }
+      const vmPmoResumeSourceRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-resume-source$/);
+      if (vmPmoResumeSourceRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-resume-source");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoResumeSourceRoute[1], "Task id");
+        const body = parseVmPmoWritebackRetry(await readJson(request));
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RESUME_NOT_ALLOWED", "Only a registered VM/PMO task can use this recovery");
+        let run;
+        try {run = await getVmRuntime().resumeDownloadedSource(taskId, body);}
+        catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (typeof error?.code === "string" && /^(?:VM_[A-Z0-9_]+|SOURCE_HASH_MISMATCH|RUN_BINDING_MISMATCH)$/u.test(error.code))
+            throw new ApiError(409, error.code, error.code);
+          throw error;
+        }
+        return sendJson(response, 202, {run});
+      }
       const vmPmoAiIntentRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-ai-intent-retry$/);
       if (vmPmoAiIntentRetryRoute) {
         assertAiLoopbackRequest(request);

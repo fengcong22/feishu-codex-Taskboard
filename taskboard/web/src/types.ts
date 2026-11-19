@@ -636,6 +636,8 @@ export interface VmPmoRunSummary {
   retryLimit: number;
   retryHistory: Array<{ planAttempt: number; errorCode: string; failedAt: string }>;
   canRetryPlan: boolean;
+  /** A download reported as unknown finished later; the file on disk may resume this run. */
+  canResumeSource?: boolean;
   canRetryAiIntent?: boolean;
   aiRetryLimit?: number;
   aiRetryHistory?: Array<{ errorCode: string; failedAt: string }>;

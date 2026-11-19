@@ -192,12 +192,14 @@ test("download failed requires the failed run and is keyed by its cause", async 
     { code: "VM_WRITEBACK_UNTRUSTED" });
 });
 
-test("processing also accepts the materials-ready status and unbound source options fail closed", async () => {
+test("processing also accepts both source statuses and unbound source options fail closed", async () => {
   const x = materialFixture();
   Object.assign(x.values.run, { state: "running", runnerStartedAt: "2026-10-14T10:00:00.000Z" });
   await x.service.enqueue({ runId: "run_vm", moment: "processing" });
+  // A run that reported a failed download and then continued from the material it produced still
+  // starts editing from the "下载失败" option; the guard must accept it alongside "素材已就绪".
   assert.deepEqual(x.enqueued[0].operation.guard,
-    { fieldId: "fld_status", optionIds: ["opt_ready", "opt_source", "opt_processing"] });
+    { fieldId: "fld_status", optionIds: ["opt_ready", "opt_source", "opt_failed", "opt_processing"] });
   const unbound = fixture();
   Object.assign(unbound.values.run, { state: "ready", runnerStartedAt: undefined, acquisition: {} });
   await assert.rejects(() => unbound.service.enqueue({ runId: "run_vm", moment: "materials_ready" }),

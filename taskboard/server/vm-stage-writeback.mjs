@@ -150,6 +150,13 @@ function validatedOperation(subject, liveFields, moment, stageId) {
     validatedOption(subject, liveFields, ready.fieldId, ready.optionId);
     statusOptions.push(ready.optionId);
   }
+  // A run whose approved download finished after "下载失败" was written continues from that option.
+  const failed = stage.writeback?.downloadFailed;
+  if (moment === "processing" && object(failed) && failed.fieldId === stage.statusFieldId
+    && validId(failed.optionId)) {
+    validatedOption(subject, liveFields, failed.fieldId, failed.optionId);
+    if (!statusOptions.includes(failed.optionId)) statusOptions.push(failed.optionId);
+  }
   if (binding.fieldId === stage.statusFieldId && !statusOptions.includes(binding.optionId))
     statusOptions.push(binding.optionId);
   return { type: "single_select", fieldId: binding.fieldId, optionId: binding.optionId,
