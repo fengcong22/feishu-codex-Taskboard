@@ -425,7 +425,12 @@ test("real review record reader and registration validate the separate frozen re
     bytes:100,durationMs:1000,reviewRound:0})}).register(body,ACTOR);
   assert.equal(created.origin.triggerValue,"待修改");
   assert.equal(created.origin.stageSnapshot.vmContext.instruction,"  删除最后一句  \n");
+  // The option id is the binding a writeback carries, so a rename keeps the record readable...
   liveFields.find(field => field.fieldId === "fld_review_status").options[1].name = "已改名";
+  assert.equal((await reader({subject:f.values.frozen,event:body.event,stageId:"review"})).statusOptionId,"opt_review");
+  // ...while dropping that id from the frozen snapshot is a real binding change.
+  f.values.frozen.reviewStatusField.options = f.values.frozen.reviewStatusField.options
+    .filter(option => option.optionId !== "opt_review");
   await assert.rejects(reader({subject:f.values.frozen,event:body.event,stageId:"review"}),
     {code:"VM_FIELD_BINDING_CHANGED"});
 });

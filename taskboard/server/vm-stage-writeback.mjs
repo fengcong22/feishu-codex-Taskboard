@@ -124,9 +124,9 @@ function validatedOption(subject, liveFields, fieldIdValue, optionIdValue) {
   const { expectedOptions, liveOptions } = liveBoundField(subject, liveFields, fieldIdValue);
   const expected = expectedOptions.filter((option) => optionId(option) === optionIdValue);
   const live = liveOptions.filter((option) => optionId(option) === optionIdValue);
-  if (expected.length !== 1 || live.length !== 1
-    || typeof optionName(expected[0]) !== "string" || !optionName(expected[0]).trim()
-    || optionName(live[0]) !== optionName(expected[0])) throw fail("VM_WRITEBACK_OPTION_CHANGED");
+  // The operation writes an option id; a renamed label still resolves to the same option, so only the
+  // id has to exist on both sides. A missing or duplicated id is a real binding change.
+  if (expected.length !== 1 || live.length !== 1) throw fail("VM_WRITEBACK_OPTION_CHANGED");
 }
 
 function validatedOperation(subject, liveFields, moment, stageId) {
