@@ -1,4 +1,4 @@
-import { appendFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { spawnCodexTurn } from "./ai-chat-process.mjs";
@@ -21,6 +21,41 @@ function failure(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+// A provider that refuses the request (auth, balance, quota, rate limit, server error) before the
+// session did any work is not a planning failure; such a session does not use a human rerun.
+const PROVIDER_STATUS = /\bunexpected status (?:40[123]|429|5\d\d)\b/u;
+const PROVIDER_CODE = /INSUFFICIENT_BALANCE|insufficient_quota|rate[ _-]?limit|quota exceeded/iu;
+
+/** Folds one Codex event into `{refused, worked}`: refused when an error or failed turn names a
+ * provider status; worked when any item other than an error appeared (command, edit, message). */
+function providerStep(state, event) {
+  if (event?.type === "item.started" || event?.type === "item.completed") {
+    if (event.item?.type !== "error") state.worked = true;
+  } else if (event?.type === "error" || event?.type === "turn.failed") {
+    const message = String(event.type === "error" ? event.message : event.error?.message ?? "");
+    if (PROVIDER_STATUS.test(message) || PROVIDER_CODE.test(message)) state.refused = true;
+  }
+  return state;
+}
+
+/** True when the session's events show only a provider refusal and no work. */
+export function isVmPmoAiProviderFailure(events) {
+  const state = events.reduce(providerStep, { refused: false, worked: false });
+  return state.refused && !state.worked;
+}
+
+/** Reads a session's bounded events.jsonl; unreadable or malformed lines never count as a refusal. */
+export async function readVmPmoAiProviderFailure(sessionDir) {
+  let text;
+  try { text = await readFile(path.join(sessionDir, "events.jsonl"), "utf8"); } catch { return false; }
+  const events = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try { events.push(JSON.parse(line)); } catch { return false; }
+  }
+  return isVmPmoAiProviderFailure(events);
 }
 
 export function validVmPmoAiModel(value) {
@@ -135,12 +170,14 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
     const eventsPath = path.join(sessionDir, "events.jsonl");
     await writeFile(eventsPath, "", { flag: "wx" });
     let logged = 0, threadId = null, report = "", turnFailed = false;
+    const provider = { refused: false, worked: false };
     let writes = Promise.resolve();
     const { child, completion } = spawnTurn({ executable: codexExecutable, args, prompt,
       env: vmPmoAiEnvironment(environment, { toolDir }),
       onRawEvent: (event) => {
         if (event?.type === "thread.started" && typeof event.thread_id === "string") threadId = event.thread_id.slice(0, 200);
         if (event?.type === "turn.failed" || event?.type === "error") turnFailed = true;
+        providerStep(provider, event);
         if (event?.type === "item.completed" && event.item?.type === "agent_message"
           && typeof event.item.text === "string") report = event.item.text.slice(0, REPORT_LIMIT);
         const line = JSON.stringify(event) + "\n";
@@ -168,13 +205,15 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
     }
     await writes;
     if (!outcome) outcome = exit?.exitCode === 0 && !turnFailed ? "completed" : "failed";
+    const providerFailure = outcome === "failed" && provider.refused && !provider.worked;
     await writeFile(path.join(sessionDir, "report.txt"), report, { flag: "wx" });
     await writeFile(path.join(sessionDir, "outcome.json"), JSON.stringify({ agent: session.agent,
       model: session.model, thread_id: threadId, resumed_from: resumeThreadId, images: images.length,
       started_at: startedAt, finished_at: now().toISOString(),
-      timeout_ms: timeoutMs, outcome, exit_code: exit?.exitCode ?? null }, null, 2) + "\n", { flag: "wx" });
+      timeout_ms: timeoutMs, outcome, provider_failure: providerFailure,
+      exit_code: exit?.exitCode ?? null }, null, 2) + "\n", { flag: "wx" });
     if (outcome === "interrupted") throw failure("VM_PMO_RUN_INTERRUPTED");
-    return { outcome, threadId, report };
+    return { outcome, threadId, report, providerFailure };
   }
   return Object.freeze({ session, run });
 }

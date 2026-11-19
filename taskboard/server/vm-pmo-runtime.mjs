@@ -31,8 +31,10 @@ const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
 const HASH = /^[a-f0-9]{64}$/u;
 const TERMINAL = new Set(["completed","blocked","needs_attention"]);
 const MAX_PLAN_ATTEMPTS = 3;
-const AI_INTENT_BLOCKS = ["AI_INTENT_TIMEOUT","AI_INTENT_MISSING","AI_INTENT_FAILED"];
+const AI_INTENT_BLOCKS = ["AI_INTENT_TIMEOUT","AI_INTENT_MISSING","AI_INTENT_FAILED","AI_PROVIDER_FAILED"];
 const MAX_AI_RETRIES = 2;
+// Provider refusals (balance, quota, auth) do not use the AI retry allowance; see the orchestrator.
+const MAX_AI_PROVIDER_RETRIES = 10;
 // Moments written without render start evidence: source acquisition and AI notes (which may explain a block).
 const MATERIAL_MOMENTS = new Set(["materials_ready","download_failed","ai_notes"]);
 // Operator-supplied sources live in a fixed folder beside the configured VM download output.
@@ -1045,9 +1047,11 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
-    const aiRetryCount = run.aiRetryHistory?.length ?? 0;
+    const providerBlock = run.errorCode === "AI_PROVIDER_FAILED";
+    const aiRetryCount = (run.aiRetryHistory ?? []).filter(entry =>
+      (entry.errorCode === "AI_PROVIDER_FAILED") === providerBlock).length;
     const canRetryAiIntent = run.state === "blocked" && AI_INTENT_BLOCKS.includes(run.errorCode)
-      && aiRetryCount < MAX_AI_RETRIES && Boolean(run.planStartedAt && run.prepared && run.acquisition)
+      && aiRetryCount < (providerBlock ? MAX_AI_PROVIDER_RETRIES : MAX_AI_RETRIES) && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
     const canRetryFailedRender = run.state === "needs_attention"

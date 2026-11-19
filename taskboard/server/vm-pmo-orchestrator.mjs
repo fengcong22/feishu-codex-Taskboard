@@ -28,8 +28,14 @@ const approvalRef = (value) => typeof value === "string" && APPROVAL_REF.test(va
 const AUTH_FAILURE_MS = 2 * 60 * 60 * 1000;
 const MANUAL_SOURCE_STATES = new Set(["pending", "accepted", "failed"]);
 // v3 AI intent step: blocks a human may rerun in the same attempt directory (no automatic retry).
-const AI_INTENT_BLOCKS = new Set(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED"]);
+const AI_INTENT_BLOCKS = new Set(["AI_INTENT_TIMEOUT", "AI_INTENT_MISSING", "AI_INTENT_FAILED", "AI_PROVIDER_FAILED"]);
 const MAX_AI_RETRIES = 2;
+// A provider refusal did no planning work, so its reruns do not use the AI retry allowance;
+// they have their own cap so a permanently refused key cannot be rerun without end.
+const MAX_AI_PROVIDER_RETRIES = 10;
+const aiRetryCounts = (history = []) => ({
+  provider: history.filter(entry => entry.errorCode === "AI_PROVIDER_FAILED").length,
+  session: history.filter(entry => entry.errorCode !== "AI_PROVIDER_FAILED").length });
 
 function failure(code) { const error = new Error(code); error.code = code; return error; }
 function object(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -236,7 +242,8 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
             || !timestamp(entry.failedAt)
             || !HASH.test(entry.inputSha256)))
         || payload.aiRetryHistory !== undefined && (!Array.isArray(payload.aiRetryHistory)
-          || payload.aiRetryHistory.length > MAX_AI_RETRIES
+          || aiRetryCounts(payload.aiRetryHistory).session > MAX_AI_RETRIES
+          || aiRetryCounts(payload.aiRetryHistory).provider > MAX_AI_PROVIDER_RETRIES
           || payload.aiRetryHistory.some((entry) => !object(entry) || Object.keys(entry).length !== 2
             || !AI_INTENT_BLOCKS.has(entry.errorCode) || !timestamp(entry.failedAt)))
         || payload.renderRetryHistory !== undefined && (!Array.isArray(payload.renderRetryHistory)
@@ -491,7 +498,9 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       || !run.planStartedAt || !run.prepared || !run.acquisition || run.runnerStartedAt
       || run.planSha256 || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt)
       throw failure("VM_PMO_RETRY_NOT_ALLOWED");
-    if ((run.aiRetryHistory?.length ?? 0) >= MAX_AI_RETRIES) throw failure("VM_PMO_RETRY_LIMIT");
+    const counts = aiRetryCounts(run.aiRetryHistory);
+    if (run.errorCode === "AI_PROVIDER_FAILED" ? counts.provider >= MAX_AI_PROVIDER_RETRIES
+      : counts.session >= MAX_AI_RETRIES) throw failure("VM_PMO_RETRY_LIMIT");
     assertCurrent(run);
     await verifyRetryInput({ run });
     assertCurrent(run);
