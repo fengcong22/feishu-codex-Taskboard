@@ -798,15 +798,19 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         if (!samePackageIdentity(packageIdentity,local.packageIdentity)) throw fail("VM_PMO_PACKAGE_CHANGED");
         const rawRecord = await readCurrentRecord({subject: local.subject,event: origin,stageId: origin.stageId,
           allowReviewImages: await reviewImagesSupported(await getPackage(origin.packageAlias))});
-        // Taskboard's own "materials ready" write is the only other status this run may see before render.
-        const readyOption = origin.stageId === "initial" && materialEdgesFor(local.subject).materialsReady
-          ? local.subject.vmWorkflow.stages.initial.writeback.materialsReady.optionId : null;
+        // Taskboard's own source writebacks are the only other statuses this run may see before render.
+        const edges = origin.stageId === "initial" ? materialEdgesFor(local.subject)
+          : {materialsReady: false,downloadFailed: false};
+        const stage = local.subject.vmWorkflow.stages.initial;
+        const sourceOptions = new Set([edges.materialsReady && stage.writeback.materialsReady.optionId,
+          edges.downloadFailed && stage.writeback.downloadFailed.optionId]
+          .filter(option => typeof option === "string"));
         const record = normalizeVmRecordContext(rawRecord,
-          {expectedStatusOptionId: readyOption && rawRecord?.statusOptionId === readyOption
-            ? readyOption : origin.afterOptionId});
+          {expectedStatusOptionId: sourceOptions.has(rawRecord?.statusOptionId)
+            ? rawRecord.statusOptionId : origin.afterOptionId});
         const frozenContext=origin.stageSnapshot?.vmContext;
-        const comparable = readyOption && record.statusOptionId === readyOption
-          ? {...record,statusOptionId: frozenContext?.statusOptionId} : record;
+        const comparable = sourceOptions.has(record.statusOptionId)
+          ? {...record,statusOptionId:frozenContext?.statusOptionId} : record;
         const instructionOnlyDrift=run.manualRevision !== undefined
           && origin.stageId === "initial" && same({...comparable,instruction:frozenContext?.instruction},frozenContext);
         if (!same(comparable,frozenContext) && !instructionOnlyDrift) throw fail("VM_PMO_RECORD_CHANGED");
@@ -998,6 +1002,16 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && planAttempt < MAX_PLAN_ATTEMPTS && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    // A verified download may continue this run: either it finished after "outcome unknown", or the
+    // record's status option stopped preparation before any planning. Nothing is re-requested.
+    const canResumeSource = run.state === "blocked"
+      && (run.errorCode === "VM_DOWNLOAD_FAILED"
+          && run.downloadFailure?.reason === "VM_DOWNLOAD_OUTCOME_UNKNOWN" && run.downloadFailure?.approved === true
+          && !run.acquisition
+        || run.errorCode === "VM_RECORD_STATUS_CHANGED" && run.acquisition?.vmid_binding === "vm_api_verified")
+      && run.identity.origin.stageId === "initial" && run.binding.approvalJobId !== null
+      && !run.prepared && !run.planStartedAt && !run.runnerStartedAt && !run.planSha256
+      && !run.renderResult && !run.artifactId && !run.deliveredFileToken && !run.completedAt;
     const canRetryValidatedPlan = run.state === "needs_attention" && run.errorCode === "PLAN_INVALID"
       && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
@@ -1037,7 +1051,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       }} : {}),
       canRetryApproval,canRetryManualRevision,
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
-        failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,
+        failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,canResumeSource,
       canRetryStepTimeout,
       stepTimeoutRetryHistory:(run.stepTimeoutRetryHistory ?? []).map(entry => ({
         errorCode: entry.errorCode, failedAt: entry.failedAt, stage: entry.stage })),
@@ -1064,6 +1078,50 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     let context;
     try {context = JSON.parse(row.bound_json).context;} catch {return null;}
     return readVmPmoRunReview(context);
+  }
+
+  /** Continue a run with the material its approved download already produced: either the download
+   * reported "outcome unknown" and finished later, or the record's status option stopped preparation
+   * before any planning. Everything is re-derived: the bound approval job must still be this run's,
+   * its receipt must match that approval, and the video bytes are re-hashed before anything is written.
+   * Nothing is re-requested, re-downloaded or re-approved. */
+  async function resumeDownloadedSource(taskId,request) {
+    await ready();
+    if (!object(request) || Object.keys(request).length !== 1
+      || !Number.isSafeInteger(request.version) || request.version < 1) throw fail("VM_PMO_RESUME_CONSENT_REQUIRED",400);
+    const assertTaskVersion = () => {
+      if (database.getTask(taskId)?.version !== request.version) throw fail("VERSION_CONFLICT",409);
+    };
+    assertTaskVersion();
+    const service = initialize(), run = service.orchestrator.getForTask(taskId);
+    const unknownOutcome = run?.state === "blocked" && run.errorCode === "VM_DOWNLOAD_FAILED"
+      && run.downloadFailure?.reason === "VM_DOWNLOAD_OUTCOME_UNKNOWN";
+    const stoppedOnStatus = run?.state === "blocked" && run.errorCode === "VM_RECORD_STATUS_CHANGED"
+      && Boolean(run.acquisition);
+    if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
+      || !(unknownOutcome || stoppedOnStatus)) throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
+    if (run.binding.approvalJobId === null) throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
+    const downloads = await getDownloads();
+    const job = downloads.lookupTaskRun?.({jobId: run.binding.approvalJobId});
+    const receiptPath = typeof job?.acquisition?.receipt_path === "string"
+      ? job.acquisition.receipt_path : job?.receipt_path;
+    if (!job || job.vmid !== run.binding.vmid || typeof receiptPath !== "string")
+      throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
+    // The receipt must still name the application and instance this run's material was approved for.
+    const applicationId = run.downloadFailure?.applicationId ?? job.application_id;
+    const instanceCode = run.downloadFailure?.instanceCode ?? job.instance_code;
+    if (![applicationId,instanceCode].every(value => typeof value === "string" && value)
+      || job.application_id !== applicationId || job.instance_code !== instanceCode)
+      throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
+    let acquisition;
+    try {
+      // Keep the exact shape a normal acquisition has, so later retries compare like with like.
+      acquisition = await verifyVmAcquisitionReceipt(receiptPath,{vmid: run.binding.vmid,
+        applicationId,instanceCode});
+    } catch {throw fail("VM_PMO_RESUME_SOURCE_CHANGED",409);}
+    const queued = await service.orchestrator.resumeDownloadedSource(run.runId,acquisition,{beforeCommit:assertTaskVersion});
+    void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
+    return publicRun(queued);
   }
 
   async function retryAiIntent(taskId,request) {
@@ -1479,6 +1537,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,
     retryStepTimeout,retryWriteback,
     retryAiIntent,
+    resumeDownloadedSource,
     submitManualSource,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),
     list: () => services?.orchestrator.list() ?? [],

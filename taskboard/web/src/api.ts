@@ -1575,6 +1575,12 @@ export async function retryTaskVmPmoWriteback(
 }
 
 // 重新校验已保存的规划，不重新规划、不重新识别。
+export async function retryTaskVmPmoResumeSource(taskId: string, version: number): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(`/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-resume-source`,
+    { method: "POST", headers: { "X-Taskboard-Client": "web" }, body: JSON.stringify({ version }) });
+  return data.run;
+}
+
 export async function retryTaskVmPmoPlanValidation(
   taskId: string,
   version: number,

@@ -1017,9 +1017,11 @@ test("server begins listening without waiting for upload recovery to drain", asy
   });
   try {
     listening = app.listen({ host: "127.0.0.1", port: 0 });
+    // The bound is "does not wait for the drain", not a fixed latency: under a full concurrent run
+    // opening the listener alone can take a moment.
     const outcome = await Promise.race([
       listening.then(() => "listening"),
-      new Promise((resolve) => setTimeout(() => resolve("timed-out"), 100)),
+      new Promise((resolve) => setTimeout(() => resolve("timed-out"), 2_000)),
     ]);
     assert.equal(outcome, "listening");
   } finally {

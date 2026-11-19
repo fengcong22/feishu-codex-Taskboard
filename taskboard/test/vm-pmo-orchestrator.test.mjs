@@ -938,3 +938,79 @@ test("a timeout retry is refused once the run produced output or already retried
   await x.f.retryStepTimeout("run_vm");
   await assert.rejects(x.f.retryStepTimeout("run_vm"),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
 });
+
+test("a download that finished after an unknown outcome continues the same run with that material", async (t) => {
+  const x = await fixture(t);
+  // The approval queue reports an unknown outcome, so the run stops on download failed — as in production.
+  const base = x.dependencies.bindings.status;
+  x.dependencies.bindings.status = async (taskId) => ({ ...(await base(taskId)), status: "needs_attention",
+    error: { code: "VM_DOWNLOAD_OUTCOME_UNKNOWN" }, approvalEvidence: { applicationId: "app_1", instanceCode: "inst_1" } });
+  x.dependencies.materialEdges = async () => ({ downloadFailed: true });
+  // Dependencies are captured when the service is created, so rebuild it with the new adapters.
+  await x.restart();
+  await x.f.register({ taskId: "task_vm" });
+  const blocked = await x.f.pump("run_vm");
+  assert.deepEqual([blocked.state, blocked.errorCode], ["blocked", "VM_DOWNLOAD_FAILED"]);
+  assert.equal(blocked.downloadFailure.reason, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.equal(blocked.downloadFailure.approved, true);
+
+  // The verified material of this run: a receipt plus the file it names, as the download queue produces it.
+  const material = { vmid: "5dd7753a4723ba416403cbad", receipt_path: path.join(path.dirname(x.prepared.contextPath), "receipt.json"),
+    path: path.join(path.dirname(x.prepared.contextPath), "source.mp4"), sha256: "a".repeat(64), bytes: 100,
+    duration_ms: 1000, width: 1920, height: 1080, vmid_binding: "vm_api_verified" };
+  const resumed = await x.f.resumeDownloadedSource("run_vm", material);
+  assert.deepEqual([resumed.state, resumed.acquisition], ["ready", material]);
+  // The failure record stays as evidence of what happened; only the state moves on.
+  assert.equal(resumed.errorCode, null);
+  assert.equal(resumed.downloadFailure.reason, "VM_DOWNLOAD_OUTCOME_UNKNOWN");
+  assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
+  assert.equal(x.calls.find(([name]) => name === "prepare")[1].acquisition.path, material.path);
+  assert.equal(x.calls.filter(([name]) => name === "reserve").length, 1);
+});
+
+test("a run stopped only because the record's status option changed continues with its adopted material", async (t) => {
+  const x = await fixture(t);
+  // The material was adopted, then preparation refused the record because the status had moved on.
+  x.dependencies.prepareInput = async (input) => {
+    x.calls.push(["prepare", input]);
+    const error = new Error("VM_RECORD_STATUS_CHANGED");
+    error.code = "VM_RECORD_STATUS_CHANGED";
+    throw error;
+  };
+  await x.restart();
+  x.setApproval("ready");
+  await x.f.register({ taskId: "task_vm" });
+  const blocked = await x.f.pump("run_vm");
+  assert.deepEqual([blocked.state, blocked.errorCode], ["blocked", "VM_RECORD_STATUS_CHANGED"]);
+  assert.equal(blocked.prepared, undefined);
+  // Such a run always carries the earlier download failure that bound the material to an approval.
+  const row = x.db.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get("run_vm");
+  x.db.prepare("UPDATE vm_pmo_runs SET payload_json = ? WHERE run_id = ?").run(JSON.stringify({
+    ...JSON.parse(row.payload_json),
+    downloadFailure: { reason: "VM_DOWNLOAD_OUTCOME_UNKNOWN", approved: true, applicationId: "app_1",
+      instanceCode: "inst_1", failedAt: "2026-11-19T02:49:07.233Z" } }), "run_vm");
+  const material = { ...blocked.acquisition, vmid: "5dd7753a4723ba416403cbad" };
+
+  // The same material is reused; a different one is refused, since this run already holds evidence.
+  await assert.rejects(x.f.resumeDownloadedSource("run_vm", { ...material, sha256: "e".repeat(64) }),
+    { code: "VM_PMO_RESUME_NOT_ALLOWED" });
+  x.dependencies.prepareInput = async (input) => { x.calls.push(["prepare", input]); return x.prepared; };
+  await x.restart();
+  const resumed = await x.f.resumeDownloadedSource("run_vm", material);
+  assert.deepEqual([resumed.state, resumed.errorCode], ["ready", null]);
+  assert.equal(resumed.acquisition.sha256, material.sha256);
+  assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
+  assert.equal(x.calls.filter(([name]) => name === "reserve").length, 1);
+});
+
+test("resume refuses a run that already planned, rendered or used another reason", async (t) => {
+  const x = await fixture(t);
+  await assert.rejects(x.f.resumeDownloadedSource("run_vm", { vmid_binding: "vm_api_verified", vmid: "5dd7753a4723ba416403cbad" }),
+    { code: "VM_PMO_RESUME_NOT_ALLOWED" });
+  x.setApproval("ready");
+  await x.f.register({ taskId: "task_vm" });
+  await x.f.pump("run_vm");
+  assert.equal(x.f.get("run_vm").state, "delivery_pending");
+  await assert.rejects(x.f.resumeDownloadedSource("run_vm", { vmid_binding: "vm_api_verified", vmid: "5dd7753a4723ba416403cbad" }),
+    { code: "VM_PMO_RESUME_NOT_ALLOWED" });
+});

@@ -286,8 +286,10 @@ export function createVmDownloadService({ store, metadata, session: injectedSess
       if (session.client() && job.requester_id && job.requester_id !== session.identity()?.user_id) {
         fail("VM_APPLICANT_CHANGED");
       }
+      // The task runtime re-derives its own acquisition from this receipt; the UI never sees it.
       return { ...publicJob(job), requestFingerprint: job.request_fingerprint,
-        request: structuredClone(job.request) };
+        request: structuredClone(job.request),
+        ...(typeof job.receipt_path === "string" ? { receipt_path: job.receipt_path } : {}) };
     },
     snapshot() {
       const summary = metadata.summary();

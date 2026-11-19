@@ -506,6 +506,46 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     } catch (error) { db.exec("ROLLBACK"); throw error; }
     return get(runId);
   }
+  /** A run whose approved download produced a verified file may continue with that file after a stop
+   * that left no work behind. Two cases qualify: the download reported "outcome unknown" (the file is
+   * adopted now), or the file was already adopted and the record's status option stopped preparation.
+   * The caller re-verifies the bound approval and the receipt; nothing is re-requested or re-approved. */
+  const RESUME_CODES = ["VM_DOWNLOAD_FAILED", "VM_RECORD_STATUS_CHANGED"];
+  // The same fields a retry re-verifies; the receipt and bytes must be this run's own evidence.
+  const ACQUISITION_KEYS = ["receipt_path", "path", "sha256", "bytes", "duration_ms", "vmid_binding"];
+  async function resumeDownloadedSource(runId, acquisition, {beforeCommit = () => {}} = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run || run.state !== "blocked" || !RESUME_CODES.includes(run.errorCode)
+      // An unknown outcome needs proof the application was approved; an adopted material already has it.
+      || run.errorCode === "VM_DOWNLOAD_FAILED" && run.downloadFailure?.approved !== true
+      || run.identity.origin.stageId !== "initial" || run.prepared || run.planStartedAt
+      || run.runnerStartedAt || run.planSha256 || run.renderResult || run.artifactId
+      || run.deliveredFileToken || run.completedAt || run.leaseToken
+      || run.manualSource !== undefined
+      || !object(acquisition) || acquisition.vmid_binding !== "vm_api_verified"
+      || acquisition.vmid !== undefined && acquisition.vmid !== run.binding.vmid
+      // An adopted acquisition is reused as-is; a fresh one only fills the download-failure stop.
+      || run.acquisition !== undefined
+        && (run.errorCode !== "VM_RECORD_STATUS_CHANGED"
+          || ACQUISITION_KEYS.some(key => run.acquisition[key] !== acquisition[key])))
+      throw failure("VM_PMO_RESUME_NOT_ALLOWED");
+    assertCurrent(run);
+    const payload = json({ ...JSON.parse(row.payload_json), acquisition: structuredClone(acquisition) });
+    const codes = RESUME_CODES.map(() => "?").join(", ");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      // Taskboard's own "materials ready" write, or the operator, may already have moved the status.
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'ready',payload_json = ?,error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'blocked' AND error_code IN (${codes}) AND payload_json = ? AND lease_token IS NULL`)
+        .run(payload, now(), now(), runId, run.taskId, ...RESUME_CODES, row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RESUME_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return get(runId);
+  }
   async function retryValidatedPlan(runId, {beforeCommit = () => {}} = {}) {
     const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
     const run = fromRow(row);
@@ -913,7 +953,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return draining;
   }
   return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryManualRevision,
-    retryPlan, retryValidatedPlan, retryAiIntent,
+    retryPlan, retryValidatedPlan, retryAiIntent, resumeDownloadedSource,
     retryFailedRender,
     retryStepTimeout,
     recoverBindingConflicts,

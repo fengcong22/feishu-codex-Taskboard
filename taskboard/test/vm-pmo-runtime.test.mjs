@@ -1219,3 +1219,72 @@ test("a verified operator VMID.mp4 continues the same approved run", async t => 
   assert.equal(f.approvals.list().length,1);
   assert.equal(outbox(f).some(row => row.moment === "materials_ready"),false);
 });
+
+async function stoppedOnStatusChange(f) {
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  // The operator moved the record off the trigger while preparation was reading it.
+  f.record.fields.fld_status = "准备";
+  await f.runtime.wake();
+  const [run] = f.runtime.list();
+  assert.deepEqual([run.state,run.errorCode],["blocked","VM_RECORD_STATUS_CHANGED"]);
+  assert.equal(run.acquisition.vmid_binding,"vm_api_verified");
+  return run;
+}
+
+test("a verified download continues a run that only stopped because the record's status moved",async t=>{
+  const f = await fixture(t,{material: true});
+  const run = await stoppedOnStatusChange(f);
+  const summary = await f.runtime.getTaskRun(run.taskId);
+  assert.equal(summary.canResumeSource,true);
+  // The operator or Taskboard's own write put the record on a source option before the recovery.
+  f.record.fields.fld_status = "素材已就绪";
+  const hold = await f.scheduler.request({requestId:"resume-hold",concurrencyGroup:"autocut:slicing",
+    maxConcurrent:1,resourceGroups:["vm-render"],queuePolicy:"per-group",fixedMaxConcurrent:true});
+  t.after(() => hold.release());
+  const resumed = await f.runtime.resumeDownloadedSource(run.taskId,
+    {version: f.database.getTask(run.taskId).version});
+  assert.equal(resumed.state,"ready");
+  assert.equal(resumed.errorCode,null);
+  // The board summary hides paths; the run itself keeps exactly the material it verified.
+  assert.deepEqual(f.runtime.list().find(entry => entry.runId === run.runId).acquisition,run.acquisition);
+  // The same run prepares with the same material: no new approval and no new download request.
+  for (let attempt = 0; attempt < 100 && f.runtime.list()[0].state !== "prepared"; attempt++)
+    await new Promise(resolve => setTimeout(resolve,20));
+  assert.equal(f.runtime.list()[0].state,"prepared");
+  assert.equal(f.approvals.list().length,1);
+});
+
+test("a records' own source option does not stop preparation after a verified download",async t=>{
+  const f = await fixture(t,{material: true});
+  const hold = await f.scheduler.request({requestId:"option-hold",concurrencyGroup:"autocut:slicing",
+    maxConcurrent:1,resourceGroups:["vm-render"],queuePolicy:"per-group",fixedMaxConcurrent:true});
+  t.after(() => hold.release());
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  // Taskboard itself writes 下载失败 or 素材已就绪; neither may be read as someone else's edit.
+  f.record.fields.fld_status = "下载失败";
+  await f.runtime.wake();
+  assert.equal(f.runtime.list()[0].state,"prepared",f.runtime.list()[0].errorCode);
+  f.record.fields.fld_status = "素材已就绪";
+  await f.runtime.wake();
+  assert.equal(f.runtime.list()[0].state,"prepared",f.runtime.list()[0].errorCode);
+});
+
+test("resume refuses a stale task version and a run with no verified material",async t=>{
+  const f = await fixture(t,{material: true});
+  const run = await stoppedOnStatusChange(f);
+  await assert.rejects(() => f.runtime.resumeDownloadedSource(run.taskId,
+    {version: f.database.getTask(run.taskId).version + 1}),{code:"VERSION_CONFLICT"});
+  await assert.rejects(() => f.runtime.resumeDownloadedSource(run.taskId,{}),{code:"VM_PMO_RESUME_CONSENT_REQUIRED"});
+  // Matching the receipt bytes is what licenses the resume; a changed file refuses it.
+  const job = f.approvals.list()[0], claim = f.approvals.claim(job.id);
+  await writeFile(job.acquisition.path,Buffer.from("replaced source"));
+  f.approvals.save(job.id,claim.leaseToken,claim.job,{release: true});
+  f.record.fields.fld_status = "素材已就绪";
+  await assert.rejects(() => f.runtime.resumeDownloadedSource(run.taskId,
+    {version: f.database.getTask(run.taskId).version}),{code:"VM_PMO_RESUME_SOURCE_CHANGED"});
+  assert.deepEqual([f.runtime.list()[0].state,f.runtime.list()[0].errorCode],["blocked","VM_RECORD_STATUS_CHANGED"]);
+});

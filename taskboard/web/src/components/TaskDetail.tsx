@@ -36,6 +36,7 @@ import {
   rerunTaskAutoCutCurrent,
   retryTaskVmPmoPlan,
   retryTaskVmPmoAiIntent,
+  retryTaskVmPmoResumeSource,
   retryTaskVmPmoWriteback,
   retryTaskVmPmoPlanValidation,
   retryTaskVmPmoRender,
@@ -492,6 +493,7 @@ export function TaskDetail({
   const [retryingVmPmoWriteback, setRetryingVmPmoWriteback] = useState(false);
   const [retryingVmPmoValidation, setRetryingVmPmoValidation] = useState(false);
   const [retryingVmPmoRender, setRetryingVmPmoRender] = useState(false);
+  const [resumingVmPmoSource, setResumingVmPmoSource] = useState(false);
   const [retryingVmPmoStepTimeout, setRetryingVmPmoStepTimeout] = useState(false);
   const [retryingVmPmoApproval, setRetryingVmPmoApproval] = useState(false);
   const [submittingVmPmoRevision, setSubmittingVmPmoRevision] = useState(false);
@@ -2032,6 +2034,18 @@ export function TaskDetail({
                         {retryingVmPmoStepTimeout
                           ? text("正在重跑…", "Rerunning…")
                           : text("重新执行超时的步骤", "Rerun the timed-out step")}
+                      </button>
+                    )}
+                    {vmPmoRun.canResumeSource && (
+                      <button type="button" disabled={resumingVmPmoSource}
+                        title={text(
+                          "下载曾报告结果未知，但素材已经下载成功；沿用原审批和这条任务继续剪辑，不重新申请",
+                          "The download reported an unknown outcome but finished; continue this run with the downloaded file, without a new request",
+                        )}
+                        onClick={() => void retryVmPmoByVersion(true, setResumingVmPmoSource, retryTaskVmPmoResumeSource)}>
+                        {resumingVmPmoSource
+                          ? text("正在接续…", "Resuming…")
+                          : text("使用已下载的素材继续", "Continue with the downloaded file")}
                       </button>
                     )}
                     {vmPmoRun.canRetryFailedRender && (
