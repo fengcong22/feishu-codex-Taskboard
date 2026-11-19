@@ -444,13 +444,16 @@ export function PackageWorkflowWorkspace({ enabled = true, ...props }: Props) {
                             onDragEnd={() => {}}
                             onOpenConversation={props.onOpenConversation}
                             showWorkflowTimestamp
-                            actions={stage === "completed" ? (
+                            actions={(
+                              // Offered in every column: limiting this to
+                              // "completed" stranded cards that stopped earlier,
+                              // since deletion needs an archived task.
                               <PackageWorkflowCardActions
                                 task={item.task}
                                 onArchiveTask={props.onArchiveTask}
                                 onDeleteTask={props.onDeleteTask}
                               />
-                            ) : null}
+                            )}
                           />
                           <div className="package-workflow-card-evidence">
                             {item.evidence?.approvalStatus &&

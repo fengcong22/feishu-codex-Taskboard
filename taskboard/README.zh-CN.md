@@ -38,6 +38,8 @@ npm start
 
 原 render 子进程已关闭且运行停在 `needs_attention/VM_PMO_START_EVIDENCE_FAILED` 时，可在本机调用 `POST /api/local/tasks/:id/vm-pmo-render-retry` 并提交当前任务 `version` 人工恢复一次。接口要求没有结果文件、MP4 或交付证据，复核原审批、采集回执、源 SHA 和已保存规划 SHA；保留首次启动时间，沿原 task/run 继续，不重新审批或下载。待启动的恢复仍受当前本机自动剪辑开关约束。已归档的重复任务不再抢占 VM 最新轮次。
 
+规划或渲染步骤超时（`needs_attention/VM_PMO_RUN_TIMEOUT`）、卡住的子进程已被结束且没有留下结果时，可在本机调用 `POST /api/local/tasks/:id/vm-pmo-step-timeout-retry` 并提交当前任务 `version` 重跑超时的那一步：规划超时从同一份冻结输入重新规划，渲染超时沿用已保存的规划只重跑渲染。接口要求没有结果文件、MP4 或交付证据，每个 run 只能重跑一次；已有产出时按钮不出现。该重跑同样受本机自动剪辑开关约束。
+
 如需在前端实时重载模式下开发：
 
 ```bash
