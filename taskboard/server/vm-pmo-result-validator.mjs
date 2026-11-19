@@ -24,7 +24,8 @@ export const VM_PMO_QA_RESULT = "qa-result.json";
 const QA_KINDS = new Set(["coverage_complete", "operation_compiled", "phrase_absent", "phrase_present",
   "cue_first_word", "must_keep_present", "duration_match", "cut_not_inside_word", "sentence_complete",
   "seam_gap", "seam_discontinuity", "opening_frame", "seam_frames", "seam_pause_picture", "freeze_frames",
-  "mute_silence", "unlisted_change", "listening", "pacing"]);
+  "mute_silence", "unlisted_change", "frame_count", "frame_timing", "black_frames", "blurred_frames",
+  "luma_flashes", "still_frames", "speech_present", "listening", "pacing"]);
 const QA_STATUSES = new Set(["passed", "failed", "ai_reviewed", "needs_human", "not_run"]);
 const QA_METHODS = new Set(["automatic", "ai_visual", "ai_reading", "human"]);
 const QA_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u;
@@ -688,9 +689,25 @@ export async function validateVmPmoAnalyze({ contextPath, signal, expectedBound 
   return { status: "ready", resultSha256: sha256, analyze: result, ...bound };
 }
 
+// A picture item may name the frames exported for its review, and their hashes.
+function qaFrame(row) {
+  return (row.frames === undefined || Array.isArray(row.frames) && row.frames.length > 0
+    && row.frames.every((name) => typeof name === "string" && name.length > 0))
+    && (row.frames_sha256 === undefined || object(row.frames_sha256)
+      && Object.values(row.frames_sha256).every(digest));
+}
+
+/** Every QA check row is valid and every (id, kind) pair appears once: the package groups the
+ * mechanical picture checks under one id, so a check is identified by its id together with its kind. */
+export function validVmPmoQaChecks(checks) {
+  return Array.isArray(checks) && checks.length > 0 && checks.every(qaCheck)
+    && new Set(checks.map((row) => `${row.check_id}\u0000${row.kind}`)).size === checks.length;
+}
+
 function qaCheck(row) {
   return exactKeys(row, ["check_id", "intent_id", "kind", "status", "method", "evidence_ids",
-    "target_start_us", "target_end_us", "detail"])
+    "target_start_us", "target_end_us", "detail"], ["frames", "frames_sha256"])
+    && qaFrame(row)
     && QA_ID.test(row.check_id) && (row.intent_id === null || QA_ID.test(row.intent_id))
     && QA_KINDS.has(row.kind) && QA_STATUSES.has(row.status) && QA_METHODS.has(row.method)
     && Array.isArray(row.evidence_ids) && row.evidence_ids.every((value) => QA_ID.test(value))
@@ -734,8 +751,7 @@ export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan
     || !bindings.source_sha256s.every(digest)
     || bindings.output_alignment_sha256 !== null && !digest(bindings.output_alignment_sha256)
     || !["failed", "ready_for_review"].includes(report.overall)
-    || !Array.isArray(report.checks) || !report.checks.length || !report.checks.every(qaCheck)
-    || new Set(report.checks.map((row) => row.check_id)).size !== report.checks.length
+    || !validVmPmoQaChecks(report.checks)
     || report.overall !== (report.checks.some((row) => row.status === "failed") ? "failed" : "ready_for_review")
     || !Array.isArray(report.limitations) || report.limitations.some((value) => typeof value !== "string"))
     fail("QA_REPORT_INVALID");
