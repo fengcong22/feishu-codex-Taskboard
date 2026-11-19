@@ -12,6 +12,9 @@ const APPROVAL_STATES = new Set(["reserved", "queued", "submitting", "reconcilin
 const LEASE_MS = 60_000;
 const MAX_ATTEMPTS = 8;
 const MAX_PLAN_ATTEMPTS = 3;
+// Planning stops a human may rerun: unresolved word timing, and a package that read the intent
+// differently from its fixed patterns (prerelease of the rule comparison).
+const PLAN_RETRY_CODES = ["WORD_ALIGNMENT_UNRESOLVED", "INTENT_RULE_MISMATCH"];
 const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepared", "planStartedAt",
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
   "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
@@ -229,7 +232,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
           || payload.retryHistory.length > MAX_PLAN_ATTEMPTS - 1
           || payload.retryHistory.some((entry) => !object(entry) || !Number.isSafeInteger(entry.planAttempt)
             || entry.planAttempt < 1 || entry.planAttempt >= MAX_PLAN_ATTEMPTS
-            || !["WORD_ALIGNMENT_UNRESOLVED","UNSUPPORTED_INSTRUCTION"].includes(entry.errorCode)
+            || !["WORD_ALIGNMENT_UNRESOLVED","UNSUPPORTED_INSTRUCTION","INTENT_RULE_MISMATCH"].includes(entry.errorCode)
             || !timestamp(entry.failedAt)
             || !HASH.test(entry.inputSha256)))
         || payload.aiRetryHistory !== undefined && (!Array.isArray(payload.aiRetryHistory)
@@ -448,7 +451,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
   async function retryPlan(runId, {beforeCommit = () => {}} = {}) {
     const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
     const run = fromRow(row);
-    if (!run || run.state !== "blocked" || run.errorCode !== "WORD_ALIGNMENT_UNRESOLVED"
+    if (!run || run.state !== "blocked" || !PLAN_RETRY_CODES.includes(run.errorCode)
       || !run.planStartedAt || !run.prepared || !run.acquisition || run.runnerStartedAt
       || run.planSha256 || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt)
       throw failure("VM_PMO_RETRY_NOT_ALLOWED");
@@ -471,8 +474,9 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       beforeCommit();
       const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'ready',payload_json = ?,error_code = NULL,
         attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
-        AND state = 'blocked' AND error_code = 'WORD_ALIGNMENT_UNRESOLVED' AND payload_json = ? AND lease_token IS NULL`)
-        .run(nextPayload, now(), now(), runId, run.taskId, row.payload_json);
+        AND state = 'blocked' AND error_code IN (${PLAN_RETRY_CODES.map(() => "?").join(", ")})
+        AND payload_json = ? AND lease_token IS NULL`)
+        .run(nextPayload, now(), now(), runId, run.taskId, ...PLAN_RETRY_CODES, row.payload_json);
       if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }

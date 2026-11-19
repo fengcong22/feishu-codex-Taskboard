@@ -1019,7 +1019,10 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         && planAttempt > 1 && planAttempt <= MAX_PLAN_ATTEMPTS && !run.prepared && !run.planStartedAt
         && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
         && !run.deliveredFileToken && !run.completedAt;
-    const canRetryPlan = run.state === "blocked" && run.errorCode === "WORD_ALIGNMENT_UNRESOLVED"
+    // Both stops need a fresh plan from the same input; a rule mismatch is the package's own reading
+    // having changed, so rerunning after the fix is the operator's decision and nothing is re-downloaded.
+    const canRetryPlan = run.state === "blocked"
+      && ["WORD_ALIGNMENT_UNRESOLVED", "INTENT_RULE_MISMATCH"].includes(run.errorCode)
       && planAttempt < MAX_PLAN_ATTEMPTS && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
