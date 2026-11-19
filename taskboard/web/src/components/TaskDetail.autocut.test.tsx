@@ -284,6 +284,30 @@ describe("TaskDetail Auto-Cut execution", () => {
     expect(JSON.parse(request.body)).toEqual({ version: TASK.version });
   });
 
+  it("reruns a timed-out step only when the server says it produced nothing", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "needs_attention",
+      errorCode: "VM_PMO_RUN_TIMEOUT", approvalStatus: "ready", planAttempt: 1, retryLimit: 3,
+      retryHistory: [], canRetryPlan: false, canRetryFailedRender: false,
+      canRetryStepTimeout: true, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("vm-pmo-step-timeout-retry"))).toBe(false);
+
+    fireEvent.click(await screen.findByRole("button", { name: "重新执行超时的步骤" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).endsWith("/vm-pmo-step-timeout-retry") && init?.method === "POST")).toBe(true));
+    const [, request] = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/vm-pmo-step-timeout-retry"))!;
+    expect(JSON.parse(request.body)).toEqual({ version: TASK.version });
+  });
+
+  it("hides the timeout retry when the server does not allow it", async () => {
+    vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "needs_attention",
+      errorCode: "VM_PMO_RUN_TIMEOUT", approvalStatus: "ready", planAttempt: 1, retryLimit: 3,
+      retryHistory: [], canRetryPlan: false, canRetryStepTimeout: false, updatedAt: CREATED_AT };
+    render(view(props(TASK)));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重新执行超时的步骤" })).toBeNull());
+  });
+
   it("requeues approval only when the server says the applicant change can be retried", async () => {
     vmRun = { runId: "vm-run-1", taskId: TASK.id, state: "blocked", errorCode: "VM_APPLICANT_CHANGED",
       approvalStatus: "reserved", planAttempt: 1, retryLimit: 3, retryHistory: [], canRetryPlan: false,

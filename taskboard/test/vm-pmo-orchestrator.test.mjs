@@ -851,3 +851,90 @@ test("a review on the original source cuts the root's verified original, not the
   assert.equal(x.calls.find(([name]) => name === "prepare")[1].acquisition.path, original.path);
   assert.equal(x.calls.some(([name]) => ["reserve", "reconcile", "status"].includes(name)), false);
 });
+
+test("a timed-out plan can be rerun once from the same frozen input",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});x.setApproval("ready");
+  let planning=0;
+  x.dependencies.runOffline=async ({mode,onStarted})=>{
+    x.calls.push([mode]);
+    await onStarted({mode,pid:42,startedAt:new Date(1_700_000_000_000+planning*1000).toISOString()});
+    if (mode === "plan" && planning++ === 0) {
+      const error=new Error("step timed out");error.code="VM_PMO_RUN_TIMEOUT";throw error;
+    }
+    return mode === "plan" ? {status:"ready",planSha256:"d".repeat(64)}
+      : {status:"rendered",planSha256:"d".repeat(64),artifact:x.artifact};
+  };
+  await x.restart();
+  const failed=await x.f.pump("run_vm");
+  assert.equal(failed.state,"needs_attention");
+  assert.equal(failed.errorCode,"VM_PMO_RUN_TIMEOUT");
+  // Nothing was produced, so the run owns no plan or render evidence yet.
+  assert.equal(failed.planSha256,undefined);
+  assert.equal(failed.renderResult,undefined);
+  assert.equal(failed.artifactId,undefined);
+
+  const retried=await x.f.retryStepTimeout("run_vm");
+  assert.equal(retried.state,"prepared");
+  assert.equal(retried.errorCode,null);
+  assert.equal(retried.stepTimeoutRetryHistory.length,1);
+  assert.equal(retried.stepTimeoutRetryHistory[0].stage,"plan");
+  // The failed stage starts clean, so its start evidence is gone.
+  assert.equal(retried.planStartedAt,undefined);
+
+  assert.equal((await x.f.pump("run_vm")).state,"delivery_pending");
+  // One retry per run, enforced by the persisted history.
+  await assert.rejects(x.f.retryStepTimeout("run_vm"),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
+});
+
+test("a timed-out render reuses the saved plan instead of replanning",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});x.setApproval("ready");
+  let rendering=0;
+  x.dependencies.runOffline=async ({mode,onStarted})=>{
+    x.calls.push([mode]);
+    await onStarted({mode,pid:42,startedAt:new Date(1_700_000_000_000+rendering*1000).toISOString()});
+    if (mode === "render" && rendering++ === 0) {
+      const error=new Error("step timed out");error.code="VM_PMO_RUN_TIMEOUT";throw error;
+    }
+    return mode === "plan" ? {status:"ready",planSha256:"d".repeat(64)}
+      : {status:"rendered",planSha256:"d".repeat(64),artifact:x.artifact};
+  };
+  await x.restart();
+  const failed=await x.f.pump("run_vm");
+  assert.equal(failed.errorCode,"VM_PMO_RUN_TIMEOUT");
+  assert.ok(failed.planSha256,"the plan survived the render timeout");
+
+  const retried=await x.f.retryStepTimeout("run_vm");
+  assert.equal(retried.state,"planned");
+  assert.equal(retried.stepTimeoutRetryHistory[0].stage,"render");
+  assert.equal(retried.planSha256,failed.planSha256);
+  assert.equal(retried.runnerStartedAt,undefined);
+  await x.f.pump("run_vm");
+  // The saved plan is reused, so planning is not repeated for the retry.
+  const modes = x.calls.filter((entry) => entry[0] === "plan" || entry[0] === "render");
+  assert.equal(modes.filter((entry) => entry[0] === "render").length, 2);
+  assert.ok(modes.length >= 2);
+});
+
+test("a timeout retry is refused once the run produced output or already retried",async t=>{
+  const x=await fixture(t);
+  await x.f.register({taskId:"task_vm"});x.setApproval("ready");
+  let rendering=0;
+  x.dependencies.runOffline=async ({mode,onStarted})=>{
+    x.calls.push([mode]);
+    await onStarted({mode,pid:42,startedAt:new Date(1_700_000_000_000+rendering*1000).toISOString()});
+    if (mode === "render" && rendering++ === 0) {
+      const error=new Error("step timed out");error.code="VM_PMO_RUN_TIMEOUT";throw error;
+    }
+    return mode === "plan" ? {status:"ready",planSha256:"d".repeat(64)}
+      : {status:"rendered",planSha256:"d".repeat(64),artifact:x.artifact};
+  };
+  await x.restart();
+  await x.f.pump("run_vm");
+  // Unknown runs are rejected before any state is inspected.
+  await assert.rejects(x.f.retryStepTimeout("missing_run"),{code:"VM_PMO_RUN_NOT_FOUND"});
+  // The first retry is allowed, and a second one is refused by its history.
+  await x.f.retryStepTimeout("run_vm");
+  await assert.rejects(x.f.retryStepTimeout("run_vm"),{code:"VM_PMO_RETRY_NOT_ALLOWED"});
+});

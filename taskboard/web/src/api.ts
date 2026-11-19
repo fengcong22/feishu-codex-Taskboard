@@ -1598,6 +1598,18 @@ export async function retryTaskVmPmoRender(
   return data.run;
 }
 
+/** Rerun the stage that hit its step timeout, from the same frozen input/plan. */
+export async function retryTaskVmPmoStepTimeout(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-step-timeout-retry`,
+    { method: "POST", body: JSON.stringify({ version }) },
+  );
+  return data.run;
+}
+
 // 申请人变更后重新排队审批，不领取旧申请的素材。
 export async function retryTaskVmPmoApproval(
   taskId: string,

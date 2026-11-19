@@ -15,7 +15,8 @@ const MAX_PLAN_ATTEMPTS = 3;
 const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepared", "planStartedAt",
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
   "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
-  "manualRevision", "downloadFailure", "manualSource", "materialsReadyNotified", "authRequiredSince", "aiRetryHistory"]);
+  "manualRevision", "downloadFailure", "manualSource", "materialsReadyNotified", "authRequiredSince", "aiRetryHistory",
+  "stepTimeoutRetryHistory"]);
 const CODE = /^[A-Z][A-Z0-9_]{1,100}$/u;
 const EVENT = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
 const APPROVAL_REF = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
@@ -558,6 +559,58 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     } catch (error) {db.exec("ROLLBACK");throw error;}
     return get(runId);
   }
+  /**
+   * A run that hit the step timeout is stuck in `needs_attention` with no way
+   * back: the failed child was signalled, so neither stage left a result, and
+   * no retry entry covers this code. The operator can rerun the same stage
+   * once from the same frozen plan/input. A run that already produced output is
+   * never reopened — that evidence may belong to a stage that finished.
+   */
+  async function retryStepTimeout(runId, { beforeCommit = () => {} } = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run) throw failure("VM_PMO_RUN_NOT_FOUND");
+    if (run.state !== "needs_attention" || run.errorCode !== "VM_PMO_RUN_TIMEOUT"
+      || !run.prepared || !run.acquisition || !run.planStartedAt
+      || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt
+      || run.stepTimeoutRetryHistory?.length) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    assertCurrent(run);
+    await verifyRetryInput({ run });
+
+    // Timed out while planning: nothing was produced, so plan again.
+    // Timed out while rendering: the saved plan is reused and only render reruns.
+    const timedOutInRender = Boolean(run.planSha256);
+    if (timedOutInRender) {
+      const checked = checkedResult(await validateSavedPlan({ run }), "plan");
+      if (checked.planSha256 !== run.planSha256) throw failure("VM_PMO_RETRY_PLAN_CHANGED");
+    }
+    assertCurrent(run);
+
+    const payload = JSON.parse(row.payload_json);
+    payload.stepTimeoutRetryHistory = [{
+      errorCode: run.errorCode,
+      failedAt: new Date(run.updatedAt).toISOString(),
+      stage: timedOutInRender ? "render" : "plan",
+    }];
+    // The retried stage must start clean, so its own start evidence is cleared.
+    if (timedOutInRender) delete payload.runnerStartedAt;
+    else { delete payload.planStartedAt; delete payload.planSha256; }
+    payload.processingNotified = false;
+
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = ?,payload_json = ?,error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'needs_attention' AND error_code = 'VM_PMO_RUN_TIMEOUT'
+        AND payload_json = ? AND lease_token IS NULL`)
+        .run(timedOutInRender ? "planned" : "prepared", json(payload), now(), now(),
+          runId, run.taskId, row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return get(runId);
+  }
   function claim(runId) {
     const owner = randomUUID();
     const changed = db.prepare(`UPDATE vm_pmo_runs SET lease_token = ?, lease_until = ?
@@ -862,6 +915,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
   return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryManualRevision,
     retryPlan, retryValidatedPlan, retryAiIntent,
     retryFailedRender,
+    retryStepTimeout,
     recoverBindingConflicts,
     requestManualSource,
     completeManualSource,

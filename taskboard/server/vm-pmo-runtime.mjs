@@ -1012,6 +1012,13 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
       && !run.renderRetryHistory?.length && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    // A step timeout leaves no result from the failed stage, so rerunning it
+    // once from the same frozen input is safe. Output means the stage finished.
+    const canRetryStepTimeout = run.state === "needs_attention"
+      && run.errorCode === "VM_PMO_RUN_TIMEOUT"
+      && Boolean(run.planStartedAt && run.prepared && run.acquisition)
+      && !run.stepTimeoutRetryHistory?.length && !run.renderResult && !run.artifactId
+      && !run.deliveredFileToken && !run.completedAt;
     // 只读摘要，供看板填写人工修改方案时绑定原视频；不含路径、回执等敏感字段。
     const sourceSha256 = /^[a-f0-9]{64}$/u.test(run.acquisition?.sha256 ?? "") ? run.acquisition.sha256 : null;
     const sourceDurationMs = Number.isSafeInteger(run.acquisition?.duration_ms) && run.acquisition.duration_ms > 0
@@ -1031,6 +1038,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       canRetryApproval,canRetryManualRevision,
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
         failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,
+      canRetryStepTimeout,
+      stepTimeoutRetryHistory:(run.stepTimeoutRetryHistory ?? []).map(entry => ({
+        errorCode: entry.errorCode, failedAt: entry.failedAt, stage: entry.stage })),
       canRetryAiIntent,aiRetryLimit:MAX_AI_RETRIES,
       aiRetryHistory:(run.aiRetryHistory ?? []).map(entry => ({errorCode:entry.errorCode,failedAt:entry.failedAt})),
       canRetryWriteback,writeback,
@@ -1175,6 +1185,34 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       assertTaskVersion();
       if (automaticCancellationEpoch !== cancellationEpoch) throw fail("AUTOMATIC_EXECUTION_DISABLED");
     }});
+    void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
+    return publicRun(queued);
+  }
+
+  /** Rerun the stage that hit the step timeout, from the same frozen input/plan. */
+  async function retryStepTimeout(taskId, request) {
+    await ready();
+    if (!object(request) || Object.keys(request).length !== 1
+      || !Number.isSafeInteger(request.version) || request.version < 1)
+      throw fail("VM_PMO_RETRY_VERSION_REQUIRED", 400);
+    const assertTaskVersion = () => {
+      if (database.getTask(taskId)?.version !== request.version) throw fail("VERSION_CONFLICT", 409);
+    };
+    assertTaskVersion();
+    const service = initialize(), run = service.orchestrator.getForTask(taskId);
+    if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
+      || run.identity.packageSnapshot.workflowTemplate.version !== TEMPLATE.version)
+      throw fail("VM_PMO_RUN_NOT_FOUND", 404);
+    const cancellationEpoch = automaticCancellationEpoch;
+    const policy = await getPolicy(), local = service.metadata(taskId);
+    if (automaticCancellationEpoch !== cancellationEpoch) throw fail("AUTOMATIC_EXECUTION_DISABLED");
+    // Rerunning spends the shared editing slot, so the local switch still gates it.
+    if (policy?.enabled !== true) throw fail("AUTOMATIC_EXECUTION_DISABLED");
+    if (policy.version !== local.policy_version) throw fail("VM_PMO_POLICY_CHANGED");
+    const queued = await service.orchestrator.retryStepTimeout(run.runId, { beforeCommit: () => {
+      assertTaskVersion();
+      if (automaticCancellationEpoch !== cancellationEpoch) throw fail("AUTOMATIC_EXECUTION_DISABLED");
+    } });
     void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
     return publicRun(queued);
   }
@@ -1438,7 +1476,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     releaseTerminalSlots();
   }
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
-    getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,retryWriteback,
+    getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,
+    retryStepTimeout,retryWriteback,
     retryAiIntent,
     submitManualSource,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),

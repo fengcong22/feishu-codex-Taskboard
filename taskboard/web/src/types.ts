@@ -642,6 +642,9 @@ export interface VmPmoRunSummary {
   review?: VmPmoRunReview | null;
   canRetryValidatedPlan?: boolean;
   canRetryFailedRender?: boolean;
+  /** The stage hit its step timeout and produced no result; rerun it once. */
+  canRetryStepTimeout?: boolean;
+  stepTimeoutRetryHistory?: Array<{ errorCode: string; failedAt: string; stage: string }>;
   canRetryManualRevision?: boolean;
   canRetryApproval?: boolean;
   sourceSha256?: string | null;

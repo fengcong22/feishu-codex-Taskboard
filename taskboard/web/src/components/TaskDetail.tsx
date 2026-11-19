@@ -39,6 +39,7 @@ import {
   retryTaskVmPmoWriteback,
   retryTaskVmPmoPlanValidation,
   retryTaskVmPmoRender,
+  retryTaskVmPmoStepTimeout,
   retryTaskVmPmoApproval,
   retryTaskVmPmoManualRevision,
   uploadAttachment,
@@ -491,6 +492,7 @@ export function TaskDetail({
   const [retryingVmPmoWriteback, setRetryingVmPmoWriteback] = useState(false);
   const [retryingVmPmoValidation, setRetryingVmPmoValidation] = useState(false);
   const [retryingVmPmoRender, setRetryingVmPmoRender] = useState(false);
+  const [retryingVmPmoStepTimeout, setRetryingVmPmoStepTimeout] = useState(false);
   const [retryingVmPmoApproval, setRetryingVmPmoApproval] = useState(false);
   const [submittingVmPmoRevision, setSubmittingVmPmoRevision] = useState(false);
   const [showVmPmoRevisionForm, setShowVmPmoRevisionForm] = useState(false);
@@ -2018,6 +2020,18 @@ export function TaskDetail({
                         {retryingVmPmoValidation
                           ? text("正在重新校验…", "Revalidating…")
                           : text("重新校验已保存的规划", "Revalidate the saved plan")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryStepTimeout && (
+                      <button type="button" disabled={retryingVmPmoStepTimeout}
+                        title={text(
+                          "该步骤超时且没有产出，可沿用原规划或原输入重跑一次",
+                          "This step timed out without producing output, so it can rerun once from the same input",
+                        )}
+                        onClick={() => void retryVmPmoByVersion(true, setRetryingVmPmoStepTimeout, retryTaskVmPmoStepTimeout)}>
+                        {retryingVmPmoStepTimeout
+                          ? text("正在重跑…", "Rerunning…")
+                          : text("重新执行超时的步骤", "Rerun the timed-out step")}
                       </button>
                     )}
                     {vmPmoRun.canRetryFailedRender && (

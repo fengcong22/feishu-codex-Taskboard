@@ -201,14 +201,35 @@ it("marks VM package cards with their workflow arrival timestamp", async () => {
   expect(screen.getByText(tasks[0].createdAt)).toBeTruthy();
 });
 
-it("does not offer completed-card cleanup while NAS publication is pending", async () => {
+it("offers cleanup on a card whose run stopped before the completed column", async () => {
+  // A card that stops at "awaiting Feishu review" is not in the completed
+  // column, and permanent deletion requires an archived task. Without a
+  // cleanup entry here it could be neither archived nor deleted.
+  // Default fixture: completed run, writeback succeeded, no archive job yet —
+  // which is exactly the "awaiting Feishu review" column.
+  vi.mocked(api.getPackageWorkflowBoard).mockResolvedValue(response());
+  const actions = { onArchiveTask: vi.fn(), onDeleteTask: vi.fn() };
+  mount(actions);
+  const review = await screen.findByRole("region", { name: "等待飞书审核" });
+  expect(within(review).getByText("VM video")).toBeTruthy();
+
+  const archiveButton = within(review).getByRole("button", { name: "归档任务" });
+  fireEvent.click(archiveButton);
+  expect(actions.onArchiveTask).toHaveBeenCalledExactlyOnceWith(tasks[0]);
+
+  fireEvent.click(within(review).getByRole("button", { name: "删除任务" }));
+  expect(actions.onDeleteTask).toHaveBeenCalledExactlyOnceWith(tasks[0]);
+});
+
+it("offers cleanup on a card stopped in the needs-attention column", async () => {
   const board = response();
-  board.status.tasks[0].archive = { state: "copying", sourceRunId: "run-vm", errorCode: null };
+  board.status.tasks[0].state = "needs_attention";
+  board.status.tasks[0].errorCode = "VM_PMO_RUN_TIMEOUT";
   vi.mocked(api.getPackageWorkflowBoard).mockResolvedValue(board);
-  mount();
-  await screen.findByText("VM video");
-  expect(screen.queryByRole("button", { name: "归档任务" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "删除任务" })).toBeNull();
+  mount({ onArchiveTask: vi.fn(), onDeleteTask: vi.fn() });
+  const attention = await screen.findByRole("region", { name: "需要处理" });
+  expect(within(attention).getByRole("button", { name: "归档任务" })).toBeTruthy();
+  expect(within(attention).getByRole("button", { name: "删除任务" })).toBeTruthy();
 });
 
 it("shows awaiting Feishu review without a manual acceptance action and isolates package switching", async () => {
@@ -216,8 +237,6 @@ it("shows awaiting Feishu review without a manual acceptance action and isolates
   const review = await screen.findByRole("region", { name: "等待飞书审核" });
   expect(within(review).getByText("VM video")).toBeTruthy();
   expect(screen.queryByText(/manual acceptance/)).toBeNull();
-  expect(screen.queryByRole("button", { name: "归档任务" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "删除任务" })).toBeNull();
   expect(screen.queryByText("ZIP draft")).toBeNull();
   fireEvent.change(screen.getByLabelText("剪辑包流程"), {
     target: { value: "lite" },
