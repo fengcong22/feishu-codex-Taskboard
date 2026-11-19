@@ -1064,3 +1064,20 @@ test("a run stopped on config drift resumes only while it holds the material it 
   assert.deepEqual([resumed.state, resumed.errorCode], ["ready", null]);
   assert.deepEqual(resumed.acquisition, material);
 });
+
+test("a rule mismatch can be replanned from the same input without another download", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.setPlanResult({ status: "blocked", errorCode: "INTENT_RULE_MISMATCH" });
+  const blocked = await x.f.pump("run_vm");
+  assert.deepEqual([blocked.state, blocked.errorCode], ["blocked", "INTENT_RULE_MISMATCH"]);
+  assert.equal(blocked.prepared !== undefined && blocked.planSha256 === undefined, true);
+  // The package was fixed; the same run replans from its frozen input, and no new approval is taken.
+  x.setPlanResult({ status: "ready", planSha256: "d".repeat(64) });
+  const queued = await x.f.retryPlan("run_vm");
+  assert.deepEqual([queued.state, queued.errorCode], ["ready", null]);
+  assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
+  assert.equal(x.calls.filter(([name]) => name === "reserve").length, 1);
+  assert.equal(x.calls.filter(([name]) => name === "plan").length, 2);
+});

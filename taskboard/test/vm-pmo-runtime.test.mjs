@@ -1354,3 +1354,25 @@ test("config drift is resumed through the runtime entry only when the live bindi
   assert.equal(f.approvals.list().length,1);
   assert.ok(row().payload_json.includes('"acquisition"'));
 });
+
+test("a rule mismatch offers a replan and never another download",async t=>{
+  const f = await fixture(t,{material: true});
+  // Hold the slot so the run reaches "prepared" and stops there; a rule mismatch happens while planning.
+  const hold = await f.scheduler.request({requestId:"rule-hold",concurrencyGroup:"autocut:slicing",
+    maxConcurrent:1,resourceGroups:["vm-render"],queuePolicy:"per-group",fixedMaxConcurrent:true});
+  t.after(() => hold.release());
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  await f.runtime.wake();
+  const run = f.runtime.list()[0];
+  assert.equal(run.state,"prepared");
+  // A rule mismatch happens after planning started: the packaged reader ran and disagreed.
+  const row = f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(run.runId);
+  f.database.database.prepare("UPDATE vm_pmo_runs SET state = 'blocked', error_code = 'INTENT_RULE_MISMATCH', payload_json = ? WHERE run_id = ?")
+    .run(JSON.stringify({...JSON.parse(row.payload_json),planStartedAt:new Date().toISOString()}),run.runId);
+  const summary = await f.runtime.getTaskRun(run.taskId);
+  assert.equal(summary.canRetryPlan,true);
+  assert.equal(summary.materialSource,"vm");
+  assert.equal(f.approvals.list().length,1);
+});
