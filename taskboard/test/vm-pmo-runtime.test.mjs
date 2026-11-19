@@ -1322,3 +1322,35 @@ test("a later subject version that changed a binding still stops the run",async 
   assert.equal(run.errorCode,"VM_PMO_CONFIG_CHANGED");
   assert.equal((await f.runtime.getTaskRun(run.taskId)).canResumeSource,false);
 });
+
+test("config drift is resumed through the runtime entry only when the live bindings match",async t=>{
+  const f = await fixture(t,{material: true});
+  // Hold the editing slot so the run stays at the point where it adopted the material.
+  const hold = await f.scheduler.request({requestId:"drift-hold",concurrencyGroup:"autocut:slicing",
+    maxConcurrent:1,resourceGroups:["vm-render"],queuePolicy:"per-group",fixedMaxConcurrent:true});
+  t.after(() => hold.release());
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  await f.runtime.wake();
+  assert.equal(f.runtime.list()[0].state,"prepared");
+  const row = () => f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(f.runtime.list()[0].runId);
+  // Drift stops the run before preparation, so it must hold no attempt of its own yet.
+  const stop = errorCode => {
+    const runId = f.runtime.list()[0].runId;
+    const payload = JSON.parse(f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(runId).payload_json);
+    for (const key of ["prepared","planStartedAt","runnerStartedAt","planSha256"]) delete payload[key];
+    f.database.database.prepare("UPDATE vm_pmo_runs SET state = 'blocked', error_code = ?, payload_json = ? WHERE run_id = ?")
+      .run(errorCode,JSON.stringify(payload),runId);
+  };
+  stop("VM_PMO_CONFIG_CHANGED");
+  const summary = await f.runtime.getTaskRun(f.runtime.list()[0].taskId);
+  const stopped = f.runtime.list()[0];
+  assert.equal(summary.canResumeSource,true,JSON.stringify({state:stopped.state,error:stopped.errorCode,
+    acq:stopped.acquisition&&stopped.acquisition.vmid_binding,prepared:Boolean(stopped.prepared)}));
+  const version = f.database.getTask(f.runtime.list()[0].taskId).version;
+  const resumed = await f.runtime.resumeDownloadedSource(f.runtime.list()[0].taskId,{version});
+  assert.equal(resumed.state,"ready",resumed.errorCode);
+  assert.equal(f.approvals.list().length,1);
+  assert.ok(row().payload_json.includes('"acquisition"'));
+});

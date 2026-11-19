@@ -1129,7 +1129,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
       || !(unknownOutcome || stoppedOnStatus || stoppedOnConfig)) throw fail("VM_PMO_RESUME_NOT_ALLOWED",409);
     if (stoppedOnConfig) {
-      const local = metadata(run.taskId), active = await getActiveSubject(run.identity.origin.subjectKey);
+      const local = service.metadata(run.taskId), active = await getActiveSubject(run.identity.origin.subjectKey);
       if (active?.lifecycle !== "enabled" || !sameExecutableWorkflow(active, local.subject))
         throw fail("VM_PMO_CONFIG_CHANGED",409);
     }

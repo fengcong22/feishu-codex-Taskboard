@@ -807,7 +807,8 @@ test("canonical replay heals a task committed before its automatic reservation",
       console.error = originalConsoleError;
     }
     assert.equal(interrupted.response.status, 500, JSON.stringify(interrupted.body));
-    assert.deepEqual(logged, ["INTERNAL_ERROR"]);
+    // The log carries the safe error code only, never the message or a stack with local paths.
+    assert.deepEqual(logged, ["INTERNAL_ERROR EXECUTION_RESERVATION_FAILED"]);
     await new Promise((resolve) => setImmediate(resolve));
     const committed = fixtureData.app.database.findFeishuTaskByRegistration({
       baseToken: payload.event.baseToken,

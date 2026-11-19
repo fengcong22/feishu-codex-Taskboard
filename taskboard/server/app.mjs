@@ -8683,7 +8683,8 @@ export function createTaskboardServer(options = {}) {
         sendJson(response, error.status, { error: { code: error.code, message: error.message } });
         return;
       }
-      console.error("INTERNAL_ERROR");
+      // Only the safe error code is logged; messages and stacks may carry local paths or record data.
+      console.error("INTERNAL_ERROR", typeof error?.code === "string" ? error.code : "");
       sendJson(response, 500, { error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
     }
   });
