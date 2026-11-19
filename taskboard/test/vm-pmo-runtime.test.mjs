@@ -1376,3 +1376,25 @@ test("a rule mismatch offers a replan and never another download",async t=>{
   assert.equal(summary.materialSource,"vm");
   assert.equal(f.approvals.list().length,1);
 });
+
+test("a stale recorded approval status does not block replanning a verified material",async t=>{
+  const f = await fixture(t,{material: true});
+  const hold = await f.scheduler.request({requestId:"stale-approval-hold",concurrencyGroup:"autocut:slicing",
+    maxConcurrent:1,resourceGroups:["vm-render"],queuePolicy:"per-group",fixedMaxConcurrent:true});
+  t.after(() => hold.release());
+  await f.runtime.register(f.body,ACTOR);
+  await f.runtime.wake();
+  await f.markReady();
+  await f.runtime.wake();
+  const run = f.runtime.list()[0];
+  // A run stopped earlier kept the stop's approval status; the queue itself is ready with that material.
+  const row = f.database.database.prepare("SELECT payload_json FROM vm_pmo_runs WHERE run_id = ?").get(run.runId);
+  f.database.database.prepare(`UPDATE vm_pmo_runs SET state = 'blocked', error_code = 'INTENT_RULE_MISMATCH',
+    payload_json = ? WHERE run_id = ?`)
+    .run(JSON.stringify({...JSON.parse(row.payload_json),planStartedAt:new Date().toISOString(),
+      approvalStatus:"needs_attention"}),run.runId);
+  const version = f.database.getTask(run.taskId).version;
+  const queued = await f.runtime.retryPlanning(run.taskId,
+    {version,runConsent:{allowVideoAudioAsr:true,allowConfiguredLocalOutput:true}});
+  assert.equal(queued.state,"ready",queued.errorCode);
+});

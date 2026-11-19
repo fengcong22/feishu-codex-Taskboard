@@ -890,8 +890,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
           if (["receipt_path","path","sha256","bytes","duration_ms","vmid_binding"]
             .some(key => verified[key] !== run.acquisition[key])) throw fail("VM_PMO_RETRY_SOURCE_CHANGED");
         } else {
-          if (run.approvalStatus !== "ready" || status.status !== "ready"
-            || status.acquisition?.vmid_binding !== "vm_api_verified")
+          // The recorded approvalStatus is a mirror an earlier stop can leave behind; the live queue
+          // and a byte-identical material are what prove this run may plan again.
+          if (status.status !== "ready" || status.acquisition?.vmid_binding !== "vm_api_verified")
             throw fail("VM_PMO_RETRY_APPROVAL_NOT_READY");
           const keys = ["receipt_path","path","sha256","bytes","duration_ms","vmid_binding","vmid"];
           if (!run.acquisition || keys.some(key => status.acquisition[key] !== run.acquisition[key]))
