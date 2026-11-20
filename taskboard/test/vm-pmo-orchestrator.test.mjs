@@ -1177,3 +1177,78 @@ test("a QA rerun is allowed once, waits on the switch, and not for other stops",
   assert.equal((await y.f.pump("run_vm")).errorCode, "INTENT_BLOCKED");
   await assert.rejects(y.f.retryQa("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
 });
+
+test("an AI picture review stop reruns only the review, twice at most, keeping the render start", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  const reviews = [];
+  let next = "QA_REVIEW_TIMEOUT";
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    x.calls.push([mode]);
+    await onStarted({ mode, pid: 42, startedAt: new Date(1_700_000_000_000 + x.calls.length * 1000).toISOString() });
+    if (mode === "plan") return { status: "ready", planSha256: "d".repeat(64) };
+    if (mode === "qa-review") reviews.push(next);
+    return next ? { status: "blocked", errorCode: next }
+      : { status: "rendered", planSha256: "d".repeat(64), artifact: x.artifact };
+  };
+  await x.restart();
+  const stopped = await x.f.pump("run_vm");
+  assert.deepEqual([stopped.state, stopped.errorCode], ["blocked", "QA_REVIEW_TIMEOUT"]);
+  // A review stop is not a QA stop: QA itself is not rerun for it.
+  await assert.rejects(x.f.retryQa("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+
+  next = "QA_REVIEW_INVALID";
+  const queued = await x.f.retryQaReview("run_vm");
+  assert.deepEqual([queued.state, queued.runnerStartedAt], ["planned", stopped.runnerStartedAt]);
+  assert.equal(queued.qaReviewStartedAt, undefined);
+  const again = await x.f.pump("run_vm");
+  assert.deepEqual([again.state, again.errorCode], ["blocked", "QA_REVIEW_INVALID"]);
+  assert.ok(again.qaReviewStartedAt);
+  assert.equal(again.runnerStartedAt, stopped.runnerStartedAt);
+
+  next = null;
+  await x.f.retryQaReview("run_vm");
+  // The queued rerun waits while automatic execution is off, like any step that has not started.
+  x.setCanExecute(async () => false);
+  assert.equal((await x.f.pump("run_vm")).state, "planned");
+  x.setCanExecute(async () => true);
+  assert.equal((await x.f.pump("run_vm")).state, "delivery_pending");
+  assert.deepEqual(reviews, ["QA_REVIEW_INVALID", null]);
+  assert.deepEqual(x.f.get("run_vm").qaReviewRetryHistory.map(entry => entry.errorCode),
+    ["QA_REVIEW_TIMEOUT", "QA_REVIEW_INVALID"]);
+  assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+  assert.equal(x.calls.filter(([kind]) => kind === "plan").length, 1);
+});
+
+test("an AI picture review rerun stops at its limit and is not offered for other review stops", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  let code = "QA_REVIEW_MISSING";
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    await onStarted({ mode, pid: 42, startedAt: new Date(1_700_000_000_000).toISOString() });
+    return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) } : { status: "blocked", errorCode: code };
+  };
+  await x.restart();
+  await x.f.pump("run_vm");
+  x.setApproval("waiting_approval");
+  await assert.rejects(x.f.retryQaReview("run_vm"), { code: "VM_PMO_RETRY_APPROVAL_NOT_READY" });
+  x.setApproval("ready");
+  await x.f.retryQaReview("run_vm");
+  await x.f.pump("run_vm");
+  await x.f.retryQaReview("run_vm");
+  assert.equal((await x.f.pump("run_vm")).errorCode, "QA_REVIEW_MISSING");
+  await assert.rejects(x.f.retryQaReview("run_vm"), { code: "VM_PMO_RETRY_LIMIT" });
+
+  for (const stop of ["QA_REVIEW_SCOPE_VIOLATION", "QA_REVIEW_BLOCKED", "VM_PMO_QA_REVIEW_DEFECT"]) {
+    const y = await fixture(t);
+    await y.f.register({ taskId: "task_vm" });
+    y.setApproval("ready");
+    code = stop;
+    y.dependencies.runOffline = x.dependencies.runOffline;
+    await y.restart();
+    assert.equal((await y.f.pump("run_vm")).errorCode, stop);
+    await assert.rejects(y.f.retryQaReview("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" }, stop);
+  }
+});

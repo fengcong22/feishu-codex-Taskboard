@@ -388,3 +388,185 @@ test("QA reports from the package's mechanical picture checks are accepted", asy
   assert.equal(validVmPmoQaChecks([row("frames-0", "opening_frame", { frames: [] })]), false);
   assert.equal(validVmPmoQaChecks([row("frames-0", "opening_frame", { other: 1 })]), false);
 });
+
+test("the AI picture review session attaches the frames, binds the QA hash and keeps the boundary", async t => {
+  const { createVmPmoQaReviewRunner, qaReviewRequestPath } = await import("../server/vm-pmo-qa-review.mjs");
+  const { sessionDir, context, runDir } = await sessionFixture(t);
+  Object.assign(context, { qa_path: path.join(runDir, "qa.json"), qa_review_path: path.join(runDir, "qa-review.json") });
+  assert.equal(qaReviewRequestPath(context), path.join(runDir, "qa-review-request.json"));
+  const frame = (file) => ({ file, path: path.join(runDir, "qa-frames", file), sha256: "a".repeat(64) });
+  const request = { schema: "auto-cut-slicing/qa-review-request", schema_version: 1,
+    frames_dir: path.join(runDir, "qa-frames"), items: [
+      { check_id: "frames-0", kind: "opening_frame", detail: "opening", frames: [frame("t0us_after.png")],
+        questions: [{ question_id: "opening_clean", text: "clean?" }] },
+      { check_id: "seam-1", kind: "seam_frames", detail: "seam", frames: [frame("seam1_after.png"), frame("bad.txt")],
+        questions: [{ question_id: "seam_clean", text: "clean?" }] }] };
+  const { seen, spawnTurn } = fakeTurn({ events: [{ type: "thread.started", thread_id: "thread-r" },
+    { type: "item.completed", item: { type: "agent_message", text: "画面干净" } }] });
+  const runner = createVmPmoQaReviewRunner({ codexExecutable: "codex.exe", model: "gpt-test", spawnTurn,
+    environment: { PATH: "p", FEISHU_APP_SECRET: "s", CODEX_FEISHU_BRIDGE_SECRET: "b" } });
+  await assert.rejects(runner.run({ context, packageRoot: "E:\\pkg", sessionDir, request, qaSha256: "nope" }),
+    { code: "VM_PMO_RUN_INPUT_INVALID" });
+  const result = await runner.run({ context, packageRoot: "E:\\pkg", sessionDir, request, qaSha256: "b".repeat(64) });
+  assert.equal(result.outcome, "completed");
+  assert.deepEqual(result.attachments, ["t0us_after.png", "seam1_after.png"]);
+  assert.deepEqual(seen.args.filter((_, index) => seen.args[index - 1] === "-i"),
+    [frame("t0us_after.png").path, frame("seam1_after.png").path]);
+  assert.ok(seen.args.includes("sandbox_workspace_write.network_access=false"));
+  assert.deepEqual(Object.keys(seen.env), ["PATH"]);
+  assert.ok(seen.prompt.includes("qa_sha256 写 " + "b".repeat(64)));
+  assert.ok(seen.prompt.includes("\"model\": \"gpt-test\""));
+  assert.match(seen.prompt, /不要猜成 clean/u);
+  assert.match(seen.prompt, /不修改质检报告/u);
+  const outcome = JSON.parse(await readFile(path.join(sessionDir, "outcome.json"), "utf8"));
+  assert.deepEqual([outcome.step, outcome.thread_id, outcome.images], ["qa_review", "thread-r", 2]);
+
+  const hang = fakeTurn({ hang: true });
+  const slow = createVmPmoQaReviewRunner({ codexExecutable: "codex.exe", model: "gpt-test", spawnTurn: hang.spawnTurn, timeoutMs: 20 });
+  const second = path.join(path.dirname(sessionDir), "session-2");
+  await mkdir(second);
+  assert.equal((await slow.run({ context, packageRoot: "E:\\pkg", sessionDir: second, request,
+    qaSha256: "b".repeat(64) })).outcome, "timeout");
+});
+
+// A checked QA, the review the AI wrote and the package's merge, without media: validateVmPmoQa
+// only reads receipts and reports, so the step-6 binding rules can be exercised directly.
+async function reviewedQaRun(t) {
+  const { validateVmPmoQa, vmPmoQaReviewable } = await import("../server/vm-pmo-result-validator.mjs");
+  const args = await fixture(t);
+  const prepared = await prepareVmPmoRunInput(args);
+  const bound = await validateVmPmoInput({ contextPath: prepared.contextPath });
+  const { context, input } = bound;
+  const planSha256 = "c".repeat(64), artifact = { sha256: "e".repeat(64) };
+  const plan = { intent_sha256: "f".repeat(64), output_id: "output-1" };
+  const base = { protocol: input.protocol, schema_version: 3, package: input.package, binding: input.binding,
+    record: input.record, review_round: input.review_round, delivery_target: input.delivery_target,
+    input_sha256: context.input_sha256, source_sha256: input.source.sha256 };
+  const row = (check_id, kind, status, extra = {}) => ({ check_id, intent_id: null, kind, status,
+    method: "automatic", evidence_ids: [], target_start_us: 0, target_end_us: null, detail: "d", ...extra });
+  const report = { schema: "auto-cut-slicing/qa-report", schema_version: 1,
+    bindings: { intent_sha256: plan.intent_sha256, plan_sha256: planSha256, output_id: plan.output_id,
+      output_sha256: artifact.sha256, source_sha256s: [input.source.sha256], output_alignment_sha256: null },
+    overall: "ready_for_review", limitations: ["l"],
+    checks: [row("coverage", "coverage_complete", "passed"),
+      row("frames-0", "opening_frame", "needs_human", { frames: ["t0.png"] }),
+      row("seam-1", "seam_frames", "needs_human", { frames: ["s1.png"] }),
+      row("listen", "listening", "needs_human")] };
+  const counts = (value) => value.checks.reduce((all, item) => ({ ...all, [item.status]: (all[item.status] ?? 0) + 1 }), {});
+  const text = (value) => JSON.stringify(value, null, 2) + "\n";
+  const originalText = text(report);
+  await writeFile(context.qa_path, originalText);
+  await writeFile(path.join(context.run_dir, "qa-result.json"), JSON.stringify({ ...base, status: "checked",
+    plan_sha256: planSha256, qa_sha256: sha(originalText), overall: report.overall, counts: counts(report),
+    reverse_asr: false, error: null }));
+  const check = (review = "require") => validateVmPmoQa({ contextPath: prepared.contextPath, expectedBound: bound,
+    plan, planSha256, artifact, review });
+  /** What `vm_pmo qa-review` leaves behind for the given verdicts (clean -> ai_reviewed, defect -> failed). */
+  async function merge(verdicts) {
+    const reviewer = { agent: "codex", model: "gpt-test" };
+    const answers = { schema: "auto-cut-slicing/qa-review", schema_version: 1, qa_sha256: sha(originalText), reviewer,
+      frames_sha256: { "t0.png": "1".repeat(64), "s1.png": "2".repeat(64) },
+      items: [["frames-0", "opening_clean", "t0.png"], ["seam-1", "seam_clean", "s1.png"]].map(([id, question, file]) => ({
+        check_id: id, question_id: question, verdict: verdicts[id], observation: id + " 看过", frames: [file] })) };
+    const answersText = text(answers);
+    await writeFile(context.qa_review_path, answersText);
+    const merged = structuredClone(report);
+    for (const item of merged.checks) {
+      const verdict = verdicts[item.check_id];
+      if (!verdict) continue;
+      item.status = verdict === "clean" ? "ai_reviewed" : verdict === "defect" ? "failed" : "needs_human";
+      item.method = "ai_visual";
+      item.detail = "AI visual review: " + item.detail;
+      item.frames_sha256 = { [item.frames[0]]: answers.frames_sha256[item.frames[0]] };
+    }
+    merged.overall = merged.checks.some((item) => item.status === "failed") ? "failed" : "ready_for_review";
+    merged.review = { ...reviewer, path: context.qa_review_path };
+    const mergedText = text(merged);
+    await writeFile(path.join(context.run_dir, "qa.before-review.json"), originalText);
+    await writeFile(context.qa_path, mergedText);
+    await writeFile(path.join(context.run_dir, "qa-review-result.json"), JSON.stringify({ ...base, status: "reviewed",
+      plan_sha256: planSha256, qa_sha256_before: sha(originalText), qa_sha256: sha(mergedText),
+      review_sha256: sha(answersText), overall: merged.overall, counts: counts(merged), error: null }));
+  }
+  return { context, base, planSha256, originalText, check, merge, report, vmPmoQaReviewable };
+}
+
+test("a picture item QA left with frames is reviewed before delivery", async t => {
+  const { check, report, vmPmoQaReviewable } = await reviewedQaRun(t);
+  assert.deepEqual(vmPmoQaReviewable(report).map(row => row.check_id), ["frames-0", "seam-1"]);
+  assert.equal((await check("pending")).status, "checked");
+  await assert.rejects(check(), { code: "QA_REVIEW_REQUIRED" });
+});
+
+test("the package's review receipt binds the merged report, the review file and the report QA wrote", async t => {
+  for (const [name, verdicts, overall, counts] of [
+    ["clean", { "frames-0": "clean", "seam-1": "clean" }, "ready_for_review", { passed: 1, ai_reviewed: 2, needs_human: 1 }],
+    ["defect", { "frames-0": "clean", "seam-1": "defect" }, "failed", { passed: 1, ai_reviewed: 1, failed: 1, needs_human: 1 }],
+    ["unclear", { "frames-0": "unclear", "seam-1": "clean" }, "ready_for_review", { passed: 1, ai_reviewed: 1, needs_human: 2 }],
+  ]) {
+    const { check, merge } = await reviewedQaRun(t);
+    await merge(verdicts);
+    const checked = await check();
+    assert.deepEqual([checked.status, checked.overall, checked.counts], ["checked", overall, counts], name);
+    assert.deepEqual(checked.review.items.map(item => item.verdict), [verdicts["frames-0"], verdicts["seam-1"]], name);
+    assert.equal(checked.review.overallBefore, "ready_for_review", name);
+  }
+});
+
+test("a review receipt that does not match what is on disk is refused", async t => {
+  const tamper = [
+    ["merged report edited", async (x) => {
+      const merged = JSON.parse(await readFile(x.context.qa_path, "utf8"));
+      merged.checks[0].detail = "edited";
+      await writeFile(x.context.qa_path, JSON.stringify(merged, null, 2) + "\n");
+    }, "QA_REVIEW_RESULT_INVALID"],
+    ["review file edited", (x) => writeFile(x.context.qa_review_path, "{\"schema\":\"x\"}\n"), "QA_REVIEW_RESULT_INVALID"],
+    ["review file missing", (x) => rm(x.context.qa_review_path), "QA_REVIEW_RESULT_INVALID"],
+    ["pre-review copy changed", (x) => writeFile(path.join(x.context.run_dir, "qa.before-review.json"), "{}\n"),
+      "QA_REPORT_INVALID"],
+    ["automatic row rewritten", async (x) => {
+      // A merge that also changes a row the AI may not answer, with every hash recomputed to match.
+      const merged = JSON.parse(await readFile(x.context.qa_path, "utf8"));
+      merged.checks[3].status = "not_run";
+      const mergedText = JSON.stringify(merged, null, 2) + "\n";
+      await writeFile(x.context.qa_path, mergedText);
+      const file = path.join(x.context.run_dir, "qa-review-result.json");
+      const receipt = JSON.parse(await readFile(file, "utf8"));
+      const counts = merged.checks.reduce((all, item) => ({ ...all, [item.status]: (all[item.status] ?? 0) + 1 }), {});
+      await writeFile(file, JSON.stringify({ ...receipt, qa_sha256: sha(mergedText), counts }));
+    }, "QA_REVIEW_RESULT_INVALID"],
+  ];
+  for (const [name, change, code] of tamper) {
+    const x = await reviewedQaRun(t);
+    await x.merge({ "frames-0": "clean", "seam-1": "clean" });
+    await change(x);
+    await assert.rejects(x.check(), { code }, name);
+  }
+});
+
+test("a review the package refused leaves qa.json unchanged and blocks; only missing or invalid files may rerun", async t => {
+  for (const [packageCode, errorCode] of [["REVIEW_INVALID", "QA_REVIEW_INVALID"], ["REVIEW_MISSING", "QA_REVIEW_INVALID"],
+    ["PLAN_CHANGED", "QA_REVIEW_BLOCKED"]]) {
+    const { context, base, planSha256, originalText, check } = await reviewedQaRun(t);
+    await writeFile(path.join(context.run_dir, "qa-review-result.json"), JSON.stringify({ ...base, status: "blocked",
+      plan_sha256: planSha256, qa_sha256_before: sha(originalText), qa_sha256: null, review_sha256: null,
+      overall: null, counts: null, error: { code: packageCode, message: "refused" } }));
+    const checked = await check();
+    assert.deepEqual([checked.status, checked.errorCode, checked.packageCode], ["blocked", errorCode, packageCode]);
+    // A refused merge that still left its copy behind is not the package's documented outcome.
+    await writeFile(path.join(context.run_dir, "qa.before-review.json"), originalText);
+    await assert.rejects(check(), { code: "QA_REVIEW_RESULT_INVALID" });
+  }
+});
+
+test("the approval summary shows each AI verdict once the package merged the review", async t => {
+  const { readVmPmoRunReview } = await import("../server/vm-pmo-run-review.mjs");
+  const { context, merge } = await reviewedQaRun(t);
+  await merge({ "frames-0": "clean", "seam-1": "unclear" });
+  const summary = await readVmPmoRunReview(context);
+  assert.deepEqual(summary.qa.visualReview.items.map(item => [item.checkId, item.verdict, item.observation]),
+    [["frames-0", "clean", "frames-0 看过"], ["seam-1", "unclear", "seam-1 看过"]]);
+  assert.deepEqual(summary.qa.aiReviewed.map(item => item.checkId), ["frames-0"]);
+  assert.deepEqual(summary.qa.needsHuman.map(item => item.checkId), ["seam-1", "listen"]);
+  assert.equal(summary.qaReviewError, null);
+});
