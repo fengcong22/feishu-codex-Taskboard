@@ -13,7 +13,8 @@ import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
 import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
-import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
+import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender, VM_PMO_QA_RESULT } from "./vm-pmo-result-validator.mjs";
+import { archiveVmPmoQa } from "./vm-pmo-qa-archive.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
 import { createVmStageWriteback, parseVmWritebackIdempotencyKey, VM_AI_NOTES_MAX_LENGTH } from "./vm-stage-writeback.mjs";
 import { createVmWritebackStore } from "./vm-writeback-store.mjs";
@@ -780,7 +781,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     }
     orchestrator = createVmPmoOrchestrator({database,bindings,now,tickMs,
       canExecute: async ({run}) => {
-        if (run.runnerStartedAt && (!run.renderRetryHistory?.length
+        // A queued QA rerun has not started yet, so it still waits on the switch like any new step.
+        const qaPending = Boolean(run.qaRetryHistory?.length) && !run.qaRetryStartedAt;
+        if (run.runnerStartedAt && !qaPending && (!run.renderRetryHistory?.length
           || run.renderRetryLaunchAt || run.renderRetryStartedAt)) return true;
         const policy = await getPolicy(), local = metadata(run.taskId);
         if (policy?.enabled !== true) throw fail("AUTOMATIC_EXECUTION_DISABLED");
@@ -934,10 +937,22 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       recoverOffline: async options => {
         const bound = await boundFor(options,{runId:options.runId,taskId:options.taskId,
           planAttempt:options.planAttempt,inputSha256:options.inputSha256});
-        const receipt = options.mode === "plan" ? bound.context.plan_result_path : bound.context.result_path;
+        const receipt = options.mode === "plan" ? bound.context.plan_result_path
+          : options.mode === "qa" ? path.join(bound.context.run_dir,VM_PMO_QA_RESULT) : bound.context.result_path;
         try {await lstat(receipt);} catch (error) {if (error?.code === "ENOENT") return null;throw fail("VM_PMO_RUN_OUTCOME_UNKNOWN");}
         return options.mode === "plan" ? validateVmPmoPlan({...options,ffprobePath,expectedBound: bound})
           : validateVmPmoRender({...options,ffprobePath,ffmpegPath,expectedBound: bound});
+      },
+      archiveQa: async ({run}) => {
+        const options = {...run.prepared.runnerOptions,runId:run.runId,taskId:run.taskId,
+          planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256};
+        const bound = await boundFor(options,{runId:run.runId,taskId:run.taskId,
+          planAttempt:options.planAttempt,inputSha256:options.inputSha256});
+        // The MP4 and its render receipt must still be the ones rendered for this plan.
+        const rendered = await validateVmPmoRender({...options,ffprobePath,ffmpegPath,expectedBound:bound,qa:"skip"});
+        if (rendered.status !== "rendered" || rendered.planSha256 !== run.planSha256)
+          throw fail("VM_PMO_RETRY_RENDER_CHANGED");
+        await archiveVmPmoQa(bound.context);
       },
       registerArtifact: async ({run,prepared,result}) => {
         trustedRun(run.runId);
@@ -1066,6 +1081,12 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.stepTimeoutRetryHistory?.length && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    // An older Taskboard or package misjudged the QA of a rendered MP4: rerun only QA, once.
+    const canRetryQa = (run.state === "needs_attention" && run.errorCode === "QA_REPORT_INVALID"
+        || run.state === "blocked" && run.errorCode === "VM_PMO_QA_FAILED")
+      && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
+      && !run.qaRetryHistory?.length && !run.renderResult && !run.artifactId
+      && !run.deliveredFileToken && !run.completedAt;
     // 只读摘要，供看板填写人工修改方案时绑定原视频；不含路径、回执等敏感字段。
     const sourceSha256 = /^[a-f0-9]{64}$/u.test(run.acquisition?.sha256 ?? "") ? run.acquisition.sha256 : null;
     const sourceDurationMs = Number.isSafeInteger(run.acquisition?.duration_ms) && run.acquisition.duration_ms > 0
@@ -1085,7 +1106,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       canRetryApproval,canRetryManualRevision,
       retryHistory:(run.retryHistory ?? []).map(entry => ({planAttempt:entry.planAttempt,errorCode:entry.errorCode,
         failedAt:entry.failedAt})),canRetryPlan,canRetryValidatedPlan,canRetryFailedRender,canResumeSource,
-      canRetryStepTimeout,
+      canRetryStepTimeout,canRetryQa,
+      qaRetryHistory:(run.qaRetryHistory ?? []).map(entry => ({errorCode:entry.errorCode,failedAt:entry.failedAt})),
       stepTimeoutRetryHistory:(run.stepTimeoutRetryHistory ?? []).map(entry => ({
         errorCode: entry.errorCode, failedAt: entry.failedAt, stage: entry.stage })),
       canRetryAiIntent,aiRetryLimit:MAX_AI_RETRIES,
@@ -1258,6 +1280,28 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       || run.identity.packageSnapshot.workflowTemplate.version !== TEMPLATE.version)
       throw fail("VM_PMO_RUN_NOT_FOUND",404);
     const queued = await service.orchestrator.retryValidatedPlan(run.runId,{beforeCommit:assertTaskVersion});
+    void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
+    return publicRun(queued);
+  }
+
+  /** QA rerun on the same rendered MP4. The request must name the task version and consent to
+   * transcribing the output's audio (reused when already transcribed) and writing new QA files. */
+  async function retryQa(taskId,request) {
+    await ready();
+    if (!object(request) || Object.keys(request).length !== 2
+      || !Number.isSafeInteger(request.version) || request.version < 1
+      || !object(request.runConsent) || Object.keys(request.runConsent).length !== 2
+      || request.runConsent.allowVideoAudioAsr !== true
+      || request.runConsent.allowLocalQaOutput !== true) throw fail("VM_PMO_RETRY_CONSENT_REQUIRED",400);
+    const assertTaskVersion = () => {
+      if (database.getTask(taskId)?.version !== request.version) throw fail("VERSION_CONFLICT",409);
+    };
+    assertTaskVersion();
+    const service = initialize(), run = service.orchestrator.getForTask(taskId);
+    if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
+      || run.identity.packageSnapshot.workflowTemplate.version !== TEMPLATE.version)
+      throw fail("VM_PMO_RUN_NOT_FOUND",404);
+    const queued = await service.orchestrator.retryQa(run.runId,{beforeCommit:assertTaskVersion});
     void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
     return publicRun(queued);
   }
@@ -1577,7 +1621,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
     getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,
     retryStepTimeout,retryWriteback,
-    retryAiIntent,
+    retryAiIntent,retryQa,
     resumeDownloadedSource,
     submitManualSource,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),

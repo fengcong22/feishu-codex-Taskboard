@@ -21,6 +21,8 @@ Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LA
 
 旧版校验器将合法的画面/语音同步 cue 误判为 `PLAN_INVALID` 时，仅允许人工通过本机 loopback 接口对同一 `needs_attention/PLAN_INVALID` run 重新校验已经保存的 ready 计划；要求任务版本匹配、原审批仍为 `ready`、获批采集回执和源 SHA 有效，并确认尚无 render 启动、结果或 MP4 证据。校验成功后沿用原 plan/run 继续渲染，不重新规划、识别、申请或下载；失败仍停在原状态，其他 `needs_attention` 不开放此恢复。
 
+v3 成片渲染完成后，若质检因旧版 Taskboard 读不懂报告停在 `needs_attention/QA_REPORT_INVALID`，或因旧版剪辑包误判停在 `blocked/VM_PMO_QA_FAILED`，只允许人工通过本机 loopback 接口 `POST /api/local/tasks/:id/vm-pmo-qa-retry` 对同一份成片重新质检一次；要求任务版本匹配、本次明确授权识别成片音轨与写入新的本机质检文件（`runConsent: {"allowVideoAudioAsr":true,"allowLocalQaOutput":true}`），重新验证原审批仍为 `ready`、获批采集回执和源 SHA 有效，并复核 render 回执与 MP4 仍绑定已保存计划的 SHA，且尚无制品、交付或完成证据。旧质检文件（回执、报告、复核请求、导出帧、AI 复核）先以不覆盖方式移到运行目录外的 `qa-archive/<attempt>-qa-1/` 保留，成片的反向识别结果绑定同一 MP4 原地复用；随后只运行包 `qa`，不重新规划、识别原片、申请、下载或渲染，首次 render 启动证据保留，QA 启动时间单独记录。待启动的重新质检仍受本机自动剪辑开关约束；每轮最多一次，再次失败仍停在原阻断，其他错误不开放此恢复。
+
 历史 task/run 专属审批若仅 `private_endpoints` 与冻结请求不同，只有在 job id 可由原 task/run 重新计算、其余请求字段完全一致、审批为 `ready` 且采集回执和源文件摘要复核通过时，才可迁移绑定到该 job 的请求；此恢复不重新下载。
 
 剪辑包看板及显示偏好按学科、包别名和模板版本隔离，只从可信来源和冻结快照筛选任务。切换看板不得启用配置、启动执行器或补跑历史任务；已移除包仅可通过可信历史快照查看任务及调整显示偏好。VM 看板将已确认 MP4 轮次投影为等待飞书审核，不要求本机验收；只有同轮获准成片 NAS 校验发布成功才表示业务流程已完成。审核修改可连续生成新轮次，父成片必须匹配包、模板、学科、记录和附件字段；并发登记须重新核对父轮。归档请求冻结源与目标，重试不得改用后续成片。共用进度字段的归档处理仅截取进入归档选项的真实边沿，不得阻断初稿或审核触发。看板状态查询不得产生执行、联网、上传或配置启用副作用。
@@ -38,14 +40,19 @@ VM 初稿阶段可选在初稿进度字段上绑定“素材已就绪”和“�
 ```powershell
 npm install
 npm test
+.\scripts\stop-local.ps1
+
+# 生产（接收真实飞书事件）：启动与检查都必须带开关；根目录 启动-Taskboard.bat / 检查-Taskboard.bat 分别等同于这两条
+.\scripts\start-local.ps1 -EnableFeishu
+.\scripts\check-local.ps1 -RequireFeishu
+
+# 仅本机模拟测试：监听器 disabled，真实飞书改动不会进入流程
 .\scripts\start-local.ps1
 .\scripts\check-local.ps1
 .\scripts\simulate-ready.ps1
-.\scripts\check-local.ps1 -RequireFeishu
-.\scripts\stop-local.ps1
 ```
 
-`-RequireFeishu` 只在需要验证真实长连接时使用；模拟流程可以在监听器 disabled 时运行。
+生产电脑重启服务时必须使用 `start-local.ps1 -EnableFeishu`：不带该开关启动会关闭飞书长连接，此后飞书表格的改动不会被接收。Bridge 不会扫描补跑断连期间的改动；重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。启动脚本不会记住上次的监听方式。不带开关的启动和 `check-local.ps1` 会输出警告，仪表板会把“监听器未启用”标为异常。`-RequireFeishu` 用于验证真实长连接；模拟流程可以在监听器 disabled 时运行。
 
 ## 配置和安全边界
 
@@ -88,6 +95,8 @@ npm test
 
 - 同时更新自动化测试和 README；
 - 先在测试表/示例项目中验证；
-- 经过代码评审后再合并。
+- 以 Pull Request 形式合并，并等 `Check` 工作流的 `test` 作业在该 PR 上通过。
+
+`test` 作业运行 `npm run test:ci`，是唯一的合并门槛。是否再请人做代码评审由改动的提交者判断；CI 未通过时不得合并，也不得用本机测试结果代替。
 
 不要创建第二份 `agents.md`，也不要把本地凭据或运行状态提交到仓库。

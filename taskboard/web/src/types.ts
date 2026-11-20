@@ -641,6 +641,9 @@ export interface VmPmoRunSummary {
   canRetryAiIntent?: boolean;
   aiRetryLimit?: number;
   aiRetryHistory?: Array<{ errorCode: string; failedAt: string }>;
+  /** QA on the rendered MP4 can be rerun once (an older reader or package misjudged it). */
+  canRetryQa?: boolean;
+  qaRetryHistory?: Array<{ errorCode: string; failedAt: string }>;
   review?: VmPmoRunReview | null;
   canRetryValidatedPlan?: boolean;
   canRetryFailedRender?: boolean;

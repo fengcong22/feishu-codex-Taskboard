@@ -170,6 +170,37 @@ describe("VmOverviewDashboard link health", () => {
     expect(screen.getByText("—")).toBeTruthy();
   });
 
+  it("marks a disabled listener as bad with an otherwise empty queue", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+          listener: { state: "disabled", lastEventAt: null, lastError: null },
+          queue: { pending: 0, processing: 0, retryWait: 0, deadLetter: 0 },
+        },
+      }),
+    });
+    renderDashboard();
+    expect(await screen.findByText("未接收事件")).toBeTruthy();
+    expect(screen.getByText("飞书 Bridge").closest(".vm-health-row")?.className).toContain("tone-bad");
+  });
+
+  it("puts a disabled listener ahead of existing dead letters", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+          listener: { state: "disabled", lastEventAt: null, lastError: null },
+          queue: { pending: 0, processing: 0, retryWait: 0, deadLetter: 20 },
+        },
+      }),
+    });
+    renderDashboard();
+    expect(await screen.findByText(/监听器未启用，飞书事件不会进来/)).toBeTruthy();
+    expect(screen.getByText("未接收事件")).toBeTruthy();
+    expect(screen.getByText("飞书 Bridge").closest(".vm-health-row")?.className).toContain("tone-bad");
+  });
+
   it("surfaces dead letters and a stale sample", async () => {
     body = overview({
       linkHealth: health({
