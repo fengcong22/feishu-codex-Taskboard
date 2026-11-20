@@ -28,7 +28,9 @@ import { createCloudConfigStore } from "./cloud-config.mjs";
 import { createFeishuPackageStore, PackageConfigError } from "./feishu-package-config.mjs";
 import { createFeishuPackageApi } from "./feishu-package-api.mjs";
 import { assertExecutablePackageWorkflow } from "./feishu-package-identity.mjs";
-import { PackageWorkflowError, normalizePackageWorkflowTemplate, workflowTemplatesEqual } from "../shared/feishu-package-workflow.mjs";
+import {
+  PackageWorkflowError, isZipWorkflowTemplate, normalizePackageWorkflowTemplate, workflowTemplatesEqual,
+} from "../shared/feishu-package-workflow.mjs";
 import { createFeishuPackageWorkflowDrafts } from "./feishu-package-workflow-drafts.mjs";
 import { createPackageBoardSettings } from "./package-board-settings.mjs";
 import { readVmOverview } from "./vm-overview.mjs";
@@ -3121,7 +3123,7 @@ export function createTaskboardServer(options = {}) {
     const origin = requireTrustedFeishuTask(task, { requirePackage: true });
     const snapshot = database.getFeishuTaskPackageSnapshot(task.id);
     if (!isPhasedAutoCutOrigin(origin) || origin.deliverySource === "simulation"
-      || snapshot?.workflowTemplate?.id !== "document_draft_zip"
+      || !isZipWorkflowTemplate(snapshot?.workflowTemplate)
       || task.status !== "blocked" || task.archivedAt !== null
       || database.listFeishuAutoCutRuns(task.id).at(-1)?.state !== "blocked"
       || database.getFeishuExecution(task.id)
@@ -4526,22 +4528,36 @@ export function createTaskboardServer(options = {}) {
     return value;
   }
 
+  /** Receipt modes and ZIP layout each document → ZIP template must prove. */
+  const ZIP_DELIVERY = Object.freeze({
+    document_draft_zip: Object.freeze({ workflowMode: "lite", deliveryMode: "lite_zip", layout: "jianying_draft" }),
+    document_edit_zip: Object.freeze({ workflowMode: "autoedit", deliveryMode: "edit_zip", layout: "edit_bundle" }),
+  });
+
+  function zipDeliveryForTask(taskId) {
+    const template = database.getFeishuTaskPackageSnapshot(taskId)?.workflowTemplate;
+    return isZipWorkflowTemplate(template)
+      ? ZIP_DELIVERY[template?.id ?? "document_draft_zip"]
+      : ZIP_DELIVERY.document_draft_zip;
+  }
+
   function normalizeAutoCutPackageReceipt(run, result, value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw autoCutResultError("autocut_package_receipt_invalid", "Auto-Cut package receipt is invalid");
     }
+    const delivery = zipDeliveryForTask(run.taskId);
     if (
       value.schema_version !== 2
       || value.status !== "pass"
-      || value.workflow_mode !== "lite"
-      || value.delivery_mode !== "lite_zip"
+      || value.workflow_mode !== delivery.workflowMode
+      || value.delivery_mode !== delivery.deliveryMode
       || value.zip_crc_pass !== true
       || value.zip_tree_identity_pass !== true
       || !Array.isArray(value.source_pairs)
     ) {
       throw autoCutResultError(
         "autocut_package_receipt_invalid",
-        "Auto-Cut package receipt does not prove a validated Lite ZIP",
+        "Auto-Cut package receipt does not prove a validated ZIP for this package workflow",
       );
     }
     if (
@@ -4671,7 +4687,7 @@ export function createTaskboardServer(options = {}) {
     return { artifactSourcePath: packageRoot };
   }
 
-  async function acceptReportedArtifact(source, report) {
+  async function acceptReportedArtifact(source, report, layout = "jianying_draft") {
     let sourceRoot;
     let reportedPath;
     try {
@@ -4717,6 +4733,7 @@ export function createTaskboardServer(options = {}) {
         filename: path.basename(reportedPath),
         contentType: "application/zip",
         stream: handle.createReadStream({ autoClose: false }),
+        layout,
       });
     } catch (error) {
       if (["EACCES", "ENOENT", "ENOTDIR", "EPERM"].includes(error?.code)) {
@@ -5918,6 +5935,14 @@ export function createTaskboardServer(options = {}) {
           && autoCutRunConsent?.allowVideoAudioAsr === true
           && autoCutRunConsent?.allowConfiguredLocalOutput === true
         ));
+      // The edit package has no Codex prompt contract: it only runs through its local runner.
+      if (!useLocalAutoCut && packageConfig.workflowTemplate?.id === "document_edit_zip") {
+        throw new ApiError(
+          409,
+          "PACKAGE_LOCAL_RUN_REQUIRED",
+          "This package runs only through the local Auto-Cut runner (automatic start or authorised retry)",
+        );
+      }
       const startClaimedTask = useLocalAutoCut
         ? startClaimedTaskWithLocalAutoCut
         : startClaimedTaskWithAi;
@@ -8039,7 +8064,7 @@ export function createTaskboardServer(options = {}) {
             "A legacy Auto-Cut run cannot report a phased manifest",
           );
         }
-        const stored = await acceptReportedArtifact(source, report);
+        const stored = await acceptReportedArtifact(source, report, zipDeliveryForTask(task.id).layout);
         let artifact;
         try {
           if (stored.sha256 !== report.sha256) {
@@ -8136,6 +8161,7 @@ export function createTaskboardServer(options = {}) {
           const stored = await artifactService.acceptUpload({
             ...artifactHeaders,
             stream: request,
+            layout: zipDeliveryForTask(task.id).layout,
           });
           let artifact;
           try {

@@ -207,7 +207,41 @@ async function validateEntryPayload(filename, entry, state, captureDraftJson) {
   return captureDraftJson ? Buffer.concat(chunks, actualSize) : null;
 }
 
-async function parseZipFile(filename) {
+/** Accepted ZIP layouts: a JianYing draft (Lite) or an edited-video bundle (autoedit). */
+export const ARTIFACT_LAYOUTS = Object.freeze(["jianying_draft", "edit_bundle"]);
+
+/**
+ * document_edit_zip bundle: one root folder named like the deliverable, holding the rendered
+ * video `<root>/<root>.mp4`, the Premiere project `<root>/工程/*.xml`, the feedback table and
+ * the edit ledger. Returns the root, or throws.
+ */
+function editBundleRoot(entries) {
+  const files = entries.filter((entry) => !entry.isDirectory).map((entry) => entry.name);
+  const roots = new Set(files.map((name) => name.split("/")[0]));
+  const root = roots.size === 1 ? [...roots][0] : null;
+  const has = (name) => files.includes(`${root}/${name}`);
+  if (
+    root === null
+    || files.some((name) => !name.includes("/"))
+    || !has(`${root}.mp4`)
+    || !has("执行反馈表.csv")
+    || !has("剪辑清单.json")
+    || !files.some((name) => name.startsWith(`${root}/工程/`) && name.toLowerCase().endsWith(".xml")
+      && name.split("/").length === 3)
+  ) {
+    throw artifactError(
+      400,
+      "INVALID_EDIT_ZIP",
+      "ZIP must contain one folder with the rendered video, the project XML, the feedback table and the ledger",
+    );
+  }
+  return root;
+}
+
+async function parseZipFile(filename, layout = "jianying_draft") {
+  if (!ARTIFACT_LAYOUTS.includes(layout)) {
+    throw artifactError(500, "INVALID_ARTIFACT_LAYOUT", "Artifact layout is not supported");
+  }
   const details = await stat(filename);
   if (!details.isFile() || details.size < 22) {
     throw artifactError(400, "INVALID_ZIP", "Artifact is not a valid ZIP file");
@@ -324,6 +358,13 @@ async function parseZipFile(filename) {
       throw artifactError(400, "INVALID_ZIP", "ZIP contains no valid entries");
     }
 
+    if (layout === "edit_bundle") {
+      const bundleRoot = editBundleRoot(entries);
+      const validationState = { totalUncompressed: 0 };
+      for (const entry of entries) await validateEntryPayload(filename, entry, validationState, false);
+      return { entryCount: entries.length, draftRoot: bundleRoot };
+    }
+
     const contentRoots = new Set(entries.flatMap((entry) => {
       if (entry.isDirectory) return [];
       const root = draftRootForEntry(entry.name, "draft_content.json");
@@ -390,7 +431,10 @@ export function createArtifactService({ rootDirectory, now = () => new Date().to
     return path.join(root, safeStorageKey(storageKey));
   }
 
-  async function acceptUpload({ filename, contentType, stream }) {
+  async function acceptUpload({ filename, contentType, stream, layout = "jianying_draft" }) {
+    if (!ARTIFACT_LAYOUTS.includes(layout)) {
+      throw artifactError(500, "INVALID_ARTIFACT_LAYOUT", "Artifact layout is not supported");
+    }
     if (typeof filename !== "string" || !filename.toLowerCase().endsWith(".zip")) {
       throw artifactError(400, "INVALID_ARTIFACT_TYPE", "Artifact must be a .zip file");
     }
@@ -423,7 +467,7 @@ export function createArtifactService({ rootDirectory, now = () => new Date().to
     }
     await handle.close();
     try {
-      const validation = await parseZipFile(temporary);
+      const validation = await parseZipFile(temporary, layout);
       await rename(temporary, destination);
       const timestamp = now();
       return {

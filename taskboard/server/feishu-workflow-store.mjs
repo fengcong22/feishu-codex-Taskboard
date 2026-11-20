@@ -14,6 +14,7 @@ import {
   isAttachmentMetadataField,
   isPhasedSubject,
   isSingleSelectMetadataField,
+  isStatusMetadataField,
   normalizeStage,
   normalizePhasedDraftBindings,
   portablePhasedSubject,
@@ -1646,8 +1647,8 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         const fieldById = new Map(fields.map((field) => [field?.fieldId ?? field?.id, field]));
         if (isPhasedSubject(subject)) {
           for (const [name, descriptor, predicate] of [
-            ["statusField", subject.statusField, isSingleSelectMetadataField],
-            ["reviewStatusField", subject.reviewStatusField, isSingleSelectMetadataField],
+            ["statusField", subject.statusField, isStatusMetadataField],
+            ["reviewStatusField", subject.reviewStatusField, isStatusMetadataField],
             ["documentField", subject.documentField, null],
             ["namingField", subject.namingField, isCourseNamingMetadataField],
           ]) {

@@ -11,7 +11,36 @@ const PROBE_PATH = fileURLToPath(new URL("./autocut-environment-probe.mjs", impo
 const PROGRESS_PHASES = new Set([
   "preflight", "document_fetch", "asset_download", "input_compile", "source_hash",
   "source_asr", "classification", "reverse_asr", "draft_write_validate", "package_publish",
+  // document_edit_zip (auto-cut-autoedit): editing and rendering, then the review-document write
+  "edit", "feishu_write",
 ]);
+
+/**
+ * How each document → ZIP template is deployed and started. The package name selects the
+ * deployment report; the arguments after the command are the same Taskboard contract.
+ */
+const RUNTIME_ENTRIES = Object.freeze({
+  document_draft_zip: Object.freeze({
+    packageName: "auto-cut-lite",
+    script: Object.freeze(["scripts", "jy_wrapper.py"]),
+    command: "review-document-run",
+    readinessEnv: "AUTOCUT_LITE_READINESS_PATH",
+  }),
+  document_edit_zip: Object.freeze({
+    packageName: "auto-cut-autoedit",
+    module: "auto_cut_autoedit",
+    command: "taskboard-run",
+    readinessEnv: "AUTOEDIT_READINESS_PATH",
+  }),
+});
+
+export function runtimeEntryForTemplate(template) {
+  const id = template?.id ?? "document_draft_zip";
+  if (!Object.hasOwn(RUNTIME_ENTRIES, id)) {
+    throw runnerError("AUTOCUT_RUNTIME_UNAVAILABLE", "This package workflow has no local Auto-Cut runtime");
+  }
+  return RUNTIME_ENTRIES[id];
+}
 const PROGRESS_STATUSES = new Set(["running", "complete", "resumed", "failed", "skipped", "retrying"]);
 const MAX_PROGRESS_LINE_LENGTH = 65_536;
 const ENVIRONMENT_ERRORS = {
@@ -114,7 +143,7 @@ function runtimeEnvironment(environment, run) {
   };
 }
 
-async function resolveInstalledRuntime(workspacePath, environment) {
+async function resolveInstalledRuntime(workspacePath, environment, entry = RUNTIME_ENTRIES.document_draft_zip) {
   if (typeof workspacePath !== "string" || !path.isAbsolute(workspacePath)) {
     throw runnerError("AUTOCUT_RUNTIME_UNAVAILABLE", "Auto-Cut package workspace is unavailable");
   }
@@ -122,7 +151,7 @@ async function resolveInstalledRuntime(workspacePath, environment) {
   if (!localAppData || !path.isAbsolute(localAppData)) {
     throw runnerError("AUTOCUT_RUNTIME_UNAVAILABLE", "Auto-Cut local runtime is unavailable");
   }
-  const reportPath = path.join(localAppData, "Auto-Cut", "auto-cut-lite", "deployment-report.json");
+  const reportPath = path.join(localAppData, "Auto-Cut", entry.packageName, "deployment-report.json");
   let report;
   try {
     report = JSON.parse(await readFile(reportPath, "utf8"));
@@ -146,7 +175,10 @@ async function resolveInstalledRuntime(workspacePath, environment) {
     runtimeRoot = await realpath(report.runtime_root);
     [python, script] = await Promise.all([
       realpath(report.components.python.runtime_path),
-      realpath(path.join(runtimeRoot, "scripts", "jy_wrapper.py")),
+      // A module package is started as `python -m <module>` from its runtime root.
+      realpath(entry.script
+        ? path.join(runtimeRoot, ...entry.script)
+        : path.join(runtimeRoot, entry.module, "__main__.py")),
     ]);
     [pythonInfo, scriptInfo] = await Promise.all([stat(python), stat(script)]);
   } catch {
@@ -159,9 +191,10 @@ async function resolveInstalledRuntime(workspacePath, environment) {
   if (typeof larkCli !== "string" || !path.isAbsolute(larkCli)) {
     throw runnerError("AUTOCUT_LARK_CLI_UNAVAILABLE", ENVIRONMENT_ERRORS.AUTOCUT_LARK_CLI_UNAVAILABLE);
   }
-  const readinessPath = environment.AUTOCUT_LITE_READINESS_PATH
-    || path.join(localAppData, "Auto-Cut", "auto-cut-lite", "runtime-readiness.json");
-  return { runtimeRoot, python, script, larkCli, readinessPath };
+  const readinessPath = environment[entry.readinessEnv]
+    || path.join(localAppData, "Auto-Cut", entry.packageName, "runtime-readiness.json");
+  const launch = entry.script ? [script, entry.command] : ["-m", entry.module, entry.command];
+  return { runtimeRoot, python, script, launch, larkCli, readinessPath, readinessEnv: entry.readinessEnv };
 }
 
 async function runProcess(command, args, options, { signal, timeoutMs, timeoutCode, preflightTimeoutMs, onProgress } = {}) {
@@ -218,14 +251,16 @@ export async function runLocalAutoCut({
   preflightTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_PREFLIGHT_TIMEOUT_MS,
   runTimeoutMs = environment.CODEX_TASKBOARD_AUTOCUT_RUN_TIMEOUT_MS,
 } = {}) {
-  await assertExecutablePackageWorkflow(packageConfig);
+  const template = await assertExecutablePackageWorkflow(packageConfig);
+  const entry = runtimeEntryForTemplate(template);
   environmentTimeoutMs = timeoutSetting(environmentTimeoutMs, 30_000);
   preflightTimeoutMs = timeoutSetting(preflightTimeoutMs, 120_000);
   runTimeoutMs = timeoutSetting(runTimeoutMs, 2 * 60 * 60 * 1_000);
   notifyProgress(onProgress, { phase: "environment_check", status: "running" });
-  const { runtimeRoot, python, script, larkCli, readinessPath } = await resolveInstalledRuntime(
+  const { runtimeRoot, python, launch, larkCli, readinessPath, readinessEnv } = await resolveInstalledRuntime(
     packageConfig.workspacePath,
     environment,
+    entry,
   );
   const runtimeEnv = runtimeEnvironment(environment, run);
   const pathKeys = Object.keys(runtimeEnv).filter((key) => key.toLowerCase() === "path");
@@ -234,7 +269,7 @@ export async function runLocalAutoCut({
   runtimeEnv.PATH = [path.dirname(larkCli), path.dirname(process.execPath), existingPath].filter(Boolean).join(path.delimiter);
   // Python 3.12+ on Windows must not prefer an executable in cwd over this PATH.
   if (process.platform === "win32") runtimeEnv.NoDefaultCurrentDirectoryInExePath = "1";
-  runtimeEnv.AUTOCUT_LITE_READINESS_PATH = readinessPath;
+  runtimeEnv[readinessEnv] = readinessPath;
   const probe = await runProcess(process.execPath, [PROBE_PATH, JSON.stringify({
     larkCli, readinessPath,
     directories: [path.dirname(run.manifestPath), run.draftsRoot, path.dirname(run.packageZipPath)],
@@ -249,8 +284,7 @@ export async function runLocalAutoCut({
   }
   notifyProgress(onProgress, { phase: "environment_check", status: "complete" });
   const args = [
-    script,
-    "review-document-run",
+    ...launch,
     "--source-manifest", run.manifestPath,
     "--execution-input", run.executionInputPath,
     "--job-root", path.dirname(run.manifestPath),

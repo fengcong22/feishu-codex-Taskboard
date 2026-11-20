@@ -156,3 +156,59 @@ test("artifact service requires the two draft metadata files to contain JSON", a
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+
+const EDIT_BUNDLE = [
+  { name: "课程_初稿/课程_初稿.mp4", content: "video" },
+  { name: "课程_初稿/工程/课程_初稿.xml", content: "<xmeml/>" },
+  { name: "课程_初稿/工程/素材/出现1.mp3", content: "sfx" },
+  { name: "课程_初稿/执行反馈表.csv", content: "成片时间" },
+  { name: "课程_初稿/剪辑清单.json", content: "{}" },
+];
+
+test("artifact service verifies an autoedit bundle only under the edit layout", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-artifact-edit-"));
+  try {
+    const service = createArtifactService({ rootDirectory: directory });
+    const accepted = await service.acceptUpload({
+      filename: "课程_初稿.zip", stream: Readable.from([createStoredZip(EDIT_BUNDLE)]), layout: "edit_bundle",
+    });
+    assert.equal(accepted.validationStatus, "verified");
+    assert.equal(accepted.draftRoot, "课程_初稿");
+    // the same bundle is not a JianYing draft
+    await assert.rejects(service.acceptUpload({
+      filename: "课程_初稿.zip", stream: Readable.from([createStoredZip(EDIT_BUNDLE)]),
+    }), { code: "INVALID_DRAFT_ZIP" });
+    // and a JianYing draft is not an edit bundle
+    await assert.rejects(service.acceptUpload({
+      filename: "draft.zip", layout: "edit_bundle", stream: Readable.from([createStoredZip([
+        { name: "draft/draft_content.json", content: "{}" },
+        { name: "draft/draft_meta_info.json", content: "{}" },
+      ])]),
+    }), { code: "INVALID_EDIT_ZIP" });
+    assert.deepEqual((await readdir(directory)).length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const [label, entries] of [
+  ["a missing project XML", EDIT_BUNDLE.filter((entry) => !entry.name.endsWith(".xml"))],
+  ["a video named unlike the folder", EDIT_BUNDLE.map((entry) => entry.name.endsWith(".mp4") ? { ...entry, name: "课程_初稿/其他.mp4" } : entry)],
+  ["two top-level folders", [...EDIT_BUNDLE, { name: "另一个/说明.md", content: "x" }]],
+  ["a file at the ZIP root", [...EDIT_BUNDLE, { name: "说明.md", content: "x" }]],
+  ["a missing ledger", EDIT_BUNDLE.filter((entry) => !entry.name.endsWith("剪辑清单.json"))],
+]) {
+  test(`artifact service rejects an edit bundle with ${label}`, async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-artifact-edit-bad-"));
+    try {
+      const service = createArtifactService({ rootDirectory: directory });
+      await assert.rejects(service.acceptUpload({
+        filename: "课程_初稿.zip", stream: Readable.from([createStoredZip(entries)]), layout: "edit_bundle",
+      }), { code: "INVALID_EDIT_ZIP" });
+      assert.deepEqual(await readdir(directory), []);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}

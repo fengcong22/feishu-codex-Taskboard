@@ -401,7 +401,7 @@ export interface Project {
 export type FeishuPackageState = "draft" | "enabled" | "disabled";
 
 export interface FeishuPackageWorkflowTemplate {
-  id: "document_draft_zip" | "vm_pmo_review_video";
+  id: "document_draft_zip" | "document_edit_zip" | "vm_pmo_review_video";
   version: 1;
 }
 

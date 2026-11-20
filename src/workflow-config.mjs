@@ -226,21 +226,23 @@ function normalizeStatusOptions(value, name) {
   }));
 }
 
-function normalizeStatusField(value, name = "statusField") {
+function normalizeStatusField(value, name = "statusField", { allowMultiSelect = false } = {}) {
   const input = plainObject(value, name);
   assertKnownKeys(input, STATUS_FIELD_KEYS, name);
   const rawType = input.type ?? input.uiType ?? "single_select";
   const normalizedType = typeof rawType === "number"
     ? rawType
     : String(rawType).trim().toLowerCase().replace(/[\s_-]/gu, "");
-  if (!(rawType === 3 || new Set(["singleselect", "singleoption", "select"]).has(normalizedType))) {
+  // A multi-select stage trigger: ticking a stage's option enters that stage.
+  const multi = allowMultiSelect && (rawType === 4 || new Set(["multiselect", "multipleselect"]).has(normalizedType));
+  if (!multi && !(rawType === 3 || new Set(["singleselect", "singleoption", "select"]).has(normalizedType))) {
     fail(`${name} must be a single-select field`);
   }
   const options = normalizeStatusOptions(input, name);
   return {
     fieldId: idString(input.fieldId, `${name}.fieldId`),
     fieldName: nonEmptyString(input.fieldName ?? input.name, `${name}.fieldName`),
-    type: "single_select",
+    type: multi ? "multi_select" : "single_select",
     ...(options.length ? { options } : {}),
   };
 }
@@ -715,9 +717,9 @@ export function validateSubjectConfig(value) {
   if (input.subjectKey !== undefined && input.subjectKey !== computedKey) {
     fail("subject.subjectKey does not match baseToken/tableId");
   }
-  const statusField = normalizeStatusField(input.statusField);
+  const statusField = normalizeStatusField(input.statusField, "statusField", { allowMultiSelect: true });
   const reviewStatusField = input.reviewStatusField == null
-    ? statusField : normalizeStatusField(input.reviewStatusField, "reviewStatusField");
+    ? statusField : normalizeStatusField(input.reviewStatusField, "reviewStatusField", { allowMultiSelect: true });
   const stages = normalizeStages(input.stages, statusField, reviewStatusField);
   const firstTrigger = STAGE_IDS.map((stageId) => stages[stageId]).find((stage) => stage.enabled).trigger;
   const execution = normalizeExecution(input.execution ?? {

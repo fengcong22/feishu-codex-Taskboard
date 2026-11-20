@@ -102,6 +102,13 @@ export function isSingleSelectField(field: StageMetadataField): boolean {
   return hasStrictMetadataType(field, 3, SINGLE_SELECT_UI_TYPES);
 }
 
+const MULTI_SELECT_UI_TYPES = new Set(["multiselect", "multipleselect"]);
+
+/** Stage trigger fields may be single-select or multi-select (ticking a stage's option). */
+export function isStageTriggerField(field: StageMetadataField): boolean {
+  return isSingleSelectField(field) || hasStrictMetadataType(field, 4, MULTI_SELECT_UI_TYPES);
+}
+
 export function audioDraftFromStage(audio: FeishuStageValue["audio"]): FeishuStageAudioDraft {
   const source = audio.mode === "replace_original" ? audio.source : null;
   return {

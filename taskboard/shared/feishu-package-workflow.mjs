@@ -1,5 +1,21 @@
 const LEGACY = Object.freeze({ id: "document_draft_zip", version: 1 });
 const VM = Object.freeze({ id: "vm_pmo_review_video", version: 1 });
+/** Same document/stage/ZIP shell as LEGACY; the package really edits (auto-cut-autoedit). */
+const EDIT = Object.freeze({ id: "document_edit_zip", version: 1 });
+
+/** Templates that run through the document stage → exact ZIP path (local runner, ZIP report). */
+export const ZIP_WORKFLOW_TEMPLATE_IDS = Object.freeze([LEGACY.id, EDIT.id]);
+export function isZipWorkflowTemplate(value) {
+  return ZIP_WORKFLOW_TEMPLATE_IDS.includes(value?.id ?? LEGACY.id) && (value?.version ?? 1) === 1;
+}
+
+/**
+ * The template whose subject-profile shape a package uses. Both document → ZIP templates share
+ * the stage/trigger/delivery configuration, stored under the legacy template key.
+ */
+export function profileTemplate(value) {
+  return isZipWorkflowTemplate(value) ? { ...LEGACY } : normalizePackageWorkflowTemplate(value);
+}
 
 export class PackageWorkflowError extends Error {
   constructor(code) {
@@ -27,7 +43,7 @@ export function normalizePackageWorkflowTemplate(value) {
   if (value === undefined) return { ...LEGACY };
   if (!object(value) || Object.keys(value).length !== 2 || !Object.hasOwn(value, "id")
     || !Object.hasOwn(value, "version") || value.version !== 1
-    || ![LEGACY.id, VM.id].includes(value.id)) unsupported();
+    || ![LEGACY.id, VM.id, EDIT.id].includes(value.id)) unsupported();
   return { id: value.id, version: value.version };
 }
 
@@ -51,6 +67,11 @@ export function packageWorkflowFromManifest(packageInterface) {
   const hasContract = Object.hasOwn(packageInterface, "contract");
   const hasDriver = Object.hasOwn(packageInterface, "driverId");
   const hasArtifact = Object.hasOwn(packageInterface, "artifactKind");
+  if (template.id === EDIT.id) {
+    // No contract/driver identifiers; an artifact kind, when declared, must be the edit bundle.
+    if (hasContract || hasDriver || (hasArtifact && packageInterface.artifactKind !== "edit_zip")) unsupported();
+    return template;
+  }
   if (template.id === LEGACY.id) {
     // No legacy contract/driver identifier has been established; do not invent one.
     if (hasContract || hasDriver || (hasArtifact && packageInterface.artifactKind !== "zip")) unsupported();
