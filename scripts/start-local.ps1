@@ -750,7 +750,13 @@ try {
   Write-Host "Taskboard root: $taskboardRoot"
   Write-Host "Taskboard started: http://127.0.0.1:47823 (PID $taskboardPid)"
   Write-Host "Feishu Bridge started: http://127.0.0.1:47824 (PID $bridgePid)"
-  if ($EnableFeishu) { Write-Host 'Feishu WebSocket listener is SDK-managed.' }
+  if ($EnableFeishu) {
+    Write-Host 'Feishu WebSocket listener is SDK-managed.'
+  } else {
+    # Without -EnableFeishu real Feishu edits never reach the Bridge, and nothing
+    # else complains, so say it loudly at the only moment the operator is looking.
+    Write-Warning 'Feishu listener is DISABLED: real Feishu table changes will NOT create tasks. For production restart with .\scripts\start-local.ps1 -EnableFeishu (the root start .bat already does this).'
+  }
   try {
     Start-Process 'http://127.0.0.1:47823'
   } catch {

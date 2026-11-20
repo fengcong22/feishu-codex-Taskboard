@@ -38,14 +38,19 @@ VM 初稿阶段可选在初稿进度字段上绑定“素材已就绪”和“�
 ```powershell
 npm install
 npm test
+.\scripts\stop-local.ps1
+
+# 生产（接收真实飞书事件）：启动与检查都必须带开关；根目录 启动-Taskboard.bat / 检查-Taskboard.bat 分别等同于这两条
+.\scripts\start-local.ps1 -EnableFeishu
+.\scripts\check-local.ps1 -RequireFeishu
+
+# 仅本机模拟测试：监听器 disabled，真实飞书改动不会进入流程
 .\scripts\start-local.ps1
 .\scripts\check-local.ps1
 .\scripts\simulate-ready.ps1
-.\scripts\check-local.ps1 -RequireFeishu
-.\scripts\stop-local.ps1
 ```
 
-`-RequireFeishu` 只在需要验证真实长连接时使用；模拟流程可以在监听器 disabled 时运行。
+生产电脑重启服务时必须使用 `start-local.ps1 -EnableFeishu`：不带该开关启动会关闭飞书长连接，此后飞书表格的改动不会被接收。Bridge 不会扫描补跑断连期间的改动；重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。启动脚本不会记住上次的监听方式。不带开关的启动和 `check-local.ps1` 会输出警告，仪表板会把“监听器未启用”标为异常。`-RequireFeishu` 用于验证真实长连接；模拟流程可以在监听器 disabled 时运行。
 
 ## 配置和安全边界
 
