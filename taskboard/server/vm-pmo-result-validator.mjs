@@ -19,8 +19,12 @@ const V3_CONTEXT_KEYS = ["evidence_dir", "intent_context_path", "intent_path", "
   "qa_path", "qa_review_path"];
 const V3_JSON_KEYS = V3_CONTEXT_KEYS.filter((key) => key !== "evidence_dir");
 // qa-result.json is the package's fixed QA receipt (written once, beside qa.json).
-const V3_FIXED_FILES = ["alignment.words.json", "output.words.json", "qa-result.json", ".plan.lock"];
+// qa-review-result.json and qa.before-review.json are the fixed files of the package's AI picture review.
+const V3_FIXED_FILES = ["alignment.words.json", "output.words.json", "qa-result.json", "qa-review-result.json",
+  "qa.before-review.json", ".plan.lock"];
 export const VM_PMO_QA_RESULT = "qa-result.json";
+export const VM_PMO_QA_REVIEW_RESULT = "qa-review-result.json";
+export const VM_PMO_QA_BEFORE_REVIEW = "qa.before-review.json";
 const QA_KINDS = new Set(["coverage_complete", "operation_compiled", "phrase_absent", "phrase_present",
   "cue_first_word", "must_keep_present", "duration_match", "cut_not_inside_word", "sentence_complete",
   "seam_gap", "seam_discontinuity", "opening_frame", "seam_frames", "seam_pause_picture", "freeze_frames",
@@ -29,6 +33,8 @@ const QA_KINDS = new Set(["coverage_complete", "operation_compiled", "phrase_abs
 const QA_STATUSES = new Set(["passed", "failed", "ai_reviewed", "needs_human", "not_run"]);
 const QA_METHODS = new Set(["automatic", "ai_visual", "ai_reading", "human"]);
 const QA_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u;
+// Picture checks an AI may answer from exported frames (the package's qa.py questions).
+const QA_VISUAL_KINDS = new Set(["opening_frame", "seam_frames", "freeze_frames"]);
 
 function fail(code) {
   const error = new Error(code);
@@ -609,7 +615,8 @@ async function probeMedia(file, { ffprobePath, ffmpegPath, timeoutMs, signal, ex
 /** For schema v3 AI intent runs a rendered MP4 is only deliverable with a passing qa.json;
  * `qa: "skip"` is reserved for the driver's check between render and qa. */
 export async function validateVmPmoRender({ contextPath, ffprobePath = "ffprobe",
-  ffmpegPath = "ffmpeg", timeoutMs = 120_000, signal, expectedBound, expectedPlan, qa = "require" } = {}) {
+  ffmpegPath = "ffmpeg", timeoutMs = 120_000, signal, expectedBound, expectedPlan, qa = "require",
+  review = "require" } = {}) {
   interrupted(signal);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647)
     fail("MEDIA_VALIDATION_FAILED");
@@ -654,9 +661,13 @@ export async function validateVmPmoRender({ contextPath, ffprobePath = "ffprobe"
     let checked;
     if (!await exists(path.join(context.run_dir, VM_PMO_QA_RESULT))) fail("QA_REQUIRED");
     checked = await validateVmPmoQa({ contextPath, signal, expectedBound: plan, plan: plan.plan,
-      planSha256, artifact });
-    if (checked.status === "blocked") return { status: "blocked", errorCode: "VM_PMO_QA_BLOCKED", context, input, qa: checked };
-    if (checked.overall === "failed") return { status: "failed", errorCode: "VM_PMO_QA_FAILED", context, input, qa: checked };
+      planSha256, artifact, review });
+    if (checked.status === "blocked") return { status: "blocked",
+      errorCode: checked.reviewBlocked ? checked.errorCode : "VM_PMO_QA_BLOCKED", context, input, qa: checked };
+    // A defect the AI saw in the frames is its own stop: rerunning QA would not change the picture.
+    if (checked.overall === "failed") return { status: "failed", errorCode: checked.review
+      && checked.review.overallBefore !== "failed" ? "VM_PMO_QA_REVIEW_DEFECT" : "VM_PMO_QA_FAILED",
+    context, input, qa: checked };
     return { ...plan, status: "rendered", artifact, media, result, qa: checked };
   }
   return { ...plan, status: "rendered", artifact, media, result };
@@ -719,12 +730,20 @@ function qaCheck(row) {
 }
 
 /** Schema v3 AI intent only: qa.json must describe this run's plan and rendered MP4.
- * `overall: failed` is returned as a result, not thrown, so callers can block delivery. */
-export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan, planSha256, artifact } = {}) {
+ * `overall: failed` is returned as a result, not thrown, so callers can block delivery.
+ *
+ * Step 6 (AI picture review) is the package's `vm_pmo qa-review`: it keeps the report QA wrote as
+ * qa.before-review.json, merges the AI's verdicts into qa.json in place and publishes
+ * qa-review-result.json once. qa-result.json keeps proving what QA produced; when the review receipt
+ * exists, delivery reads it and checks the current qa.json against its `qa_sha256`.
+ * `review: "pending"` is the driver's check between QA and the review; every other caller requires
+ * a review whenever QA left a picture item with frames for a person. */
+export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan, planSha256, artifact,
+  review = "require" } = {}) {
   const bound = await loadBoundInput(contextPath, signal, expectedBound, false);
   const { context, input } = bound;
   if (input.schema_version !== 3 || input.planning_mode !== "ai_intent" || !object(plan) || !object(artifact)
-    || !digest(planSha256)) fail("QA_REPORT_INVALID");
+    || !digest(planSha256) || !["require", "pending"].includes(review)) fail("QA_REPORT_INVALID");
   // qa-result.json is the receipt for every outcome; qa.json exists only when QA actually checked.
   const { value: receipt } = await jsonFile(path.join(context.run_dir, VM_PMO_QA_RESULT), "QA_RESULT_INVALID");
   if (!exactKeys(receipt, ["protocol", "schema_version", "status", ...IDENTITY, "input_sha256", "source_sha256",
@@ -735,13 +754,43 @@ export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan
     if (!["blocked", "failed"].includes(receipt.status) || !safeError(receipt.error) || receipt.qa_sha256 !== null
       || receipt.overall !== null || receipt.counts !== null
       || receipt.plan_sha256 !== null && receipt.plan_sha256 !== planSha256) fail("QA_RESULT_INVALID");
+    // The package only reviews a checked QA, so a review receipt here belongs to something else.
+    await assertAbsent(path.join(context.run_dir, VM_PMO_QA_REVIEW_RESULT), "QA_REVIEW_RESULT_INVALID");
     return { status: "blocked", errorCode: receipt.error.code, reverseAsr: receipt.reverse_asr };
   }
   if (receipt.error !== null || receipt.plan_sha256 !== planSha256 || !digest(receipt.qa_sha256))
     fail("QA_RESULT_INVALID");
-  const { value: report, sha256 } = await jsonFile(context.qa_path, "QA_REPORT_INVALID");
+  const expected = { input, plan, planSha256, artifact };
+  const reviewPath = path.join(context.run_dir, VM_PMO_QA_REVIEW_RESULT);
+  if (await exists(reviewPath)) return reviewedQa({ context, receipt, reviewPath, expected });
+  const original = await qaReport(context.qa_path, expected, false);
+  if (receipt.qa_sha256 !== original.sha256 || receipt.overall !== original.report.overall
+    || !same(receipt.counts, original.counts) || receipt.reverse_asr !== original.reverseAsr) fail("QA_RESULT_INVALID");
+  await assertAbsent(path.join(context.run_dir, VM_PMO_QA_BEFORE_REVIEW), "QA_REVIEW_RESULT_INVALID");
+  // A picture item QA left with frames is reviewed before delivery; it never ships unread. A QA that
+  // already failed is not deliverable either way, so it reports the failure itself.
+  if (review === "require" && original.report.overall !== "failed" && vmPmoQaReviewable(original.report).length)
+    fail("QA_REVIEW_REQUIRED");
+  return { status: "checked", overall: original.report.overall, qaSha256: original.sha256,
+    counts: original.counts, reverseAsr: original.reverseAsr, report: original.report, review: null };
+}
+
+/** Picture items an AI can answer: the package asks a question for these kinds when QA left the
+ * item for a person and exported frames for it (qa.py `_QUESTIONS` / `_review_request`). */
+export function vmPmoQaReviewable(report) {
+  return (Array.isArray(report?.checks) ? report.checks : []).filter((row) => row?.status === "needs_human"
+    && QA_VISUAL_KINDS.has(row.kind) && Array.isArray(row.frames) && row.frames.length > 0);
+}
+
+/** One qa.json, checked against this run's plan and MP4. `reviewed` allows the `review` block the
+ * merge adds; the report QA wrote never has one. */
+async function qaReport(file, { input, plan, planSha256, artifact }, reviewed) {
+  const { value: report, sha256 } = await jsonFile(file, "QA_REPORT_INVALID");
   const bindings = report.bindings;
-  if (!exactKeys(report, ["schema", "schema_version", "bindings", "overall", "checks", "limitations"])
+  if (!exactKeys(report, ["schema", "schema_version", "bindings", "overall", "checks", "limitations"],
+    reviewed ? ["review"] : [])
+    || reviewed && (!exactKeys(report.review, ["agent", "model", "path"]) || !identifier(report.review.agent)
+      || !identifier(report.review.model) || typeof report.review.path !== "string")
     || report.schema !== "auto-cut-slicing/qa-report" || report.schema_version !== 1
     || !exactKeys(bindings, ["intent_sha256", "plan_sha256", "output_id", "output_sha256", "source_sha256s",
       "output_alignment_sha256"])
@@ -757,8 +806,78 @@ export async function validateVmPmoQa({ contextPath, signal, expectedBound, plan
     fail("QA_REPORT_INVALID");
   const counts = {};
   for (const row of report.checks) counts[row.status] = (counts[row.status] ?? 0) + 1;
-  const reverseAsr = bindings.output_alignment_sha256 !== null;
-  if (receipt.qa_sha256 !== sha256 || receipt.overall !== report.overall || !same(receipt.counts, counts)
-    || receipt.reverse_asr !== reverseAsr) fail("QA_RESULT_INVALID");
-  return { status: "checked", overall: report.overall, qaSha256: sha256, counts, reverseAsr, report };
+  return { report, sha256, counts, reverseAsr: bindings.output_alignment_sha256 !== null };
+}
+
+function samePath(a, b) {
+  const normal = (value) => path.resolve(value);
+  return process.platform === "win32" ? normal(a).toLowerCase() === normal(b).toLowerCase() : normal(a) === normal(b);
+}
+
+/** The merge may only answer the picture items QA left for a person: such a row may change its
+ * status (ai_reviewed, failed or still needs_human), method (ai_visual), detail and frame hashes.
+ * Every other row, the bindings and the limitations keep exactly what QA wrote. */
+function mergedOnlyReviewable(before, after) {
+  if (!same(before.bindings, after.bindings) || !same(before.limitations, after.limitations)
+    || before.checks.length !== after.checks.length) return false;
+  const answerable = (row) => { const { status, method, detail, frames_sha256: hashes, ...kept } = row; return kept; };
+  return before.checks.every((row, index) => {
+    const merged = after.checks[index];
+    if (same(row, merged)) return true;
+    return vmPmoQaReviewable({ checks: [row] }).length === 1 && same(answerable(row), answerable(merged))
+      && merged.method === "ai_visual" && ["ai_reviewed", "failed", "needs_human"].includes(merged.status)
+      && (merged.frames_sha256 === undefined || Object.keys(merged.frames_sha256)
+        .every((name) => row.frames.includes(name)));
+  });
+}
+
+const QA_REVIEW_RESULT_KEYS = ["protocol", "schema_version", "status", ...IDENTITY, "input_sha256", "source_sha256",
+  "plan_sha256", "qa_sha256_before", "qa_sha256", "review_sha256", "overall", "counts", "error"];
+// The package found the review file missing or not matching the report: qa.json is unchanged and a
+// fresh AI reading may be merged after the stale receipt is set aside. Other blocks stop the run.
+export const VM_PMO_QA_REVIEW_RETRYABLE = Object.freeze(["REVIEW_MISSING", "REVIEW_INVALID"]);
+
+async function reviewedQa({ context, receipt, reviewPath, expected }) {
+  const { value: result } = await jsonFile(reviewPath, "QA_REVIEW_RESULT_INVALID");
+  const { input } = expected;
+  if (!exactKeys(result, QA_REVIEW_RESULT_KEYS)) fail("QA_REVIEW_RESULT_INVALID");
+  assertIdentity(result, input, context, input.source.sha256, "RUN_BINDING_MISMATCH");
+  if (result.plan_sha256 !== expected.planSha256 || result.qa_sha256_before !== receipt.qa_sha256)
+    fail("QA_REVIEW_RESULT_INVALID");
+  const beforePath = path.join(context.run_dir, VM_PMO_QA_BEFORE_REVIEW);
+  if (result.status !== "reviewed") {
+    if (!["blocked", "failed"].includes(result.status) || !safeError(result.error) || result.qa_sha256 !== null
+      || result.review_sha256 !== null || result.overall !== null || result.counts !== null)
+      fail("QA_REVIEW_RESULT_INVALID");
+    // A rejected merge restores the report QA wrote and removes its copy.
+    const original = await qaReport(context.qa_path, expected, false);
+    if (original.sha256 !== receipt.qa_sha256 || receipt.overall !== original.report.overall
+      || !same(receipt.counts, original.counts)) fail("QA_RESULT_INVALID");
+    await assertAbsent(beforePath, "QA_REVIEW_RESULT_INVALID");
+    const retryable = result.status === "blocked" && VM_PMO_QA_REVIEW_RETRYABLE.includes(result.error.code);
+    return { status: "blocked", reviewBlocked: true, packageCode: result.error.code,
+      errorCode: retryable ? "QA_REVIEW_INVALID" : "QA_REVIEW_BLOCKED", reverseAsr: receipt.reverse_asr };
+  }
+  if (result.error !== null || !digest(result.qa_sha256) || !digest(result.review_sha256)
+    || !["failed", "ready_for_review"].includes(result.overall) || !object(result.counts))
+    fail("QA_REVIEW_RESULT_INVALID");
+  // The report as QA wrote it, kept by the package before merging.
+  const before = await qaReport(beforePath, expected, false);
+  if (before.sha256 !== receipt.qa_sha256 || before.report.overall !== receipt.overall
+    || !same(before.counts, receipt.counts) || before.reverseAsr !== receipt.reverse_asr)
+    fail("QA_REVIEW_RESULT_INVALID");
+  const { value: answers, sha256: reviewSha256 } = await jsonFile(context.qa_review_path, "QA_REVIEW_RESULT_INVALID");
+  const merged = await qaReport(context.qa_path, expected, true);
+  if (reviewSha256 !== result.review_sha256 || merged.sha256 !== result.qa_sha256
+    || merged.report.overall !== result.overall || !same(merged.counts, result.counts)
+    || merged.reverseAsr !== receipt.reverse_asr || !samePath(merged.report.review.path, context.qa_review_path)
+    || answers.qa_sha256 !== receipt.qa_sha256 || !object(answers.reviewer)
+    || answers.reviewer.agent !== merged.report.review.agent || answers.reviewer.model !== merged.report.review.model
+    || !mergedOnlyReviewable(before.report, merged.report)) fail("QA_REVIEW_RESULT_INVALID");
+  const items = (Array.isArray(answers.items) ? answers.items : []).filter(object).map((item) => ({
+    checkId: item.check_id, questionId: item.question_id, verdict: item.verdict, observation: item.observation }));
+  return { status: "checked", overall: merged.report.overall, qaSha256: merged.sha256, counts: merged.counts,
+    reverseAsr: merged.reverseAsr, report: merged.report,
+    review: { agent: merged.report.review.agent, model: merged.report.review.model, reviewSha256,
+      qaSha256Before: before.sha256, overallBefore: before.report.overall, items } };
 }

@@ -1,7 +1,7 @@
 import { lstat, mkdir, readdir, rename } from "node:fs/promises";
 import path from "node:path";
 
-import { VM_PMO_QA_RESULT } from "./vm-pmo-result-validator.mjs";
+import { VM_PMO_QA_BEFORE_REVIEW, VM_PMO_QA_RESULT, VM_PMO_QA_REVIEW_RESULT } from "./vm-pmo-result-validator.mjs";
 
 function failure(code) {
   const error = new Error(code);
@@ -17,13 +17,15 @@ async function present(file) {
 }
 
 /** The QA outputs of one attempt: the receipt, the report, its review request and exported frames,
- * and an AI picture review when one exists. The reverse ASR of the MP4 (output.words.json) is bound
+ * and an AI picture review when one exists (the AI's file, the package's receipt and the report as
+ * QA wrote it before the merge). The reverse ASR of the MP4 (output.words.json) is bound
  * to the unchanged MP4 and stays in place, so a rerun does not transcribe it again. */
 function qaFiles(context) {
   const report = path.parse(context.qa_path);
   return [path.join(context.run_dir, VM_PMO_QA_RESULT), context.qa_path,
     path.join(report.dir, `${report.name}-review-request.json`), path.join(report.dir, `${report.name}-frames`),
-    context.qa_review_path];
+    context.qa_review_path, path.join(context.run_dir, VM_PMO_QA_REVIEW_RESULT),
+    path.join(context.run_dir, VM_PMO_QA_BEFORE_REVIEW)];
 }
 
 /** Moves one attempt's QA outputs beside the attempt directories, into
