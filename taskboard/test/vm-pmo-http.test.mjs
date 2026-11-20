@@ -252,3 +252,26 @@ test("missing VM runtime configuration stays disabled without registering tasks"
   assert.equal(result.body.error.code,"VM_PMO_RUNTIME_UNAVAILABLE");
   assert.equal(app.database.database.prepare("SELECT COUNT(*) AS n FROM tasks").get().n,0);
 });
+
+test("VM AI transcript route is read only and limited to registered VM tasks",async t=>{
+  const calls=[];
+  const runtime={ready:async()=>({available:true}),start:async()=>{},close:async()=>{},
+    getTaskAiTranscript:async taskId=>{calls.push(taskId);return {runId:"run_vm",sessions:[{name:"attempt-1-session-1"}]};}};
+  const {app,request}=await fixture(t,runtime);
+  app.database.createProject({id:"project-ai-transcript",name:"VM transcript",workspacePath:process.cwd()});
+  const base={projectId:"project-ai-transcript",status:"todo",labels:["feishu"],priority:"high",description:"",
+    actor:{type:"user",id:"test",name:"Test",avatarUrl:null},assignee:{type:"user",id:"test",name:"Test",avatarUrl:null},
+    developmentContext:null,startDate:null,dueDate:null,recurrence:null};
+  const vmTask=app.database.createTask({...base,title:"VM transcript",
+    feishuOrigin:{version:1,source:"feishu-base",eventId:"evt_ai",baseToken:"bas_vm",tableId:"tbl_vm",
+      recordId:"rec_ai",subjectKey:"bas_vm:tbl_vm",configVersion:1,stageId:"initial",executionMode:"manual"},
+    packageSnapshot:{packageAlias:"slicing",packageRevision:1,workflowTemplate:{id:"vm_pmo_review_video",version:1}}});
+  const plainTask=app.database.createTask({...base,title:"Plain task"});
+  const route=id=>`/api/local/tasks/${id}/vm-pmo-ai-transcript`;
+  assert.deepEqual((await request(route(vmTask.id))).body,{runId:"run_vm",sessions:[{name:"attempt-1-session-1"}]});
+  assert.deepEqual((await request(route(plainTask.id))).body,{runId:null,sessions:[]});
+  assert.equal((await request(route("missing"))).status,404);
+  assert.equal((await request(route(vmTask.id),{})).status,405);
+  assert.equal((await request(`${route(vmTask.id)}?x=1`)).status,400);
+  assert.deepEqual(calls,[vmTask.id]);
+});
