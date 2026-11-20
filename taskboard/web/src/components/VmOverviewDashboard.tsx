@@ -72,7 +72,7 @@ type HealthRow = { key: string; label: string; detail: string; value: string; to
 const LISTENER_LABELS: Record<string, [string, string]> = {
   sdk_managed: ["长连接已接管", "Long connection managed"],
   starting: ["正在启动", "Starting"],
-  disabled: ["监听器未启用", "Listener disabled"],
+  disabled: ["监听器未启用，飞书事件不会进来", "Listener disabled, Feishu events are not received"],
   error: ["连接出错", "Connection error"],
   stopping: ["正在停止", "Stopping"],
 };
@@ -100,8 +100,12 @@ function bridgeRow(health: LinkHealth, text: (zh: string, en: string) => string)
     }
     return parts.join(" · ");
   })();
+  // A disabled listener must not hide behind the dead-letter count: it means no
+  // new Feishu event reaches the flow at all, which is the more urgent fact.
+  const listenerOff = listener?.state === "disabled";
   const value = bridge.state !== "up" || bridge.stale
     ? "—"
+    : listenerOff ? text("未接收事件", "Not receiving")
     : dead > 0 ? text(`${dead} 条死信`, `${dead} dead`) : text(`${queued} 条待处理`, `${queued} queued`);
   return {
     key: "bridge",
@@ -109,7 +113,7 @@ function bridgeRow(health: LinkHealth, text: (zh: string, en: string) => string)
     detail: listener?.lastError ? `${detail} · ${listener.lastError}` : detail,
     value,
     tone: bridge.state === "up" && !bridge.stale
-      ? (dead > 0 || listener?.state === "error" ? "bad" : "ok")
+      ? (dead > 0 || listenerOff || listener?.state === "error" ? "bad" : "ok")
       : bridge.state === "unknown" ? "idle" : "bad",
   };
 }

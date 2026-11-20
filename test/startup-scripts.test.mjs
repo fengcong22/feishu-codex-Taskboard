@@ -62,6 +62,10 @@ test("startup binds both services to loopback and scopes runtime paths", async (
   assert.match(source, /\/health/);
   assert.match(source, /EnableFeishu/);
   assert.match(source, /FEISHU_LISTENER_ENABLED/);
+  // A start without -EnableFeishu must warn that real Feishu edits will not arrive.
+  assert.match(source, /Write-Warning 'Feishu listener is DISABLED: real Feishu table changes will NOT create tasks\./);
+  // Windows PowerShell 5.1 reads BOM-less scripts as the ANSI code page.
+  assert.doesNotMatch(source, /[^\x00-\x7F]/);
   assert.match(source, /function Build-TaskboardWeb/);
   assert.match(source, /Build-TaskboardWeb \$taskboardRoot/);
   assert.match(source, /run 'build:web'/);
@@ -1636,6 +1640,12 @@ test("local check keeps the Node validation import quoted for Windows PowerShell
   const source = await readFile(new URL("../scripts/check-local.ps1", import.meta.url), "utf8");
   assert.match(source, /from '\.\/src\/config\.mjs'/);
   assert.doesNotMatch(source, /from "\.\/src\/config\.mjs"/);
+});
+
+test("local check without -RequireFeishu says real Feishu edits will not create tasks", async () => {
+  const source = await readFile(new URL("../scripts/check-local.ps1", import.meta.url), "utf8");
+  assert.match(source, /real Feishu table changes will NOT create tasks/);
+  assert.match(source, /start-local\.ps1 -EnableFeishu/);
 });
 
 test("local check accepts only a validated enabled VM initial package", async () => {

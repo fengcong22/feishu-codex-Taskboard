@@ -126,7 +126,7 @@ if ($RequireFeishu) {
 }
 Write-Host "Queue: pending=$queuePending processing=$queueProcessing retryWait=$queueRetryWait deadLetter=$queueDeadLetter"
 if (-not $RequireFeishu -and $listenerState -ne 'sdk_managed') {
-  Write-Warning 'Feishu listener is not SDK-managed; rerun with -RequireFeishu when real events are required.'
+  Write-Warning "Feishu listener is not SDK-managed (state: $listenerState): real Feishu table changes will NOT create tasks. For production restart with .\scripts\start-local.ps1 -EnableFeishu and check with -RequireFeishu."
 }
 Write-Host 'Local stack check passed.'
 exit 0
