@@ -75,6 +75,7 @@ import { createVmCredentialStore } from "./vm-credential-store.mjs";
 import { openVmLoginPage } from "./vm-login-page.mjs";
 import { createVmPmoRuntime } from "./vm-pmo-runtime.mjs";
 import { createVmPmoAiIntentRunner, validVmPmoAiModel } from "./vm-pmo-ai-intent.mjs";
+import { createVmPmoQaReviewRunner } from "./vm-pmo-qa-review.mjs";
 import { createAiProviderStore } from "./ai-provider-store.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { describeBlockedFeishuTask } from "./blocked-notification.mjs";
@@ -2904,6 +2905,37 @@ export function createTaskboardServer(options = {}) {
       },
     };
   }
+  /** v3 driver step 6. Frames are attached as images and the same Codex sandbox reads them; a
+   * missing runner blocks delivery rather than quietly leaving the picture items to a person. */
+  function vmPmoQaReviewRunner(model, toolDir) {
+    if (!validVmPmoAiModel(model) || !resolved.codexExecutable) return null;
+    if (toolDir !== undefined && toolDir !== null && !path.isAbsolute(toolDir)) return null;
+    return createVmPmoQaReviewRunner({codexExecutable: resolved.codexExecutable, model, environment: serviceEnvironment,
+      toolDir: toolDir ?? null});
+  }
+  /** Mirrors dynamicVmPmoAiIntent: the active provider's VM model wins, and a run is reviewed only
+   * by the model frozen into its input.ai_session. */
+  function dynamicVmPmoAiQaReview(fallbackModel, toolDir) {
+    let model = fallbackModel ?? null;
+    const refresh = () => aiProviders.activeVmModel().then((value) => { model = value ?? fallbackModel ?? null; }, () => {});
+    void refresh();
+    const runnerFor = (value) => vmPmoQaReviewRunner(value, toolDir);
+    return {
+      refresh,
+      get session() { return runnerFor(model)?.session; },
+      async run(input) {
+        await refresh();
+        const runner = runnerFor(model);
+        if (!runner) { const error = new Error("VM_PMO_AI_NOT_CONFIGURED"); error.code = "VM_PMO_AI_NOT_CONFIGURED"; throw error; }
+        let frozen = null;
+        try { frozen = JSON.parse(await readFile(path.join(input.context.run_dir, "input.json"), "utf8")).ai_session?.model; } catch {}
+        if (frozen !== runner.session.model) {
+          const error = new Error("VM_PMO_AI_SESSION_CHANGED"); error.code = "VM_PMO_AI_SESSION_CHANGED"; throw error;
+        }
+        return runner.run(input);
+      },
+    };
+  }
   function getVmRuntime() {
     if (vmRuntime) return vmRuntime;
     let config = {};
@@ -2922,6 +2954,9 @@ export function createTaskboardServer(options = {}) {
       runRoot: options.vmPmoRunRoot ?? config.vmPmoRunRoot ?? path.join(resolved.dataDirectory, "vm-pmo-runs"),
       pythonPath: options.vmPmoPythonPath ?? config.vmPmoPythonPath ?? null,
       aiIntent: options.vmPmoAiIntent ?? dynamicVmPmoAiIntent(options.vmPmoAiModel ?? config.vmPmoAiModel,
+        options.vmPmoAiToolDir ?? config.vmPmoAiToolDir),
+      // Step 6 reads the frames QA exports for its picture items; the same Codex and model do it.
+      aiQaReview: options.vmPmoQaReview ?? dynamicVmPmoAiQaReview(options.vmPmoAiModel ?? config.vmPmoAiModel,
         options.vmPmoAiToolDir ?? config.vmPmoAiToolDir),
       coursePathResolver,
     });
@@ -7866,6 +7901,31 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
         let run;
         try {run = await getVmRuntime().retryAiIntent(taskId, body);}
+        catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (typeof error?.code === "string" && /^(?:VM_[A-Z0-9_]+|SOURCE_HASH_MISMATCH|RUN_BINDING_MISMATCH)$/u.test(error.code))
+            throw new ApiError(409, error.code, error.code);
+          throw error;
+        }
+        return sendJson(response, 202, {run});
+      }
+      const vmPmoQaReviewRetryRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-qa-review-retry$/);
+      if (vmPmoQaReviewRetryRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/vm-pmo-qa-review-retry");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const taskId = decodeRouteSegment(vmPmoQaReviewRetryRoute[1], "Task id");
+        const body = await readJson(request);
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (body?.version !== task.version) throw new ApiError(409, "VERSION_CONFLICT", "The task changed. Refresh and retry.");
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1)
+          throw new ApiError(409, "VM_PMO_RETRY_NOT_ALLOWED", "Only a registered VM/PMO task can use this retry");
+        let run;
+        try {run = await getVmRuntime().retryQaReview(taskId, body);}
         catch (error) {
           if (error instanceof ApiError) throw error;
           if (typeof error?.code === "string" && /^(?:VM_[A-Z0-9_]+|SOURCE_HASH_MISMATCH|RUN_BINDING_MISMATCH)$/u.test(error.code))

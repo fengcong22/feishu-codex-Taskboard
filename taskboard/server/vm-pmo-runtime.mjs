@@ -13,7 +13,8 @@ import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
 import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
-import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender, VM_PMO_QA_RESULT } from "./vm-pmo-result-validator.mjs";
+import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender, VM_PMO_QA_RESULT,
+  VM_PMO_QA_REVIEW_RESULT } from "./vm-pmo-result-validator.mjs";
 import { archiveVmPmoQa } from "./vm-pmo-qa-archive.mjs";
 import { createVmMp4DeliveryService } from "./vm-mp4-delivery.mjs";
 import { createVmStageWriteback, parseVmWritebackIdempotencyKey, VM_AI_NOTES_MAX_LENGTH } from "./vm-stage-writeback.mjs";
@@ -36,6 +37,10 @@ const AI_INTENT_BLOCKS = ["AI_INTENT_TIMEOUT","AI_INTENT_MISSING","AI_INTENT_FAI
 const MAX_AI_RETRIES = 2;
 // Provider refusals (balance, quota, auth) do not use the AI retry allowance; see the orchestrator.
 const MAX_AI_PROVIDER_RETRIES = 10;
+// Step 6 (AI picture review of step 5's frames): a rerun reuses the MP4, QA report and exported
+// frames; only a new AI session reads them. See the orchestrator's retryQaReview.
+const QA_REVIEW_BLOCKS = ["QA_REVIEW_TIMEOUT","QA_REVIEW_MISSING","QA_REVIEW_FAILED","QA_REVIEW_INVALID"];
+const MAX_QA_REVIEW_RETRIES = 2;
 // Moments written without render start evidence: source acquisition and AI notes (which may explain a block).
 const MATERIAL_MOMENTS = new Set(["materials_ready","download_failed","ai_notes"]);
 // Operator-supplied sources live in a fixed folder beside the configured VM download output.
@@ -261,7 +266,7 @@ function initialProfile(subject, config) {
  * Neither the registration body nor PMO record may choose an executable or a workspace.
  * Local readiness never initializes the approval queue, a remote adapter, or run directories. */
 export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubjectVersion,getDownloads,getAdapter,getPolicy,
-  scheduler,dispatchWriteback,onTaskUpdated = () => {},runRoot,pythonPath,aiIntent = null,
+  scheduler,dispatchWriteback,onTaskUpdated = () => {},runRoot,pythonPath,aiIntent = null,aiQaReview = null,
   ffprobePath = "ffprobe",ffmpegPath = "ffmpeg",coursePathResolver = {},tickMs = 5_000,now = Date.now} = {}) {
   const db = database?.database;
   let services, closed = false, timer, archiveTimer, draining, archiveDraining;
@@ -510,6 +515,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       for (const name of await readdir(sessions).catch(() => [])) {
         try {
           const outcome = JSON.parse(await readFile(path.join(sessions, name, "outcome.json"), "utf8"));
+          if (outcome?.step === "qa_review") continue;
           if (outcome?.outcome === "completed" && typeof outcome.thread_id === "string"
             && (!latest || String(outcome.finished_at) > String(latest.finished_at))) latest = outcome;
         } catch {}
@@ -731,6 +737,11 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const counts = review.qa.counts;
         lines.push("", `质检：通过 ${counts.passed ?? 0} 项，需人工复核 ${counts.needs_human ?? 0} 项，未通过 ${counts.failed ?? 0} 项。`);
       }
+      if (review?.qa?.visualReview) {
+        const verdicts = review.qa.visualReview.items ?? [];
+        const count = (verdict) => verdicts.filter(item => item.verdict === verdict).length;
+        lines.push(`AI 看图复核：画面干净 ${count("clean")} 处，发现问题 ${count("defect")} 处，看不清仍需人工 ${count("unclear")} 处。`);
+      }
       const text = lines.join("\n");
       return text.length > VM_AI_NOTES_MAX_LENGTH ? `${text.slice(0, VM_AI_NOTES_MAX_LENGTH - 2)}…` : text;
     }
@@ -782,7 +793,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     orchestrator = createVmPmoOrchestrator({database,bindings,now,tickMs,
       canExecute: async ({run}) => {
         // A queued QA rerun has not started yet, so it still waits on the switch like any new step.
-        const qaPending = Boolean(run.qaRetryHistory?.length) && !run.qaRetryStartedAt;
+        const qaPending = Boolean(run.qaRetryHistory?.length) && !run.qaRetryStartedAt
+          || Boolean(run.qaReviewRetryHistory?.length) && !run.qaReviewStartedAt;
         if (run.runnerStartedAt && !qaPending && (!run.renderRetryHistory?.length
           || run.renderRetryLaunchAt || run.renderRetryStartedAt)) return true;
         const policy = await getPolicy(), local = metadata(run.taskId);
@@ -930,7 +942,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         // Reverse ASR on the finished MP4 is on by default for v3 (decided 2026-11-17).
         const aiHistory = options.mode === "plan" ? await aiHistoryFor(orchestrator.get(options.runId)) : null;
         const result = await runVmPmoDriver({...options,ffprobePath,ffmpegPath,expectedBound: bound,
-          aiIntent,aiHistory,reverseAsr: true});
+          aiIntent,aiQaReview,aiHistory,reverseAsr: true});
         await validateVmPmoInput({...options,expectedBound: bound});
         return result;
       },
@@ -938,7 +950,9 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
         const bound = await boundFor(options,{runId:options.runId,taskId:options.taskId,
           planAttempt:options.planAttempt,inputSha256:options.inputSha256});
         const receipt = options.mode === "plan" ? bound.context.plan_result_path
-          : options.mode === "qa" ? path.join(bound.context.run_dir,VM_PMO_QA_RESULT) : bound.context.result_path;
+          : options.mode === "qa" ? path.join(bound.context.run_dir,VM_PMO_QA_RESULT)
+            : options.mode === "qa-review" ? path.join(bound.context.run_dir,VM_PMO_QA_REVIEW_RESULT)
+              : bound.context.result_path;
         try {await lstat(receipt);} catch (error) {if (error?.code === "ENOENT") return null;throw fail("VM_PMO_RUN_OUTCOME_UNKNOWN");}
         return options.mode === "plan" ? validateVmPmoPlan({...options,ffprobePath,expectedBound: bound})
           : validateVmPmoRender({...options,ffprobePath,ffmpegPath,expectedBound: bound});
@@ -1069,6 +1083,14 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       && aiRetryCount < (providerBlock ? MAX_AI_PROVIDER_RETRIES : MAX_AI_RETRIES) && Boolean(run.planStartedAt && run.prepared && run.acquisition)
       && !run.runnerStartedAt && !run.planSha256 && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
+    // The picture review ran after render and QA; rerunning the render step reuses both and the
+    // exported frames, and the retry is spent whether or not the review succeeded.
+    const qaReviewRetryCount = run.qaReviewRetryHistory?.length ?? 0;
+    const canRetryQaReview = run.state === "blocked" && QA_REVIEW_BLOCKS.includes(run.errorCode)
+      && qaReviewRetryCount < MAX_QA_REVIEW_RETRIES
+      && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
+      && !run.renderResult && !run.artifactId && !run.deliveredFileToken && !run.completedAt
+      && !(run.qaRetryHistory?.length && !run.qaRetryStartedAt);
     const canRetryFailedRender = run.state === "needs_attention"
       && run.errorCode === "VM_PMO_START_EVIDENCE_FAILED"
       && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
@@ -1085,7 +1107,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     const canRetryQa = (run.state === "needs_attention" && run.errorCode === "QA_REPORT_INVALID"
         || run.state === "blocked" && run.errorCode === "VM_PMO_QA_FAILED")
       && Boolean(run.runnerStartedAt && run.planSha256 && run.prepared && run.acquisition)
-      && !run.qaRetryHistory?.length && !run.renderResult && !run.artifactId
+      && !run.qaRetryHistory?.length && !run.qaReviewRetryHistory?.length && !run.renderResult && !run.artifactId
       && !run.deliveredFileToken && !run.completedAt;
     // 只读摘要，供看板填写人工修改方案时绑定原视频；不含路径、回执等敏感字段。
     const sourceSha256 = /^[a-f0-9]{64}$/u.test(run.acquisition?.sha256 ?? "") ? run.acquisition.sha256 : null;
@@ -1110,7 +1132,8 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       qaRetryHistory:(run.qaRetryHistory ?? []).map(entry => ({errorCode:entry.errorCode,failedAt:entry.failedAt})),
       stepTimeoutRetryHistory:(run.stepTimeoutRetryHistory ?? []).map(entry => ({
         errorCode: entry.errorCode, failedAt: entry.failedAt, stage: entry.stage })),
-      canRetryAiIntent,aiRetryLimit:MAX_AI_RETRIES,
+      canRetryAiIntent,aiRetryLimit:MAX_AI_RETRIES,canRetryQaReview,qaReviewRetryLimit:MAX_QA_REVIEW_RETRIES,
+      qaReviewRetryHistory:(run.qaReviewRetryHistory ?? []).map(entry => ({errorCode:entry.errorCode,failedAt:entry.failedAt})),
       aiRetryHistory:(run.aiRetryHistory ?? []).map(entry => ({errorCode:entry.errorCode,failedAt:entry.failedAt})),
       canRetryWriteback,writeback,
       updatedAt:new Date(run.updatedAt).toISOString()};
@@ -1204,6 +1227,28 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
       throw fail("VM_PMO_RUN_NOT_FOUND",404);
     if (typeof aiIntent?.run !== "function" || !aiIntent.session) throw fail("VM_PMO_AI_NOT_CONFIGURED",503);
     const queued = await service.orchestrator.retryAiIntent(run.runId,{beforeCommit:assertTaskVersion});
+    void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
+    return publicRun(queued);
+  }
+
+  /** Step 6 rerun: the same frozen plan, the MP4 and QA report already on disk, and a fresh AI
+   * reading of the frames. The operator authorizes the AI session; no new download or planning. */
+  async function retryQaReview(taskId,request) {
+    await ready();
+    if (!object(request) || Object.keys(request).length !== 2
+      || !Number.isSafeInteger(request.version) || request.version < 1
+      || !object(request.runConsent) || Object.keys(request.runConsent).length !== 1
+      || request.runConsent.allowAiSession !== true) throw fail("VM_PMO_RETRY_CONSENT_REQUIRED",400);
+    const assertTaskVersion = () => {
+      if (database.getTask(taskId)?.version !== request.version) throw fail("VERSION_CONFLICT",409);
+    };
+    assertTaskVersion();
+    const service = initialize(), run = service.orchestrator.getForTask(taskId);
+    if (!run || run.identity.packageSnapshot.workflowTemplate.id !== TEMPLATE.id
+      || run.identity.packageSnapshot.workflowTemplate.version !== TEMPLATE.version)
+      throw fail("VM_PMO_RUN_NOT_FOUND",404);
+    if (typeof aiQaReview?.run !== "function" || !aiQaReview.session) throw fail("VM_PMO_AI_NOT_CONFIGURED",503);
+    const queued = await service.orchestrator.retryQaReview(run.runId,{beforeCommit:assertTaskVersion});
     void service.orchestrator.pump(run.runId).finally(releaseTerminalSlots).catch(() => {});
     return publicRun(queued);
   }
@@ -1621,7 +1666,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
     getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,
     retryStepTimeout,retryWriteback,
-    retryAiIntent,retryQa,
+    retryAiIntent,retryQa,retryQaReview,
     resumeDownloadedSource,
     submitManualSource,
     getPackageBoard: async ({subjectKey,packageAlias} = {}) => readVmPackageBoard({database,subjectKey,packageAlias}),

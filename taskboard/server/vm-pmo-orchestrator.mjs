@@ -19,7 +19,7 @@ const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepa
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
   "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
   "manualRevision", "downloadFailure", "manualSource", "materialsReadyNotified", "authRequiredSince", "aiRetryHistory",
-  "stepTimeoutRetryHistory", "qaRetryHistory", "qaRetryStartedAt"]);
+  "stepTimeoutRetryHistory", "qaRetryHistory", "qaRetryStartedAt", "qaReviewRetryHistory", "qaReviewStartedAt"]);
 // QA stops a human may rerun once on the same rendered MP4: a report an older Taskboard could not
 // read, or a check an older package judged wrongly. Render and plan are never repeated.
 const QA_RETRY_CODES = ["QA_REPORT_INVALID", "VM_PMO_QA_FAILED"];
@@ -39,6 +39,10 @@ const MAX_AI_PROVIDER_RETRIES = 10;
 const aiRetryCounts = (history = []) => ({
   provider: history.filter(entry => entry.errorCode === "AI_PROVIDER_FAILED").length,
   session: history.filter(entry => entry.errorCode !== "AI_PROVIDER_FAILED").length });
+// Step 6 (AI picture review) stops a human may rerun: only the AI's reading of the frames repeats;
+// the MP4, QA report and frames stay. QA_REVIEW_INVALID is the package refusing the AI's file.
+const QA_REVIEW_BLOCKS = new Set(["QA_REVIEW_TIMEOUT", "QA_REVIEW_MISSING", "QA_REVIEW_FAILED", "QA_REVIEW_INVALID"]);
+const MAX_QA_REVIEW_RETRIES = 2;
 
 function failure(code) { const error = new Error(code); error.code = code; return error; }
 function object(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -259,7 +263,13 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
             || !AI_INTENT_BLOCKS.has(entry.errorCode) || !timestamp(entry.failedAt)))
         || payload.renderRetryHistory !== undefined && (!Array.isArray(payload.renderRetryHistory)
           || payload.renderRetryHistory.length > 1
-          || payload.renderRetryHistory.some(value => !timestamp(value))))
+          || payload.renderRetryHistory.some(value => !timestamp(value)))
+        || payload.qaReviewRetryHistory !== undefined && (!Array.isArray(payload.qaReviewRetryHistory)
+          || payload.qaReviewRetryHistory.length > MAX_QA_REVIEW_RETRIES
+          || payload.qaReviewRetryHistory.some((entry) => !object(entry) || Object.keys(entry).length !== 2
+            || !QA_REVIEW_BLOCKS.has(entry.errorCode) || !timestamp(entry.failedAt)))
+        || payload.qaReviewStartedAt !== undefined && (!timestamp(payload.qaReviewStartedAt)
+          || !payload.qaReviewRetryHistory?.length))
         throw failure("VM_PMO_STATE_INVALID");
     } catch { throw failure("VM_PMO_STATE_INVALID"); }
     return { runId: row.run_id, taskId: row.task_id, state: row.state, identity,
@@ -599,6 +609,40 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     } catch (error) { db.exec("ROLLBACK"); throw error; }
     return get(runId);
   }
+  /** A picture review that timed out, wrote nothing, failed, or wrote a file the package refused may
+   * be read again by a new AI session the operator authorized. Render and QA are not repeated: the
+   * render step re-enters in `qa-review` mode, keeps the first render start evidence and records the
+   * AI session's spawn as this rerun's start. Each rerun is spent whether or not it succeeds. */
+  async function retryQaReview(runId, {beforeCommit = () => {}} = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run || run.state !== "blocked" || !QA_REVIEW_BLOCKS.has(run.errorCode)
+      || !run.runnerStartedAt || !run.planSha256 || !run.prepared || !run.acquisition
+      || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt
+      || run.qaRetryHistory?.length && !run.qaRetryStartedAt)
+      throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    if ((run.qaReviewRetryHistory?.length ?? 0) >= MAX_QA_REVIEW_RETRIES) throw failure("VM_PMO_RETRY_LIMIT");
+    assertCurrent(run);
+    await verifyRetryInput({ run });
+    const checked = checkedResult(await validateSavedPlan({ run }), "plan");
+    if (checked.planSha256 !== run.planSha256) throw failure("VM_PMO_RETRY_PLAN_CHANGED");
+    assertCurrent(run);
+    const payload = JSON.parse(row.payload_json);
+    payload.qaReviewRetryHistory = [...(run.qaReviewRetryHistory ?? []),
+      { errorCode: run.errorCode, failedAt: new Date(now()).toISOString() }];
+    delete payload.qaReviewStartedAt;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'planned',payload_json = ?,error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = 'blocked' AND error_code = ? AND payload_json = ? AND lease_token IS NULL`)
+        .run(json(payload), now(), now(), runId, run.taskId, run.errorCode, row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return get(runId);
+  }
   async function retryFailedRender(runId, {beforeCommit = () => {}} = {}) {
     const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
     const run = fromRow(row);
@@ -641,7 +685,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt
       || run.renderRetryLaunchAt && !run.renderRetryStartedAt)
       throw failure("VM_PMO_RETRY_NOT_ALLOWED");
-    if (run.qaRetryHistory?.length) throw failure("VM_PMO_RETRY_LIMIT");
+    if (run.qaRetryHistory?.length || run.qaReviewRetryHistory?.length) throw failure("VM_PMO_RETRY_LIMIT");
     assertCurrent(run);
     await verifyRetryInput({ run });
     assertCurrent(run);
@@ -786,7 +830,8 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return run;
   }
   async function offline(run, owner, mode, signal, recovering) {
-    const key = mode === "plan" ? "planStartedAt" : mode === "qa" ? "qaRetryStartedAt" : "runnerStartedAt";
+    const key = mode === "plan" ? "planStartedAt" : mode === "qa" ? "qaRetryStartedAt"
+      : mode === "qa-review" ? "qaReviewStartedAt" : "runnerStartedAt";
     let started = recovering ? Boolean(run[key]) : false;
     const options = { ...run.prepared.runnerOptions, taskId:run.taskId,runId:run.runId,
       planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256,mode,signal };
@@ -901,8 +946,10 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       assertCurrent(run);
       run = update(runId, owner, "prepared", { prepared });
     }
-    // A queued QA rerun reuses the rendered MP4: the render step only reruns its QA.
-    const renderMode = () => (run.qaRetryHistory?.length ? "qa" : "render");
+    // A queued QA rerun reuses the rendered MP4: the render step only reruns its QA (and review).
+    // A queued review rerun reuses the MP4 and QA report: only the AI reads the frames again.
+    const renderMode = () => (run.qaReviewRetryHistory?.length ? "qa-review"
+      : run.qaRetryHistory?.length ? "qa" : "render");
     if (["planning", "rendering"].includes(run.state))
       run = await offline(run, owner, run.state === "planning" ? "plan" : renderMode(), signal, true);
     if (["prepared", "planned"].includes(run.state)) {
@@ -1019,7 +1066,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return draining;
   }
   return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryManualRevision,
-    retryPlan, retryValidatedPlan, retryAiIntent, retryQa, resumeDownloadedSource,
+    retryPlan, retryValidatedPlan, retryAiIntent, retryQa, retryQaReview, resumeDownloadedSource,
     retryFailedRender,
     retryStepTimeout,
     recoverBindingConflicts,
