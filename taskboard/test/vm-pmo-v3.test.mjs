@@ -372,3 +372,19 @@ test("a review on the original source refuses another source, rule planning or a
     await assert.rejects(prepareVmPmoRunInput(args), { code: "VM_PMO_REVIEW_SOURCE_INVALID" }, name);
   }
 });
+
+test("QA reports from the package's mechanical picture checks are accepted", async () => {
+  const { validVmPmoQaChecks } = await import("../server/vm-pmo-result-validator.mjs");
+  const row = (check_id, kind, extra = {}) => ({ check_id, intent_id: null, kind, status: "passed",
+    method: "automatic", evidence_ids: [], target_start_us: 0, target_end_us: null, detail: "ok", ...extra });
+  // The package groups frame checks under one id; the kind tells them apart.
+  const checks = ["frame_count", "frame_timing", "black_frames", "blurred_frames", "luma_flashes", "still_frames"]
+    .map(kind => row("frames", kind));
+  checks.push(row("speech", "speech_present"),
+    row("frames-0", "opening_frame", { status: "needs_human", frames: ["t0us_after.png"] }));
+  assert.equal(validVmPmoQaChecks(checks), true);
+  assert.equal(validVmPmoQaChecks([...checks, row("frames", "still_frames")]), false);
+  assert.equal(validVmPmoQaChecks([row("frames", "unknown_kind")]), false);
+  assert.equal(validVmPmoQaChecks([row("frames-0", "opening_frame", { frames: [] })]), false);
+  assert.equal(validVmPmoQaChecks([row("frames-0", "opening_frame", { other: 1 })]), false);
+});
