@@ -19,7 +19,10 @@ const PAYLOAD_KEYS = new Set(["binding", "approvalStatus", "acquisition", "prepa
   "runnerStartedAt", "processingNotified", "planSha256", "renderResult", "artifactId", "deliveredFileToken", "completedAt",
   "planAttempt", "retryHistory", "renderRetryHistory", "renderRetryLaunchAt", "renderRetryStartedAt",
   "manualRevision", "downloadFailure", "manualSource", "materialsReadyNotified", "authRequiredSince", "aiRetryHistory",
-  "stepTimeoutRetryHistory"]);
+  "stepTimeoutRetryHistory", "qaRetryHistory", "qaRetryStartedAt"]);
+// QA stops a human may rerun once on the same rendered MP4: a report an older Taskboard could not
+// read, or a check an older package judged wrongly. Render and plan are never repeated.
+const QA_RETRY_CODES = ["QA_REPORT_INVALID", "VM_PMO_QA_FAILED"];
 const CODE = /^[A-Z][A-Z0-9_]{1,100}$/u;
 const EVENT = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
 const APPROVAL_REF = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
@@ -173,6 +176,7 @@ function checkedResult(result, mode, previousPlanSha256) {
  * recoverOffline must validate an existing receipt or return null, and must never launch a process. */
 export function createVmPmoOrchestrator({ database, bindings, canExecute, acquireSlot, prepareInput,
   runOffline, recoverOffline, registerArtifact, delivery, verifyRetryInput, validateSavedPlan,
+  archiveQa = async () => { throw failure("VM_PMO_RETRY_NOT_ALLOWED"); },
   onRunStarted = async () => {},
   onCompleted = async () => {}, onAttention = async () => {},
   materialEdges = async () => ({}), onMaterialsReady = async () => {}, onDownloadFailed = async () => {},
@@ -181,7 +185,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
   if (!db || [database?.getTask, database?.getFeishuTaskOrigin, database?.getFeishuTaskPackageSnapshot,
     bindings?.reserve, bindings?.reconcile, bindings?.status, canExecute, acquireSlot, prepareInput,
     runOffline, recoverOffline, registerArtifact, delivery?.enqueue, delivery?.get, verifyRetryInput,
-    validateSavedPlan, onRunStarted,
+    validateSavedPlan, archiveQa, onRunStarted,
     onCompleted, onAttention, materialEdges, onMaterialsReady, onDownloadFailed, now]
     .some((callback) => typeof callback !== "function")
     || !Number.isSafeInteger(tickMs) || tickMs < 100)
@@ -222,6 +226,13 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
         || !payload.renderRetryHistory?.length)
         || payload.renderRetryStartedAt !== undefined && (!timestamp(payload.renderRetryStartedAt)
           || !payload.renderRetryHistory?.length))
+        throw failure("VM_PMO_STATE_INVALID");
+      if (payload.qaRetryHistory !== undefined && (!Array.isArray(payload.qaRetryHistory)
+        || payload.qaRetryHistory.length !== 1 || payload.qaRetryHistory.some((entry) => !object(entry)
+          || Object.keys(entry).length !== 3 || !QA_RETRY_CODES.includes(entry.errorCode)
+          || !timestamp(entry.failedAt) || !timestamp(entry.runnerStartedAt)))
+        || payload.qaRetryStartedAt !== undefined && (!timestamp(payload.qaRetryStartedAt)
+          || !payload.qaRetryHistory?.length))
         throw failure("VM_PMO_STATE_INVALID");
       if (payload.renderResult !== undefined
         && checkedResult(payload.renderResult, "render", payload.planSha256).status !== "rendered")
@@ -617,6 +628,41 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     } catch (error) {db.exec("ROLLBACK");throw error;}
     return get(runId);
   }
+  /** Rerun the package QA once on the same rendered MP4. The caller re-verifies the approval,
+   * receipt and source, the saved plan and the MP4; the previous QA files are archived (never
+   * overwritten) before the run is queued. The pending rerun runs only QA, keeps the first render
+   * start evidence, and still waits on the automatic-execution switch. */
+  async function retryQa(runId, {beforeCommit = () => {}} = {}) {
+    const row = db.prepare("SELECT * FROM vm_pmo_runs WHERE run_id = ?").get(runId);
+    const run = fromRow(row);
+    if (!run || !(run.state === "needs_attention" && run.errorCode === "QA_REPORT_INVALID"
+        || run.state === "blocked" && run.errorCode === "VM_PMO_QA_FAILED")
+      || !run.runnerStartedAt || !run.planSha256 || !run.prepared || !run.acquisition
+      || run.renderResult || run.artifactId || run.deliveredFileToken || run.completedAt
+      || run.renderRetryLaunchAt && !run.renderRetryStartedAt)
+      throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+    if (run.qaRetryHistory?.length) throw failure("VM_PMO_RETRY_LIMIT");
+    assertCurrent(run);
+    await verifyRetryInput({ run });
+    assertCurrent(run);
+    beforeCommit();
+    await archiveQa({ run });
+    assertCurrent(run);
+    const payload = JSON.parse(row.payload_json);
+    payload.qaRetryHistory = [{ errorCode: run.errorCode, failedAt: new Date(now()).toISOString(),
+      runnerStartedAt: run.runnerStartedAt }];
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      beforeCommit();
+      const changed = db.prepare(`UPDATE vm_pmo_runs SET state = 'planned',payload_json = ?,error_code = NULL,
+        attempt_count = 0,next_attempt_at = ?,updated_at = ? WHERE run_id = ? AND task_id = ?
+        AND state = ? AND error_code = ? AND payload_json = ? AND lease_token IS NULL`)
+        .run(json(payload), now(), now(), runId, run.taskId, run.state, run.errorCode, row.payload_json);
+      if (changed.changes !== 1) throw failure("VM_PMO_RETRY_NOT_ALLOWED");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return get(runId);
+  }
   /**
    * A run that hit the step timeout is stuck in `needs_attention` with no way
    * back: the failed child was signalled, so neither stage left a result, and
@@ -740,7 +786,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return run;
   }
   async function offline(run, owner, mode, signal, recovering) {
-    const key = mode === "plan" ? "planStartedAt" : "runnerStartedAt";
+    const key = mode === "plan" ? "planStartedAt" : mode === "qa" ? "qaRetryStartedAt" : "runnerStartedAt";
     let started = recovering ? Boolean(run[key]) : false;
     const options = { ...run.prepared.runnerOptions, taskId:run.taskId,runId:run.runId,
       planAttempt:run.planAttempt ?? 1,inputSha256:run.prepared.inputSha256,mode,signal };
@@ -784,7 +830,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     }
     if (!result && recovering) throw failure("VM_PMO_RUN_OUTCOME_UNKNOWN");
     if (!started) throw failure("VM_PMO_START_NOT_CONFIRMED");
-    const checked = checkedResult(result, mode, mode === "render" ? run.planSha256 : null);
+    const checked = checkedResult(result, mode, mode === "plan" ? null : run.planSha256);
     if (["blocked", "failed"].includes(checked.status)) return update(run.runId, owner, "blocked", {}, checked.errorCode);
     return mode === "plan" ? update(run.runId, owner, "planned", { planSha256: checked.planSha256 })
       : update(run.runId, owner, "rendered", { renderResult: checked });
@@ -855,8 +901,10 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
       assertCurrent(run);
       run = update(runId, owner, "prepared", { prepared });
     }
+    // A queued QA rerun reuses the rendered MP4: the render step only reruns its QA.
+    const renderMode = () => (run.qaRetryHistory?.length ? "qa" : "render");
     if (["planning", "rendering"].includes(run.state))
-      run = await offline(run, owner, run.state === "planning" ? "plan" : "render", signal, true);
+      run = await offline(run, owner, run.state === "planning" ? "plan" : renderMode(), signal, true);
     if (["prepared", "planned"].includes(run.state)) {
       if (!await canExecute({ run })) return run;
       const slot = await acquireSlot({ run });
@@ -873,7 +921,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
           assertCurrent(run);
           if (!await canExecute({ run })) return run;
           run = update(runId, owner, "rendering");
-          run = await offline(run, owner, "render", signal, false);
+          run = await offline(run, owner, renderMode(), signal, false);
         }
       } finally { await slot.release(); }
     }
@@ -971,7 +1019,7 @@ export function createVmPmoOrchestrator({ database, bindings, canExecute, acquir
     return draining;
   }
   return Object.freeze({ register, get, getForTask, list, pump, wake, retryApproval, retryManualRevision,
-    retryPlan, retryValidatedPlan, retryAiIntent, resumeDownloadedSource,
+    retryPlan, retryValidatedPlan, retryAiIntent, retryQa, resumeDownloadedSource,
     retryFailedRender,
     retryStepTimeout,
     recoverBindingConflicts,
