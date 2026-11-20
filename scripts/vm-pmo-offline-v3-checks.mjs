@@ -40,14 +40,17 @@ function alignment(sourceSha256, rows = UTTERANCES) {
     utterances: rows.map(([text, list]) => ({text, words: list.map(([word, start, end]) => ({text: word, start, end}))}))};
 }
 
-function span(raw, text) {
+function span(raw, text, instruction = 'instruction-1') {
   const start = raw.indexOf(text);
   assert.ok(start >= 0);
-  return {instruction_id: 'instruction-1', start, end: start + text.length};
+  return {instruction_id: instruction, start, end: start + text.length};
 }
 
 /** The intent an AI session would write for RAW: keep 0–5.6 s and delete the second repetition. */
-async function intentFor(context, descriptor, {blocked = false} = {}) {
+export async function intentFor(context, descriptor, {blocked = false, end = '0:05.60', endUs = 5_600_000,
+  model = MODEL} = {}) {
+  const RANGE = `0:00-${end}`;
+  const RAW = `${RANGE}，删掉第二遍的“我们再看一下”`;
   const alignmentSha256 = sha256(await readFile(path.join(context.run_dir, 'alignment.words.json')));
   const clipSpan = span(RAW, RANGE);
   const deleteText = '删掉第二遍的“我们再看一下”';
@@ -60,14 +63,14 @@ async function intentFor(context, descriptor, {blocked = false} = {}) {
   ];
   const operations = blocked ? [] : [{intent_id: 'del-1', kind: 'delete_phrase', covers: [deleteSpan], rationale: '第二遍',
     phrase: {source_id: 'source-1', alignment_sha256: alignmentSha256, first_index: 7, last_index: 8, text: '我们再看一下',
-      selection: {method: 'user_ordinal', scope_start_us: 0, scope_end_us: 5_600_000,
+      selection: {method: 'user_ordinal', scope_start_us: 0, scope_end_us: endUs,
         candidates: [{first_index: 2, last_index: 3, start_us: 1_200_000, end_us: 1_900_000},
           {first_index: 7, last_index: 8, start_us: 3_300_000, end_us: 4_000_000}],
         evidence_id: null, ordinal: 2, ordinal_span: span(RAW, '第二遍')}}}];
   const anchor = (text, us) => ({ref: 'user_anchor', value_us: us, span: span(RAW, text)});
   return {
     schema: 'auto-cut-slicing/edit-intent', schema_version: 1, status: blocked ? 'blocked' : 'proposed',
-    author: {kind: 'ai', agent: 'codex', model: MODEL, session_id: 'offline-fixture-session'},
+    author: {kind: 'ai', agent: 'codex', model, session_id: 'offline-fixture-session'},
     bindings: {timeline_basis: 'vm_original',
       sources: [{source_id: 'source-1', sha256: descriptor.sha256, duration_us: descriptor.duration_us,
         alignment_sha256: alignmentSha256}],
@@ -75,7 +78,7 @@ async function intentFor(context, descriptor, {blocked = false} = {}) {
     instructions: [{instruction_id: 'instruction-1', raw_text: RAW, raw_text_sha256: sha256(Buffer.from(RAW))}],
     coverage,
     outputs: [{output_id: 'review', clips: [{intent_id: 'clip-1', source_id: 'source-1', covers: [clipSpan],
-      start: {mode: 'time', at: anchor('0:00', 0)}, end: {mode: 'time', at: anchor('0:05.60', 5_600_000)},
+      start: {mode: 'time', at: anchor('0:00', 0)}, end: {mode: 'time', at: anchor(end, endUs)},
       operations, must_keep: [], rationale: 'offline fixture'}]}],
     blockers: blocked ? [{code: 'INTENT_NEEDS_USER_DECISION', spans: [deleteSpan], message: '两处都可能是要删的那一遍',
       missing_evidence: [], candidates: []}] : [],
