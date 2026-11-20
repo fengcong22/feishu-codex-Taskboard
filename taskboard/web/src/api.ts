@@ -1575,6 +1575,19 @@ export async function retryTaskVmPmoQa(
   return data.run;
 }
 
+/** Step 6 rerun: the same plan and MP4, a fresh AI reading of the exported frames. */
+export async function retryTaskVmPmoQaReview(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-qa-review-retry`,
+    { method: "POST", body: JSON.stringify({ version,
+      runConsent: { allowAiSession: true } }) },
+  );
+  return data.run;
+}
+
 export async function retryTaskVmPmoWriteback(
   taskId: string,
   version: number,

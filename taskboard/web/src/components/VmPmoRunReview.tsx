@@ -1,5 +1,11 @@
 import { useTaskboardI18n } from "../i18n";
-import type { VmPmoQaItem, VmPmoRunReview as Review } from "../types";
+import type { VmPmoQaItem, VmPmoQaVerdict, VmPmoQaVisualItem, VmPmoRunReview as Review } from "../types";
+
+const VERDICTS: Record<VmPmoQaVerdict["verdict"], [string, string]> = {
+  clean: ["画面干净", "Clean"],
+  defect: ["发现问题", "Defect"],
+  unclear: ["看不清，需人工", "Unclear, needs a person"],
+};
 
 const DISPOSITIONS: Record<string, [string, string]> = {
   operation: ["执行", "Edited"],
@@ -32,8 +38,46 @@ function QaList({ items, label }: { items: VmPmoQaItem[]; label: string }) {
   );
 }
 
-/** v3 approval view: how the AI intent covered each instruction, why planning blocked, and which
- * QA checks still need a person. `overall: failed` never reaches delivery; this view only explains. */
+function VisualList({ items, label }: { items: VmPmoQaVisualItem[]; label: string }) {
+  if (items.length === 0) return null;
+  return (
+    <ul className="vm-pmo-review-list" aria-label={label}>
+      {items.map((item, index) => (
+        <li key={`${item.checkId ?? "visual"}-${index}`}>
+          <code>{item.kind}</code>
+          {item.targetStartUs !== null && (
+            <span>{seconds(item.targetStartUs)}{item.targetEndUs !== null && item.targetEndUs !== item.targetStartUs
+              ? `–${seconds(item.targetEndUs)}` : ""}</span>
+          )}
+          <span>{item.detail}</span>
+          {item.frames.length > 0 && <span>{item.frames.join("、")}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function VerdictList({ items, label }: { items: VmPmoQaVerdict[]; label: string }) {
+  const { text } = useTaskboardI18n();
+  if (items.length === 0) return null;
+  return (
+    <ul className="vm-pmo-review-list" aria-label={label}>
+      {items.map((item, index) => (
+        <li key={`${item.checkId ?? "verdict"}-${item.questionId ?? index}`}>
+          <code>{item.checkId}</code>
+          <span className={`vm-pmo-verdict vm-pmo-verdict-${item.verdict}`}>
+            {text(VERDICTS[item.verdict][0], VERDICTS[item.verdict][1])}</span>
+          <span>{item.observation}</span>
+          {item.frames.length > 0 && <span>{item.frames.join("、")}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** v3 approval view: how the AI intent covered each instruction, why planning blocked, what the AI
+ * picture review concluded, and which QA checks still need a person. `overall: failed` never reaches
+ * delivery; this view only explains. */
 export function VmPmoRunReview({ review }: { review: Review }) {
   const { text } = useTaskboardI18n();
   const qa = review.qa;
@@ -89,6 +133,13 @@ export function VmPmoRunReview({ review }: { review: Review }) {
           {review.qaError.code && <code className="vm-pmo-run-error-code">{review.qaError.code}</code>}
         </div>
       )}
+      {review.qaReviewError && (
+        <div className="vm-pmo-run-meta" role="status">
+          <span>{text("AI 看图复核没有被剪辑包接受，不会交付", "The package did not accept the AI picture review; it will not be delivered")}</span>
+          {review.qaReviewError.code && <code className="vm-pmo-run-error-code">{review.qaReviewError.code}</code>}
+          {review.qaReviewError.message && <span>{review.qaReviewError.message}</span>}
+        </div>
+      )}
       {qa && (
         <div aria-label={text("成片质量检查", "Video QA")}>
           <div className="vm-pmo-run-meta">
@@ -96,6 +147,16 @@ export function VmPmoRunReview({ review }: { review: Review }) {
               : text("成片检查完成，仍需人工复核下列项目", "Video QA ran; a person still has to check the items below")}</span>
             {!qa.reverseAsr && <span>{text("未做成片反向识别", "No reverse speech recognition")}</span>}
           </div>
+          {qa.visualReview && (
+            <div className="vm-pmo-run-meta">
+              <span>{text("已由 AI 看图复核", "Picture items reviewed by AI")}{qa.visualReview.model
+                ? `（${qa.visualReview.model}）` : ""}</span>
+            </div>
+          )}
+          {qa.visualReview && (
+            <VerdictList items={qa.visualReview.items} label={text("AI 看图复核结论", "AI picture review verdicts")} />
+          )}
+          <VisualList items={qa.aiReviewed ?? []} label={text("AI 复核通过的画面项", "Picture items the AI reviewed")} />
           <QaList items={qa.failed} label={text("未通过的检查", "Failed checks")} />
           <QaList items={qa.needsHuman} label={text("需要人工复核", "Needs human review")} />
         </div>

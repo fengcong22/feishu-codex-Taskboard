@@ -36,6 +36,7 @@ import {
   rerunTaskAutoCutCurrent,
   retryTaskVmPmoPlan,
   retryTaskVmPmoAiIntent,
+  retryTaskVmPmoQaReview,
   retryTaskVmPmoQa,
   retryTaskVmPmoResumeSource,
   retryTaskVmPmoWriteback,
@@ -489,6 +490,9 @@ export function TaskDetail({
   const [vmPmoRunError, setVmPmoRunError] = useState<TaskDetailError | null>(null);
   const [retryingVmPmoPlan, setRetryingVmPmoPlan] = useState(false);
   const [retryingVmPmoAi, setRetryingVmPmoAi] = useState(false);
+  const [retryingVmPmoQaReview, setRetryingVmPmoQaReview] = useState(false);
+  const [showVmPmoQaReviewConsent, setShowVmPmoQaReviewConsent] = useState(false);
+  const [allowVmPmoQaReviewSession, setAllowVmPmoQaReviewSession] = useState(false);
   const [showVmPmoAiConsent, setShowVmPmoAiConsent] = useState(false);
   const [allowVmPmoAiSession, setAllowVmPmoAiSession] = useState(false);
   const [retryingVmPmoQa, setRetryingVmPmoQa] = useState(false);
@@ -1394,6 +1398,24 @@ export function TaskDetail({
     }
   }
 
+  async function retryVmPmoQaReview() {
+    if (!vmPmoRun?.canRetryQaReview || !allowVmPmoQaReviewSession || retryingVmPmoQaReview) return;
+    const taskId = currentTask.id;
+    setRetryingVmPmoQaReview(true);
+    setVmPmoRunError(null);
+    try {
+      const run = await retryTaskVmPmoQaReview(taskId, currentTask.version);
+      if (currentTaskIdRef.current !== taskId) return;
+      setVmPmoRun(run);
+      setShowVmPmoQaReviewConsent(false);
+      setAllowVmPmoQaReviewSession(false);
+    } catch (error) {
+      if (currentTaskIdRef.current === taskId) setVmPmoRunError(messageFor(error));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setRetryingVmPmoQaReview(false);
+    }
+  }
+
   async function retryVmPmoQa() {
     if (!vmPmoRun?.canRetryQa || !allowVmPmoQa || retryingVmPmoQa) return;
     const taskId = currentTask.id;
@@ -1981,6 +2003,42 @@ export function TaskDetail({
                           </li>
                         ))}
                       </ul>
+                    )}
+                    {(vmPmoRun.qaReviewRetryHistory?.length ?? 0) > 0 && (
+                      <ul className="vm-pmo-retry-history">
+                        {vmPmoRun.qaReviewRetryHistory!.map((entry, index) => (
+                          <li key={`${entry.failedAt}-${index}`}>
+                            {text(`第 ${index + 1} 次 AI 看图复核`, `AI picture review ${index + 1}`)}
+                            <code>{entry.errorCode}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {vmPmoRun.canRetryQaReview && !showVmPmoQaReviewConsent && (
+                      <button type="button" disabled={retryingVmPmoQaReview}
+                        onClick={() => setShowVmPmoQaReviewConsent(true)}>
+                        {text("重新运行 AI 看图复核", "Rerun AI picture review")}
+                      </button>
+                    )}
+                    {vmPmoRun.canRetryQaReview && showVmPmoQaReviewConsent && (
+                      <div className="vm-pmo-retry-consent">
+                        <label>
+                          <input type="checkbox" checked={allowVmPmoQaReviewSession}
+                            onChange={(event) => setAllowVmPmoQaReviewSession(event.target.checked)} />
+                          {text("允许再启动一次无人值守 AI 会话（最长 15 分钟），重新查看这一轮的帧；成片和质检结果不变",
+                            "Allow one more unattended AI session (up to 15 minutes) to re-read this round's frames; the video and QA result stay the same")}
+                        </label>
+                        <div className="vm-pmo-retry-actions">
+                          <button type="button" disabled={retryingVmPmoQaReview || !allowVmPmoQaReviewSession}
+                            onClick={() => void retryVmPmoQaReview()}>
+                            {retryingVmPmoQaReview ? text("正在重试…", "Retrying…") : text("确认重跑", "Confirm rerun")}
+                          </button>
+                          <button type="button" disabled={retryingVmPmoQaReview} onClick={() => {
+                            setShowVmPmoQaReviewConsent(false);
+                            setAllowVmPmoQaReviewSession(false);
+                          }}>{text("取消", "Cancel")}</button>
+                        </div>
+                      </div>
                     )}
                     {vmPmoRun.canRetryQa && !showVmPmoQaConsent && (
                       <button type="button" disabled={retryingVmPmoQa} onClick={() => setShowVmPmoQaConsent(true)}>
