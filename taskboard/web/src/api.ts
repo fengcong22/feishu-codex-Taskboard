@@ -1563,6 +1563,18 @@ export async function retryTaskVmPmoAiIntent(
   return data.run;
 }
 
+export async function retryTaskVmPmoQa(
+  taskId: string,
+  version: number,
+): Promise<VmPmoRunSummary> {
+  const data = await request<{ run: VmPmoRunSummary }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-qa-retry`,
+    { method: "POST", body: JSON.stringify({ version,
+      runConsent: { allowVideoAudioAsr: true, allowLocalQaOutput: true } }) },
+  );
+  return data.run;
+}
+
 export async function retryTaskVmPmoWriteback(
   taskId: string,
   version: number,

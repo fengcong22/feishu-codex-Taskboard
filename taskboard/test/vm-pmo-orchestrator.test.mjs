@@ -1105,3 +1105,75 @@ test("a rule mismatch can be replanned from the same input without another downl
   assert.equal(x.calls.filter(([name]) => name === "reserve").length, 1);
   assert.equal(x.calls.filter(([name]) => name === "plan").length, 2);
 });
+
+test("a QA stop reruns only QA once on the same MP4 and keeps the first render start", async (t) => {
+  for (const [stop, state] of [["QA_REPORT_INVALID", "needs_attention"], ["VM_PMO_QA_FAILED", "blocked"]]) {
+    const x = await fixture(t);
+    await x.f.register({ taskId: "task_vm" });
+    x.setApproval("ready");
+    let qaRuns = 0;
+    x.dependencies.archiveQa = async ({ run }) => { x.calls.push(["archiveQa", run.runId]); };
+    x.dependencies.runOffline = async ({ mode, onStarted }) => {
+      x.calls.push([mode]);
+      await onStarted({ mode, pid: 42, startedAt: new Date(1_700_000_000_000 + x.calls.length * 1000).toISOString() });
+      if (mode === "plan") return { status: "ready", planSha256: "d".repeat(64) };
+      if (mode === "render") {
+        if (stop === "VM_PMO_QA_FAILED") return { status: "failed", errorCode: stop };
+        const error = new Error(stop); error.code = stop; throw error;
+      }
+      qaRuns += 1;
+      return { status: "rendered", planSha256: "d".repeat(64), artifact: x.artifact };
+    };
+    await x.restart();
+    const stopped = await x.f.pump("run_vm");
+    assert.deepEqual([stopped.state, stopped.errorCode], [state, stop]);
+    assert.ok(stopped.runnerStartedAt);
+
+    x.setApproval("waiting_approval");
+    await assert.rejects(x.f.retryQa("run_vm"), { code: "VM_PMO_RETRY_APPROVAL_NOT_READY" });
+    assert.equal(x.calls.filter(([kind]) => kind === "archiveQa").length, 0);
+    x.setApproval("ready");
+
+    const queued = await x.f.retryQa("run_vm");
+    assert.equal(queued.state, "planned");
+    assert.deepEqual(queued.qaRetryHistory.map(entry => [entry.errorCode, entry.runnerStartedAt]),
+      [[stop, stopped.runnerStartedAt]]);
+    assert.equal((await x.f.pump("run_vm")).state, "delivery_pending", stop);
+    const done = x.f.get("run_vm");
+    assert.equal(done.runnerStartedAt, stopped.runnerStartedAt);
+    assert.ok(done.qaRetryStartedAt);
+    assert.equal(qaRuns, 1);
+    assert.equal(x.calls.filter(([kind]) => kind === "render").length, 1);
+    assert.equal(x.calls.filter(([kind]) => kind === "plan").length, 1);
+    assert.equal(x.calls.filter(([kind]) => kind === "archiveQa").length, 1);
+    await assert.rejects(x.f.retryQa("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+  }
+});
+
+test("a QA rerun is allowed once, waits on the switch, and not for other stops", async (t) => {
+  const x = await fixture(t);
+  await x.f.register({ taskId: "task_vm" });
+  x.setApproval("ready");
+  x.dependencies.archiveQa = async () => {};
+  x.dependencies.runOffline = async ({ mode, onStarted }) => {
+    await onStarted({ mode, pid: 42, startedAt: new Date(1_700_000_000_000).toISOString() });
+    return mode === "plan" ? { status: "ready", planSha256: "d".repeat(64) }
+      : { status: "failed", errorCode: "VM_PMO_QA_FAILED" };
+  };
+  await x.restart();
+  assert.equal((await x.f.pump("run_vm")).errorCode, "VM_PMO_QA_FAILED");
+  await x.f.retryQa("run_vm");
+  // The queued rerun waits while automatic execution is off.
+  x.setCanExecute(async () => false);
+  assert.equal((await x.f.pump("run_vm")).state, "planned");
+  x.setCanExecute(async () => true);
+  assert.equal((await x.f.pump("run_vm")).errorCode, "VM_PMO_QA_FAILED");
+  await assert.rejects(x.f.retryQa("run_vm"), { code: "VM_PMO_RETRY_LIMIT" });
+
+  const y = await fixture(t);
+  await y.f.register({ taskId: "task_vm" });
+  y.setApproval("ready");
+  y.setPlanResult({ status: "blocked", errorCode: "INTENT_BLOCKED" });
+  assert.equal((await y.f.pump("run_vm")).errorCode, "INTENT_BLOCKED");
+  await assert.rejects(y.f.retryQa("run_vm"), { code: "VM_PMO_RETRY_NOT_ALLOWED" });
+});

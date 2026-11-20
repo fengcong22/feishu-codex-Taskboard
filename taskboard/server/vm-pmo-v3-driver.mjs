@@ -97,8 +97,15 @@ export function isVmPmoAiIntentInput(input) {
 
 export async function runVmPmoDriver(options = {}) {
   const { mode, contextPath, signal, expectedBound: frozenBound = null } = options;
-  if (!["plan", "render"].includes(mode)) throw failure("VM_PMO_RUN_INPUT_INVALID");
+  if (!["plan", "render", "qa"].includes(mode)) throw failure("VM_PMO_RUN_INPUT_INVALID");
   const bound = await validateVmPmoInput({ contextPath, signal, expectedBound: frozenBound });
+  // A QA rerun checks the MP4 already rendered for this plan; only AI intent runs have QA.
+  if (mode === "qa") {
+    if (!isVmPmoAiIntentInput(bound.input)) throw failure("VM_PMO_RUN_INPUT_INVALID");
+    const { aiIntent: _aiIntent, aiHistory: _aiHistory, reverseAsr = true, beforeSpawn: _before,
+      assertBeforeSpawn: _assert, onLaunched: _launched, ...step } = options;
+    return runVmPmoOffline({ ...step, mode: "qa", reverseAsr, expectedBound: bound });
+  }
   if (!isVmPmoAiIntentInput(bound.input)) {
     const { aiIntent: _aiIntent, reverseAsr: _reverseAsr, ...rest } = options;
     return runVmPmoOffline({ ...rest, expectedBound: bound });
