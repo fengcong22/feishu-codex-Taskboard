@@ -132,6 +132,7 @@ import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
 import { AutoCutRunSummary } from "./AutoCutRunSummary";
 import { VmPmoRunReview } from "./VmPmoRunReview";
+import { VmPmoAiTranscript } from "./VmPmoAiTranscript";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -1972,6 +1973,7 @@ export function TaskDetail({
                       </ul>
                     )}
                     {vmPmoRun.review && <VmPmoRunReview review={vmPmoRun.review} />}
+                    <VmPmoAiTranscript taskId={task.id} refreshKey={`${vmPmoRun.runId}:${vmPmoRun.state}:${vmPmoRun.updatedAt}`} />
                     {(vmPmoRun.aiRetryHistory?.length ?? 0) > 0 && (
                       <ul className="vm-pmo-retry-history">
                         {vmPmoRun.aiRetryHistory!.map((entry, index) => (

@@ -7686,6 +7686,20 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const vmPmoAiTranscriptRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-ai-transcript$/);
+      if (vmPmoAiTranscriptRoute) {
+        assertAiLoopbackRequest(request);
+        assertNoQuery(url.searchParams, "/api/local/tasks/:id/vm-pmo-ai-transcript");
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const taskId = decodeRouteSegment(vmPmoAiTranscriptRoute[1], "Task id");
+        if (!database.getTask(taskId)) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        const snapshot = database.getFeishuTaskPackageSnapshot(taskId);
+        if (database.getFeishuTaskOrigin(taskId)?.source !== "feishu-base"
+          || snapshot?.workflowTemplate?.id !== "vm_pmo_review_video"
+          || snapshot.workflowTemplate.version !== 1) return sendJson(response, 200, {runId:null,sessions:[]});
+        return sendJson(response, 200, await getVmRuntime().getTaskAiTranscript(taskId));
+      }
+
       const vmPmoRunRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/vm-pmo-run$/);
       if (vmPmoRunRoute) {
         assertAiLoopbackRequest(request);

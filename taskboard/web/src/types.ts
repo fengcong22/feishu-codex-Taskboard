@@ -683,6 +683,27 @@ export interface VmPmoQaItem {
   evidenceIds: string[];
 }
 
+/** One step of a VM/PMO AI planning session, read from its events.jsonl; display only. */
+export type VmPmoAiStep =
+  | { kind: "message" | "reasoning" | "error"; text: string | null }
+  | { kind: "command"; command: string | null; exitCode: number | null; output: string | null }
+  | { kind: "file_change"; files: string[] };
+
+export interface VmPmoAiSession {
+  name: string;
+  attempt: string;
+  session: number;
+  outcome: string | null;
+  model: string | null;
+  resumed: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  report: string | null;
+  eventsMissing: boolean;
+  steps: VmPmoAiStep[];
+  truncated: boolean;
+}
+
 /** v3 approval details read from plan-result.json and qa.json; display only. */
 export interface VmPmoRunReview {
   planningMode: string | null;
