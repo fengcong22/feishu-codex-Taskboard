@@ -14,6 +14,7 @@ import { createStoredZip } from "./stored-zip-fixture.mjs";
 
 const SECRET = "lifecycle-fixture-secret";
 const SUBJECT_KEY = "bas_lifecycle:tbl_math";
+const EDIT_TEMPLATE = { id: "document_edit_zip", version: 1 };
 
 async function jsonRequest(baseUrl, pathname, body, { method = "POST", headers = {} } = {}) {
   const response = await fetch(`${baseUrl}${pathname}`, {
@@ -116,12 +117,19 @@ async function createFixture({
   coursePathResolver = undefined,
   vmDownloadNotifier = undefined,
   vmDownloadSession = undefined,
+  editPackage = false,
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-autocut-lifecycle-"));
   const workspacePath = path.join(directory, "workspace");
   const zipSourceDirectory = path.join(directory, "zip-source");
   await mkdir(workspacePath);
   await mkdir(zipSourceDirectory);
+  if (editPackage) {
+    await writeFile(path.join(workspacePath, "PACKAGE-MANIFEST.json"), JSON.stringify({
+      embedded_runtime: { version: "0.1.0" },
+      interface: { workflowTemplate: EDIT_TEMPLATE, artifactKind: "edit_zip", zipOutput: { relativeDirectory: "output" } },
+    }));
+  }
   const capturePath = path.join(directory, "codex-env.json");
   const promptCapturePath = path.join(directory, "codex-prompt.txt");
   const codexExecutable = path.join(directory, "fake-codex.mjs");
@@ -191,6 +199,7 @@ if (args[0] === "debug") {
           state: "enabled",
           revision: 1,
           maxConcurrent: 1,
+          ...(editPackage ? { workflowTemplate: EDIT_TEMPLATE } : {}),
         },
       },
     },
@@ -349,11 +358,19 @@ async function writePassingRunResult(run, {
   draftRoot = run.artifactName,
   resultOverrides = {},
   receiptOverrides = {},
+  edit = false,
+  entries = undefined,
 } = {}) {
-  const zip = createStoredZip([
+  const zip = createStoredZip(entries ?? (edit ? [
+    { name: `${draftRoot}/${draftRoot}.mp4`, content: "video" },
+    { name: `${draftRoot}/工程/${draftRoot}.xml`, content: "<xmeml/>" },
+    { name: `${draftRoot}/工程/录屏.mp4`, content: "source" },
+    { name: `${draftRoot}/执行反馈表.csv`, content: "成片时间" },
+    { name: `${draftRoot}/剪辑清单.json`, content: "{}" },
+  ] : [
     { name: `${draftRoot}/draft_content.json`, content: "{}" },
     { name: `${draftRoot}/draft_meta_info.json`, content: "{}" },
-  ]);
+  ]));
   await writeFile(run.packageZipPath, zip);
   const archiveSha256 = createHash("sha256").update(zip).digest("hex");
   await writeFile(run.resultPath, `${JSON.stringify({
@@ -370,8 +387,8 @@ async function writePassingRunResult(run, {
     await writeFile(`${run.packageZipPath}.receipt.json`, `${JSON.stringify({
       schema_version: 2,
       status: "pass",
-      workflow_mode: "lite",
-      delivery_mode: "lite_zip",
+      workflow_mode: edit ? "autoedit" : "lite",
+      delivery_mode: edit ? "edit_zip" : "lite_zip",
       archive_path: run.packageZipPath,
       archive_sha256: archiveSha256,
       package_root_name: run.artifactName,
@@ -2754,6 +2771,106 @@ test("Auto-Cut retry rejects non-blocked, copied-marker, and legacy tasks", asyn
     );
     assert.equal(legacyRetry.response.status, 409, JSON.stringify(legacyRetry.body));
     assert.equal(legacyRetry.body.error.code, "AUTOCUT_RETRY_NOT_ALLOWED");
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+
+test("a document_edit_zip package runs locally and its edit bundle ZIP is verified", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/autoedit-local-runner"],
+    namingDisplayValue: "自动剪辑课程",
+    namingValueUnique: true,
+  };
+  const invocations = [];
+  const fixture = await createFixture({
+    controlledContext,
+    allowAutomaticExecution: true,
+    editPackage: true,
+    autoCutRunner: async ({ run, packageConfig }) => {
+      invocations.push({ runId: run.runId, template: packageConfig.workflowTemplate });
+      await writePassingRunResult(run, { edit: true });
+      return { exitCode: 0 };
+    },
+  });
+  try {
+    const subject = await registerSubject(fixture, { executionMode: "automatic" });
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
+    const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
+    assert.deepEqual(invocations, [{ runId: run.runId, template: EDIT_TEMPLATE }]);
+    const artifact = fixture.app.database.getTaskArtifactForRun(task.id, run.runId);
+    assert.equal(artifact.validationStatus, "verified");
+    assert.equal(artifact.draftRoot, run.artifactName);
+    assert.deepEqual(fixture.app.database.getFeishuTaskPackageSnapshot(task.id).workflowTemplate, EDIT_TEMPLATE);
+  } finally {
+    await fixture.app.close();
+    await fixture.bridge.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+for (const [label, options, code] of [
+  ["a Lite receipt", { edit: true, receiptOverrides: { workflow_mode: "lite", delivery_mode: "lite_zip" } }, "autocut_package_receipt_invalid"],
+  ["a JianYing draft ZIP", { edit: false, receiptOverrides: { workflow_mode: "autoedit", delivery_mode: "edit_zip" } }, "AUTOCUT_ARTIFACT_REPORT_FAILED"],
+  ["a bundle without the project XML", { edit: true, entries: [
+    { name: "自动剪辑负例/自动剪辑负例.mp4", content: "video" },
+    { name: "自动剪辑负例/执行反馈表.csv", content: "x" },
+    { name: "自动剪辑负例/剪辑清单.json", content: "{}" },
+  ] }, "AUTOCUT_ARTIFACT_REPORT_FAILED"],
+]) {
+  test(`a document_edit_zip run rejects ${label}`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/autoedit-negative"],
+      namingDisplayValue: "自动剪辑负例",
+      namingValueUnique: true,
+    };
+    const fixture = await createFixture({
+      controlledContext,
+      allowAutomaticExecution: true,
+      editPackage: true,
+      autoCutRunner: async ({ run }) => {
+        await writePassingRunResult(run, options);
+        return { exitCode: 0 };
+      },
+    });
+    try {
+      const subject = await registerSubject(fixture, { executionMode: "automatic" });
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      const task = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 8_000);
+      const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
+      assert.equal(run.state, "blocked");
+      assert.equal(run.errorCode, code);
+      assert.deepEqual(fixture.app.database.listTaskArtifacts(task.id), []);
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a document_edit_zip task is not started through a Codex turn", async () => {
+  const controlledContext = {
+    documentLinks: ["https://guanghe.feishu.cn/docx/autoedit-no-codex"],
+    namingDisplayValue: "自动剪辑不走AI",
+    namingValueUnique: true,
+  };
+  const fixture = await createFixture({ controlledContext, editPackage: true });
+  try {
+    const subject = await registerSubject(fixture);
+    const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+    assert.equal(created.response.status, 201, JSON.stringify(created.body));
+    const started = await jsonRequest(fixture.baseUrl, `/api/tasks/${created.body.task.id}/start-ai`, {});
+    assert.equal(started.response.status, 409, JSON.stringify(started.body));
+    assert.equal(started.body.error.code, "PACKAGE_LOCAL_RUN_REQUIRED");
+    await assert.rejects(readFile(fixture.promptCapturePath, "utf8"), { code: "ENOENT" });
+    assert.equal(fixture.app.database.getTask(created.body.task.id).status, "todo");
   } finally {
     await fixture.app.close();
     await fixture.bridge.close();

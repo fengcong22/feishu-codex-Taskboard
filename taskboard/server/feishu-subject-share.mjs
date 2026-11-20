@@ -1,7 +1,7 @@
 import { ApiError } from "./database.mjs";
 import { subjectProjectId, validateSubjectConfig } from "./feishu-workflow-store.mjs";
 import { normalizeVmPackageWorkflowConfig } from "./feishu-package-workflow-drafts.mjs";
-import { normalizePackageWorkflowTemplate } from "../shared/feishu-package-workflow.mjs";
+import { isZipWorkflowTemplate, normalizePackageWorkflowTemplate, profileTemplate } from "../shared/feishu-package-workflow.mjs";
 
 const ZIP = "document_draft_zip";
 const VM = "vm_pmo_review_video";
@@ -57,7 +57,7 @@ function stripPaths(config, template) {
   return result;
 }
 function normalizeConfig(config, template, source, packageAlias, { portable = false } = {}) {
-  object(config, "config", template.id === ZIP ? CONFIG_KEYS : undefined);
+  object(config, "config", isZipWorkflowTemplate(template) ? CONFIG_KEYS : undefined);
   if (template.id === VM) {
     // A portable document deliberately has no machine directory. Validate its
     // shape as an inactive archive, then retain the requested enable intent
@@ -181,7 +181,7 @@ function remapConfig(configuration, target, localConfig) {
     return result;
   }
   const result = walk(config, "config");
-  if (template.id === ZIP) {
+  if (isZipWorkflowTemplate(template)) {
     const pendingFieldIds = { statusField: "pending_status_field", reviewStatusField: "pending_review_status_field", documentField: "pending_document_field", namingField: "pending_naming_field", trigger: "pending_status_field" };
     for (const key of ["statusField", "reviewStatusField", "documentField", "namingField", "trigger"]) {
       if (result[key] && !result[key].fieldId) result[key] = { ...result[key], fieldId: pendingFieldIds[key], fieldName: "待配置" };
@@ -225,13 +225,14 @@ export function createFeishuSubjectShareApi({ database, workflowStore, packageSt
     return subject;
   }
   function readProfile(subject, alias, template) {
-    const row = selectProfile.get(subject.subjectKey, alias, template.id, template.version);
+    const key = profileTemplate(template);
+    const row = selectProfile.get(subject.subjectKey, alias, key.id, key.version);
     if (row) {
       let config;
       try { config = JSON.parse(row.config_json); } catch { throw new ApiError(500, "PACKAGE_WORKFLOW_DRAFT_INVALID", "Saved workflow draft is invalid"); }
       return { revision: row.revision, config: normalizeConfig(config, template, subject, alias) };
     }
-    return { revision: 0, config: template.id === ZIP && subject.packageRoute?.packageAlias === alias ? pick(subject, CONFIG_KEYS) : null };
+    return { revision: 0, config: isZipWorkflowTemplate(template) && subject.packageRoute?.packageAlias === alias ? pick(subject, CONFIG_KEYS) : null };
   }
   async function templateForAlias(alias) {
     const record = typeof packageStore.get === "function" ? await packageStore.get(alias) : (await packageStore.read())?.[alias];
@@ -280,12 +281,13 @@ export function createFeishuSubjectShareApi({ database, workflowStore, packageSt
         const live = db.prepare("SELECT config_version, metadata_json FROM feishu_subjects WHERE subject_key=? AND removed_at IS NULL AND base_token IN (SELECT base_token FROM feishu_bases WHERE removed_at IS NULL)").get(target.subjectKey);
         if (!live) throw new ApiError(404, "SUBJECT_NOT_FOUND", "目标学科已移除。");
         if (live.config_version !== body.expectedVersion || JSON.stringify(portableMetadata(JSON.parse(live.metadata_json))) !== JSON.stringify(portableMetadata(target.metadata))) throw new ApiError(409, "VERSION_CONFLICT", "目标学科已变化，请重新预览。");
-        const current = selectProfile.get(target.subjectKey, configuration.packageAlias, template.id, template.version);
+        const key = profileTemplate(template);
+        const current = selectProfile.get(target.subjectKey, configuration.packageAlias, key.id, key.version);
         if ((current?.revision ?? 0) !== body.expectedRevision) throw new ApiError(409, "VERSION_CONFLICT", "目标剪辑包草稿已变化，请重新预览。");
         const timestamp = new Date().toISOString();
         db.prepare(`INSERT INTO feishu_package_workflow_drafts (subject_key,package_alias,template_id,template_version,revision,config_json,updated_at)
           VALUES (?,?,?,?,?,?,?) ON CONFLICT(subject_key,package_alias,template_id,template_version) DO UPDATE SET revision=excluded.revision,config_json=excluded.config_json,updated_at=excluded.updated_at`)
-          .run(target.subjectKey, configuration.packageAlias, template.id, template.version, profile.revision + 1, JSON.stringify(mapped.config), timestamp);
+          .run(target.subjectKey, configuration.packageAlias, key.id, key.version, profile.revision + 1, JSON.stringify(mapped.config), timestamp);
         db.prepare(`INSERT INTO feishu_subject_editing_preferences (subject_key,package_alias,updated_at) VALUES (?,?,?)
           ON CONFLICT(subject_key) DO UPDATE SET package_alias=excluded.package_alias,updated_at=excluded.updated_at`).run(target.subjectKey, configuration.packageAlias, timestamp);
         db.exec("COMMIT");

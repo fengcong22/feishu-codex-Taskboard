@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { runLocalAutoCut } from "../server/autocut-local-runner.mjs";
+import { runLocalAutoCut, runtimeEntryForTemplate } from "../server/autocut-local-runner.mjs";
 
 // Bound Windows directory-lock cleanup without retrying runtime operations.
 const FIXTURE_CLEANUP_OPTIONS = { recursive: true, force: true, maxRetries: 5, retryDelay: 100 };
@@ -451,3 +451,115 @@ setTimeout(() => {}, 900);
     } finally { await rm(current.root, FIXTURE_CLEANUP_OPTIONS); }
   });
 }
+
+
+test("each document ZIP template has its own deployed runtime entry", () => {
+  assert.deepEqual(runtimeEntryForTemplate(undefined), runtimeEntryForTemplate({ id: "document_draft_zip", version: 1 }));
+  assert.equal(runtimeEntryForTemplate({ id: "document_draft_zip", version: 1 }).packageName, "auto-cut-lite");
+  assert.equal(runtimeEntryForTemplate({ id: "document_draft_zip", version: 1 }).command, "review-document-run");
+  const edit = runtimeEntryForTemplate({ id: "document_edit_zip", version: 1 });
+  assert.deepEqual([edit.packageName, edit.module, edit.command, edit.readinessEnv],
+    ["auto-cut-autoedit", "auto_cut_autoedit", "taskboard-run", "AUTOEDIT_READINESS_PATH"]);
+  assert.throws(() => runtimeEntryForTemplate({ id: "vm_pmo_review_video", version: 1 }), { code: "AUTOCUT_RUNTIME_UNAVAILABLE" });
+});
+
+// Spawning a .cmd shim needs a shell on Windows, which the runner never uses; POSIX only.
+test("a document_edit_zip package starts its own deployed module with the same run contract",
+  { skip: process.platform === "win32" && "needs a POSIX shim standing in for python" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "taskboard-autoedit-runner-"));
+  const capturePath = path.join(root, "capture.json");
+  try {
+    const localAppData = path.join(root, "localappdata");
+    const workspacePath = path.join(root, "autoedit workspace");
+    const runtimeRoot = path.join(root, "autoedit runtime");
+    const entry = path.join(runtimeRoot, "auto_cut_autoedit", "__main__.py");
+    await Promise.all([
+      mkdir(path.dirname(entry), { recursive: true }),
+      mkdir(workspacePath, { recursive: true }),
+      mkdir(path.join(localAppData, "Auto-Cut", "auto-cut-autoedit"), { recursive: true }),
+    ]);
+    // Node stands in for Python: "-m auto_cut_autoedit" resolves to this script through a shim.
+    await writeFile(path.join(workspacePath, "PACKAGE-MANIFEST.json"), JSON.stringify({
+      embedded_runtime: { version: "0.1.0" },
+      interface: { workflowTemplate: { id: "document_edit_zip", version: 1 }, artifactKind: "edit_zip",
+        zipOutput: { relativeDirectory: "output" } },
+    }));
+    await writeFile(entry, "fixture");
+    const fakePython = path.join(root, "fake-python.mjs");
+    await writeFile(fakePython, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.RUNNER_CAPTURE_PATH, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(),
+  readiness: process.env.AUTOEDIT_READINESS_PATH ?? null, lite: process.env.AUTOCUT_LITE_READINESS_PATH ?? null,
+  stage: process.env.CODEX_AUTOCUT_STAGE_ID }));
+`);
+    const larkDirectory = path.join(root, "user npm");
+    const larkScript = path.join(larkDirectory, "node_modules", "@larksuite", "cli", "scripts", "run.js");
+    await mkdir(path.dirname(larkScript), { recursive: true });
+    await writeFile(path.join(larkDirectory, "lark-cli.cmd"), "fixture shim");
+    await writeFile(larkScript, 'console.log(JSON.stringify({available:true,identity:"user",defaultAs:"user"}));');
+    await writeFile(path.join(localAppData, "Auto-Cut", "auto-cut-autoedit", "deployment-report.json"), JSON.stringify({
+      deployment_status: "installed", workspace_root: workspacePath, runtime_root: runtimeRoot,
+      components: { python: { runtime_path: process.execPath }, lark_cli: { path: path.join(larkDirectory, "lark-cli.cmd") } },
+    }));
+    const jobRoot = path.join(root, "job");
+    const outputRoot = path.join(root, "output");
+    await mkdir(path.join(jobRoot, "drafts"), { recursive: true });
+    await mkdir(outputRoot);
+    const run = {
+      taskId: "task-edit", runId: "run-edit", subjectKey: "base:table", configVersion: 2, stageId: "first_review",
+      eventId: "event-edit", manifestPath: path.join(jobRoot, "source-manifest.json"), manifestSha256: "b".repeat(64),
+      executionInputPath: path.join(jobRoot, "execution_input.json"), draftsRoot: path.join(jobRoot, "drafts"),
+      resultPath: path.join(jobRoot, "result.json"), packageZipPath: path.join(outputRoot, "课程_初审修改.zip"),
+    };
+    // process.execPath (node) receives ["-m", "auto_cut_autoedit", ...]; node rejects "-m", so wrap it:
+    // NODE_OPTIONS cannot help here, therefore the report points python at a cmd/sh shim around node.
+    const shim = process.platform === "win32" ? path.join(root, "python.cmd") : path.join(root, "python");
+    await writeFile(shim, process.platform === "win32"
+      ? `@"${process.execPath}" "${fakePython}" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "${fakePython}" "$@"\n`);
+    await chmod(shim, 0o755);
+    const report = JSON.parse(await readFile(path.join(localAppData, "Auto-Cut", "auto-cut-autoedit", "deployment-report.json"), "utf8"));
+    report.components.python.runtime_path = shim;
+    await writeFile(path.join(localAppData, "Auto-Cut", "auto-cut-autoedit", "deployment-report.json"), JSON.stringify(report));
+    await runLocalAutoCut({
+      run,
+      packageConfig: { workspacePath, workflowTemplate: { id: "document_edit_zip", version: 1 } },
+      environment: { ...process.env, LOCALAPPDATA: localAppData, RUNNER_CAPTURE_PATH: capturePath },
+    });
+    const capture = await waitForJson(capturePath);
+    assert.deepEqual(capture.args, [
+      "-m", "auto_cut_autoedit", "taskboard-run",
+      "--source-manifest", run.manifestPath,
+      "--execution-input", run.executionInputPath,
+      "--job-root", path.dirname(run.manifestPath),
+      "--drafts-root", run.draftsRoot,
+      "--package-zip", run.packageZipPath,
+      "--result-path", run.resultPath,
+      "--json",
+    ]);
+    assert.equal(await realpath(capture.cwd), await realpath(runtimeRoot));
+    assert.equal(capture.readiness, path.join(localAppData, "Auto-Cut", "auto-cut-autoedit", "runtime-readiness.json"));
+    assert.equal(capture.stage, "first_review");
+  } finally {
+    await rm(root, FIXTURE_CLEANUP_OPTIONS);
+  }
+});
+
+test("a document_edit_zip package without its own deployment report does not fall back to Lite", async () => {
+  const current = await fixture('require("node:fs").writeFileSync(process.env.UNEXPECTED_RUN, "started");');
+  const capture = path.join(current.root, "unexpected-run");
+  try {
+    await writeFile(path.join(current.workspacePath, "PACKAGE-MANIFEST.json"), JSON.stringify({
+      embedded_runtime: { version: "0.1.0" },
+      interface: { workflowTemplate: { id: "document_edit_zip", version: 1 }, artifactKind: "edit_zip" },
+    }));
+    await assert.rejects(runLocalAutoCut({
+      run: current.run,
+      packageConfig: { workspacePath: current.workspacePath, workflowTemplate: { id: "document_edit_zip", version: 1 } },
+      environment: { ...process.env, LOCALAPPDATA: current.localAppData, UNEXPECTED_RUN: capture },
+    }), { code: "AUTOCUT_RUNTIME_UNAVAILABLE" });
+    await assert.rejects(readFile(capture), { code: "ENOENT" });
+  } finally {
+    await rm(current.root, FIXTURE_CLEANUP_OPTIONS);
+  }
+});

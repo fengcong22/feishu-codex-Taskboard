@@ -3,7 +3,7 @@ import {
   isAttachmentMetadataField,
   isSingleSelectMetadataField,
 } from "./feishu-workflow-stages.mjs";
-import { normalizePackageWorkflowTemplate } from "../shared/feishu-package-workflow.mjs";
+import { isZipWorkflowTemplate, normalizePackageWorkflowTemplate } from "../shared/feishu-package-workflow.mjs";
 import { normalizeCourseRootPath } from "./feishu-course-path.mjs";
 
 const TEMPLATE_ID = "vm_pmo_review_video";
@@ -418,7 +418,8 @@ export function createFeishuPackageWorkflowDrafts({ database, packageStore, work
       try { workflowTemplate = normalizePackageWorkflowTemplate(packageRecord.workflowTemplate); } catch {
         throw new ApiError(409, "PACKAGE_WORKFLOW_DRAFT_UNSUPPORTED", "Package workflow does not support these drafts");
       }
-      if (workflowTemplate.id === "document_draft_zip" && workflowTemplate.version === 1) {
+      // Both document → ZIP templates (Lite and autoedit) share the stage profile.
+      if (isZipWorkflowTemplate(workflowTemplate)) {
         if (enabling) {
           assertShape(body, ["expectedRevision", "expectedVersion"], "activation");
           const subject = await workflowStore.enablePackageWorkflowProfile(subjectKey, packageAlias, body);

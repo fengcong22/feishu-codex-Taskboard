@@ -1,11 +1,11 @@
 import { subjectKey as makeSubjectKey } from "./workflow-config.mjs";
-import { packageWorkflowFromManifest } from "../taskboard/shared/feishu-package-workflow.mjs";
+import { isZipWorkflowTemplate, packageWorkflowFromManifest } from "../taskboard/shared/feishu-package-workflow.mjs";
 
 /** ZIP routes never become VM routes by changing a trusted package binding. */
 export function zipPackageWorkflowErrorCode(packageConfig) {
   if (!packageConfig) return null;
   try {
-    return packageWorkflowFromManifest(packageConfig).id === "document_draft_zip"
+    return isZipWorkflowTemplate(packageWorkflowFromManifest(packageConfig))
       ? null : "PACKAGE_WORKFLOW_MISMATCH";
   } catch {
     return "PACKAGE_WORKFLOW_UNSUPPORTED";
@@ -221,6 +221,45 @@ function finalDirectoryDecision(subject, event) {
   return null;
 }
 
+const NO_TRIGGER_OPTION = "\u0000no-trigger-option";
+
+function isMultiSelectDescriptor(descriptor) {
+  return descriptor?.type === "multi_select";
+}
+
+/**
+ * A multi-select status field carries a set of options. Ticking exactly one stage trigger is
+ * entering that stage; unticking a trigger is leaving it. The edge is reduced to the single
+ * before/after option ids the stage decision below already understands. Returns null for a
+ * single-select field (unchanged behaviour).
+ */
+function multiSelectStageEdge(subject, event, statusFieldId, reviewStatusFieldId) {
+  const descriptor = [subject.statusField, subject.reviewStatusField].find((field) => (
+    (field?.fieldId ?? field?.field_id) === event.statusFieldId
+  ));
+  if (!isMultiSelectDescriptor(descriptor)) return null;
+  if (!Array.isArray(event.beforeOptionIds) || !Array.isArray(event.afterOptionIds)) {
+    return { kind: "blocked", reason: "missing_status_edge", reasonCode: "MISSING_STATUS_EDGE" };
+  }
+  const before = new Set(event.beforeOptionIds);
+  const after = new Set(event.afterOptionIds);
+  const triggers = new Set(Object.entries(subject.stages ?? {})
+    .filter(([stageId, stage]) => stage && typeof stage === "object"
+      && (stage.trigger?.fieldId ?? (stageId === "initial" ? statusFieldId : reviewStatusFieldId)) === event.statusFieldId)
+    .map(([, stage]) => stage.trigger?.optionId)
+    .filter(Boolean));
+  const added = [...after].filter((id) => !before.has(id) && triggers.has(id));
+  const removed = [...before].filter((id) => !after.has(id) && triggers.has(id));
+  if (added.length > 1) {
+    return { kind: "blocked", reason: "ambiguous_status_edge", reasonCode: "AMBIGUOUS_STATUS_EDGE" };
+  }
+  if (added.length === 1) {
+    return { beforeOptionId: removed[0] ?? NO_TRIGGER_OPTION, afterOptionId: added[0] };
+  }
+  if (removed.length >= 1) return { beforeOptionId: removed[0], afterOptionId: NO_TRIGGER_OPTION };
+  return { kind: "ignored", reason: "new_value_not_trigger" };
+}
+
 function modernDecision(subject, event, externalPackages = null) {
   if (!subject || !event || typeof event !== "object") {
     return { kind: "ignored", reason: "invalid_event" };
@@ -240,6 +279,12 @@ function modernDecision(subject, event, externalPackages = null) {
   const watchedFieldIds = [statusFieldId, reviewStatusFieldId].filter(Boolean);
   if (watchedFieldIds.length && event.fieldId && !watchedFieldIds.includes(event.fieldId)) {
     return { kind: "ignored", reason: "unrelated_field" };
+  }
+  const multiEdge = multiSelectStageEdge(subject, event, statusFieldId, reviewStatusFieldId);
+  if (multiEdge) {
+    if (multiEdge.kind) return { ...multiEdge, subject, table: subjectTable(subject), event };
+    event = { ...event, beforePresent: true, afterPresent: true,
+      beforeOptionId: multiEdge.beforeOptionId, afterOptionId: multiEdge.afterOptionId };
   }
   if (!event.beforePresent || !event.afterPresent
     || !Object.hasOwn(event, "beforeOptionId") || !Object.hasOwn(event, "afterOptionId")
