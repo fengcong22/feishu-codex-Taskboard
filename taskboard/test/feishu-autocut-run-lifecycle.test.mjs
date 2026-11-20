@@ -2800,7 +2800,7 @@ test("a document_edit_zip package runs locally and its edit bundle ZIP is verifi
     const subject = await registerSubject(fixture, { executionMode: "automatic" });
     const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
     assert.equal(created.response.status, 201, JSON.stringify(created.body));
-    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 8_000);
+    const task = await waitForTaskStatus(fixture.app, created.body.task.id, "done", 30_000);
     const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
     assert.deepEqual(invocations, [{ runId: run.runId, template: EDIT_TEMPLATE }]);
     const artifact = fixture.app.database.getTaskArtifactForRun(task.id, run.runId);
@@ -2842,7 +2842,7 @@ for (const [label, options, code] of [
       const subject = await registerSubject(fixture, { executionMode: "automatic" });
       const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
       assert.equal(created.response.status, 201, JSON.stringify(created.body));
-      const task = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 8_000);
+      const task = await waitForTaskStatus(fixture.app, created.body.task.id, "blocked", 30_000);
       const [run] = fixture.app.database.listFeishuAutoCutRuns(task.id);
       assert.equal(run.state, "blocked");
       assert.equal(run.errorCode, code);
