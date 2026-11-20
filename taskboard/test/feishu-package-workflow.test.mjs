@@ -226,3 +226,40 @@ test("repository VM preview fixture reports no embedded runtime and cannot be en
   const saved = await store.saveDraft({ alias: inspection.alias, workspacePath });
   await assert.rejects(() => store.enable(saved.alias, saved.revision), code("PACKAGE_WORKFLOW_NOT_READY"));
 });
+
+
+const EDIT = { id: "document_edit_zip", version: 1 };
+
+test("document_edit_zip is an executable document ZIP template with its own artifact kind", async () => {
+  const { isZipWorkflowTemplate, profileTemplate } = await import("../shared/feishu-package-workflow.mjs");
+  assert.deepEqual(normalizePackageWorkflowTemplate(EDIT), EDIT);
+  assert.deepEqual(assertPackageWorkflowExecutable(EDIT), EDIT);
+  assert.equal(workflowTemplatesEqual(EDIT, LEGACY), false);
+  assert.equal(workflowTemplatesEqual(undefined, EDIT), false);
+  assert.deepEqual(packageWorkflowFromManifest({ workflowTemplate: EDIT }), EDIT);
+  assert.deepEqual(packageWorkflowFromManifest({ workflowTemplate: EDIT, artifactKind: "edit_zip" }), EDIT);
+  for (const value of [
+    { workflowTemplate: EDIT, artifactKind: "zip" }, { workflowTemplate: EDIT, artifactKind: "review_mp4" },
+    { workflowTemplate: EDIT, contract: EDIT }, { workflowTemplate: EDIT, driverId: "document_edit_zip_v1" },
+    { workflowTemplate: { ...EDIT, version: 2 } }, { artifactKind: "edit_zip" },
+  ]) {
+    assert.throws(() => packageWorkflowFromManifest(value), code("PACKAGE_WORKFLOW_UNSUPPORTED"));
+  }
+  assert.equal(isZipWorkflowTemplate(EDIT), true);
+  assert.equal(isZipWorkflowTemplate(undefined), true);
+  assert.equal(isZipWorkflowTemplate(VM), false);
+  // both document ZIP templates edit the same stage profile; VM keeps its own
+  assert.deepEqual(profileTemplate(EDIT), LEGACY);
+  assert.deepEqual(profileTemplate(VM), VM);
+});
+
+test("an autoedit workspace inspects as document_edit_zip with its ZIP output directory", async (t) => {
+  const current = await fixture(t, { workflowTemplate: EDIT, artifactKind: "edit_zip", zipOutput: { relativeDirectory: "output" } });
+  const inspected = await inspectAutoCutPackageWorkspace({ workspacePath: current.workspacePath });
+  assert.deepEqual(inspected.workflowTemplate, EDIT);
+  assert.equal(inspected.zipOutput.relativeDirectory, "output");
+  assert.deepEqual(await assertExecutablePackageWorkflow({ workspacePath: current.workspacePath, workflowTemplate: EDIT }), EDIT);
+  // a saved Lite identity cannot silently become the edit package
+  await assert.rejects(assertExecutablePackageWorkflow({ workspacePath: current.workspacePath, workflowTemplate: LEGACY }),
+    code("PACKAGE_WORKFLOW_MISMATCH"));
+});

@@ -13,6 +13,7 @@ import { prepareVmPmoRunInput } from "./vm-pmo-run-input.mjs";
 import {validateVmPmoManualRevision} from "./vm-pmo-manual-revision.mjs";
 import { AI_INTENT_SCOPE_VIOLATION, runVmPmoDriver } from "./vm-pmo-v3-driver.mjs";
 import { readVmPmoRunReview } from "./vm-pmo-run-review.mjs";
+import { readVmPmoAiTranscript } from "./vm-pmo-ai-transcript.mjs";
 import { validateVmPmoInput, validateVmPmoInputSnapshot, validateVmPmoPlan, validateVmPmoRender, VM_PMO_QA_RESULT,
   VM_PMO_QA_REVIEW_RESULT } from "./vm-pmo-result-validator.mjs";
 import { archiveVmPmoQa } from "./vm-pmo-qa-archive.mjs";
@@ -1147,6 +1148,16 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     return value;
   }
 
+  /** The run's AI planning sessions for the task view (read only). Session files live beside the
+   * attempt directories, outside what the AI may write, so they are shown even after a scope violation. */
+  async function getTaskAiTranscript(taskId) {
+    await ready();
+    const run = initialize().orchestrator.getForTask(taskId);
+    if (!run?.prepared?.contextPath) return {runId: run?.runId ?? null, sessions: []};
+    const runRoot = path.dirname(path.dirname(run.prepared.contextPath));
+    return {runId: run.runId, sessions: await readVmPmoAiTranscript(runRoot)};
+  }
+
   /** v3 approval details (coverage, blockers, QA items for a human) from the frozen run context. */
   async function runReview(run) {
     // Plan and QA files in a run the AI overstepped may be its own forgeries, not package output.
@@ -1664,7 +1675,7 @@ export function createVmPmoRuntime({database,getPackage,getActiveSubject,getSubj
     releaseTerminalSlots();
   }
   return Object.freeze({ready,validateVmPackage,validateActivation,register,wake,cancelPendingAutomatic,
-    getTaskRun,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,
+    getTaskRun,getTaskAiTranscript,retryApproval,retryManualRevision,retryPlanning,retryValidatedPlan,retryFailedRender,
     retryStepTimeout,retryWriteback,
     retryAiIntent,retryQa,retryQaReview,
     resumeDownloadedSource,

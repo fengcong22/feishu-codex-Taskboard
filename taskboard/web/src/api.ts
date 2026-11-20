@@ -57,6 +57,7 @@ import type {
   FeishuZipWorkflowConfig,
   FeishuAutoCutRun,
   VmPmoRunSummary,
+  VmPmoAiSession,
   AutoCutRunConsent,
   CreateUnifiedWorkflowViewInput,
   StageDisplayOverride,
@@ -1537,6 +1538,17 @@ export async function getTaskVmPmoRun(
     { signal },
   );
   return data.run;
+}
+
+export async function getTaskVmPmoAiTranscript(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<VmPmoAiSession[]> {
+  const data = await request<{ runId: string | null; sessions: VmPmoAiSession[] }>(
+    `/api/local/tasks/${encodeURIComponent(taskId)}/vm-pmo-ai-transcript`,
+    { signal },
+  );
+  return data.sessions;
 }
 
 export async function retryTaskVmPmoPlan(

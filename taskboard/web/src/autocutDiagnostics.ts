@@ -19,6 +19,8 @@ const PHASES: Record<string, { label: string; checks: string[] }> = {
   classification: { label: "分析剪辑内容", checks: ["检查剪辑意见格式、语音识别结果和剪辑包分析服务配置。"] },
   reverse_asr: { label: "核对语音内容", checks: ["检查语音服务连接与额度，并在剪辑包日志中核对音频处理结果。"] },
   draft_write_validate: { label: "生成并校验剪映草稿", checks: ["检查草稿输出目录是否可写、磁盘空间是否足够，以及剪辑包草稿校验结果。"] },
+  edit: { label: "剪辑并出片", checks: ["检查原片、语音识别配置和剪辑包日志；本学科是否已在剪辑包的学科配置里设置开关。"] },
+  feishu_write: { label: "写入审核文档", checks: ["检查运行 Taskboard 的账户所用飞书 CLI 对审核文档的编辑权限，以及文档里的阶段目录是否完整。"] },
   package_publish: { label: "打包 ZIP", checks: ["检查 ZIP 输出目录是否可写、磁盘空间，以及文件是否被其他程序占用。"] },
   artifact_report: { label: "校验并登记 ZIP", checks: ["检查 Taskboard 本机服务是否正常，以及剪辑包生成的 ZIP 和结果回执是否通过校验。"] },
 };

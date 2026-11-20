@@ -13906,6 +13906,23 @@ kbd {
 .vm-pmo-review-list { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: 10px; }
 .vm-pmo-review-list li > * + * { margin-left: 6px; }
 .vm-pmo-review-list code { overflow-wrap: anywhere; }
+.vm-pmo-ai-transcript { display: grid; gap: 6px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.vm-pmo-ai-transcript > summary, .vm-pmo-ai-session > summary { cursor: pointer; color: var(--text-primary); }
+.vm-pmo-ai-transcript p { margin: 0; }
+.vm-pmo-ai-session { display: grid; gap: 6px; padding: 6px 8px; border: var(--border-hairline) solid var(--border); border-radius: 6px; }
+.vm-pmo-ai-session > summary > * + * { margin-left: 6px; }
+.vm-pmo-ai-steps { display: grid; gap: 4px; margin: 0; padding-left: 20px; }
+.vm-pmo-ai-step { white-space: pre-wrap; overflow-wrap: anywhere; }
+.vm-pmo-ai-step.is-message { color: var(--text-primary); }
+.vm-pmo-ai-step.is-error { color: var(--danger); }
+.vm-pmo-ai-step.is-command summary { cursor: pointer; font-size: 10px; }
+.vm-pmo-ai-step.is-command summary > * + * { margin-left: 6px; }
+.vm-pmo-ai-step code { overflow-wrap: anywhere; }
+.vm-pmo-ai-transcript, .vm-pmo-ai-transcript * { min-width: 0; }
+.vm-pmo-ai-step.is-command summary > code:last-child { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vm-pmo-ai-step.is-command details[open] summary > code:last-child { white-space: pre-wrap; }
+.vm-pmo-ai-step pre { max-height: 240px; margin: 4px 0 0; padding: 6px; overflow: auto; background: var(--surface-muted); font-size: 10px; white-space: pre-wrap; }
+.vm-pmo-ai-report { display: grid; gap: 2px; color: var(--text-primary); white-space: pre-wrap; }
 .vm-pmo-material-source { margin: 0; color: var(--text-secondary); font-size: 11px; }
 .vm-pmo-download-failure { display: grid; gap: 4px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
 .vm-pmo-download-failure p { margin: 0; }

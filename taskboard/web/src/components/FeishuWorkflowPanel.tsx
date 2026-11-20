@@ -21,6 +21,7 @@ import {
   FeishuStageEditor,
   isAttachmentField,
   isSingleSelectField,
+  isStageTriggerField,
   type FeishuStageAudioDraft,
   type FeishuStageValue,
 } from "./FeishuStageEditor";
@@ -759,7 +760,11 @@ export function FeishuWorkflowPanel({
   const selectedPackage = packageOptions?.find((item) => item.alias === editingAlias);
   const missingSelectedPackage = packageListLoadState === "ready" && Boolean(editingAlias) && !selectedPackage;
   const workflowTemplate = selectedPackage?.workflowTemplate ?? selectedPackage?.identity?.workflowTemplate;
-  const profileKey = JSON.stringify([selected?.subjectKey, editingAlias, workflowTemplate?.id ?? "document_draft_zip", workflowTemplate?.version ?? 1]);
+  // Both document → ZIP templates (Lite, autoedit) edit the same stage profile.
+  const isZipWorkflow = !workflowTemplate || ((workflowTemplate.id === "document_draft_zip"
+    || workflowTemplate.id === "document_edit_zip") && workflowTemplate.version === 1);
+  const profileTemplateId = isZipWorkflow ? "document_draft_zip" : workflowTemplate.id;
+  const profileKey = JSON.stringify([selected?.subjectKey, editingAlias, profileTemplateId, workflowTemplate?.version ?? 1]);
   const selectedProfileKeyRef = useRef(profileKey);
   selectedProfileKeyRef.current = profileKey;
   const reportedProfileErrors = useRef(new Map<string, { message: string; source: "profile-read" | "package-list" | "other" }>());
@@ -821,8 +826,7 @@ export function FeishuWorkflowPanel({
       || (!profileMode && phasedFieldNamesNeedRefresh(selected))
       || (!profileMode && metadataRefreshNeedsSaveRef.current.get(selected.subjectKey) === selected.configVersion)));
   const isVmWorkflow = workflowTemplate?.id === "vm_pmo_review_video" && workflowTemplate.version === 1;
-  const workflowUnknown = Boolean(workflowTemplate && !isVmWorkflow
-    && (workflowTemplate.id !== "document_draft_zip" || workflowTemplate.version !== 1));
+  const workflowUnknown = Boolean(workflowTemplate && !isVmWorkflow && !isZipWorkflow);
   const visibleSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => subject.displayEnabled);
   const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);
   const triggerFields = selected ? selected.metadata?.fields ?? [] : [];
@@ -1985,8 +1989,8 @@ export function FeishuWorkflowPanel({
           <fieldset className="feishu-config-subsection" disabled={busy || (!selectedPackage && !onSaveDraft && !onEnable)}>
             <legend>字段来源</legend>
             <div className="feishu-settings-grid">
-              <label><span>初稿触发字段</span><select aria-label="初稿触发字段" value={subjectForm.statusFieldId} onChange={(event) => selectPhasedField("status", event.target.value)}><option value="">选择单选字段</option>{triggerFields.filter(isSingleSelectField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
-              <label><span>审核修改触发字段</span><select aria-label="审核修改触发字段" value={subjectForm.reviewStatusFieldId} onChange={(event) => selectPhasedField("reviewStatus", event.target.value)}><option value="">选择单选字段</option>{triggerFields.filter(isSingleSelectField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
+              <label><span>初稿触发字段</span><select aria-label="初稿触发字段" value={subjectForm.statusFieldId} onChange={(event) => selectPhasedField("status", event.target.value)}><option value="">选择单选或多选字段</option>{triggerFields.filter(isStageTriggerField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
+              <label><span>审核修改触发字段</span><select aria-label="审核修改触发字段" value={subjectForm.reviewStatusFieldId} onChange={(event) => selectPhasedField("reviewStatus", event.target.value)}><option value="">选择单选或多选字段</option>{triggerFields.filter(isStageTriggerField).map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
               <label><span>素材文档字段</span><select aria-label="素材文档字段" value={subjectForm.documentFieldId} onChange={(event) => selectPhasedField("document", event.target.value)}><option value="">选择文档字段</option>{metadataFieldOptions.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
               <label><span>命名字段</span><select aria-label="命名字段" value={subjectForm.namingFieldId} onChange={(event) => selectPhasedField("naming", event.target.value)}><option value="">选择命名字段</option>{metadataFieldOptions.map((field, index) => <option key={`${field.fieldId}:${index}`} value={field.fieldId}>{field.fieldName}</option>)}</select></label>
             </div>

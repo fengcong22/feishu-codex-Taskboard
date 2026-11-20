@@ -34,8 +34,9 @@ const AUDIO_KEYS = new Set([
   "durationToleranceSeconds",
   "duration_tolerance_seconds",
 ]);
-const FIELD_DESCRIPTOR_KEYS = new Set(["fieldId", "field_id", "fieldName", "field_name"]);
+const FIELD_DESCRIPTOR_KEYS = new Set(["fieldId", "field_id", "fieldName", "field_name", "type"]);
 const SINGLE_SELECT_UI_TYPES = new Set(["singleselect", "select"]);
+const MULTI_SELECT_UI_TYPES = new Set(["multiselect", "multipleselect"]);
 const ATTACHMENT_UI_TYPES = new Set(["attachment", "attachments"]);
 
 function fail(message, code = "INVALID_FIELD") {
@@ -277,6 +278,22 @@ export function isSingleSelectMetadataField(field) {
   return strictMetadataType(field, 3, SINGLE_SELECT_UI_TYPES);
 }
 
+export function isMultiSelectMetadataField(field) {
+  return strictMetadataType(field, 4, MULTI_SELECT_UI_TYPES);
+}
+
+/** Stage trigger fields: single-select (one status) or multi-select (a set of ticked stages). */
+export function isStatusMetadataField(field) {
+  return isSingleSelectMetadataField(field) || isMultiSelectMetadataField(field);
+}
+
+/** The descriptor records a multi-select trigger so the Bridge can read set edges. */
+function withStatusType(descriptor, metadata, value) {
+  const field = descriptor.fieldId ? metadataField(metadata, descriptor.fieldId) : null;
+  const multi = field ? isMultiSelectMetadataField(field) : value?.type === "multi_select";
+  return multi ? { ...descriptor, type: "multi_select" } : descriptor;
+}
+
 export function isAttachmentMetadataField(field) {
   return strictMetadataType(field, 17, ATTACHMENT_UI_TYPES);
 }
@@ -454,10 +471,14 @@ export function assertPhasedAttachmentBindings(value, metadata = value?.metadata
 export function validatePhasedSubjectConfig(value, { allowIncompleteBindings = false } = {}) {
   plainObject(value, "Subject configuration");
   const metadata = value.metadata ?? null;
-  const statusField = validateMetadataField(metadata, value.statusField, "statusField", isSingleSelectMetadataField, { allowIncompleteBindings });
+  const statusField = withStatusType(
+    validateMetadataField(metadata, value.statusField, "statusField", isStatusMetadataField, { allowIncompleteBindings }),
+    metadata, value.statusField);
   if (!statusField.fieldId) throw fail("statusField is required");
   const reviewStatusField = value.reviewStatusField == null ? statusField
-    : validateMetadataField(metadata, value.reviewStatusField, "reviewStatusField", isSingleSelectMetadataField, { allowIncompleteBindings });
+    : withStatusType(
+      validateMetadataField(metadata, value.reviewStatusField, "reviewStatusField", isStatusMetadataField, { allowIncompleteBindings }),
+      metadata, value.reviewStatusField);
   const documentField = validateMetadataField(metadata, value.documentField, "documentField", null, { allowIncompleteBindings });
   if (!documentField.fieldId) throw fail("documentField is required");
   const namingField = validateMetadataField(metadata, value.namingField, "namingField", null, { allowIncompleteBindings });

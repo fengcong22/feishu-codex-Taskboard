@@ -9,6 +9,8 @@ Bridge 和 Taskboard 只绑定本机 loopback（`127.0.0.1`），不得改成 LA
 
 模拟事件只用于本机测试和可靠投递演练，必须由 Bridge 标记为非生产来源；即使 Taskboard 的自动执行开关已开启，模拟事件也不得获得自动执行资格。
 
+`document_edit_zip` 模板（auto-cut-autoedit）与旧 ZIP 流程共用触发、素材清单、运行目录、结果文件、上报、上传和回写，只有三处按包快照的模板分开：本机 runtime 读 `auto-cut-autoedit` 自己的部署报告并以 `python -m auto_cut_autoedit taskboard-run` 启动（参数不变），回执必须是 `workflow_mode: autoedit` / `delivery_mode: edit_zip`，ZIP 必须是成片包（单一根目录内含同名 MP4、`工程/*.xml`、执行反馈表和剪辑清单）。该模板只能经本机 runtime 运行，不开放 Codex 路径；两种模板不能互相冒充或回退。阶段触发字段可以是多选：新勾上某阶段的触发选项即进入该阶段，取消勾选即离开，同时勾上两个阶段的触发选项时阻断，单选规则不变。详见 `taskboard/docs/auto-cut-autoedit-interface.md`。
+
 独立 `vm_pmo_review_video` 流程使用认证的 `/api/local/feishu/vm/tasks` 登记接口。包模板身份为 v1；可执行的包 manifest 必须同时声明 `vm_pmo_review_video` 执行协议 v2 和固定 driver。活动配置可启用 `initial` 与 `review` 阶段，使用实时校验过的单选选项边沿触发；初稿按正常 VM 审批队列取得源视频，审核只复用 Taskboard 已确认交付的上一轮 MP4，不另申请下载。VM 初稿审批以 Taskboard `task/run` 为幂等范围：同一任务重放复用原审批项，不同任务即使 VMID 与请求内容相同也创建独立审批项；手动下载仍按规范化请求复用，下载资源摘要按 `application_id` 隔离，同一申请不可经不同任务重复领取相同素材，不同已批准申请可独立领取相同素材；Bridge 的 `event_id` 去重保持独立。task/run 首次登记时冻结规范化审批请求；本机下载设置后续变化不得改写历史 run，VMID、部门和原因仍须匹配冻结任务上下文。Taskboard 启动时只自动恢复 `needs_attention/VM_TASK_BINDING_CONFLICT` 且没有 plan/render/制品证据的 run；恢复前必须重新验证原绑定审批仍为 `ready`、采集回执及源文件摘要有效，并沿用原 task/run/审批。其他 `needs_attention` 不自动恢复，已有 render 启动证据的 run 不得自动重跑。v2 支持明确保留区间和证据绑定的语音删词/静音/cue；词级操作必须绑定本轮源 SHA 和唯一词时间戳，缺少 ASR、匹配有歧义或保护词冲突时在渲染前阻断。该流程的完成凭据为同一 task/run 的唯一 MP4 校验通过、上传到配置附件字段并读回确认，不要求 ZIP；不得全局放宽旧 ZIP 的完成条件。实际 render 子进程启动后才回写处理中，附件读回确认后才回写阶段完成。独立成片归档只读取已确认的最新交付指针，重新校验 SHA 并采用无覆盖发布；同名异 SHA 为冲突。审批等待不占剪辑槽，申请必须由正常审批队列和获批采集回执证明，不能通过改数据库或复制源文件绕过审批。普通任务、模拟来源和伪造标签不得申请、渲染、上传 MP4 或回写。附件更新接口无条件写入能力，真实联调时避免同时编辑目标附件字段。
 
 只允许对 `WORD_ALIGNMENT_UNRESOLVED` 且尚无 render/制品证据的 VM run 提供用户手动规划重试。重试沿用原 task/run、已批准审批项和已校验素材，不重新申请或下载；开始前重新检查审批仍为 `ready`、获批采集回执有效且素材 SHA 未变。每次尝试写入独立、不可覆盖的输入目录并保留旧失败证据，最多三次规划尝试。Taskboard 本机重试接口必须 loopback 保护、校验任务版本，并要求本次明确授权原视频音轨 ASR 和新的本机规划文件写入；不得自动重试、不得对其他错误开放，也不得通过更改数据库状态绕过审批。
@@ -38,14 +40,19 @@ VM 初稿阶段可选在初稿进度字段上绑定“素材已就绪”和“�
 ```powershell
 npm install
 npm test
+.\scripts\stop-local.ps1
+
+# 生产（接收真实飞书事件）：启动与检查都必须带开关；根目录 启动-Taskboard.bat / 检查-Taskboard.bat 分别等同于这两条
+.\scripts\start-local.ps1 -EnableFeishu
+.\scripts\check-local.ps1 -RequireFeishu
+
+# 仅本机模拟测试：监听器 disabled，真实飞书改动不会进入流程
 .\scripts\start-local.ps1
 .\scripts\check-local.ps1
 .\scripts\simulate-ready.ps1
-.\scripts\check-local.ps1 -RequireFeishu
-.\scripts\stop-local.ps1
 ```
 
-`-RequireFeishu` 只在需要验证真实长连接时使用；模拟流程可以在监听器 disabled 时运行。
+生产电脑重启服务时必须使用 `start-local.ps1 -EnableFeishu`：不带该开关启动会关闭飞书长连接，此后飞书表格的改动不会被接收。Bridge 不会扫描补跑断连期间的改动；重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。启动脚本不会记住上次的监听方式。不带开关的启动和 `check-local.ps1` 会输出警告，仪表板会把“监听器未启用”标为异常。`-RequireFeishu` 用于验证真实长连接；模拟流程可以在监听器 disabled 时运行。
 
 ## 配置和安全边界
 
@@ -88,6 +95,8 @@ npm test
 
 - 同时更新自动化测试和 README；
 - 先在测试表/示例项目中验证；
-- 经过代码评审后再合并。
+- 以 Pull Request 形式合并，并等 `Check` 工作流的 `test` 作业在该 PR 上通过。
+
+`test` 作业运行 `npm run test:ci`，是唯一的合并门槛。是否再请人做代码评审由改动的提交者判断；CI 未通过时不得合并，也不得用本机测试结果代替。
 
 不要创建第二份 `agents.md`，也不要把本地凭据或运行状态提交到仓库。

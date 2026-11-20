@@ -401,7 +401,7 @@ export interface Project {
 export type FeishuPackageState = "draft" | "enabled" | "disabled";
 
 export interface FeishuPackageWorkflowTemplate {
-  id: "document_draft_zip" | "vm_pmo_review_video";
+  id: "document_draft_zip" | "document_edit_zip" | "vm_pmo_review_video";
   version: 1;
 }
 
@@ -699,6 +699,27 @@ export interface VmPmoQaVerdict {
   verdict: "clean" | "defect" | "unclear";
   observation: string | null;
   frames: string[];
+}
+
+/** One step of a VM/PMO AI planning session, read from its events.jsonl; display only. */
+export type VmPmoAiStep =
+  | { kind: "message" | "reasoning" | "error"; text: string | null }
+  | { kind: "command"; command: string | null; exitCode: number | null; output: string | null }
+  | { kind: "file_change"; files: string[] };
+
+export interface VmPmoAiSession {
+  name: string;
+  attempt: string;
+  session: number;
+  outcome: string | null;
+  model: string | null;
+  resumed: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  report: string | null;
+  eventsMissing: boolean;
+  steps: VmPmoAiStep[];
+  truncated: boolean;
 }
 
 /** v3 approval details read from plan-result.json and qa.json; display only. */
