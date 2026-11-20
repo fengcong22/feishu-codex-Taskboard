@@ -40,7 +40,7 @@ npm install
 npm test
 .\scripts\stop-local.ps1
 
-# 生产（接收真实飞书事件）：启动与检查都必须带开关；根目录 启动-Taskboard.bat 等同于此
+# 生产（接收真实飞书事件）：启动与检查都必须带开关；根目录 启动-Taskboard.bat / 检查-Taskboard.bat 分别等同于这两条
 .\scripts\start-local.ps1 -EnableFeishu
 .\scripts\check-local.ps1 -RequireFeishu
 
@@ -50,7 +50,7 @@ npm test
 .\scripts\simulate-ready.ps1
 ```
 
-生产电脑重启服务时必须使用 `start-local.ps1 -EnableFeishu`：不带该开关启动会关闭飞书长连接，此后飞书表格的改动不会被接收，断连期间的改动也不会在重新开启后自动补跑，需要在飞书中把记录改离触发选项再改回。启动脚本不会记住上次的监听方式。不带开关的启动和 `check-local.ps1` 会输出警告，仪表板会把“监听器未启用”标为异常。`-RequireFeishu` 用于验证真实长连接；模拟流程可以在监听器 disabled 时运行。
+生产电脑重启服务时必须使用 `start-local.ps1 -EnableFeishu`：不带该开关启动会关闭飞书长连接，此后飞书表格的改动不会被接收。Bridge 不会扫描补跑断连期间的改动；重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。启动脚本不会记住上次的监听方式。不带开关的启动和 `check-local.ps1` 会输出警告，仪表板会把“监听器未启用”标为异常。`-RequireFeishu` 用于验证真实长连接；模拟流程可以在监听器 disabled 时运行。
 
 ## 配置和安全边界
 

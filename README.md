@@ -222,7 +222,7 @@ Set-Location ..
 
 浏览器会打开 Taskboard：<http://127.0.0.1:47823>。
 
-> 这是本机模拟体验的启动方式，飞书长连接是关闭的，脚本结束时会输出 `Feishu listener is DISABLED` 警告。接收真实飞书事件的生产电脑必须用 `.\scripts\start-local.ps1 -EnableFeishu`（或双击 `启动-Taskboard.bat`）启动，并用 `.\scripts\check-local.ps1 -RequireFeishu` 检查。用不带开关的命令重启生产电脑会让飞书表格的改动静默丢失：断连期间的改动不会自动补跑，需要在飞书中把记录改离触发选项再改回。此时仪表板“飞书 Bridge”一行会标红并显示“监听器未启用，飞书事件不会进来”。
+> 这是本机模拟体验的启动方式，飞书长连接是关闭的，脚本结束时会输出 `Feishu listener is DISABLED` 警告。接收真实飞书事件的生产电脑必须用 `.\scripts\start-local.ps1 -EnableFeishu`（或双击 `启动-Taskboard.bat`）启动，并用 `.\scripts\check-local.ps1 -RequireFeishu` 检查。用不带开关的命令重启生产电脑会让飞书表格的改动静默丢失：Bridge 不会扫描补跑断连期间的改动，重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。此时仪表板“飞书 Bridge”一行会标红并显示“监听器未启用，飞书事件不会进来”。
 
 ### 2. 检查运行状态
 

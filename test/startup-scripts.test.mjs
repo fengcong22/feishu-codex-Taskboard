@@ -1644,8 +1644,10 @@ test("local check keeps the Node validation import quoted for Windows PowerShell
 
 test("local check without -RequireFeishu says real Feishu edits will not create tasks", async () => {
   const source = await readFile(new URL("../scripts/check-local.ps1", import.meta.url), "utf8");
-  assert.match(source, /real Feishu table changes will NOT create tasks/);
-  assert.match(source, /start-local\.ps1 -EnableFeishu/);
+  // Only a disabled listener is blamed on the missing switch; other states point at the logs.
+  assert.match(source, /\$listenerState -eq 'disabled'\) \{\r?\n\s*Write-Warning 'Feishu listener is DISABLED: real Feishu table changes will NOT create tasks\. For production restart with \.\\scripts\\start-local\.ps1 -EnableFeishu/);
+  assert.match(source, /real Feishu events may not arrive\. Check \.runtime\\logs\\bridge\.stderr\.log/);
+  assert.doesNotMatch(source, /[^\x00-\x7F]/);
 });
 
 test("local check accepts only a validated enabled VM initial package", async () => {
