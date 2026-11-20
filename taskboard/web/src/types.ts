@@ -639,6 +639,10 @@ export interface VmPmoRunSummary {
   /** A download reported as unknown finished later; the file on disk may resume this run. */
   canResumeSource?: boolean;
   canRetryAiIntent?: boolean;
+  /** The AI picture review of QA's exported frames blocked; a new AI session may read them again. */
+  canRetryQaReview?: boolean;
+  qaReviewRetryLimit?: number;
+  qaReviewRetryHistory?: Array<{ errorCode: string; failedAt: string }>;
   aiRetryLimit?: number;
   aiRetryHistory?: Array<{ errorCode: string; failedAt: string }>;
   /** QA on the rendered MP4 can be rerun once (an older reader or package misjudged it). */
@@ -683,6 +687,20 @@ export interface VmPmoQaItem {
   evidenceIds: string[];
 }
 
+export interface VmPmoQaVisualItem extends VmPmoQaItem {
+  /** Frames the AI looked at; their hashes bind the answer to those bytes. */
+  frames: string[];
+}
+
+/** One answer of the AI picture review (qa-review.json), shown beside the QA items. */
+export interface VmPmoQaVerdict {
+  checkId: string | null;
+  questionId: string | null;
+  verdict: "clean" | "defect" | "unclear";
+  observation: string | null;
+  frames: string[];
+}
+
 /** One step of a VM/PMO AI planning session, read from its events.jsonl; display only. */
 export type VmPmoAiStep =
   | { kind: "message" | "reasoning" | "error"; text: string | null }
@@ -716,11 +734,17 @@ export interface VmPmoRunReview {
     overall: string | null;
     counts: Record<string, number>;
     reverseAsr: boolean;
+    /** Which model reviewed the picture items and what it saw, once the package merged the review. */
+    visualReview?: { agent: string | null; model: string | null; items: VmPmoQaVerdict[] } | null;
+    /** Picture items the AI re-read clean from the exported frames. */
+    aiReviewed?: VmPmoQaVisualItem[];
     needsHuman: VmPmoQaItem[];
     failed: VmPmoQaItem[];
     limitations: string[];
   } | null;
   qaError?: { code: string | null; message: string | null } | null;
+  /** The package refused or could not merge the AI picture review (qa-review-result.json). */
+  qaReviewError?: { code: string | null; message: string | null } | null;
 }
 
 export type PackageBoardStage = UnifiedWorkflowStage | "materials" | "editing" | "feishu_delivery"

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { cp, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { prepareVmPmoRunInput } from '../taskboard/server/vm-pmo-run-input.mjs';
 import { runVmPmoOffline } from '../taskboard/server/vm-pmo-offline-runner.mjs';
 import { runVmPmoDriver } from '../taskboard/server/vm-pmo-v3-driver.mjs';
+import { createVmPmoQaReviewRunner } from '../taskboard/server/vm-pmo-qa-review.mjs';
 import { readVmPmoRunReview } from '../taskboard/server/vm-pmo-run-review.mjs';
 import { validateVmPmoInput, validateVmPmoRender } from '../taskboard/server/vm-pmo-result-validator.mjs';
 
@@ -107,6 +109,41 @@ function fakeAi(behaviour, descriptor) {
   }};
 }
 
+/** Stand-in for the step-6 Codex session: it writes qa-review.json exactly as a model would, with
+ * no model call. `behaviour` returns `{write, outcome}` (`outcome` "completed" or "failed"), or is
+ * "hang" for a session that never finishes (it has no pid, so the deadline never signals a real
+ * process on this machine). */
+function fakeReviewTurn(behaviour) {
+  return ({ args, prompt, env, onRawEvent }) => {
+    const child = new EventEmitter();
+    let finish;
+    const stopped = new Promise(resolve => { finish = resolve; });
+    if (behaviour === 'hang') {
+      child.kill = () => finish({ exitCode: null, signal: 'SIGKILL' });
+      return { child, completion: stopped };
+    }
+    child.pid = process.pid;
+    const completion = (async () => {
+      onRawEvent({ type: 'thread.started', thread_id: 'offline-review-thread' });
+      const outcome = typeof behaviour === 'function' ? await behaviour({ args, prompt, env }) : behaviour;
+      if (outcome?.write) await outcome.write();
+      onRawEvent({ type: 'item.completed', item: { type: 'agent_message', text: 'offline picture review' } });
+      return { exitCode: outcome?.outcome === 'failed' ? 1 : 0, signal: null };
+    })();
+    return { child, completion };
+  };
+}
+
+/** The first frame the session was given, for a review that oversteps its boundary. */
+const attachmentOf = ({ args }) => args[args.indexOf('-i') + 1];
+
+function reviewFile({ items, reviewer = { agent: 'codex', model: MODEL }, reportSha256 }) {
+  return { schema: 'auto-cut-slicing/qa-review', schema_version: 1, qa_sha256: reportSha256,
+    reviewer, frames_sha256: Object.fromEntries(items.flatMap(item => item.frames.map(name =>
+      [name, item.hashes[name]]))), items: items.map(item => ({ check_id: item.check_id,
+      question_id: item.question_id, verdict: item.verdict, observation: item.observation, frames: item.frames })) };
+}
+
 /** Synthetic v3 run directories bound to a v3-manifest copy of the package, with word timing
  * pre-written so analyze never calls ASR. Shared by the offline checks and the opt-in AI smoke test. */
 export async function createV3Fixture({root, packageRoot, pythonPath, safeEnv, model = MODEL}) {
@@ -165,11 +202,18 @@ export async function createV3Fixture({root, packageRoot, pythonPath, safeEnv, m
     return {prepared, context, input, options};
   }
 
-  return {prepare, descriptor, manifestSha256, v3Root, raw: RAW};
+  /** The render step (or a review rerun) through the driver, with a scripted picture review. */
+  async function renderWithReview({options, review, mode = 'render', timeoutMs = undefined}) {
+    const runner = review === null ? null : createVmPmoQaReviewRunner({codexExecutable: 'codex.exe', model,
+      spawnTurn: fakeReviewTurn(review), ...(timeoutMs ? {timeoutMs} : {})});
+    return runVmPmoDriver({...options, mode, aiQaReview: runner, reverseAsr: false});
+  }
+
+  return {prepare, renderWithReview, descriptor, manifestSha256, v3Root, raw: RAW};
 }
 
 export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, checks}) {
-  const {prepare, descriptor, manifestSha256} = await createV3Fixture({root, packageRoot, pythonPath, safeEnv});
+  const {prepare, renderWithReview, descriptor, manifestSha256} = await createV3Fixture({root, packageRoot, pythonPath, safeEnv});
 
   // 1. Taskboard-generated v3 input, analyze -> AI intent -> plan, render, QA with reverse ASR.
   const happy = await prepare('ai-intent');
@@ -207,10 +251,12 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
   assert.equal(checked.status, 'rendered', checked.errorCode);
   assert.equal(checked.qa.overall, 'ready_for_review');
   assert.equal(checked.qa.reverseAsr, true);
-  const delivered = await validateVmPmoRender({contextPath: happy.prepared.contextPath});
+  // QA left picture items with exported frames: the AI review (section 4c) must run before delivery.
+  await assert.rejects(validateVmPmoRender({contextPath: happy.prepared.contextPath}), {code: 'QA_REVIEW_REQUIRED'});
+  const delivered = await validateVmPmoRender({contextPath: happy.prepared.contextPath, review: 'pending'});
   assert.equal(delivered.status, 'rendered');
   assert.ok(Math.abs(delivered.media.durationMs - 4_900) <= 80);
-  checks.push('v3 render is not deliverable until qa.json exists; QA with --reverse-asr binds the rendered MP4');
+  checks.push('v3 render is not deliverable until qa.json exists and its picture items are reviewed; QA with --reverse-asr binds the rendered MP4');
 
   const review = await readVmPmoRunReview(happy.context);
   assert.equal(review.planningMode, 'ai_intent');
@@ -264,7 +310,7 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
   const qaBlocked = await validateVmPmoRender({contextPath});
   assert.deepEqual([qaBlocked.status, qaBlocked.errorCode], ['blocked', 'VM_PMO_QA_BLOCKED']);
   await restore();
-  assert.equal((await validateVmPmoRender({contextPath})).status, 'rendered');
+  assert.equal((await validateVmPmoRender({contextPath, review: 'pending'})).status, 'rendered');
   checks.push('qa-result.json binds plan.json and qa.json; failed or blocked QA never delivers; forged reports are rejected');
 
   // 2. A timed-out session blocks; a manual rerun reuses the attempt's ASR and evidence.
@@ -281,7 +327,8 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
   assert.equal(path.basename(rerunAi.calls[0].sessionDir), 'attempt-1-session-2');
   assert.ok((await readFile(path.join(sessions, 'attempt-1-session-2', 'superseded-edit-intent.json'), 'utf8'))
     .startsWith('{"schema"'));
-  const timeoutRendered = await runVmPmoDriver({...timeout.options, mode: 'render', reverseAsr: false});
+  // The render step now runs the picture review; the session answers every picture item clean.
+  const timeoutRendered = await renderWithReview({options: timeout.options, review: answering(timeout)});
   assert.equal(timeoutRendered.status, 'rendered', timeoutRendered.errorCode);
   assert.equal(timeoutRendered.qa.reverseAsr, false);
   checks.push('AI timeout blocks without a plan receipt; rerun reuses analyze and keeps the partial intent as evidence');
@@ -359,6 +406,157 @@ export async function runV3Checks({root, packageRoot, pythonPath, safeEnv, check
   assert.equal(rebasedPlan.plan.expected_duration_ms, 4_400);
   assert.equal(rebasedPlan.plan.rule_cross_check, 'not_applicable');
   checks.push('a review on the original source maps the draft time back, re-applies earlier feedback and plans on the original');
+
+  // 4c. Step 6: the AI reads the frames QA exported and the package (`vm_pmo qa-review`) merges its
+  // verdicts. A clean answer becomes ai_reviewed, a defect fails the video, and unclear keeps the
+  // item for a person. Prewritten review files stand in for the model.
+  async function pictureRun(name) {
+    const run = await prepare(name);
+    assert.equal((await runVmPmoDriver({...run.options, mode: 'plan', aiIntent: fakeAi('intent', descriptor)})).status,
+      'ready');
+    return run;
+  }
+  /** What the review session sees: the request the package wrote, and the frames it points at. */
+  async function requestFor(run) {
+    const request = JSON.parse(await readFile(path.join(run.context.run_dir, 'qa-review-request.json'), 'utf8'));
+    const items = [];
+    for (const item of request.items) {
+      for (const question of item.questions) {
+        items.push({ check_id: item.check_id, question_id: question.question_id, frames: item.frames.map(f => f.file),
+          hashes: Object.fromEntries(item.frames.map(f => [f.file, f.sha256])), verdict: 'clean',
+          observation: 'offline picture review' });
+      }
+    }
+    return { request, items };
+  }
+  /** A review session that answers every question with `verdict(index)` (hoisted: section 2 uses it). */
+  function answering(run, verdict = () => 'clean', change = value => value) {
+    return async ({ prompt }) => {
+      const { items } = await requestFor(run);
+      const reportSha256 = sha256(await readFile(run.context.qa_path));
+      assert.ok(prompt.includes(reportSha256), 'the prompt gives the hash of the report under review');
+      return { write: async () => save(run.context.qa_review_path, change(reviewFile({ reportSha256,
+        items: items.map((item, index) => ({ ...item, verdict: verdict(index) })) }))) };
+    };
+  }
+  const reviewReceipt = run => json(path.join(run.context.run_dir, 'qa-review-result.json'));
+
+  const cleanRun = await pictureRun('ai-picture-clean');
+  const cleanQaReceipt = async () => json(path.join(cleanRun.context.run_dir, 'qa-result.json'));
+  let attachments = [];
+  const clean = await renderWithReview({ options: cleanRun.options, review: async (call) => {
+    assert.match(call.prompt, /qa-review\.v1\.schema\.json/u);
+    // Every exported frame is attached by absolute path.
+    attachments = call.args.filter((value, index) => call.args[index - 1] === '-i');
+    assert.ok(attachments.length > 0 && attachments.every(file => path.isAbsolute(file)));
+    return answering(cleanRun)(call);
+  }});
+  assert.equal(clean.status, 'rendered', clean.errorCode);
+  const cleanReport = await json(cleanRun.context.qa_path);
+  assert.ok(cleanReport.checks.some(row => row.status === 'ai_reviewed' && row.method === 'ai_visual'));
+  assert.deepEqual([cleanReport.review.agent, cleanReport.review.model], ['codex', MODEL]);
+  assert.equal(cleanReport.overall, 'ready_for_review');
+  // qa-result.json still proves what QA wrote; the review receipt binds both reports and the review.
+  const cleanReceipt = await reviewReceipt(cleanRun);
+  const qaReceiptBefore = await cleanQaReceipt();
+  assert.equal(cleanReceipt.status, 'reviewed');
+  assert.equal(cleanReceipt.qa_sha256_before, qaReceiptBefore.qa_sha256);
+  assert.equal(cleanReceipt.qa_sha256, sha256(await readFile(cleanRun.context.qa_path)));
+  assert.equal(sha256(await readFile(path.join(cleanRun.context.run_dir, 'qa.before-review.json'))),
+    qaReceiptBefore.qa_sha256);
+  assert.equal(clean.qa.review.items.length, cleanReceipt.counts.ai_reviewed ?? 0);
+  const cleanReview = await readVmPmoRunReview(cleanRun.context);
+  assert.ok(cleanReview.qa.aiReviewed.length > 0);
+  assert.deepEqual([cleanReview.qa.visualReview.model, cleanReview.qa.visualReview.items.every(item =>
+    item.verdict === 'clean' && item.observation === 'offline picture review')], [MODEL, true]);
+  assert.ok(cleanReview.qa.needsHuman.some(row => row.kind === 'listening'));
+  checks.push('AI picture review: frames attached, clean answers merged by vm_pmo qa-review into ai_reviewed, receipt binds both reports');
+
+  // Editing qa.json, the review file or the pre-review copy after the merge is refused.
+  for (const file of [cleanRun.context.qa_path, cleanRun.context.qa_review_path,
+    path.join(cleanRun.context.run_dir, 'qa.before-review.json')]) {
+    const bytes = await readFile(file);
+    const edited = JSON.parse(bytes.toString('utf8'));
+    edited.edited_after_review = true;
+    await writeFile(file, JSON.stringify(edited));
+    await assert.rejects(validateVmPmoRender({contextPath: cleanRun.prepared.contextPath}),
+      error => ['QA_REVIEW_RESULT_INVALID', 'QA_REPORT_INVALID'].includes(error.code), path.basename(file));
+    await writeFile(file, bytes);
+  }
+  assert.equal((await validateVmPmoRender({contextPath: cleanRun.prepared.contextPath})).status, 'rendered');
+  checks.push('a post-review edit to qa.json, qa-review.json or qa.before-review.json is refused');
+
+  const defectRun = await pictureRun('ai-picture-defect');
+  const defect = await renderWithReview({ options: defectRun.options,
+    review: answering(defectRun, index => (index === 0 ? 'defect' : 'clean')) });
+  assert.deepEqual([defect.status, defect.errorCode], ['failed', 'VM_PMO_QA_REVIEW_DEFECT']);
+  assert.equal((await reviewReceipt(defectRun)).overall, 'failed');
+  assert.equal((await validateVmPmoRender({contextPath: defectRun.prepared.contextPath})).status, 'failed');
+  checks.push('a defect answer fails the video (VM_PMO_QA_REVIEW_DEFECT) and it is never delivered');
+
+  const unclearRun = await pictureRun('ai-picture-unclear');
+  const unclear = await renderWithReview({ options: unclearRun.options,
+    review: answering(unclearRun, index => (index === 0 ? 'unclear' : 'clean')) });
+  assert.equal(unclear.status, 'rendered', unclear.errorCode);
+  const unclearReport = await json(unclearRun.context.qa_path);
+  assert.ok(unclearReport.checks.some(row => row.status === 'needs_human' && row.method === 'ai_visual'));
+  const unclearSummary = await readVmPmoRunReview(unclearRun.context);
+  assert.ok(unclearSummary.qa.visualReview.items.some(item => item.verdict === 'unclear'));
+  assert.ok(unclearSummary.qa.needsHuman.some(row => row.method === 'ai_visual'));
+  checks.push('an unclear answer leaves the picture item needs_human and the approval view shows it');
+
+  // A review the package refuses (frame hash does not match) blocks with qa.json unchanged; an
+  // operator rerun sets the refused receipt aside and merges a fresh reading.
+  const refusedRun = await pictureRun('ai-picture-refused');
+  const refused = await renderWithReview({ options: refusedRun.options, review: answering(refusedRun, () => 'clean',
+    value => ({ ...value, frames_sha256: Object.fromEntries(Object.keys(value.frames_sha256)
+      .map(name => [name, '0'.repeat(64)])) })) });
+  assert.deepEqual([refused.status, refused.errorCode], ['blocked', 'QA_REVIEW_INVALID']);
+  const refusedReceipt = await reviewReceipt(refusedRun);
+  assert.deepEqual([refusedReceipt.status, refusedReceipt.error.code], ['blocked', 'REVIEW_INVALID']);
+  assert.equal(sha256(await readFile(refusedRun.context.qa_path)),
+    (await json(path.join(refusedRun.context.run_dir, 'qa-result.json'))).qa_sha256);
+  assert.equal(await exists(path.join(refusedRun.context.run_dir, 'qa.before-review.json')), false);
+  assert.equal((await readVmPmoRunReview(refusedRun.context)).qaReviewError.code, 'REVIEW_INVALID');
+  const reviewStarts = [];
+  const retried = await renderWithReview({ options: { ...refusedRun.options, onStarted: evidence => {
+    reviewStarts.push(evidence); } }, mode: 'qa-review', review: answering(refusedRun) });
+  assert.equal(retried.status, 'rendered', retried.errorCode);
+  assert.deepEqual(reviewStarts.map(evidence => evidence.mode), ['qa-review']);
+  const refusedSessions = path.join(path.dirname(refusedRun.context.run_dir), 'ai-sessions');
+  assert.equal((await json(path.join(refusedSessions, 'attempt-1-review-2', 'superseded-qa-review-result.json')))
+    .error.code, 'REVIEW_INVALID');
+  assert.ok(await exists(path.join(refusedSessions, 'attempt-1-review-2', 'superseded-qa-review.json')));
+  assert.equal((await reviewReceipt(refusedRun)).status, 'reviewed');
+  checks.push('a review file with a wrong frame hash is refused by the package and blocks; a rerun keeps the refused files as evidence and merges a fresh reading');
+
+  // No review file at all: a timeout and an empty session are blocks, never "assume clean". The
+  // package is not called, so a rerun in the same attempt can still merge a review.
+  for (const [name, behaviour, code] of [['ai-picture-timeout', 'hang', 'QA_REVIEW_TIMEOUT'],
+    ['ai-picture-missing', { outcome: 'completed' }, 'QA_REVIEW_MISSING'],
+    ['ai-picture-failed', { outcome: 'failed' }, 'QA_REVIEW_FAILED']]) {
+    const run = await pictureRun(name);
+    const result = await renderWithReview({ options: run.options, review: behaviour, timeoutMs: 200 });
+    assert.deepEqual([result.status, result.errorCode], ['blocked', code], name);
+    assert.equal(await exists(run.context.qa_review_path), false, name);
+    assert.equal(await exists(path.join(run.context.run_dir, 'qa-review-result.json')), false, name);
+    await assert.rejects(validateVmPmoRender({contextPath: run.prepared.contextPath}), {code: 'QA_REVIEW_REQUIRED'}, name);
+    if (name === 'ai-picture-missing') {
+      const again = await renderWithReview({ options: run.options, mode: 'qa-review', review: answering(run) });
+      assert.equal(again.status, 'rendered', again.errorCode);
+    }
+  }
+  checks.push('a timed-out, empty or failed picture review blocks, leaves no merge, and the MP4 is not deliverable until a rerun is merged');
+
+  // The review session may only write qa-review.json: touching the report or a frame is a scope violation.
+  const scopeRun = await pictureRun('ai-picture-scope');
+  const scoped = await renderWithReview({ options: scopeRun.options, review: async (call) => {
+    const answer = await answering(scopeRun)(call);
+    return { write: async () => { await answer.write(); await writeFile(attachmentOf(call), 'not a frame'); } };
+  }});
+  assert.deepEqual([scoped.status, scoped.errorCode], ['blocked', 'QA_REVIEW_SCOPE_VIOLATION']);
+  assert.equal(await exists(path.join(scopeRun.context.run_dir, 'qa-review-result.json')), false);
+  checks.push('a picture review that edits an exported frame is blocked as a scope violation before the package merges it');
 
   // 5. Tampered v3 bindings are refused before any package launch.
   const tampered = path.join(root, 'v3-tampered');

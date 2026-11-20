@@ -1,61 +1,23 @@
-import { appendFile, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { spawnCodexTurn } from "./ai-chat-process.mjs";
-import { signalProcessTree } from "../shared/process-tree.mjs";
+import { isVmPmoAiProviderFailure, readVmPmoAiProviderFailure, runCodexSession, vmPmoAiEnvironment }
+  from "./vm-pmo-ai-session.mjs";
 
 /** Step 2 of VM/PMO v3: one unattended Codex session writes edit-intent.json for a run.
  * Decided 2026-11-17: 15 minutes, no automatic retry, and a timeout or a missing intent is a
  * block for a human to rerun; Taskboard never falls back to guessing with the fixed patterns. */
 export const AI_INTENT_TIMEOUT_MS = 15 * 60 * 1000;
 export const AI_INTENT_AGENT = "codex";
-const EVENT_LOG_LIMIT = 8 * 1024 * 1024;
-const REPORT_LIMIT = 64 * 1024;
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const THREAD = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/u;
-// The session reads the package and writes one run directory; it never needs Feishu, VM approval,
-// bridge or Jira credentials, so those are removed before Codex starts.
-const PRIVATE_ENVIRONMENT = /^(?:FEISHU|LARK|CODEX_FEISHU|CODEX_TASKBOARD|CODEX_AUTOCUT|VM_|JIRA)|SECRET|PASSWORD/iu;
+
+export { isVmPmoAiProviderFailure, readVmPmoAiProviderFailure, vmPmoAiEnvironment };
 
 function failure(code) {
   const error = new Error(code);
   error.code = code;
   return error;
-}
-
-// A provider that refuses the request (auth, balance, quota, rate limit, server error) before the
-// session did any work is not a planning failure; such a session does not use a human rerun.
-const PROVIDER_STATUS = /\bunexpected status (?:40[123]|429|5\d\d)\b/u;
-const PROVIDER_CODE = /INSUFFICIENT_BALANCE|insufficient_quota|rate[ _-]?limit|quota exceeded/iu;
-
-/** Folds one Codex event into `{refused, worked}`: refused when an error or failed turn names a
- * provider status; worked when any item other than an error appeared (command, edit, message). */
-function providerStep(state, event) {
-  if (event?.type === "item.started" || event?.type === "item.completed") {
-    if (event.item?.type !== "error") state.worked = true;
-  } else if (event?.type === "error" || event?.type === "turn.failed") {
-    const message = String(event.type === "error" ? event.message : event.error?.message ?? "");
-    if (PROVIDER_STATUS.test(message) || PROVIDER_CODE.test(message)) state.refused = true;
-  }
-  return state;
-}
-
-/** True when the session's events show only a provider refusal and no work. */
-export function isVmPmoAiProviderFailure(events) {
-  const state = events.reduce(providerStep, { refused: false, worked: false });
-  return state.refused && !state.worked;
-}
-
-/** Reads a session's bounded events.jsonl; unreadable or malformed lines never count as a refusal. */
-export async function readVmPmoAiProviderFailure(sessionDir) {
-  let text;
-  try { text = await readFile(path.join(sessionDir, "events.jsonl"), "utf8"); } catch { return false; }
-  const events = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    try { events.push(JSON.parse(line)); } catch { return false; }
-  }
-  return isVmPmoAiProviderFailure(events);
 }
 
 export function validVmPmoAiModel(value) {
@@ -128,17 +90,6 @@ export function buildVmPmoAiIntentPrompt({ packageRoot, pythonPath, context, his
   ].join("\n");
 }
 
-/** On Windows the Codex sandbox runs as a restricted user that cannot open per-user install folders
- * such as WinGet packages, so evidence commands need FFmpeg from a directory it can read (`toolDir`). */
-export function vmPmoAiEnvironment(environment = process.env, { toolDir = null } = {}) {
-  const result = Object.fromEntries(Object.entries(environment).filter(([key]) => !PRIVATE_ENVIRONMENT.test(key)));
-  if (toolDir) {
-    const key = Object.keys(result).find((name) => name.toLowerCase() === "path") ?? "PATH";
-    result[key] = [toolDir, result[key]].filter(Boolean).join(path.delimiter);
-  }
-  return result;
-}
-
 /** Returns a runner `({context, packageRoot, pythonPath, sessionDir, signal, onSpawn}) =>
  * {outcome: "completed" | "failed" | "timeout", threadId}`. Interruption throws VM_PMO_RUN_INTERRUPTED.
  * Session evidence (prompt, bounded JSONL events, final report, outcome) goes to sessionDir, which
@@ -165,55 +116,10 @@ export function createVmPmoAiIntentRunner({ codexExecutable, model, environment 
       // Review rounds continue the previous round's conversation; images ride along as attachments.
       ...(resumeThreadId ? ["resume"] : []), ...images.flatMap((file) => ["-i", file]),
       ...(resumeThreadId ? [resumeThreadId] : []), "-"];
-    const startedAt = now().toISOString();
-    await writeFile(path.join(sessionDir, "prompt.txt"), prompt, { flag: "wx" });
-    const eventsPath = path.join(sessionDir, "events.jsonl");
-    await writeFile(eventsPath, "", { flag: "wx" });
-    let logged = 0, threadId = null, report = "", turnFailed = false;
-    const provider = { refused: false, worked: false };
-    let writes = Promise.resolve();
-    const { child, completion } = spawnTurn({ executable: codexExecutable, args, prompt,
-      env: vmPmoAiEnvironment(environment, { toolDir }),
-      onRawEvent: (event) => {
-        if (event?.type === "thread.started" && typeof event.thread_id === "string") threadId = event.thread_id.slice(0, 200);
-        if (event?.type === "turn.failed" || event?.type === "error") turnFailed = true;
-        providerStep(provider, event);
-        if (event?.type === "item.completed" && event.item?.type === "agent_message"
-          && typeof event.item.text === "string") report = event.item.text.slice(0, REPORT_LIMIT);
-        const line = JSON.stringify(event) + "\n";
-        if (logged + line.length > EVENT_LOG_LIMIT) return;
-        logged += line.length;
-        writes = writes.then(() => appendFile(eventsPath, line)).catch(() => {});
-      } });
-    let outcome = null;
-    const stop = (value) => {
-      if (outcome) return;
-      outcome = value;
-      signalProcessTree(child, "SIGKILL");
-    };
-    const deadline = setTimeout(() => stop("timeout"), timeoutMs);
-    const abort = () => stop("interrupted");
-    signal?.addEventListener("abort", abort, { once: true });
-    if (Number.isSafeInteger(child?.pid) && child.pid > 0 && onSpawn) {
-      try { await onSpawn({ pid: child.pid, startedAt }); } catch (error) { stop("failed"); await completion.catch(() => {}); throw error; }
-    }
-    let exit;
-    try { exit = await completion; } catch { exit = null; }
-    finally {
-      clearTimeout(deadline);
-      signal?.removeEventListener("abort", abort);
-    }
-    await writes;
-    if (!outcome) outcome = exit?.exitCode === 0 && !turnFailed ? "completed" : "failed";
-    const providerFailure = outcome === "failed" && provider.refused && !provider.worked;
-    await writeFile(path.join(sessionDir, "report.txt"), report, { flag: "wx" });
-    await writeFile(path.join(sessionDir, "outcome.json"), JSON.stringify({ agent: session.agent,
-      model: session.model, thread_id: threadId, resumed_from: resumeThreadId, images: images.length,
-      started_at: startedAt, finished_at: now().toISOString(),
-      timeout_ms: timeoutMs, outcome, provider_failure: providerFailure,
-      exit_code: exit?.exitCode ?? null }, null, 2) + "\n", { flag: "wx" });
-    if (outcome === "interrupted") throw failure("VM_PMO_RUN_INTERRUPTED");
-    return { outcome, threadId, report, providerFailure };
+    return runCodexSession({ executable: codexExecutable, args, prompt,
+      env: vmPmoAiEnvironment(environment, { toolDir }), sessionDir, signal, onSpawn, timeoutMs,
+      spawnTurn, now, evidence: { agent: session.agent, model: session.model, resumed_from: resumeThreadId,
+        images: images.length } });
   }
   return Object.freeze({ session, run });
 }

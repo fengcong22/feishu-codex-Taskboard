@@ -3,10 +3,11 @@ import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
-import { VM_PMO_QA_RESULT, validateVmPmoAnalyze, validateVmPmoInput, validateVmPmoPlan,
-  validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
+import { VM_PMO_QA_RESULT, VM_PMO_QA_REVIEW_RESULT, validateVmPmoAnalyze, validateVmPmoInput,
+  validateVmPmoPlan, validateVmPmoRender } from "./vm-pmo-result-validator.mjs";
 
-const MODES = ["analyze", "plan", "render", "qa"];
+const MODES = ["analyze", "plan", "render", "qa", "qa-review"];
+const V3_ONLY = ["analyze", "qa", "qa-review"];
 
 function failure(code) {
   const error = new Error(code);
@@ -27,9 +28,12 @@ function processEnvironment(environment) {
   return result;
 }
 
-/** One package command. `analyze` and `qa` exist only for schema v3 AI intent runs; `qa` always
- * publishes qa-result.json (checked, blocked or failed), which is its receipt. `qa: "skip"` lets the
- * v3 driver validate the MP4 before its QA step; every other render validation requires QA. */
+/** One package command. `analyze`, `qa` and `qa-review` exist only for schema v3 AI intent runs.
+ * `qa` always publishes qa-result.json (checked, blocked or failed), which is its receipt; the
+ * driver reviews its picture items next, so QA alone is validated with the review still pending.
+ * `qa-review` merges the AI's picture verdicts into qa.json and publishes qa-review-result.json
+ * (reviewed, blocked or failed) once. `qa: "skip"` lets the v3 driver validate the MP4 before its
+ * QA step; every other render validation requires QA. */
 export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPath,
   signal, timeoutMs = 2 * 60 * 60 * 1000, environment = process.env,
   ffprobePath = "ffprobe", ffmpegPath = "ffmpeg", onStarted = null,
@@ -47,10 +51,10 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
   if (signal?.aborted) throw failure("VM_PMO_RUN_INTERRUPTED");
   const expectedBound = await validateVmPmoInput({ contextPath, signal, expectedBound: frozenBound });
   const { context, input } = expectedBound;
-  if (["analyze", "qa"].includes(mode) && (input.schema_version !== 3 || input.planning_mode !== "ai_intent"))
+  if (V3_ONLY.includes(mode) && (input.schema_version !== 3 || input.planning_mode !== "ai_intent"))
     throw failure("VM_PMO_RUN_INPUT_INVALID");
   let expectedPlan;
-  if (["render", "qa"].includes(mode)) {
+  if (["render", "qa", "qa-review"].includes(mode)) {
     expectedPlan = await validateVmPmoPlan({ contextPath, signal, ffprobePath, expectedBound,
       timeoutMs: Math.min(timeoutMs, 120_000) });
     if (expectedPlan.status === "blocked") return { ...expectedPlan, receiptPath: context.plan_result_path, exitCode: 0 };
@@ -63,11 +67,14 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
     root = await realpath(packageRoot);
     if (root !== packageRoot || await realpath(pythonPath) !== pythonPath) throw new Error("not canonical");
     if (!(await regularFile(path.join(context.run_dir, "input.json")))) throw new Error("missing input");
-    if (["render", "qa"].includes(mode) && !(await regularFile(context.plan_path))) throw new Error("missing plan");
-    if (mode === "qa" && !(await regularFile(context.result_path))) throw new Error("missing render");
+    if (["render", "qa", "qa-review"].includes(mode) && !(await regularFile(context.plan_path))) throw new Error("missing plan");
+    if (["qa", "qa-review"].includes(mode) && !(await regularFile(context.result_path))) throw new Error("missing render");
+    // The package reviews the QA it checked, using the AI's file at the context path.
+    if (mode === "qa-review" && !(await regularFile(context.qa_path))) throw new Error("missing qa");
   } catch { throw failure("VM_PMO_RUN_INPUT_INVALID"); }
   const receiptPath = { analyze: context.analyze_result_path, plan: context.plan_result_path,
-    render: context.result_path, qa: path.join(context.run_dir, VM_PMO_QA_RESULT) }[mode];
+    render: context.result_path, qa: path.join(context.run_dir, VM_PMO_QA_RESULT),
+    "qa-review": path.join(context.run_dir, VM_PMO_QA_REVIEW_RESULT) }[mode];
   if (mode === "qa") {
     try { await lstat(context.qa_path); throw failure("VM_PMO_RUN_INPUT_INVALID"); }
     catch (error) { if (error?.code !== "ENOENT") throw error; }
@@ -121,14 +128,16 @@ export async function runVmPmoOffline({ mode, pythonPath, packageRoot, contextPa
     signal?.removeEventListener("abort", abort);
   }
   if (stopped) throw stopped;
-  // A failed QA exits 1 but still publishes its receipt; validate that instead of guessing.
-  if (exitCode !== 0 && !(mode === "qa" && await regularFile(receiptPath))) throw failure("VM_PMO_PROCESS_FAILED");
+  // A failed QA or review exits 1 but still publishes its receipt; validate that instead of guessing.
+  if (exitCode !== 0 && !(["qa", "qa-review"].includes(mode) && await regularFile(receiptPath)))
+    throw failure("VM_PMO_PROCESS_FAILED");
   try { if (!(await regularFile(receiptPath))) throw new Error("not regular"); }
   catch { throw failure("VM_PMO_RECEIPT_MISSING"); }
   const limit = Math.min(timeoutMs, 120_000);
   const validated = mode === "analyze" ? await validateVmPmoAnalyze({ contextPath, signal, expectedBound })
     : mode === "plan" ? await validateVmPmoPlan({ contextPath, signal, ffprobePath, timeoutMs: limit, expectedBound })
       : await validateVmPmoRender({ contextPath, ffprobePath, ffmpegPath, timeoutMs: limit, signal,
-        expectedBound, expectedPlan, qa: mode === "qa" ? "require" : qa });
+        expectedBound, expectedPlan, qa: mode === "render" ? qa : "require",
+        review: mode === "qa" ? "pending" : "require" });
   return { ...validated, receiptPath, exitCode };
 }

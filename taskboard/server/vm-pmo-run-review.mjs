@@ -38,6 +38,21 @@ function blockerRow(row) {
     candidateCount: Array.isArray(row.candidates) ? row.candidates.length : 0 };
 }
 
+function visualRow(row) {
+  const base = qaRow(row);
+  return { ...base, frames: Array.isArray(row.frames) ? row.frames.slice(0, 10).map(text).filter(Boolean) : [] };
+}
+
+const VERDICTS = new Set(["clean", "defect", "unclear"]);
+
+/** One answer of the AI picture review: what it saw at a check, for the operator to compare. */
+function verdictRow(item) {
+  if (!object(item) || !VERDICTS.has(item.verdict)) return null;
+  return { checkId: text(item.check_id), questionId: text(item.question_id), verdict: item.verdict,
+    observation: text(item.observation),
+    frames: Array.isArray(item.frames) ? item.frames.slice(0, 10).map(text).filter(Boolean) : [] };
+}
+
 function qaRow(row) {
   return { checkId: text(row.check_id), kind: text(row.kind), status: text(row.status), method: text(row.method),
     detail: text(row.detail), targetStartUs: integer(row.target_start_us), targetEndUs: integer(row.target_end_us),
@@ -46,9 +61,14 @@ function qaRow(row) {
 
 export async function readVmPmoRunReview(context) {
   if (!object(context) || context.schema_version !== 3) return null;
-  const [receipt, report, qaResult] = await Promise.all([readJson(context.plan_result_path), readJson(context.qa_path),
-    readJson(typeof context.run_dir === "string" ? path.join(context.run_dir, "qa-result.json") : null)]);
-  const review = { planningMode: null, planStatus: null, coverage: [], blockers: [], qa: null, qaError: null };
+  const runFile = (name) => typeof context.run_dir === "string" ? path.join(context.run_dir, name) : null;
+  const [receipt, report, qaResult, reviewResult, answers] = await Promise.all([readJson(context.plan_result_path),
+    readJson(context.qa_path), readJson(runFile("qa-result.json")), readJson(runFile("qa-review-result.json")),
+    readJson(context.qa_review_path)]);
+  const review = { planningMode: null, planStatus: null, coverage: [], blockers: [], qa: null, qaError: null,
+    qaReviewError: null };
+  if (reviewResult && reviewResult.status !== "reviewed" && object(reviewResult.error))
+    review.qaReviewError = { code: code(reviewResult.error.code), message: text(reviewResult.error.message) };
   if (qaResult && qaResult.status !== "checked" && object(qaResult.error))
     review.qaError = { code: code(qaResult.error.code), message: text(qaResult.error.message) };
   if (receipt) {
@@ -62,6 +82,14 @@ export async function readVmPmoRunReview(context) {
     const counts = {};
     for (const row of checks) if (typeof row.status === "string") counts[row.status] = (counts[row.status] ?? 0) + 1;
     review.qa = { overall: text(report.overall), counts,
+      // What the picture review concluded, so the operator sees the AI's reading next to the items
+      // it left for them. Display only: the validator decides delivery.
+      // Shown only once the package merged the review (its receipt says reviewed).
+      visualReview: object(report.review) && reviewResult?.status === "reviewed"
+        ? { agent: text(report.review.agent), model: text(report.review.model),
+          items: Array.isArray(answers?.items) ? answers.items.slice(0, LIST_LIMIT).map(verdictRow).filter(Boolean) : [] }
+        : null,
+      aiReviewed: checks.filter((row) => row.status === "ai_reviewed").slice(0, LIST_LIMIT).map(visualRow),
       reverseAsr: typeof report.bindings?.output_alignment_sha256 === "string",
       needsHuman: checks.filter((row) => row.status === "needs_human").slice(0, LIST_LIMIT).map(qaRow),
       failed: checks.filter((row) => row.status === "failed").slice(0, LIST_LIMIT).map(qaRow),
