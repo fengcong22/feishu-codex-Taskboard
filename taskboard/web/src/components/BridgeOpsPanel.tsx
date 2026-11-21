@@ -25,11 +25,13 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
   const [issues, setIssues] = useState<BridgeDeliveryIssue[] | null>(null);
   const [total, setTotal] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [showAcknowledged, setShowAcknowledged] = useState(false);
 
   if (bridge.state !== "up" || bridge.stale) return null;
   const listenerState = bridge.listener?.state ?? null;
   const queue = bridge.queue;
-  const openIssues = (queue?.deadLetter ?? 0) + (queue?.retryWait ?? 0) + (queue?.deadLetterAcknowledged ?? 0);
+  // Acknowledged dead letters are reviewed already; they never make the panel appear on their own.
+  const openIssues = (queue?.deadLetter ?? 0) + (queue?.retryWait ?? 0);
   const canStart = listenerState !== null && STARTABLE.has(listenerState);
   if (!canStart && openIssues === 0 && issues === null) return null;
 
@@ -88,6 +90,8 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
   }
 
   const openDeadLetters = (issues ?? []).filter(item => item.deliveryState === "dead_letter" && !item.acknowledgedAt);
+  const acknowledgedCount = (issues ?? []).filter(item => item.acknowledgedAt).length;
+  const visibleIssues = (issues ?? []).filter(item => showAcknowledged || !item.acknowledgedAt);
   const allSelected = openDeadLetters.length > 0 && openDeadLetters.every(item => selected.has(item.eventId));
 
   return (
@@ -100,7 +104,7 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
         )}
         {openIssues > 0 && (
           <button type="button" disabled={busy} onClick={() => {
-            if (issues) { setIssues(null); return; }
+            if (issues) { setIssues(null); setShowAcknowledged(false); return; }
             void run(async () => { await load(); return ""; });
           }}>
             {issues ? text("收起明细", "Hide details") : text("查看队列明细", "Show queue details")}
@@ -111,6 +115,13 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
             {text(`确认清除所选死信（${selected.size}）`, `Acknowledge selected (${selected.size})`)}
           </button>
         )}
+        {issues && acknowledgedCount > 0 && (
+          <button type="button" disabled={busy} aria-pressed={showAcknowledged} onClick={() => setShowAcknowledged(value => !value)}>
+            {showAcknowledged
+              ? text(`隐藏已确认（${acknowledgedCount}）`, `Hide acknowledged (${acknowledgedCount})`)
+              : text(`显示已确认（${acknowledgedCount}）`, `Show acknowledged (${acknowledgedCount})`)}
+          </button>
+        )}
         {issues && total > issues.length && (
           <span>{text(`仅显示最近 ${issues.length} 条，共 ${total} 条`, `Showing the latest ${issues.length} of ${total}`)}</span>
         )}
@@ -118,8 +129,8 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
       </div>
       {issues && (
         <div className="vm-bridge-ops-list">
-          {issues.length === 0 ? (
-            <div className="vm-bridge-ops-empty">{text("没有待重试或死信事件。", "No retrying or dead-letter events.")}</div>
+          {visibleIssues.length === 0 ? (
+            <div className="vm-bridge-ops-empty">{text("没有待重试或未确认的死信。", "No retrying or open dead-letter events.")}</div>
           ) : (
             <table>
               <thead>
@@ -141,7 +152,7 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
                 </tr>
               </thead>
               <tbody>
-                {issues.map(item => {
+                {visibleIssues.map(item => {
                   const selectable = item.deliveryState === "dead_letter" && !item.acknowledgedAt;
                   const state = item.deliveryState === "retry_wait"
                     ? text(`等待重试（${time(item.nextAttemptAt)}）`, `Retry at ${time(item.nextAttemptAt)}`)

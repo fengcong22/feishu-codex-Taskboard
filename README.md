@@ -146,7 +146,7 @@ Auto-cut-slicing 的业务列为：待处理 → 素材准备 → 排队中 → 
 | 三阶段工作流 | Taskboard 管理的活动配置可分别启用 `initial`、`first_review`、`final_review`；“初稿触发字段”用于初稿，“审核修改触发字段”共用于初审修改和终审修改。审核字段未单独选择时兼容使用初稿字段。Bridge 只在记录从其他 option 进入已启用阶段 option 时登记该阶段任务。 |
 | Auto-Cut 与产物 | Taskboard 负责统一执行入口、并发控制、Auto-Cut 调用、剪映草稿/ZIP 校验以及本地或 NAS 上传；这些能力不在 Bridge 进程中执行。 |
 | 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
-| 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。仪表盘“链路健康”的“查看队列明细”列出待重试和死信事件（时间、记录、安全错误码、次数），可勾选死信后“确认清除”：记录保留在状态文件中（同一 `event_id` 重放仍被去重），只标记 `deadLetterAcknowledgedAt` 并改计入健康接口的 `deadLetterAcknowledged`，不重试、不建任务。 |
+| 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。仪表盘“链路健康”的“查看队列明细”列出待重试和死信事件（时间、记录、安全错误码、次数），可勾选死信后“确认清除”：记录保留在状态文件中（同一 `event_id` 重放仍被去重），只标记 `deadLetterAcknowledgedAt` 并改计入健康接口的 `deadLetterAcknowledged`，不重试、不建任务。已确认的记录在明细中默认隐藏，可用“显示已确认（N）”展开；只剩已确认记录时不再显示“查看队列明细”。 |
 | VM 成片归档恢复 | 仅对真实 VM `final_archive` 死信提供绑定 run、delivery、artifact、SHA 与字节数的本机受限重试；其他死信仍不可手工重放。 |
 | 状态文件保护 | 损坏的状态文件、无效租约或不完整快照会安全停留在可诊断状态；读写（包括健康队列统计）使用同一稳定路径校验和操作系统本机互斥锁，写入使用原子替换，崩溃后可安全恢复；Bridge 启动时在同一互斥锁内清理超过 10 分钟的残留 `state.json.<uuid>.tmp`，不触碰状态文件本身。状态文件必须是稳定的普通文件，不接受符号链接或硬链接别名。 |
 | Base 元数据预览 | `POST /api/feishu/base-preview` 只接受携带 `x-feishu-bridge-client: taskboard` 和本机共享密钥的 Taskboard 请求；在本机配置飞书凭据后，它仅执行只读 metadata 操作，按 Base 链接读取 Base、子表、字段和单选项元数据。即使长连接监听关闭，预览仍可使用，且不会启用子表或接收事件。 |

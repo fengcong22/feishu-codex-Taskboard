@@ -1180,6 +1180,17 @@ test("acknowledging a dead letter keeps the record terminal and moves it out of 
   assert.equal((await store.get("evt_dead")).deadLetterAcknowledgedAt, 50);
 });
 
+test("lists unacknowledged issues before acknowledged history even when the history is newer", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  for (const [eventId, at] of [["evt_old_open", 1], ["evt_new_acked", 9]]) {
+    const claim = await store.claimEvent(event(eventId), { ownerId: "one", now: 0, leaseMs: 100 });
+    await store.fail(eventId, { ownerId: "one", token: claim.record.lease.token, error: { code: "DELIVERY_FAILED" }, deadLetter: true, now: at });
+  }
+  await store.acknowledgeDeadLetters(["evt_new_acked"], { now: () => 10 });
+  const { items } = await store.listDeliveryIssues();
+  assert.deepEqual(items.map((item) => [item.eventId, item.acknowledgedAt]), [["evt_old_open", null], ["evt_new_acked", 10]]);
+});
+
 test("rejects malformed dead-letter acknowledgements before touching the state file", async () => {
   const store = new JsonStateStore(await stateFilename());
   for (const ids of [[], "evt", ["evt", "evt"], [""], ["../x"], Array.from({ length: 201 }, (_, i) => `evt_${i}`)]) {

@@ -1337,7 +1337,7 @@ export class JsonStateStore {
 
   /**
    * Read-only view of the events that did not succeed: `retry_wait` and
-   * `dead_letter` records, newest first, with only identifiers, safe error
+   * `dead_letter` records, unacknowledged first and then newest first, with only identifiers, safe error
    * codes and timestamps. No field values, no options and no raw errors.
    */
   async listDeliveryIssues({ limit = DELIVERY_ISSUE_LIMIT } = {}) {
@@ -1346,7 +1346,10 @@ export class JsonStateStore {
       const state = await this.#read();
       const issues = Object.values(state)
         .filter((record) => record.deliveryState === "retry_wait" || record.deliveryState === "dead_letter")
-        .sort((left, right) => right.updatedAt - left.updatedAt || (left.eventId < right.eventId ? -1 : 1));
+        // Open problems first, then newest first: acknowledged history can never push
+        // a new retry or dead letter past the list limit.
+        .sort((left, right) => (Number.isFinite(left.deadLetterAcknowledgedAt) - Number.isFinite(right.deadLetterAcknowledgedAt))
+          || right.updatedAt - left.updatedAt || (left.eventId < right.eventId ? -1 : 1));
       return {
         total: issues.length,
         items: issues.slice(0, max).map(deliveryIssueView),
