@@ -1155,7 +1155,69 @@ test("reports queue statistics for non-terminal delivery states", async () => {
   await store.complete("evt_done", { ownerId: "one", token: doneClaim.record.lease.token, decision: "ignored", outcome: { kind: "ignored" }, now: 1 });
   const deadClaim = await store.claimEvent(event("evt_dead"), { ownerId: "one", now: 0, leaseMs: 100 });
   await store.fail("evt_dead", { ownerId: "one", token: deadClaim.record.lease.token, error: { code: "DELIVERY_FAILED" }, deadLetter: true, now: 1 });
-  assert.deepEqual(await store.getQueueStats(), { pending: 0, processing: 1, retryWait: 1, deadLetter: 1 });
+  assert.deepEqual(await store.getQueueStats(), { pending: 0, processing: 1, retryWait: 1, deadLetter: 1, deadLetterAcknowledged: 0 });
+});
+
+test("acknowledging a dead letter keeps the record terminal and moves it out of the open count", async () => {
+  const filename = await stateFilename();
+  const store = new JsonStateStore(filename);
+  const deadClaim = await store.claimEvent(event("evt_dead"), { ownerId: "one", now: 0, leaseMs: 100 });
+  await store.fail("evt_dead", { ownerId: "one", token: deadClaim.record.lease.token, error: { code: "DELIVERY_FAILED" }, deadLetter: true, now: 1 });
+  const retryClaim = await store.claimEvent(event("evt_retry"), { ownerId: "one", now: 0, leaseMs: 100 });
+  await store.fail("evt_retry", { ownerId: "one", token: retryClaim.record.lease.token, error: { code: "TASKBOARD_UNAVAILABLE" }, nextAttemptAt: 100, deadLetter: false, now: 2 });
+
+  const result = await store.acknowledgeDeadLetters(["evt_dead", "evt_retry", "evt_missing"], { now: () => 50 });
+  assert.deepEqual(result, { acknowledged: ["evt_dead"], skipped: ["evt_retry", "evt_missing"] });
+  const record = await store.get("evt_dead");
+  assert.equal(record.deliveryState, "dead_letter");
+  assert.equal(record.deadLetterAcknowledgedAt, 50);
+  assert.deepEqual(await store.getQueueStats(), { pending: 0, processing: 0, retryWait: 1, deadLetter: 0, deadLetterAcknowledged: 1 });
+  // A replay of the same event id is still a terminal duplicate.
+  const replay = await store.claimEvent(event("evt_dead"), { ownerId: "two", now: 60, leaseMs: 100 });
+  assert.equal(replay.kind, "terminal");
+  // A second acknowledgement is reported as skipped and changes nothing.
+  assert.deepEqual(await store.acknowledgeDeadLetters(["evt_dead"], { now: () => 70 }), { acknowledged: [], skipped: ["evt_dead"] });
+  assert.equal((await store.get("evt_dead")).deadLetterAcknowledgedAt, 50);
+});
+
+test("lists unacknowledged issues before acknowledged history even when the history is newer", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  for (const [eventId, at] of [["evt_old_open", 1], ["evt_new_acked", 9]]) {
+    const claim = await store.claimEvent(event(eventId), { ownerId: "one", now: 0, leaseMs: 100 });
+    await store.fail(eventId, { ownerId: "one", token: claim.record.lease.token, error: { code: "DELIVERY_FAILED" }, deadLetter: true, now: at });
+  }
+  await store.acknowledgeDeadLetters(["evt_new_acked"], { now: () => 10 });
+  const { items } = await store.listDeliveryIssues();
+  assert.deepEqual(items.map((item) => [item.eventId, item.acknowledgedAt]), [["evt_old_open", null], ["evt_new_acked", 10]]);
+});
+
+test("rejects malformed dead-letter acknowledgements before touching the state file", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  for (const ids of [[], "evt", ["evt", "evt"], [""], ["../x"], Array.from({ length: 201 }, (_, i) => `evt_${i}`)]) {
+    await assert.rejects(store.acknowledgeDeadLetters(ids), { code: "INVALID_DEAD_LETTER_ACKNOWLEDGEMENT" });
+  }
+});
+
+test("lists retrying and dead-letter events with only safe fields, newest first", async () => {
+  const store = new JsonStateStore(await stateFilename());
+  const deadClaim = await store.claimEvent({ ...event("evt_dead"), recordTitle: "课程 A" }, { ownerId: "one", now: 0, leaseMs: 100 });
+  await store.fail("evt_dead", { ownerId: "one", token: deadClaim.record.lease.token, error: { code: "DELIVERY_FAILED", message: "secret detail" }, deadLetter: true, now: 1 });
+  const retryClaim = await store.claimEvent(event("evt_retry"), { ownerId: "one", now: 0, leaseMs: 100 });
+  await store.fail("evt_retry", { ownerId: "one", token: retryClaim.record.lease.token, error: { code: "TASKBOARD_UNAVAILABLE" }, nextAttemptAt: 100, deadLetter: false, now: 5 });
+  const doneClaim = await store.claimEvent(event("evt_done"), { ownerId: "one", now: 0, leaseMs: 100 });
+  await store.complete("evt_done", { ownerId: "one", token: doneClaim.record.lease.token, decision: "ignored", outcome: { kind: "ignored" }, now: 9 });
+
+  const issues = await store.listDeliveryIssues();
+  assert.equal(issues.total, 2);
+  assert.deepEqual(issues.items.map((item) => item.eventId), ["evt_retry", "evt_dead"]);
+  assert.deepEqual(issues.items[1], {
+    eventId: "evt_dead", deliveryState: "dead_letter", source: "feishu", tableId: "tbl_demo",
+    recordId: "rec_demo", recordTitle: "课程  A", errorCode: "DELIVERY_FAILED", attempts: 1,
+    nextAttemptAt: null, createdAt: 0, updatedAt: 1, acknowledgedAt: null,
+  });
+  assert.equal(issues.items[0].nextAttemptAt, 100);
+  assert.equal(JSON.stringify(issues).includes("secret detail"), false);
+  assert.equal(JSON.stringify(issues).includes("待剪辑"), false);
 });
 
 test("migrates legacy pending records to dead letter and rehydrates on replay", async () => {
@@ -1629,6 +1691,7 @@ test("normalizes a partial pending snapshot to rehydratable dead letter", async 
     processing: 0,
     retryWait: 0,
     deadLetter: 1,
+    deadLetterAcknowledged: 0,
   });
 });
 

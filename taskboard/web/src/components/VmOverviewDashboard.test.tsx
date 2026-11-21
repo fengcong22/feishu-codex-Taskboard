@@ -235,3 +235,128 @@ describe("VmOverviewDashboard link health", () => {
     expect(screen.queryByText("链路健康")).toBeNull();
   });
 });
+
+describe("VmOverviewDashboard Bridge operator actions", () => {
+  function routeFetch(routes: Record<string, (init?: RequestInit) => unknown>) {
+    const calls: Array<{ url: string; method: string; body: string | null }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: (init?.method ?? "GET").toUpperCase(), body: typeof init?.body === "string" ? init.body : null });
+      const match = Object.keys(routes).find(route => url.includes(route));
+      const payload = match ? routes[match](init) : body;
+      return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    return calls;
+  }
+
+  it("offers a confirmed listener start when the listener is disabled", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+          listener: { state: "disabled", lastEventAt: null, lastError: null },
+          queue: { pending: 0, processing: 0, retryWait: 0, deadLetter: 0 },
+        },
+      }),
+    });
+    const calls = routeFetch({ "/bridge/listener/start": () => ({ listener: { state: "sdk_managed" } }) });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    renderDashboard();
+    const button = await screen.findByRole("button", { name: "启动长连接" });
+    fireEvent.click(button);
+    expect(calls.some(call => call.url.includes("/listener/start"))).toBe(false);
+    fireEvent.click(button);
+    expect(await screen.findByText(/长连接已接管。请用测试表事件确认端到端/)).toBeTruthy();
+    const start = calls.find(call => call.url.includes("/listener/start"))!;
+    expect(start.method).toBe("POST");
+    expect(start.body).toBe("{}");
+    expect(confirm).toHaveBeenCalledTimes(2);
+    confirm.mockRestore();
+  });
+
+  it("shows no Bridge actions for a healthy listener with an empty queue", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+          listener: { state: "sdk_managed", lastEventAt: null, lastError: null },
+          queue: { pending: 0, processing: 0, retryWait: 0, deadLetter: 0 },
+        },
+      }),
+    });
+    renderDashboard();
+    await screen.findByText("飞书 Bridge");
+    expect(screen.queryByRole("button", { name: /长连接|队列明细/ })).toBeNull();
+  });
+
+  it("lists dead letters and acknowledges only the selected ones after confirmation", async () => {
+    body = overview({
+      linkHealth: health({
+        bridge: {
+          state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+          listener: { state: "sdk_managed", lastEventAt: null, lastError: null },
+          queue: { pending: 0, processing: 0, retryWait: 1, deadLetter: 2 },
+        },
+      }),
+    });
+    const issue = (eventId: string, overrides = {}) => ({
+      eventId, deliveryState: "dead_letter", source: "feishu", tableId: "tbl", recordId: `rec_${eventId}`,
+      recordTitle: null, errorCode: "DELIVERY_FAILED", attempts: 1, nextAttemptAt: null,
+      createdAt: "2026-10-15T07:42:00.000Z", updatedAt: "2026-10-15T07:42:00.000Z", acknowledgedAt: null, ...overrides,
+    });
+    const calls = routeFetch({
+      "/bridge/delivery-issues": () => ({ total: 3, items: [
+        issue("evt_retry", { deliveryState: "retry_wait", nextAttemptAt: "2026-11-21T08:00:00.000Z", errorCode: "TASKBOARD_UNAVAILABLE" }),
+        issue("evt_a"), issue("evt_b"),
+      ] }),
+      "/bridge/dead-letters/acknowledge": (init) => ({ acknowledged: JSON.parse(String(init?.body)).eventIds, skipped: [] }),
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderDashboard();
+    fireEvent.click(await screen.findByRole("button", { name: "查看队列明细" }));
+    expect(await screen.findByText("TASKBOARD_UNAVAILABLE")).toBeTruthy();
+    // The retrying event has no checkbox; only open dead letters can be acknowledged.
+    expect(screen.queryByLabelText("选择 evt_retry")).toBeNull();
+    fireEvent.click(screen.getByLabelText("选择 evt_a"));
+    fireEvent.click(screen.getByRole("button", { name: "确认清除所选死信（1）" }));
+    expect(await screen.findByText("已确认 1 条")).toBeTruthy();
+    const ack = calls.find(call => call.url.includes("/dead-letters/acknowledge"))!;
+    expect(JSON.parse(ack.body!)).toEqual({ eventIds: ["evt_a"] });
+    confirm.mockRestore();
+  });
+
+  it("hides acknowledged dead letters behind a toggle and never shows the panel for them alone", async () => {
+    const healthWith = (deadLetter: number, deadLetterAcknowledged: number) => health({
+      bridge: {
+        state: "up", checkedAt: new Date().toISOString(), ageMs: 1_000, stale: false, detail: null,
+        listener: { state: "sdk_managed", lastEventAt: null, lastError: null },
+        queue: { pending: 0, processing: 0, retryWait: 0, deadLetter, deadLetterAcknowledged },
+      },
+    });
+    // Only acknowledged history: no queue-details button at all.
+    body = overview({ linkHealth: healthWith(0, 20) });
+    renderDashboard();
+    await screen.findByText("飞书 Bridge");
+    expect(screen.queryByRole("button", { name: "查看队列明细" })).toBeNull();
+    cleanup();
+
+    body = overview({ linkHealth: healthWith(1, 1) });
+    const item = (eventId: string, acknowledgedAt: string | null) => ({
+      eventId, deliveryState: "dead_letter", source: "feishu", tableId: "tbl", recordId: `rec_${eventId}`,
+      recordTitle: null, errorCode: "DELIVERY_FAILED", attempts: 1, nextAttemptAt: null,
+      createdAt: "2026-10-15T07:42:00.000Z", updatedAt: "2026-10-15T07:42:00.000Z", acknowledgedAt,
+    });
+    routeFetch({
+      "/bridge/delivery-issues": () => ({ total: 2, items: [item("evt_open", null), item("evt_old", "2026-11-21T08:00:00.000Z")] }),
+    });
+    renderDashboard();
+    fireEvent.click(await screen.findByRole("button", { name: "查看队列明细" }));
+    expect(await screen.findByText("rec_evt_open")).toBeTruthy();
+    expect(screen.queryByText("rec_evt_old")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "显示已确认（1）" }));
+    expect(screen.getByText("rec_evt_old")).toBeTruthy();
+    expect(screen.getByText("死信·已确认")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "隐藏已确认（1）" }));
+    expect(screen.queryByText("rec_evt_old")).toBeNull();
+  });
+});

@@ -1161,5 +1161,13 @@ export function createBridge({
     getQueueStats() {
       return store.getQueueStats();
     },
+
+    listDeliveryIssues() {
+      return store.listDeliveryIssues();
+    },
+
+    acknowledgeDeadLetters(eventIds) {
+      return store.acknowledgeDeadLetters(eventIds, { now });
+    },
   };
 }

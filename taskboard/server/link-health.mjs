@@ -102,6 +102,15 @@ export function createLinkHealthMonitor({
     if (typeof timer.unref === "function") timer.unref();
   }
 
+  /**
+   * Re-sample now after an operator action, but only once `start()` has run:
+   * a test or injected server never probes the Bridge.
+   */
+  function refresh() {
+    if (!timer || closed) return Promise.resolve();
+    return sample();
+  }
+
   async function close() {
     closed = true;
     if (timer) clearInterval(timer);
@@ -130,7 +139,7 @@ export function createLinkHealthMonitor({
     };
   }
 
-  return { start, close, sample, snapshot, get intervalMs() { return intervalMs; } };
+  return { start, close, sample, refresh, snapshot, get intervalMs() { return intervalMs; } };
 }
 
 /** Keep only the field names the dashboard renders; the Bridge response is remote data. */
@@ -149,7 +158,7 @@ function viewHealth(body) {
         }
       : null,
     queue: queue && typeof queue === "object" && !Array.isArray(queue)
-      ? Object.fromEntries(["pending", "processing", "retryWait", "deadLetter"].map(key => [
+      ? Object.fromEntries(["pending", "processing", "retryWait", "deadLetter", "deadLetterAcknowledged"].map(key => [
           key,
           Number.isSafeInteger(queue[key]) && queue[key] >= 0 ? queue[key] : null,
         ]))
@@ -196,4 +205,42 @@ function validIso(value) {
 
 function safeCode(value) {
   return typeof value === "string" && /^[A-Z][A-Z0-9_]{1,100}$/u.test(value) ? value : null;
+}
+
+const ISSUE_STATES = new Set(["retry_wait", "dead_letter"]);
+const ISSUE_LIMIT = 200;
+
+function safeTime(value) {
+  return Number.isSafeInteger(value) && value > 0 ? new Date(value).toISOString() : null;
+}
+
+/**
+ * Reduce the Bridge delivery-issue list to the fields the dashboard shows.
+ * The Bridge already redacts, but its response is still remote data here.
+ */
+export function viewBridgeDeliveryIssues(body) {
+  const items = Array.isArray(body?.items) ? body.items.slice(0, ISSUE_LIMIT) : [];
+  return {
+    total: Number.isSafeInteger(body?.total) && body.total >= 0 ? body.total : items.length,
+    items: items.flatMap((item) => {
+      if (!item || typeof item !== "object" || typeof item.eventId !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u.test(item.eventId)
+        || !ISSUE_STATES.has(item.deliveryState)) return [];
+      const id = (value) => (typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(value) ? value : null);
+      return [{
+        eventId: item.eventId,
+        deliveryState: item.deliveryState,
+        source: item.source === "simulation" ? "simulation" : "feishu",
+        tableId: id(item.tableId),
+        recordId: id(item.recordId),
+        recordTitle: typeof item.recordTitle === "string" ? item.recordTitle.slice(0, 200) : null,
+        errorCode: safeCode(item.errorCode),
+        attempts: Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0,
+        nextAttemptAt: safeTime(item.nextAttemptAt),
+        createdAt: safeTime(item.createdAt),
+        updatedAt: safeTime(item.updatedAt),
+        acknowledgedAt: safeTime(item.acknowledgedAt),
+      }];
+    }),
+  };
 }
