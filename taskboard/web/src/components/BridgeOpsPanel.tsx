@@ -106,6 +106,14 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
             {issues ? text("收起明细", "Hide details") : text("查看队列明细", "Show queue details")}
           </button>
         )}
+        {issues && openDeadLetters.length > 0 && (
+          <button type="button" className="is-primary" disabled={busy || selected.size === 0} onClick={acknowledge}>
+            {text(`确认清除所选死信（${selected.size}）`, `Acknowledge selected (${selected.size})`)}
+          </button>
+        )}
+        {issues && total > issues.length && (
+          <span>{text(`仅显示最近 ${issues.length} 条，共 ${total} 条`, `Showing the latest ${issues.length} of ${total}`)}</span>
+        )}
         {message && <span className="vm-bridge-ops-message" role="status">{message}</span>}
       </div>
       {issues && (
@@ -166,14 +174,6 @@ export function BridgeOpsPanel({ health, text, onChanged }: { health: LinkHealth
               </tbody>
             </table>
           )}
-          <div className="vm-bridge-ops-actions">
-            {total > issues.length && (
-              <span>{text(`仅显示最近 ${issues.length} 条，共 ${total} 条`, `Showing the latest ${issues.length} of ${total}`)}</span>
-            )}
-            <button type="button" disabled={busy || selected.size === 0} onClick={acknowledge}>
-              {text(`确认清除所选死信（${selected.size}）`, `Acknowledge selected (${selected.size})`)}
-            </button>
-          </div>
         </div>
       )}
     </div>

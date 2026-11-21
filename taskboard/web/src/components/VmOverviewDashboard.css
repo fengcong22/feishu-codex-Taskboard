@@ -371,6 +371,7 @@
   cursor: pointer;
 }
 .vm-bridge-ops-actions button:disabled { cursor: default; opacity: .5; }
+.vm-bridge-ops-actions button.is-primary { border-color: var(--status-blocked); color: var(--status-blocked); }
 .vm-bridge-ops-message { color: var(--text-secondary); }
 .vm-bridge-ops-list { display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow: auto; }
 .vm-bridge-ops-list table { width: 100%; border-collapse: collapse; font-size: 11px; }
@@ -381,6 +382,6 @@
   text-align: left;
   white-space: nowrap;
 }
-.vm-bridge-ops-list th { color: var(--text-tertiary); font-weight: 500; }
+.vm-bridge-ops-list th { position: sticky; top: 0; background: var(--surface); color: var(--text-tertiary); font-weight: 500; }
 .vm-bridge-ops-list tr.is-acknowledged td { color: var(--text-tertiary); }
 .vm-bridge-ops-empty { color: var(--text-tertiary); font-size: 11px; }
