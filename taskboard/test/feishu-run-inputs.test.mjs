@@ -392,3 +392,62 @@ test("video-original run inputs emit only the audio mode", async () => {
     await rm(fixtureData.packageRoot, { recursive: true, force: true });
   }
 });
+
+const EDIT_TEMPLATE = { id: "document_edit_zip", version: 1 };
+const PACKAGE_OPTIONS = { selfEdit: false, defaultSfx: true, bgm: false, preset: "politics-fine" };
+
+test("document_edit_zip run inputs hand the subject's package options to the manifest", async () => {
+  const fixtureData = await fixture();
+  try {
+    const request = input(fixtureData);
+    request.packageSnapshot.workflowTemplate = EDIT_TEMPLATE;
+    request.subjectVersion.packageOptions = PACKAGE_OPTIONS;
+    const result = await prepareFeishuRunInputs(request);
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    assert.deepEqual(manifest.package_options, {
+      self_edit: false, default_sfx: true, bgm: false, preset: "politics-fine",
+    });
+    assert.equal(result.manifestSha256, sourceManifestSha256(manifest, { workflowTemplate: EDIT_TEMPLATE }));
+    // The options are part of the hashed identity: different options, different hash.
+    const changed = sourceManifestSha256({ ...manifest, package_options: { ...manifest.package_options, bgm: true } },
+      { workflowTemplate: EDIT_TEMPLATE });
+    assert.notEqual(changed, result.manifestSha256);
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+test("Lite run inputs never write package options, even if the snapshot carries them", async () => {
+  const fixtureData = await fixture();
+  try {
+    const request = input(fixtureData);
+    request.subjectVersion.packageOptions = PACKAGE_OPTIONS;
+    const result = await prepareFeishuRunInputs(request);
+    const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+    assert.equal(Object.hasOwn(manifest, "package_options"), false);
+  } finally {
+    await rm(fixtureData.dataDirectory, { recursive: true, force: true });
+    await rm(fixtureData.packageRoot, { recursive: true, force: true });
+  }
+});
+
+for (const [label, packageOptions] of [
+  ["missing", undefined],
+  ["incomplete", { ...PACKAGE_OPTIONS, preset: null }],
+]) {
+  test(`document_edit_zip run inputs are blocked when the package options are ${label}`, async () => {
+    const data = await fixture();
+    try {
+      const request = input(data);
+      request.packageSnapshot.workflowTemplate = EDIT_TEMPLATE;
+      if (packageOptions) request.subjectVersion.packageOptions = packageOptions;
+      await assert.rejects(prepareFeishuRunInputs(request), { code: "AUTOCUT_PACKAGE_OPTIONS_MISSING" });
+      assert.deepEqual(await readdir(data.dataDirectory), []);
+      assert.deepEqual(await readdir(data.packageRoot), []);
+    } finally {
+      await rm(data.dataDirectory, { recursive: true, force: true });
+      await rm(data.packageRoot, { recursive: true, force: true });
+    }
+  });
+}

@@ -456,7 +456,18 @@ export interface FeishuVmPmoWorkflowConfig {
 
 export type FeishuZipWorkflowConfig = Pick<FeishuSubjectConfig,
   "trigger" | "title" | "execution" | "packageRoute" | "upload" | "statusField"
-  | "reviewStatusField" | "documentField" | "namingField" | "stages" | "delivery">;
+  | "reviewStatusField" | "documentField" | "namingField" | "stages" | "delivery" | "packageOptions">;
+
+/** Preset names shared with auto-cut-autoedit; do not rename. */
+export type FeishuPackagePreset = "politics-fine" | "civics-medium" | "english-dub" | "general-medium";
+
+/** document_edit_zip options. Null while drafting; all four must be set to enable. */
+export interface FeishuPackageOptions {
+  selfEdit: boolean | null;
+  defaultSfx: boolean | null;
+  bgm: boolean | null;
+  preset: FeishuPackagePreset | null;
+}
 
 export interface FeishuPackageWorkflowDraft<Config = FeishuVmPmoWorkflowConfig> {
   subjectKey: string;
@@ -817,6 +828,8 @@ export interface FeishuSubjectConfig {
   namingField?: { fieldId: string; fieldName: string; kind?: string };
   stages?: FeishuStageConfigMap;
   delivery?: FeishuDeliveryConfig | null;
+  /** Only for document_edit_zip packages (auto-cut-autoedit). */
+  packageOptions?: FeishuPackageOptions | null;
   trigger?: { fieldId: string; fieldName: string; startValue: string; optionId: string | null };
   title?: { fieldId: string | null; fieldName: string | null };
   execution?: { mode: "manual" | "automatic"; concurrencyGroup: string; maxConcurrent: number; resourceGroups: string[] };

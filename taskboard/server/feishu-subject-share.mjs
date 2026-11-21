@@ -2,10 +2,11 @@ import { ApiError } from "./database.mjs";
 import { subjectProjectId, validateSubjectConfig } from "./feishu-workflow-store.mjs";
 import { normalizeVmPackageWorkflowConfig } from "./feishu-package-workflow-drafts.mjs";
 import { isZipWorkflowTemplate, normalizePackageWorkflowTemplate, profileTemplate } from "../shared/feishu-package-workflow.mjs";
+import { isEditPackageTemplate } from "../shared/feishu-package-options.mjs";
 
 const ZIP = "document_draft_zip";
 const VM = "vm_pmo_review_video";
-const CONFIG_KEYS = ["trigger", "title", "execution", "packageRoute", "upload", "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery"];
+const CONFIG_KEYS = ["trigger", "title", "execution", "packageRoute", "upload", "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery", "packageOptions"];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const ROUTE = "/api/local/feishu/workflow/subject-share";
 const clone = (value) => structuredClone(value);
@@ -70,6 +71,9 @@ function normalizeConfig(config, template, source, packageAlias, { portable = fa
     return normalized;
   }
   if (config.packageRoute?.packageAlias !== packageAlias) throw new ApiError(400, "PACKAGE_WORKFLOW_MISMATCH", "Shared package alias does not match its configuration");
+  if (config.packageOptions !== undefined && config.packageOptions !== null && !isEditPackageTemplate(template)) {
+    throw new ApiError(400, "PACKAGE_OPTIONS_UNSUPPORTED", "只有 document_edit_zip 剪辑包可以设置剪辑包选项", { path: "config.packageOptions" });
+  }
   const value = validateSubjectConfig({ ...clone(config), ...subjectIdentity(source.subjectKey),
     baseName: source.baseName, tableName: source.tableName, displayEnabled: true, lifecycle: "draft", configVersion: 1, metadata: null,
   }, { projectLegacyTrigger: true });

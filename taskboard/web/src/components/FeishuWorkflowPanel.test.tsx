@@ -2841,3 +2841,90 @@ describe("FeishuWorkflowPanel audio drafts", () => {
     expect(JSON.stringify(patch)).not.toMatch(/audioDraft|temporary|cache/i);
   });
 });
+
+describe("document_edit_zip package options", () => {
+  const editTemplate = { id: "document_edit_zip", version: 1 } as const;
+  const liteTemplate = { id: "document_draft_zip", version: 1 } as const;
+  const packageList = [["auto-cut-autoedit", editTemplate], ["zip-a", liteTemplate]].map(([alias, workflowTemplate]) => ({
+    alias, name: alias, projectId: alias, workspacePath: null, model: null, reasoningEffort: null, prompt: null,
+    zipSourceDirectory: null, maxConcurrent: 1, resourceGroups: [], state: "enabled",
+    revision: 1, updatedAt: "now", referenceCount: 0, references: [], workflowTemplate,
+  })) as FeishuPackageSummary[];
+  function profileFor(key: string, alias: string, revision = 2, packageOptions?: unknown) {
+    const source = subject(key, key);
+    // The server reports both document → ZIP templates under the shared profile key.
+    return { subjectKey: key, packageAlias: alias, workflowTemplate: liteTemplate, revision, updatedAt: null,
+      config: { trigger: source.trigger, title: source.title, execution: source.execution,
+        packageRoute: { ...source.packageRoute!, packageAlias: alias }, upload: source.upload,
+        statusField: source.statusField, documentField: source.documentField, namingField: source.namingField,
+        stages: source.stages, delivery: null, ...(packageOptions ? { packageOptions } : {}) } };
+  }
+  function setup(alias: string, packageOptions?: unknown) {
+    const configured = { ...subject("options-subject", "道法"), preferredPackageAlias: alias };
+    configured.packageRoute!.packageAlias = alias;
+    vi.mocked(listFeishuPackages).mockResolvedValue(packageList);
+    vi.mocked(getFeishuPackageWorkflowDraft).mockImplementation(async (key, requested) => profileFor(key, requested, 2,
+      requested === alias ? packageOptions : undefined) as never);
+    vi.mocked(saveFeishuPackageWorkflowDraft).mockImplementation(async (key, requested, revision, config) => ({ ...profileFor(key, requested, revision + 1), config }) as never);
+    return render(<FeishuWorkflowPanel catalog={catalog(configured)} configurationBaseToken="bas_test"
+      selectedSubjectKey={configured.subjectKey} onSelectSubject={vi.fn()} onCatalogChange={vi.fn()} onSubjectChange={vi.fn()} />);
+  }
+  afterEach(() => { cleanup(); vi.clearAllMocks(); vi.mocked(listFeishuPackages).mockResolvedValue([]); });
+
+  it("shows the switches and preset only while a document_edit_zip package is selected", async () => {
+    setup("auto-cut-autoedit");
+    await screen.findByText("草稿版本 2");
+    const options = screen.getByRole("group", { name: "剪辑包选项" });
+    for (const name of ["初稿自动剪辑", "音效需求", "BGM"]) expect(within(options).getByRole("radiogroup", { name })).toBeTruthy();
+    expect(options.textContent).toContain("按常规剪辑规则自行处理（停顿、气口、讲错、重复、打嗝），同时处理讲师意见");
+    expect(options.textContent).toContain("只处理讲师意见");
+    expect(options.textContent).toContain("不自动加；讲师意见附了音效文件就照放，没附就写进反馈表");
+    expect(options.textContent).toContain("需要加 BGM（目前在反馈表提示人工添加，并留一条空 BGM 轨）");
+    const preset = within(options).getByRole("combobox", { name: "剪辑预设" }) as HTMLSelectElement;
+    expect([...preset.options].map((option) => option.textContent)).toEqual(["请选择剪辑预设", "政治精剪", "道法中剪", "英语配音", "通用"]);
+    expect([...preset.options].map((option) => option.value)).toEqual(["", "politics-fine", "civics-medium", "english-dub", "general-medium"]);
+    const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
+    expect(enable.disabled).toBe(true);
+    expect(enable.title).toContain("初稿自动剪辑");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Auto-Cut 包" }), { target: { value: "zip-a" } });
+    await waitFor(() => expect(screen.queryByRole("group", { name: "剪辑包选项" })).toBeNull());
+    await screen.findByText("草稿版本 2");
+    expect(screen.getByRole("spinbutton", { name: "上传并发数" })).toBeTruthy();
+    expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).title).not.toContain("剪辑包选项");
+  });
+
+  it("saves the chosen options with the autoedit profile and unblocks activation", async () => {
+    setup("auto-cut-autoedit");
+    await screen.findByText("草稿版本 2");
+    fireEvent.click(screen.getByRole("radio", { name: "初稿自动剪辑：关" }));
+    fireEvent.click(screen.getByRole("radio", { name: "音效需求：开" }));
+    expect((screen.getByRole("button", { name: "启用" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: "BGM：关" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "剪辑预设" }), { target: { value: "civics-medium" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await screen.findByText("草稿版本 3");
+    expect(vi.mocked(saveFeishuPackageWorkflowDraft).mock.calls[0][3]).toMatchObject({
+      packageOptions: { selfEdit: false, defaultSfx: true, bgm: false, preset: "civics-medium" },
+    });
+    const enable = screen.getByRole("button", { name: "启用" }) as HTMLButtonElement;
+    expect(enable.disabled).toBe(false);
+  });
+
+  it("reopens saved options and never sends them for a Lite package", async () => {
+    setup("auto-cut-autoedit", { selfEdit: true, defaultSfx: false, bgm: true, preset: "english-dub" });
+    await screen.findByText("草稿版本 2");
+    expect((screen.getByRole("radio", { name: "初稿自动剪辑：开" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("radio", { name: "音效需求：关" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("radio", { name: "BGM：开" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("combobox", { name: "剪辑预设" }) as HTMLSelectElement).value).toBe("english-dub");
+    cleanup();
+
+    setup("zip-a");
+    await screen.findByText("草稿版本 2");
+    fireEvent.change(screen.getByRole("spinbutton", { name: "上传并发数" }), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await screen.findByText("草稿版本 3");
+    expect(Object.hasOwn(vi.mocked(saveFeishuPackageWorkflowDraft).mock.calls[0][3] as object, "packageOptions")).toBe(false);
+  });
+});

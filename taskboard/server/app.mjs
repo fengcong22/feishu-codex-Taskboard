@@ -3735,6 +3735,13 @@ export function createTaskboardServer(options = {}) {
         ? await feishuPackages.get(alias) : (await feishuPackages.read())[alias];
       if (record) await assertExecutablePackageWorkflow(record);
     },
+    // Read the registered template only; packageOptions follow document_edit_zip packages.
+    packageWorkflowTemplate: async (alias) => {
+      const record = typeof feishuPackages.get === "function"
+        ? await feishuPackages.get(alias) : (await feishuPackages.read())[alias];
+      if (!record) return null;
+      try { return normalizePackageWorkflowTemplate(record.workflowTemplate); } catch { return null; }
+    },
     packageAliases: async () => (typeof feishuPackages.list === "function"
       ? (await feishuPackages.list()).filter((record) => record.state === "enabled").map((record) => record.alias)
       : Object.keys(await feishuPackages.read()).filter((alias) => alias)),

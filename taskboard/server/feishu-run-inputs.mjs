@@ -1,6 +1,7 @@
 import { mkdir, realpath, stat, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { assertPackageWorkflowExecutable } from "../shared/feishu-package-workflow.mjs";
+import { isEditPackageTemplate, manifestPackageOptions } from "../shared/feishu-package-options.mjs";
 
 import {
   createSourceManifest,
@@ -74,6 +75,16 @@ function sourceToManifest(source, name) {
   throw fail("AUTOCUT_SOURCE_INVALID", `${name}.kind is unsupported`, 409);
 }
 
+/** document_edit_zip runs hand the subject's options to the package; other templates never do. */
+function packageOptionsFor(workflowTemplate, subjectVersion) {
+  if (!isEditPackageTemplate(workflowTemplate)) return undefined;
+  try {
+    return manifestPackageOptions(subjectVersion?.packageOptions);
+  } catch {
+    throw fail("AUTOCUT_PACKAGE_OPTIONS_MISSING", "The subject version has no complete package options for this package");
+  }
+}
+
 function stageFor(origin, subjectVersion) {
   const stageId = text(origin.stageId ?? origin.stage_id, "origin.stageId");
   const stages = subjectVersion?.stages;
@@ -127,7 +138,8 @@ export async function prepareFeishuRunInputs({
   packageSnapshot,
   controlledContext,
 }) {
-  assertPackageWorkflowExecutable(packageSnapshot?.workflowTemplate);
+  const workflowTemplate = assertPackageWorkflowExecutable(packageSnapshot?.workflowTemplate);
+  const packageOptions = packageOptionsFor(workflowTemplate, subjectVersion);
   const root = path.resolve(text(dataDirectory, "dataDirectory"));
   const taskId = identifier(task?.id ?? origin?.taskId, "task.id");
   const runId = identifier(run?.runId ?? run?.id, "run.id");
@@ -214,9 +226,11 @@ export async function prepareFeishuRunInputs({
         };
       })(),
     },
+    ...(packageOptions === undefined ? {} : { package_options: packageOptions }),
   };
-  const created = createSourceManifest(manifestInput);
-  await writeSourceManifest(manifestPath, created.manifest);
+  const manifestOptions = { workflowTemplate };
+  const created = createSourceManifest(manifestInput, manifestOptions);
+  await writeSourceManifest(manifestPath, created.manifest, manifestOptions);
   await atomicJson(executionInputPath, { schema_version: 1, artifact_name: artifactName });
   return {
     manifestPath,

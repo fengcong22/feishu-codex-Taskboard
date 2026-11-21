@@ -10,11 +10,13 @@ import { listenOnFetchSafePort, listenTaskboardOnFetchSafePort } from "../../tes
 import { createTaskboardServer } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import { subjectProjectId } from "../server/feishu-workflow-store.mjs";
+import { sourceManifestSha256 } from "../server/feishu-source-manifest.mjs";
 import { createStoredZip } from "./stored-zip-fixture.mjs";
 
 const SECRET = "lifecycle-fixture-secret";
 const SUBJECT_KEY = "bas_lifecycle:tbl_math";
 const EDIT_TEMPLATE = { id: "document_edit_zip", version: 1 };
+const EDIT_PACKAGE_OPTIONS = { selfEdit: true, defaultSfx: false, bgm: true, preset: "english-dub" };
 
 async function jsonRequest(baseUrl, pathname, body, { method = "POST", headers = {} } = {}) {
   const response = await fetch(`${baseUrl}${pathname}`, {
@@ -223,6 +225,7 @@ if (args[0] === "debug") {
     workspacePath,
     zipSourceDirectory,
     serverOptions,
+    editPackage,
   };
 }
 
@@ -312,6 +315,8 @@ async function registerSubject(fixture, {
       uploadConcurrency: 1,
     },
     ...(delivery === undefined ? {} : { delivery }),
+    // A document_edit_zip subject is enabled only with its package options set.
+    ...(fixture.editPackage ? { packageOptions: EDIT_PACKAGE_OPTIONS } : {}),
   }, { method: "PATCH" });
   assert.equal(patch.response.status, 200, JSON.stringify(patch.body));
   const enabled = await jsonRequest(fixture.baseUrl, `${route}/enable`, {
@@ -2814,8 +2819,53 @@ test("a document_edit_zip package runs locally and its edit bundle ZIP is verifi
   }
 });
 
+for (const edit of [true, false]) {
+  test(`a ${edit ? "document_edit_zip" : "Lite"} run's source manifest ${edit ? "carries the subject's package options" : "has no package options"}`, async () => {
+    const controlledContext = {
+      documentLinks: ["https://guanghe.feishu.cn/docx/autoedit-options"],
+      namingDisplayValue: "剪辑包选项",
+      namingValueUnique: true,
+    };
+    const manifests = [];
+    const fixture = await createFixture({
+      controlledContext,
+      allowAutomaticExecution: true,
+      editPackage: edit,
+      autoCutRunner: async ({ run }) => {
+        manifests.push({ run, manifest: JSON.parse(await readFile(run.manifestPath, "utf8")) });
+        await writePassingRunResult(run, { edit });
+        return { exitCode: 0 };
+      },
+    });
+    try {
+      const subject = await registerSubject(fixture, { executionMode: "automatic" });
+      assert.deepEqual(subject.packageOptions, edit ? EDIT_PACKAGE_OPTIONS : undefined);
+      const created = await jsonRequest(fixture.baseUrl, "/api/local/feishu/tasks", registration(subject, controlledContext));
+      assert.equal(created.response.status, 201, JSON.stringify(created.body));
+      await waitForTaskStatus(fixture.app, created.body.task.id, "done", 30_000);
+      assert.equal(manifests.length, 1);
+      const [{ run, manifest }] = manifests;
+      if (edit) {
+        assert.deepEqual(manifest.package_options, {
+          self_edit: true, default_sfx: false, bgm: true, preset: "english-dub",
+        });
+      } else {
+        assert.equal(Object.hasOwn(manifest, "package_options"), false);
+      }
+      // The options are part of the manifest identity handed to the package.
+      assert.equal(run.manifestSha256, sourceManifestSha256(manifest, {
+        workflowTemplate: edit ? EDIT_TEMPLATE : { id: "document_draft_zip", version: 1 },
+      }));
+    } finally {
+      await fixture.app.close();
+      await fixture.bridge.close();
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+}
+
 for (const [label, options, code] of [
-  ["a Lite receipt", { edit: true, receiptOverrides: { workflow_mode: "lite", delivery_mode: "lite_zip" } }, "autocut_package_receipt_invalid"],
+  ["a Lite receipt",{ edit: true, receiptOverrides: { workflow_mode: "lite", delivery_mode: "lite_zip" } }, "autocut_package_receipt_invalid"],
   ["a JianYing draft ZIP", { edit: false, receiptOverrides: { workflow_mode: "autoedit", delivery_mode: "edit_zip" } }, "AUTOCUT_ARTIFACT_REPORT_FAILED"],
   ["a bundle without the project XML", { edit: true, entries: [
     { name: "自动剪辑负例/自动剪辑负例.mp4", content: "video" },

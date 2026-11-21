@@ -13845,6 +13845,13 @@ kbd {
 .feishu-delivery-settings { display: grid; gap: 10px; }
 .feishu-delivery-toggle { display: inline-flex; min-width: 0; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 10px; }
 .feishu-delivery-toggle input { width: 14px; height: 14px; margin: 0; accent-color: var(--accent); }
+.feishu-package-options { display: grid; gap: 10px; }
+.feishu-package-option { display: grid; grid-template-columns: 96px minmax(0, 1fr); align-items: start; gap: 6px 12px; padding-top: 8px; border-top: var(--border-hairline) solid var(--border); }
+.feishu-package-option-label { color: var(--text-primary); font-size: 11px; font-weight: 600; }
+.feishu-package-option[role="radiogroup"] .feishu-package-option-label { grid-row: span 2; }
+.feishu-package-option select { max-width: 240px; }
+.feishu-package-option-choice { display: flex; min-width: 0; align-items: flex-start; gap: 7px; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
+.feishu-package-option-choice input { width: 14px; height: 14px; margin: 2px 0 0; flex: none; accent-color: var(--accent); }
 .feishu-delivery-writeback { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .feishu-delivery-stage { min-width: 0; padding: 9px; border: var(--border-hairline) solid var(--border); border-radius: 5px; background: var(--surface-muted); }
 .feishu-delivery-stage h4 { margin: 0 0 8px; color: var(--text-secondary); font-size: 10px; font-weight: 600; }

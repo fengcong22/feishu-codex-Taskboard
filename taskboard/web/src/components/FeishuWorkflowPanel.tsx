@@ -4,6 +4,7 @@ import type {
   FeishuFieldMetadata,
   FeishuDeliveryAssignment,
   FeishuDeliveryConfig,
+  FeishuPackageOptions,
   FeishuPackageSummary,
   FeishuStageConfig,
   FeishuStageConfigMap,
@@ -38,6 +39,7 @@ import { packageDisplayName } from "../feishuPackageDisplay";
 import { RefreshIcon } from "./SemanticIcons";
 import { useFeishuConfigurationLayout } from "./useFeishuConfigurationLayout";
 import { FeishuVmPmoWorkflowEditor, type VmPmoDraftCache } from "./FeishuVmPmoWorkflowEditor";
+import { FeishuPackageOptionsEditor, packageOptionsIncompleteReason } from "./FeishuPackageOptionsEditor";
 
 export interface FeishuWorkflowPanelProps {
   catalog: FeishuBaseCatalog[];
@@ -235,6 +237,8 @@ type SubjectForm = {
   namingFieldName: string;
   stages: FeishuStageConfigMap | null;
   delivery: FeishuDeliveryConfig | null;
+  /** document_edit_zip packages only; null until an option is chosen. */
+  packageOptions: FeishuPackageOptions | null;
 };
 
 type SubjectAudioDrafts = {
@@ -283,7 +287,7 @@ function reconcileAudioDraftMetadata(audio: SubjectAudioDrafts["stages"], fields
 function subjectWithProfile(subject: FeishuSubjectConfig, config: FeishuZipWorkflowConfig): FeishuSubjectConfig {
   return { ...subject, trigger: undefined, title: undefined, execution: undefined, packageRoute: undefined,
     upload: undefined, statusField: undefined, reviewStatusField: undefined, documentField: undefined,
-    namingField: undefined, stages: undefined, delivery: null, ...config };
+    namingField: undefined, stages: undefined, delivery: null, packageOptions: undefined, ...config };
 }
 
 /** Retain local changes while adopting untouched values from a refreshed draft. */
@@ -463,6 +467,7 @@ function formForSubject(subject: FeishuSubjectConfig, reconcile = true): Subject
       ? stageDefaults(subject, fields)
       : null,
     delivery: subject.delivery ? structuredClone(subject.delivery) : null,
+    packageOptions: subject.packageOptions ? { ...subject.packageOptions } : null,
   };
   // Pending bindings are saved empty selections, not unsaved metadata repairs.
   const pendingFields = new Set(["pending", "pending_status_field", "pending_review_status_field", "pending_document_field", "pending_naming_field"]);
@@ -625,6 +630,7 @@ function editableSubjectSignature(subject: FeishuSubjectConfig): string {
     namingField: subject.namingField ?? null,
     stages: subject.stages ?? null,
     delivery: subject.delivery ?? null,
+    packageOptions: subject.packageOptions ?? null,
   });
 }
 
@@ -826,6 +832,8 @@ export function FeishuWorkflowPanel({
       || (!profileMode && phasedFieldNamesNeedRefresh(selected))
       || (!profileMode && metadataRefreshNeedsSaveRef.current.get(selected.subjectKey) === selected.configVersion)));
   const isVmWorkflow = workflowTemplate?.id === "vm_pmo_review_video" && workflowTemplate.version === 1;
+  // auto-cut-autoedit takes per-subject package options; other packages never see them.
+  const isEditWorkflow = workflowTemplate?.id === "document_edit_zip" && workflowTemplate.version === 1;
   const workflowUnknown = Boolean(workflowTemplate && !isVmWorkflow && !isZipWorkflow);
   const visibleSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => subject.displayEnabled);
   const hiddenSubjects = (base: FeishuBaseCatalog) => base.subjects.filter((subject) => !subject.displayEnabled);
@@ -965,6 +973,8 @@ export function FeishuWorkflowPanel({
                   ? "请填写上传路径"
                   : phased && phasedValidationErrors.length > 0
                     ? phasedValidationErrors[0]
+                    : isEditWorkflow && packageOptionsIncompleteReason(subjectForm.packageOptions)
+                      ? packageOptionsIncompleteReason(subjectForm.packageOptions)!
                     : namingFieldTypeWarning
                       ? namingFieldTypeWarning
                     : courseNamingBindingWarning
@@ -1415,6 +1425,8 @@ export function FeishuWorkflowPanel({
           stages: subjectForm.stages,
         } : {}),
         ...(subjectForm.stages ? { delivery: subjectForm.delivery } : {}),
+        // Only document_edit_zip packages carry options; a profile for any other package omits them.
+        ...(isEditWorkflow && subjectForm.packageOptions ? { packageOptions: subjectForm.packageOptions } : {}),
       };
       if (!profileMode) {
         const subject = await (onSaveDraft ? onSaveDraft(selected.subjectKey, patch) : saveFeishuWorkflowDraft(selected.subjectKey, patch));
@@ -1949,6 +1961,11 @@ export function FeishuWorkflowPanel({
             {onOpenLocalSettings && <button className="button secondary" type="button" onClick={onOpenLocalSettings}>本机设置</button>}
           </div>
         </section>
+        {isEditWorkflow && <FeishuPackageOptionsEditor
+          value={subjectForm.packageOptions}
+          disabled={busy || (!selectedPackage && !onSaveDraft && !onEnable)}
+          onChange={(packageOptions) => setSubjectForm({ ...subjectForm, packageOptions })}
+        />}
         {!phased && <fieldset className="feishu-config-card" disabled={busy || (!selectedPackage && !onSaveDraft && !onEnable)}>
           <legend>触发配置</legend>
           <div className="feishu-settings-grid">
