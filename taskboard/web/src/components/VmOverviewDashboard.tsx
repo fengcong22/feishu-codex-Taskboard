@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import "./VmOverviewDashboard.css";
 import { getVmOverview } from "../api";
+import { BridgeOpsPanel } from "./BridgeOpsPanel";
 import { useTaskboardI18n } from "../i18n";
 import type { LinkHealth, Task, VmOverview, VmOverviewTask } from "../types";
 
@@ -75,6 +76,7 @@ const LISTENER_LABELS: Record<string, [string, string]> = {
   disabled: ["监听器未启用，飞书事件不会进来", "Listener disabled, Feishu events are not received"],
   error: ["连接出错", "Connection error"],
   stopping: ["正在停止", "Stopping"],
+  stopped: ["长连接已停止", "Listener stopped"],
 };
 
 /** The Bridge row answers "is Feishu still reaching us, and how far behind". */
@@ -171,13 +173,19 @@ export function VmOverviewDashboard({ projectId, tasks, onOpenTask }: Props) {
   const { text } = useTaskboardI18n();
   const [overview, setOverview] = useState<VmOverview | null>(null);
   const [error, setError] = useState(false);
+  const [reload, setReload] = useState(0);
+  const loadedProject = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controller = new AbortController();
-    setOverview(null);
-    setError(false);
+    // A Bridge action asks for a fresh read; only a project switch clears the view.
+    if (loadedProject.current !== projectId) {
+      loadedProject.current = projectId;
+      setOverview(null);
+      setError(false);
+    }
 
     async function load() {
       try {
@@ -198,7 +206,7 @@ export function VmOverviewDashboard({ projectId, tasks, onOpenTask }: Props) {
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [projectId]);
+  }, [projectId, reload]);
 
   const taskById = useMemo(() => new Map(tasks.map(task => [task.id, task])), [tasks]);
 
@@ -421,6 +429,7 @@ export function VmOverviewDashboard({ projectId, tasks, onOpenTask }: Props) {
                 <b>{row.value}</b>
               </div>
             ))}
+            <BridgeOpsPanel health={overview.linkHealth} text={text} onChanged={() => setReload(value => value + 1)} />
           </div>
         </section>
       )}

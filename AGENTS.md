@@ -87,7 +87,7 @@ npm test
 
 生命周期归档按“同一记录、触发字段和阶段的全部匹配流程任务”筛选；如果离开阶段事件延迟到一次快速“离开 → 再次进入同一阶段”之后，旧事件可能把新一轮仍为 `todo` 的任务一并归档。这是当前至少一次事件模型下的已知边界，后续如需严格按轮次隔离再增加记录版本/事件顺序约束。
 
-健康接口 `/health` 返回脱敏的监听器对象（`state`、`lastEventAt`、`lastError`）和队列计数（`pending`、`processing`、`retryWait`、`deadLetter`）。模拟事件在已持久化的 `retry_wait` 或 `dead_letter` 结果下返回 HTTP 202，表示 Bridge 已安全接收并记录，不能据此要求飞书重复投递。
+健康接口 `/health` 返回脱敏的监听器对象（`state`、`lastEventAt`、`lastError`）和队列计数（`pending`、`processing`、`retryWait`、`deadLetter`、`deadLetterAcknowledged`）。仪表盘可经 Taskboard 以本机共享密钥调用 Bridge 的三个运维接口：`GET /api/local/bridge/delivery-issues` 只读列出待重试与死信事件的标识、安全错误码和时间；`POST /api/local/bridge/dead-letters/acknowledge` 只给选中的死信加 `deadLetterAcknowledgedAt` 标记，记录仍为终态 `dead_letter` 以保持 `event_id` 去重，不重试、不建任务、不删除；`POST /api/local/bridge/listener/start` 在监听器为 disabled、error 或 stopped 时于进程内创建官方 SDK 长连接，已在启动或已接管时复用现有连接，启动后该进程不再接受模拟事件，断连期间的改动不补跑，重启时仍须使用 `-EnableFeishu`。这三个接口不接受 `local-operator` 客户端；Taskboard 侧对应 `/api/local/feishu/bridge/*` 只接受 loopback 且带 `x-taskboard-client: web` 的请求。模拟事件在已持久化的 `retry_wait` 或 `dead_letter` 结果下返回 HTTP 202，表示 Bridge 已安全接收并记录，不能据此要求飞书重复投递。
 
 ## 变更规则
 

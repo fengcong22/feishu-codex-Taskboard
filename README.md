@@ -146,7 +146,7 @@ Auto-cut-slicing 的业务列为：待处理 → 素材准备 → 排队中 → 
 | 三阶段工作流 | Taskboard 管理的活动配置可分别启用 `initial`、`first_review`、`final_review`；“初稿触发字段”用于初稿，“审核修改触发字段”共用于初审修改和终审修改。审核字段未单独选择时兼容使用初稿字段。Bridge 只在记录从其他 option 进入已启用阶段 option 时登记该阶段任务。 |
 | Auto-Cut 与产物 | Taskboard 负责统一执行入口、并发控制、Auto-Cut 调用、剪映草稿/ZIP 校验以及本地或 NAS 上传；这些能力不在 Bridge 进程中执行。 |
 | 可靠投递 | 投递状态持久化重试，临时 Taskboard 故障按有限退避处理，Bridge 重启后恢复未完成租约。 |
-| 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。 |
+| 死信可见性 | 超过重试上限的事件进入 `dead_letter`，可从健康接口的队列计数定位。仪表盘“链路健康”的“查看队列明细”列出待重试和死信事件（时间、记录、安全错误码、次数），可勾选死信后“确认清除”：记录保留在状态文件中（同一 `event_id` 重放仍被去重），只标记 `deadLetterAcknowledgedAt` 并改计入健康接口的 `deadLetterAcknowledged`，不重试、不建任务。 |
 | VM 成片归档恢复 | 仅对真实 VM `final_archive` 死信提供绑定 run、delivery、artifact、SHA 与字节数的本机受限重试；其他死信仍不可手工重放。 |
 | 状态文件保护 | 损坏的状态文件、无效租约或不完整快照会安全停留在可诊断状态；读写（包括健康队列统计）使用同一稳定路径校验和操作系统本机互斥锁，写入使用原子替换，崩溃后可安全恢复；Bridge 启动时在同一互斥锁内清理超过 10 分钟的残留 `state.json.<uuid>.tmp`，不触碰状态文件本身。状态文件必须是稳定的普通文件，不接受符号链接或硬链接别名。 |
 | Base 元数据预览 | `POST /api/feishu/base-preview` 只接受携带 `x-feishu-bridge-client: taskboard` 和本机共享密钥的 Taskboard 请求；在本机配置飞书凭据后，它仅执行只读 metadata 操作，按 Base 链接读取 Base、子表、字段和单选项元数据。即使长连接监听关闭，预览仍可使用，且不会启用子表或接收事件。 |
@@ -222,7 +222,7 @@ Set-Location ..
 
 浏览器会打开 Taskboard：<http://127.0.0.1:47823>。
 
-> 这是本机模拟体验的启动方式，飞书长连接是关闭的，脚本结束时会输出 `Feishu listener is DISABLED` 警告。接收真实飞书事件的生产电脑必须用 `.\scripts\start-local.ps1 -EnableFeishu`（或双击 `启动-Taskboard.bat`）启动，并用 `.\scripts\check-local.ps1 -RequireFeishu` 检查。用不带开关的命令重启生产电脑会让飞书表格的改动静默丢失：Bridge 不会扫描补跑断连期间的改动，重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。此时仪表板“飞书 Bridge”一行会标红并显示“监听器未启用，飞书事件不会进来”。
+> 这是本机模拟体验的启动方式，飞书长连接是关闭的，脚本结束时会输出 `Feishu listener is DISABLED` 警告。接收真实飞书事件的生产电脑必须用 `.\scripts\start-local.ps1 -EnableFeishu`（或双击 `启动-Taskboard.bat`）启动，并用 `.\scripts\check-local.ps1 -RequireFeishu` 检查。用不带开关的命令重启生产电脑会让飞书表格的改动静默丢失：Bridge 不会扫描补跑断连期间的改动，重新开启后若该记录仍未登记任务，再在飞书中把记录改离触发选项后改回。此时仪表板“飞书 Bridge”一行会标红并显示“监听器未启用，飞书事件不会进来”，同时提供“启动长连接”按钮；连接出错时显示“重连长连接”。按钮经 Taskboard 用本机共享密钥调用 Bridge 的 `POST /api/local/bridge/listener/start`，在不重启进程的情况下创建官方 SDK 长连接（需要 `.env.local` 中的飞书凭据）。启动后该 Bridge 进程不再接受模拟事件；断连期间的改动仍不补跑。下次重启仍须带 `-EnableFeishu`，启动脚本不会记住这次操作。
 
 ### 2. 检查运行状态
 
@@ -404,7 +404,7 @@ npm install
 - Bridge 不会自动启动或停止 Codex；它只把经过筛选的事件登记为受控任务。执行发生在 Taskboard 中。
 - 课程交付配置可以在草稿中保存上传开关、课程命名字段、已有单选项回写规则与 `00成片` 触发条件；启用前会重新检查字段与选项。配置共享只保留字段/选项 ID，课程总路径始终是本机绑定。实际 ZIP 发布、目录创建和飞书回写由交付 worker 执行，不能由普通任务或模拟事件触发。
 - 当前 SDK 没有公开的物理 socket 确认或连接生命周期回调；健康接口不会伪造 `connected` 状态。
-- 通用队列仍没有无条件的人工 `dead_letter` 重试 endpoint。VM/PMO 支持两种独立的受限恢复：任务详情中的进度回写重试（同一 run 已完成、任务仍为“待验收”，两条原始意图均为死信），以及绑定原成片身份的 Bridge `final_archive` 死信重试（见上方脚本）。后者只接受本机 loopback 的 `POST /api/local/bridge/vm/final-archive-dead-letter/retry`，要求 JSON、loopback Host/Origin 与 `x-feishu-bridge-client: local-operator`；Bridge 投递 Taskboard 仍必须使用共享密钥认证的专用接口。模拟来源、非归档事件和身份不符的恢复均被拒绝。
+- 通用队列仍没有无条件的人工 `dead_letter` 重试 endpoint；仪表盘的“确认清除”只做标记，不重放事件。VM/PMO 支持两种独立的受限恢复：任务详情中的进度回写重试（同一 run 已完成、任务仍为“待验收”，两条原始意图均为死信），以及绑定原成片身份的 Bridge `final_archive` 死信重试（见上方脚本）。后者只接受本机 loopback 的 `POST /api/local/bridge/vm/final-archive-dead-letter/retry`，要求 JSON、loopback Host/Origin 与 `x-feishu-bridge-client: local-operator`；Bridge 投递 Taskboard 仍必须使用共享密钥认证的专用接口。模拟来源、非归档事件和身份不符的恢复均被拒绝。
 - 不提供多实例高可用（HA）；补偿 worker 在单个 Bridge 进程内串行运行。
 - 投递语义是至少一次；同机状态锁只封闭 Bridge 状态文件的并发窗口。Taskboard 专用登记接口对非空 `event_id` 使用数据库唯一索引，迁移后的兼容触发器也会为旧版 Taskboard 写入占用同一全局键，并在精确重放时返回已有任务，因此 POST 成功但 Bridge 尚未提交状态时可安全重放；身份或受控上下文发生变化时会 fail-closed 返回冲突。服务端登记的飞书任务可以归档、恢复，并在无活动执行或上传时永久删除；删除记录继续保留事件占用，精确重放由 Bridge 记录为已忽略，避免旧事件重新创建任务。
 - `stateFile` 必须保持稳定的普通文件路径；不支持状态文件本身的符号链接、硬链接或多链接别名，也不要在运行中替换状态文件路径。锁只覆盖本机 Windows/Linux 进程。

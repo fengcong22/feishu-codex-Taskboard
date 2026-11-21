@@ -34,7 +34,7 @@ import {
 import { createFeishuPackageWorkflowDrafts } from "./feishu-package-workflow-drafts.mjs";
 import { createPackageBoardSettings } from "./package-board-settings.mjs";
 import { readVmOverview } from "./vm-overview.mjs";
-import { createLinkHealthMonitor } from "./link-health.mjs";
+import { createLinkHealthMonitor, viewBridgeDeliveryIssues } from "./link-health.mjs";
 import { createFeishuSubjectShareApi } from "./feishu-subject-share.mjs";
 import {
   CloudProxyError,
@@ -3691,6 +3691,48 @@ export function createTaskboardServer(options = {}) {
     }
     return { diagnostics: normalizeBridgeShareDiagnostics(payload.diagnostics, configuration) };
   }
+  /**
+   * Forward one dashboard operator action to the Bridge. Only the three fixed
+   * Bridge paths are reachable, always with the shared Bridge secret; the
+   * response is reduced to safe fields before it reaches the browser.
+   */
+  async function callBridgeOperation(path, method, body = null) {
+    let bridgeUrl;
+    try {
+      bridgeUrl = new URL(resolved.feishuBridgeUrl);
+    } catch {
+      throw new ApiError(503, "BRIDGE_OPERATION_UNAVAILABLE", "Feishu Bridge is unavailable");
+    }
+    if (bridgeUrl.protocol !== "http:" || bridgeUrl.hostname !== "127.0.0.1"
+      || typeof resolved.feishuBridgeSecret !== "string" || !resolved.feishuBridgeSecret.trim()) {
+      throw new ApiError(503, "BRIDGE_OPERATION_UNAVAILABLE", "Feishu Bridge is unavailable");
+    }
+    let response;
+    try {
+      response = await fetch(new URL(path, bridgeUrl), {
+        method,
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+        headers: {
+          ...(method === "GET" ? {} : { "content-type": "application/json" }),
+          "x-feishu-bridge-client": "taskboard",
+          "x-feishu-bridge-secret": resolved.feishuBridgeSecret,
+        },
+        ...(method === "GET" ? {} : { body: JSON.stringify(body ?? {}) }),
+      });
+    } catch {
+      throw new ApiError(503, "BRIDGE_OPERATION_UNAVAILABLE", "Feishu Bridge is unavailable");
+    }
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!response.ok) {
+      const code = typeof payload?.error?.code === "string" && /^[A-Z][A-Z0-9_]{1,100}$/u.test(payload.error.code)
+        ? payload.error.code : "BRIDGE_OPERATION_FAILED";
+      const status = response.status >= 400 && response.status < 500 ? response.status : 502;
+      throw new ApiError(status, code, "Feishu Bridge request failed");
+    }
+    return payload;
+  }
   async function manageFeishuBaseSubscription(baseToken, operation) {
     let bridgeUrl;
     try {
@@ -6434,6 +6476,40 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, await aiProviders.remove(id, input));
         }
         return methodNotAllowed(response, ["PUT", "DELETE"]);
+      }
+      if (pathname === "/api/local/feishu/bridge/delivery-issues") {
+        assertLocalSettingsRequest();
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const payload = await callBridgeOperation("/api/local/bridge/delivery-issues", "GET");
+        return sendJson(response, 200, viewBridgeDeliveryIssues(payload));
+      }
+      if (pathname === "/api/local/feishu/bridge/dead-letters/acknowledge") {
+        assertLocalSettingsRequest();
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const input = await readLocalSettingsJson();
+        assertAllowedKeys(input, new Set(["eventIds"]));
+        if (!Array.isArray(input.eventIds) || input.eventIds.length === 0 || input.eventIds.length > 200
+          || input.eventIds.some(id => typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u.test(id))) {
+          throw new ApiError(400, "INVALID_DEAD_LETTER_ACKNOWLEDGEMENT", "Dead-letter event ids are invalid");
+        }
+        const payload = await callBridgeOperation("/api/local/bridge/dead-letters/acknowledge", "POST", { eventIds: input.eventIds });
+        void linkHealth.refresh?.();
+        return sendJson(response, 200, {
+          acknowledged: Array.isArray(payload?.acknowledged) ? payload.acknowledged.filter(id => typeof id === "string") : [],
+          skipped: Array.isArray(payload?.skipped) ? payload.skipped.filter(id => typeof id === "string") : [],
+        });
+      }
+      if (pathname === "/api/local/feishu/bridge/listener/start") {
+        assertLocalSettingsRequest();
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const input = await readLocalSettingsJson();
+        assertAllowedKeys(input, new Set());
+        const payload = await callBridgeOperation("/api/local/bridge/listener/start", "POST", {});
+        void linkHealth.refresh?.();
+        const state = payload?.feishuListener?.state;
+        return sendJson(response, 200, {
+          listener: { state: typeof state === "string" && /^[a-z_]{1,40}$/u.test(state) ? state : null },
+        });
       }
       if (pathname === "/api/local/settings/automatic-execution") {
         assertLocalSettingsRequest();

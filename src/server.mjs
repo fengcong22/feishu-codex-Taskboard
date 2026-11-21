@@ -269,6 +269,14 @@ function isLoopbackOrigin(value) {
   }
 }
 
+// Operator actions that Taskboard forwards for the dashboard. Every one needs
+// the Bridge secret, so only the local Taskboard can call them.
+const BRIDGE_OPERATIONS = new Map([
+  ["/api/local/bridge/delivery-issues", { method: "GET", handler: "listDeliveryIssues" }],
+  ["/api/local/bridge/dead-letters/acknowledge", { method: "POST", handler: "acknowledgeDeadLetters" }],
+  ["/api/local/bridge/listener/start", { method: "POST", handler: "startFeishuListener" }],
+]);
+
 function requireLocalJsonWrite(request, response, expectedClient) {
   if (!isLoopbackHostHeader(request.headers.host)) {
     sendJson(response, 403, {
@@ -375,6 +383,9 @@ export function createBridgeServer({
   recordWriter = null,
   simulationEnabled = false,
   retryFinalArchiveDeadLetter = null,
+  listDeliveryIssues = null,
+  acknowledgeDeadLetters = null,
+  startFeishuListener = null,
 }) {
   let address = null;
   const server = createServer(async (request, response) => {
@@ -403,6 +414,45 @@ export function createBridgeServer({
         try {
           const result = await retryFinalArchiveDeadLetter(input.eventId, input.expectedSource);
           return sendJson(response, 202, result);
+        } catch (error) {
+          return sendJson(response, controlledErrorStatus(error), { error: publicFailure(error) });
+        }
+      }
+      if (BRIDGE_OPERATIONS.has(url.pathname)) {
+        const operation = BRIDGE_OPERATIONS.get(url.pathname);
+        if (request.method !== operation.method) return sendJson(response, 405, {
+          error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed" },
+        });
+        if (operation.method !== "GET" && !requireLocalJsonWrite(request, response, "taskboard")) return;
+        try {
+          assertTaskboardCaller(request, bridgeSecret);
+          const handler = { listDeliveryIssues, acknowledgeDeadLetters, startFeishuListener }[operation.handler];
+          if (typeof handler !== "function") {
+            throw Object.assign(new Error("Bridge operation is unavailable"), {
+              code: "BRIDGE_OPERATION_UNAVAILABLE", status: 503,
+            });
+          }
+          if (operation.handler === "listDeliveryIssues") {
+            return sendJson(response, 200, await handler());
+          }
+          let input;
+          try { input = await readJson(request); }
+          catch {
+            throw Object.assign(new Error("Invalid request body"), { code: "INVALID_REQUEST", status: 400 });
+          }
+          if (operation.handler === "acknowledgeDeadLetters") {
+            if (!input || typeof input !== "object" || Array.isArray(input)
+              || Object.keys(input).length !== 1 || !Array.isArray(input.eventIds)) {
+              throw Object.assign(new Error("Invalid request body"), {
+                code: "INVALID_DEAD_LETTER_ACKNOWLEDGEMENT", status: 400,
+              });
+            }
+            return sendJson(response, 200, await handler(input.eventIds));
+          }
+          if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length !== 0) {
+            throw Object.assign(new Error("Invalid request body"), { code: "INVALID_REQUEST", status: 400 });
+          }
+          return sendJson(response, 200, { feishuListener: await handler() });
         } catch (error) {
           return sendJson(response, controlledErrorStatus(error), { error: publicFailure(error) });
         }

@@ -93,6 +93,36 @@ const DELIVERY_PROVENANCE_SOURCES = new Set(["feishu", "simulation"]);
 const FINAL_ARCHIVE_RECOVERY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
 const FINAL_ARCHIVE_RECOVERY_EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,511}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const DELIVERY_ISSUE_LIMIT = 200;
+const ISSUE_TEXT_LIMIT = 200;
+
+function issueText(value) {
+  if (typeof value !== "string") return null;
+  const text = value.replace(/[\u0000-\u001f\u007f]/gu, " ").trim();
+  return text === "" ? null : text.slice(0, ISSUE_TEXT_LIMIT);
+}
+
+function issueId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(value) ? value : null;
+}
+
+function deliveryIssueView(record) {
+  const event = record.event ?? {};
+  return {
+    eventId: record.eventId,
+    deliveryState: record.deliveryState,
+    source: record.deliveryProvenance?.source === "simulation" ? "simulation" : "feishu",
+    tableId: issueId(event.tableId),
+    recordId: issueId(event.recordId),
+    recordTitle: issueText(event.recordTitle),
+    errorCode: safeDeliveryErrorCode(record.lastError?.code, "DELIVERY_FAILED"),
+    attempts: record.attempts,
+    nextAttemptAt: record.deliveryState === "retry_wait" ? record.nextAttemptAt : null,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    acknowledgedAt: Number.isFinite(record.deadLetterAcknowledgedAt) ? record.deadLetterAcknowledgedAt : null,
+  };
+}
 const REHYDRATABLE_SNAPSHOT_ERRORS = new Set([
   "LEGACY_EVENT_SNAPSHOT_MISSING",
   "EVENT_SNAPSHOT_MISSING",
@@ -806,6 +836,9 @@ function normalizeRecord(eventId, value, now) {
     if (record.decisionSnapshot && !snapshotMatchesEvent(record.decisionSnapshot, record.event)) {
       return invalidRecord(eventId, record, now, "DECISION_SNAPSHOT_INVALID");
     }
+    if (record.deliveryState !== "dead_letter" || !Number.isFinite(record.deadLetterAcknowledgedAt)) {
+      delete record.deadLetterAcknowledgedAt;
+    }
     if (record.archiveRecoverySource !== undefined && record.archiveRecoverySource !== null) {
       try {
         record.archiveRecoverySource = normalizeFinalArchiveRecoverySource(record.archiveRecoverySource);
@@ -1229,6 +1262,7 @@ export class JsonStateStore {
       }
       assertFinalArchiveRecoveryRecord(record);
       record.archiveRecoverySource = source;
+      delete record.deadLetterAcknowledgedAt;
       record.deliveryState = "retry_wait";
       record.attempts = 0;
       record.nextAttemptAt = currentNow;
@@ -1284,14 +1318,67 @@ export class JsonStateStore {
         processing: 0,
         retryWait: 0,
         deadLetter: 0,
+        deadLetterAcknowledged: 0,
       };
       for (const record of Object.values(state)) {
         if (record.deliveryState === "pending") stats.pending += 1;
         else if (record.deliveryState === "processing") stats.processing += 1;
         else if (record.deliveryState === "retry_wait") stats.retryWait += 1;
-        else if (record.deliveryState === "dead_letter") stats.deadLetter += 1;
+        else if (record.deliveryState === "dead_letter") {
+          // An acknowledged dead letter stays in the state file so `event_id`
+          // dedupe keeps working; it only stops counting as an open problem.
+          if (Number.isFinite(record.deadLetterAcknowledgedAt)) stats.deadLetterAcknowledged += 1;
+          else stats.deadLetter += 1;
+        }
       }
       return stats;
     });
+  }
+
+  /**
+   * Read-only view of the events that did not succeed: `retry_wait` and
+   * `dead_letter` records, newest first, with only identifiers, safe error
+   * codes and timestamps. No field values, no options and no raw errors.
+   */
+  async listDeliveryIssues({ limit = DELIVERY_ISSUE_LIMIT } = {}) {
+    const max = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, DELIVERY_ISSUE_LIMIT) : DELIVERY_ISSUE_LIMIT;
+    return this.#withFileLock(async () => {
+      const state = await this.#read();
+      const issues = Object.values(state)
+        .filter((record) => record.deliveryState === "retry_wait" || record.deliveryState === "dead_letter")
+        .sort((left, right) => right.updatedAt - left.updatedAt || (left.eventId < right.eventId ? -1 : 1));
+      return {
+        total: issues.length,
+        items: issues.slice(0, max).map(deliveryIssueView),
+      };
+    });
+  }
+
+  /**
+   * Mark dead letters as reviewed by the local operator. The records stay
+   * `dead_letter` (terminal, so a replay of the same `event_id` is still a
+   * duplicate); only `deadLetterAcknowledgedAt` is added. Ids that are not an
+   * open dead letter are reported back and left untouched.
+   */
+  async acknowledgeDeadLetters(eventIds, { now = Date.now } = {}) {
+    if (!Array.isArray(eventIds) || eventIds.length === 0 || eventIds.length > DELIVERY_ISSUE_LIMIT
+      || new Set(eventIds).size !== eventIds.length
+      || eventIds.some((id) => typeof id !== "string" || !FINAL_ARCHIVE_RECOVERY_EVENT_ID.test(id))) {
+      throw archiveRecoveryError("INVALID_DEAD_LETTER_ACKNOWLEDGEMENT", 400);
+    }
+    return this.#mutate((state, currentNow) => {
+      const acknowledged = [];
+      const skipped = [];
+      for (const eventId of eventIds) {
+        const record = Object.hasOwn(state, eventId) ? state[eventId] : null;
+        if (!record || record.deliveryState !== "dead_letter" || Number.isFinite(record.deadLetterAcknowledgedAt)) {
+          skipped.push(eventId);
+          continue;
+        }
+        record.deadLetterAcknowledgedAt = currentNow;
+        acknowledged.push(eventId);
+      }
+      return { acknowledged, skipped };
+    }, undefined, now);
   }
 }

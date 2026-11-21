@@ -41,7 +41,7 @@ test("a healthy bridge is cached as a redacted snapshot and never probed by a re
   assert.equal(first.bridge.stale, false);
   assert.equal(first.bridge.listener.state, "sdk_managed");
   assert.equal(first.bridge.listener.lastEventAt, "2026-11-18T07:00:00.000Z");
-  assert.deepEqual(first.bridge.queue, { pending: 2, processing: 1, retryWait: 3, deadLetter: 0 });
+  assert.deepEqual(first.bridge.queue, { pending: 2, processing: 1, retryWait: 3, deadLetter: 0, deadLetterAcknowledged: null });
   await subject.close();
 });
 
@@ -121,7 +121,7 @@ test("remote field names and values are whitelisted, so unknown data cannot reac
   assert.equal(bridge.listener.lastEventAt, null);
   assert.equal(bridge.listener.lastError, null);
   assert.equal(bridge.listener.secret, undefined);
-  assert.deepEqual(bridge.queue, { pending: null, processing: null, retryWait: null, deadLetter: 4 });
+  assert.deepEqual(bridge.queue, { pending: null, processing: null, retryWait: null, deadLetter: 4, deadLetterAcknowledged: null });
   assert.equal(bridge.internalToken, undefined);
   await subject.close();
 });

@@ -111,6 +111,8 @@ const compensationWorker = createCompensationWorker({
   logger: console,
 });
 let feishuListener = null;
+// Becomes true once a real listener is created, at startup or from the dashboard.
+let listenerActive = listenerEnabled;
 const app = createBridgeServer({
   host: config.host,
   port: config.port,
@@ -172,7 +174,10 @@ const app = createBridgeServer({
   retryFinalArchiveDeadLetter: (eventId, expectedSource) => (
     bridge.retryFinalArchiveDeadLetter(eventId, expectedSource)
   ),
-  simulationEnabled: async () => listenerEnabled === false
+  listDeliveryIssues: () => bridge.listDeliveryIssues(),
+  acknowledgeDeadLetters: (eventIds) => bridge.acknowledgeDeadLetters(eventIds),
+  startFeishuListener: () => startFeishuListener(),
+  simulationEnabled: async () => listenerActive === false
     && (await taskboard.getAutomaticExecutionEnabled()) === false,
   workflowStore: workflowRuntime,
   baseMetadataReader: metadataReader,
@@ -191,32 +196,69 @@ const address = await app.listen();
 console.log(`Feishu bridge listening on http://127.0.0.1:${address.port}`);
 compensationWorker.start();
 
+function createListener() {
+  return createFeishuWsListener({
+    appId: process.env.FEISHU_APP_ID,
+    appSecret: process.env.FEISHU_APP_SECRET,
+    tables: config.tables,
+    getTables: workflowRuntime.getTables,
+    handleEvent: (event) => bridge.handle(event),
+    sdk: feishuApi.sdk,
+    logger: console,
+    onStatus: (status, detail) => {
+      if (status === "error" && detail?.code) {
+        console.error(`Feishu listener error: ${detail.code}`);
+      }
+    },
+  });
+}
+
+function launchListener(listener) {
+  feishuListener = listener;
+  listenerActive = true;
+  return listener.start().then(() => {
+    console.log("Feishu WebSocket listener started");
+  }, () => {
+    console.error("Feishu WebSocket listener failed: FEISHU_LISTENER_START_FAILED");
+  });
+}
+
+/**
+ * The dashboard's "start / reconnect" action. A listener that is already
+ * starting or SDK-managed is reused; only a disabled listener or one whose
+ * start failed (state `error`) is (re)created. Once a real listener exists this
+ * process stops accepting simulated events, exactly like an -EnableFeishu start.
+ * Changes made in Feishu while the listener was off are not replayed.
+ */
+let listenerStarting = null;
+async function startFeishuListener() {
+  if (listenerStarting) return listenerStarting;
+  if (feishuListener && feishuListener.state !== "error") return feishuListener.health;
+  if (!feishuApi.sdk) {
+    throw Object.assign(new Error("Feishu credentials are not configured"), {
+      code: "FEISHU_CREDENTIALS_MISSING", status: 409,
+    });
+  }
+  listenerStarting = (async () => {
+    const previous = feishuListener;
+    const listener = createListener();
+    if (previous) await previous.stop().catch(() => {});
+    await launchListener(listener);
+    return listener.health;
+  })().finally(() => { listenerStarting = null; });
+  return listenerStarting;
+}
+
 if (listenerEnabled) {
+  let listener;
   try {
-    feishuListener = createFeishuWsListener({
-      appId: process.env.FEISHU_APP_ID,
-      appSecret: process.env.FEISHU_APP_SECRET,
-      tables: config.tables,
-      getTables: workflowRuntime.getTables,
-      handleEvent: (event) => bridge.handle(event),
-      sdk: feishuApi.sdk,
-      logger: console,
-      onStatus: (status, detail) => {
-        if (status === "error" && detail?.code) {
-          console.error(`Feishu listener error: ${detail.code}`);
-        }
-      },
-    });
-    void feishuListener.start().then(() => {
-      console.log("Feishu WebSocket listener started");
-    }).catch(() => {
-      console.error("Feishu WebSocket listener failed: FEISHU_LISTENER_START_FAILED");
-    });
+    listener = createListener();
   } catch (error) {
     await compensationWorker.stop();
     await app.close();
     throw error;
   }
+  void launchListener(listener);
 }
 
 let closing = false;

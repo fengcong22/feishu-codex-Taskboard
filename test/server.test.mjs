@@ -77,6 +77,8 @@ async function start(handler, getHealth, baseMetadataReader, workflowStore, opti
     ...(Object.hasOwn(options, "retryFinalArchiveDeadLetter")
       ? { retryFinalArchiveDeadLetter: options.retryFinalArchiveDeadLetter }
       : {}),
+    ...Object.fromEntries(["listDeliveryIssues", "acknowledgeDeadLetters", "startFeishuListener"]
+      .filter((key) => Object.hasOwn(options, key)).map((key) => [key, options[key]])),
   });
   const address = await app.listen();
   return {
@@ -916,4 +918,74 @@ test("manual VM archive recovery exposes only safe recovery failure codes", asyn
   assert.deepEqual(await result.json(), { error: {
     code: "FINAL_ARCHIVE_RECOVERY_CONFLICT", message: "Bridge request failed",
   } });
+});
+
+const AUTHENTICATED_TASKBOARD_HEADERS = {
+  ...TASKBOARD_WRITE_HEADERS,
+  "x-feishu-bridge-secret": BRIDGE_SECRET,
+};
+
+test("bridge operator actions require the Taskboard secret and exact bodies", async (t) => {
+  const calls = [];
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    bridgeSecret: BRIDGE_SECRET,
+    listDeliveryIssues: async () => { calls.push("list"); return { total: 1, items: [{ eventId: "evt_1" }] }; },
+    acknowledgeDeadLetters: async (ids) => { calls.push(["ack", ids]); return { acknowledged: ids, skipped: [] }; },
+    startFeishuListener: async () => { calls.push("start"); return { state: "sdk_managed", lastEventAt: null, lastError: null }; },
+  });
+  t.after(app.close);
+  const list = `${app.url}/api/local/bridge/delivery-issues`;
+  const ack = `${app.url}/api/local/bridge/dead-letters/acknowledge`;
+  const startUrl = `${app.url}/api/local/bridge/listener/start`;
+
+  // No secret, wrong secret, or the local-operator client are all rejected.
+  assert.equal((await localRequest(list, { headers: { "x-feishu-bridge-client": "taskboard" } })).status, 403);
+  assert.equal((await localRequest(list, { headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": "wrong" } })).status, 403);
+  assert.equal((await localRequest(startUrl, { method: "POST", headers: SIMULATION_WRITE_HEADERS, body: "{}" })).status, 403);
+  assert.equal((await localRequest(ack, { method: "POST", headers: TASKBOARD_WRITE_HEADERS, body: JSON.stringify({ eventIds: ["evt_1"] }) })).status, 403);
+  assert.deepEqual(calls, []);
+
+  const listed = await localRequest(list, { headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": BRIDGE_SECRET } });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(await listed.json(), { total: 1, items: [{ eventId: "evt_1" }] });
+
+  const acknowledged = await localRequest(ack, { method: "POST", headers: AUTHENTICATED_TASKBOARD_HEADERS, body: JSON.stringify({ eventIds: ["evt_1"] }) });
+  assert.equal(acknowledged.status, 200);
+  assert.deepEqual(await acknowledged.json(), { acknowledged: ["evt_1"], skipped: [] });
+  const extra = await localRequest(ack, { method: "POST", headers: AUTHENTICATED_TASKBOARD_HEADERS, body: JSON.stringify({ eventIds: ["evt_1"], force: true }) });
+  assert.equal(extra.status, 400);
+  assert.equal((await extra.json()).error.code, "INVALID_DEAD_LETTER_ACKNOWLEDGEMENT");
+
+  const started = await localRequest(startUrl, { method: "POST", headers: AUTHENTICATED_TASKBOARD_HEADERS, body: "{}" });
+  assert.equal(started.status, 200);
+  assert.equal((await started.json()).feishuListener.state, "sdk_managed");
+  assert.equal((await localRequest(startUrl, { method: "POST", headers: AUTHENTICATED_TASKBOARD_HEADERS, body: JSON.stringify({ appId: "x" }) })).status, 400);
+  assert.equal((await localRequest(startUrl, { headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": BRIDGE_SECRET } })).status, 405);
+  assert.equal((await localRequest(startUrl, { method: "POST", headers: { ...AUTHENTICATED_TASKBOARD_HEADERS, origin: "https://example.com" }, body: "{}" })).status, 403);
+  assert.deepEqual(calls, ["list", ["ack", ["evt_1"]], "start"]);
+});
+
+test("bridge listener start exposes only a safe failure code", async (t) => {
+  const app = await start(assert.fail, undefined, undefined, undefined, {
+    bridgeSecret: BRIDGE_SECRET,
+    startFeishuListener: async () => {
+      throw Object.assign(new Error("app secret abc"), { code: "FEISHU_CREDENTIALS_MISSING", status: 409 });
+    },
+  });
+  t.after(app.close);
+  const result = await localRequest(`${app.url}/api/local/bridge/listener/start`, {
+    method: "POST", headers: AUTHENTICATED_TASKBOARD_HEADERS, body: "{}",
+  });
+  assert.equal(result.status, 409);
+  assert.deepEqual(await result.json(), { error: { code: "FEISHU_CREDENTIALS_MISSING", message: "Bridge request failed" } });
+});
+
+test("bridge operator actions report unavailable when not wired", async (t) => {
+  const app = await start(assert.fail, undefined, undefined, undefined, { bridgeSecret: BRIDGE_SECRET });
+  t.after(app.close);
+  const result = await localRequest(`${app.url}/api/local/bridge/delivery-issues`, {
+    headers: { "x-feishu-bridge-client": "taskboard", "x-feishu-bridge-secret": BRIDGE_SECRET },
+  });
+  assert.equal(result.status, 503);
+  assert.equal((await result.json()).error.code, "BRIDGE_OPERATION_UNAVAILABLE");
 });
