@@ -427,7 +427,7 @@ export function createFeishuPackageWorkflowDrafts({ database, packageStore, work
         }
         if (method === "GET") return { status: 200, body: await workflowStore.getPackageWorkflowProfile(subjectKey, packageAlias) };
         assertShape(body, ["expectedRevision", "config"], "draft");
-        return { status: 200, body: await workflowStore.savePackageWorkflowProfile(subjectKey, packageAlias, body) };
+        return { status: 200, body: await workflowStore.savePackageWorkflowProfile(subjectKey, packageAlias, body, { workflowTemplate }) };
       }
       if (workflowTemplate.id !== TEMPLATE_ID || workflowTemplate.version !== TEMPLATE_VERSION) {
         throw new ApiError(409, "PACKAGE_WORKFLOW_DRAFT_UNSUPPORTED", "Package workflow does not support these drafts");

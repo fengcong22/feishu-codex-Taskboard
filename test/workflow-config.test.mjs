@@ -269,6 +269,26 @@ function waitForExit(child) {
   });
 }
 
+test("phased subjects carry validated document_edit_zip package options through Bridge validation", () => {
+  const packageOptions = { selfEdit: true, defaultSfx: false, bgm: false, preset: "english-dub" };
+  const subject = validateSubjectConfig({ ...twoFieldSubject(), lifecycle: "enabled", packageOptions });
+  assert.deepEqual(subject.packageOptions, packageOptions);
+  assert.deepEqual(portableSubject(subject).packageOptions, packageOptions);
+  const catalog = validateWorkflowConfig(validConfig({ bases: [{ ...validConfig().bases[0], subjects: [{ ...twoFieldSubject(), packageOptions }] }] }));
+  assert.deepEqual(catalog.bases[0].subjects[0].packageOptions, packageOptions);
+  assert.equal(Object.hasOwn(validateSubjectConfig(twoFieldSubject()), "packageOptions"), false);
+  assert.equal(Object.hasOwn(validateSubjectConfig({ ...twoFieldSubject(), packageOptions: null }), "packageOptions"), false);
+  // Drafts may leave options unset; an enabled snapshot may not, and values stay within the contract.
+  assert.equal(validateSubjectConfig({ ...twoFieldSubject(), packageOptions: { selfEdit: true } }).packageOptions.preset, null);
+  for (const invalid of [
+    { ...packageOptions, preset: "math-fine" },
+    { ...packageOptions, bgm: "no" },
+    { ...packageOptions, voice: true },
+  ]) assert.throws(() => validateSubjectConfig({ ...twoFieldSubject(), packageOptions: invalid }), /packageOptions/u);
+  assert.throws(() => validateSubjectConfig({ ...twoFieldSubject(), lifecycle: "enabled", packageOptions: { ...packageOptions, bgm: null } }),
+    /packageOptions\.bgm/u);
+});
+
 test("subjectKey uses base token and table id and keeps identities isolated", () => {
   assert.equal(subjectKey("bas_a", "tbl_x"), "bas_a:tbl_x");
   assert.notEqual(subjectKey("bas_a", "tbl_x"), subjectKey("bas_b", "tbl_x"));

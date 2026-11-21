@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { isEditPackageTemplate, normalizeManifestPackageOptions } from "../shared/feishu-package-options.mjs";
+
 export const SOURCE_MANIFEST_SCHEMA_VERSION = 1;
 const STAGE_IDS = new Set(["initial", "first_review", "final_review"]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u;
@@ -138,20 +140,26 @@ function manifestValue(value) {
     && typeof value.manifest === "object" ? value.manifest : value;
 }
 
-export function canonicalSourceManifestJson(value) {
-  return canonicalJson(normalizeSourceManifest(manifestValue(value)));
+export function canonicalSourceManifestJson(value, options = {}) {
+  return canonicalJson(normalizeSourceManifest(manifestValue(value), options));
 }
 
-export function sourceManifestSha256(value) {
+export function sourceManifestSha256(value, options = {}) {
   return createHash("sha256")
-    .update(canonicalSourceManifestJson(value), "utf8")
+    .update(canonicalSourceManifestJson(value, options), "utf8")
     .digest("hex");
 }
 
-export function normalizeSourceManifest(value) {
+/**
+ * `workflowTemplate` is the run's frozen package template. Only document_edit_zip accepts the
+ * top-level `package_options`; any other template (Lite) rejects it like any unknown field.
+ */
+export function normalizeSourceManifest(value, { workflowTemplate } = {}) {
   const input = object(value, "source manifest");
   rejectExecutableKeys(input);
-  assertAllowed(input, new Set(["schema_version", "binding", "record", "document", "sources"]), "manifest");
+  const packageOptionsAllowed = isEditPackageTemplate(workflowTemplate);
+  assertAllowed(input, new Set(["schema_version", "binding", "record", "document", "sources",
+    ...(packageOptionsAllowed ? ["package_options"] : [])]), "manifest");
   if (input.schema_version !== undefined && input.schema_version !== SOURCE_MANIFEST_SCHEMA_VERSION) {
     throw error(`schema_version must be ${SOURCE_MANIFEST_SCHEMA_VERSION}`, "SOURCE_MANIFEST_SCHEMA_UNSUPPORTED");
   }
@@ -202,11 +210,15 @@ export function normalizeSourceManifest(value) {
   } else {
     throw error("sources.audio.mode is invalid");
   }
+  if (input.package_options !== undefined) {
+    try { normalized.package_options = normalizeManifestPackageOptions(input.package_options); }
+    catch (cause) { throw error(`${cause.path ?? "package_options"} is invalid`); }
+  }
   return normalized;
 }
 
-export function createSourceManifest(value) {
-  const manifest = normalizeSourceManifest(value);
+export function createSourceManifest(value, options = {}) {
+  const manifest = normalizeSourceManifest(value, options);
   return {
     schema_version: SOURCE_MANIFEST_SCHEMA_VERSION,
     manifest,
@@ -214,8 +226,8 @@ export function createSourceManifest(value) {
   };
 }
 
-export async function writeSourceManifest(filename, value) {
-  const created = createSourceManifest(value);
+export async function writeSourceManifest(filename, value, options = {}) {
+  const created = createSourceManifest(value, options);
   const target = path.resolve(filename);
   await mkdir(path.dirname(target), { recursive: true });
   const temporary = `${target}.${process.pid}.tmp`;
@@ -229,9 +241,9 @@ export async function writeSourceManifest(filename, value) {
   return { ...created, path: target };
 }
 
-export async function readSourceManifest(filename) {
+export async function readSourceManifest(filename, options = {}) {
   const target = path.resolve(filename);
   const parsed = JSON.parse(await readFile(target, "utf8"));
-  const created = createSourceManifest(parsed);
+  const created = createSourceManifest(parsed, options);
   return { ...created, path: target };
 }

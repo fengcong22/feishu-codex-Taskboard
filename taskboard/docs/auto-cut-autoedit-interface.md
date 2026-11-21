@@ -3,8 +3,8 @@
 auto-cut-autoedit 按剪辑清单真实剪辑课程视频（成片会变短），交付成片、PR 工程和执行反馈表。
 它沿用 Lite 的“文档 → 阶段 → 精确 ZIP”整条外壳，只有下面几处按模板分开。
 Lite 的完整协议见 [auto-cut-lite-interface-requirements.md](auto-cut-lite-interface-requirements.md)，
-本文只写不同的地方；没有写到的（素材清单、execution_input、环境变量、结果文件、上报、NAS 上传、状态回写、
-重试）与 Lite 完全相同。
+本文只写不同的地方；没有写到的（素材清单除第 4 节的 `package_options` 外、execution_input、环境变量、结果文件、
+上报、NAS 上传、状态回写、重试）与 Lite 完全相同。
 
 ## 1. 包声明
 
@@ -48,7 +48,48 @@ Lite 的完整协议见 [auto-cut-lite-interface-requirements.md](auto-cut-lite-
   `<根目录>/<根目录>.mp4`、`<根目录>/工程/*.xml`、`<根目录>/执行反馈表.csv`、`<根目录>/剪辑清单.json`；
   ZIP 根目录下不能有散落的文件。其余 ZIP 结构检查（无 ZIP64、路径安全、CRC、大小上限）与 Lite 相同。
 
-## 4. 多选触发字段（对所有 ZIP 模板生效）
+## 4. 剪辑包选项（`packageOptions` → `package_options`）
+
+本模板的学科配置多一组剪辑包选项，每次运行原样写进素材清单交给剪辑包。剪辑包从素材清单读取这些开关，
+不再用本机的 `autoedit.subjects.json`。
+
+学科配置字段 `packageOptions`：
+
+```json
+{ "selfEdit": true, "defaultSfx": true, "bgm": false, "preset": "civics-medium" }
+```
+
+素材清单 `source-manifest.json` 顶层字段 `package_options`：
+
+```json
+{ "self_edit": true, "default_sfx": true, "bgm": false, "preset": "civics-medium" }
+```
+
+| 字段 | 页面名称 | 开（`true`） | 关（`false`） |
+|---|---|---|---|
+| `selfEdit` / `self_edit` | 初稿自动剪辑 | 按常规剪辑规则自行处理（停顿、气口、讲错、重复、打嗝），同时处理讲师意见 | 只处理讲师意见 |
+| `defaultSfx` / `default_sfx` | 音效需求 | 按规则给画面事件自动加音效 | 不自动加；讲师意见附了音效文件就照放，没附就写进反馈表 |
+| `bgm` | BGM | 需要加 BGM（目前在反馈表提示人工添加，并留一条空 BGM 轨） | 不加 |
+
+`preset`（剪辑预设）只能是 `politics-fine`（政治精剪）、`civics-medium`（道法中剪）、`english-dub`（英语配音）、
+`general-medium`（通用）之一。
+
+规则：
+
+- 只有包模板是 `document_edit_zip` 的学科配置能带 `packageOptions`。保存草稿、保存包配置、启用、
+  学科共享导入和整体配置导入遇到其他模板的 `packageOptions` 一律拒绝（`PACKAGE_OPTIONS_UNSUPPORTED`）。
+  旧版整体 PATCH 把学科从本模板切到其他包时，继承来的选项不跟过去。
+- 草稿可以先留空（值为 `null`）；启用时四项都必须明确填写，三个开关必须是 `true` 或 `false`，
+  否则报 `PACKAGE_OPTIONS_REQUIRED`，学科不变、也不会同步给 Bridge。值不合法报 `INVALID_FIELD`。
+- `packageOptions` 和其他配置一样：保存会产生新的包配置修订，启用会产生新的学科配置版本并冻结在该版本快照里；
+  学科共享导出/导入、整体配置导出/导入都会带上它（它不是本机路径，不会被清空）。
+- 运行时取任务冻结的学科版本：模板是 `document_edit_zip` 才写 `package_options`，四项不全时在准备输入阶段
+  阻断为 `AUTOCUT_PACKAGE_OPTIONS_MISSING`，不建运行目录。Lite（`document_draft_zip`）的素材清单永远不带这个字段；
+  素材清单校验只在本模板下接受它，其他模板遇到即 `SOURCE_MANIFEST_FIELD_UNSUPPORTED`。
+- `package_options` 计入素材清单哈希（`CODEX_AUTOCUT_SOURCE_MANIFEST_SHA256`），改了选项的新运行哈希随之变化。
+- 页面：所选剪辑包是 `document_edit_zip` 时，「基础与执行」里显示这三个开关和剪辑预设下拉框；选其他包时不显示。
+
+## 5. 多选触发字段（对所有 ZIP 模板生效）
 
 阶段触发字段可以是单选，也可以是多选（`statusField.type: "multi_select"`）：
 

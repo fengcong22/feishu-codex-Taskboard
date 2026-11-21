@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import { normalizeDeliveryConfig } from "../taskboard/shared/feishu-delivery-config.mjs";
+import { normalizePackageOptions } from "../taskboard/shared/feishu-package-options.mjs";
 
 /**
  * Version of the local Base/subject configuration document.
@@ -67,6 +68,7 @@ const SUBJECT_KEYS = new Set([
   "courseNamingField",
   "stages",
   "delivery",
+  "packageOptions",
   "enabledAt",
   "closedAt",
   "activeSnapshot",
@@ -769,6 +771,15 @@ export function validateSubjectConfig(value) {
     ...(delivery === undefined ? {} : { delivery }),
     ...(courseNamingField ? { courseNamingField } : {}),
   };
+  // document_edit_zip options travel with the subject; Taskboard owns the template check.
+  delete normalized.packageOptions;
+  if (input.packageOptions !== undefined && input.packageOptions !== null) {
+    try {
+      normalized.packageOptions = normalizePackageOptions(input.packageOptions, { requireComplete: lifecycle === "enabled" });
+    } catch (error) {
+      fail(`subject.${error.path ?? "packageOptions"} is invalid`);
+    }
+  }
   if (input.activeSnapshot !== undefined && input.activeSnapshot !== null) {
     normalized.activeSnapshot = validateSubjectConfig({
       ...input.activeSnapshot,

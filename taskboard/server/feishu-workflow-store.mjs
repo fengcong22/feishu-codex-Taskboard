@@ -7,6 +7,8 @@ import {
   normalizeDeliveryConfig,
   validateDeliveryConfig,
 } from "../shared/feishu-delivery-config.mjs";
+import { isEditPackageTemplate, normalizePackageOptions } from "../shared/feishu-package-options.mjs";
+import { normalizePackageWorkflowTemplate } from "../shared/feishu-package-workflow.mjs";
 import {
   STAGE_IDS,
   assertPhasedAttachmentBindings,
@@ -56,6 +58,30 @@ const PENDING_STAGE_OPTION_IDS = Object.freeze({
 
 const DEFAULT_STAGE_SUFFIXES = Object.freeze(["_初稿", "_初审修改", "_终审修改"]);
 const VM_WORKFLOW_TEMPLATE = Object.freeze({ id: "vm_pmo_review_video", version: 1 });
+
+function packageOptionsError(error) {
+  if (error instanceof ApiError) return error;
+  return new ApiError(error?.code === "PACKAGE_OPTIONS_REQUIRED" ? 409 : 400, error?.code ?? "INVALID_FIELD",
+    error?.message ?? "packageOptions is invalid", { path: error?.path ?? "packageOptions" });
+}
+
+/**
+ * `packageOptions` belongs to document_edit_zip packages only. Activation of such a package
+ * also requires every option to be set explicitly.
+ */
+function assertPackageOptionsForTemplate(subject, template, { activation = false } = {}) {
+  const edit = isEditPackageTemplate(template);
+  if (subject.packageOptions !== undefined && !edit) {
+    throw new ApiError(400, "PACKAGE_OPTIONS_UNSUPPORTED", "只有 document_edit_zip 剪辑包可以设置剪辑包选项", { path: "packageOptions" });
+  }
+  if (activation && edit) {
+    if (subject.packageOptions === undefined) {
+      throw new ApiError(409, "PACKAGE_OPTIONS_REQUIRED", "请先完成剪辑包选项再启用学科流程", { path: "packageOptions" });
+    }
+    try { normalizePackageOptions(subject.packageOptions, { requireComplete: true }); }
+    catch (error) { throw packageOptionsError(error); }
+  }
+}
 
 function isVmSubject(subject) {
   return subject?.workflowTemplate?.id === VM_WORKFLOW_TEMPLATE.id || subject?.vmWorkflow !== undefined;
@@ -595,6 +621,7 @@ function phasedDefaultsForSubject({
       uploadConcurrency: 1,
     }),
     ...(existing?.delivery === undefined ? {} : { delivery: clone(existing.delivery) }),
+    ...(existing?.packageOptions === undefined ? {} : { packageOptions: clone(existing.packageOptions) }),
     statusField,
     ...(reviewStatusField === undefined ? {} : { reviewStatusField }),
     documentField,
@@ -1059,6 +1086,7 @@ function shareableSubject(subject, { forceDraft = false } = {}) {
     packageRoute: clone(subject.packageRoute),
     upload: clone(subject.upload),
     ...(delivery === undefined ? {} : { delivery }),
+    ...(subject.packageOptions === undefined ? {} : { packageOptions: clone(subject.packageOptions) }),
     metadata: portableMetadata(subject.metadata),
   };
   // A share file is a portable description of workflow intent.  Runtime
@@ -1130,6 +1158,7 @@ function validateShareDocument(value) {
         "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId", "displayEnabled",
         "lifecycle", "configVersion", "createdAt", "updatedAt", "trigger", "title", "execution",
         "packageRoute", "upload", "metadata", "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery",
+        "packageOptions",
       ]);
       const subjectUnknown = Object.keys(inputSubject).find((key) => !subjectAllowed.has(key));
       if (subjectUnknown) {
@@ -1167,6 +1196,7 @@ function validateShareDocument(value) {
         packageRoute: clone(inputSubject.packageRoute),
         upload: clone(inputSubject.upload),
         ...(inputSubject.delivery === undefined ? {} : { delivery: clone(inputSubject.delivery) }),
+        ...(inputSubject.packageOptions === undefined ? {} : { packageOptions: clone(inputSubject.packageOptions) }),
         statusField: clone(inputSubject.statusField),
         ...(inputSubject.reviewStatusField === undefined ? {} : { reviewStatusField: clone(inputSubject.reviewStatusField) }),
         documentField: clone(inputSubject.documentField),
@@ -1259,7 +1289,7 @@ function validateShareDocument(value) {
 
 const SUBJECT_PATCH_KEYS = new Set([
   "displayEnabled", "trigger", "title", "execution", "packageRoute", "upload",
-  "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery", "expectedVersion",
+  "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery", "packageOptions", "expectedVersion",
 ]);
 
 const PACKAGE_PROFILE_KEYS = new Set([...SUBJECT_PATCH_KEYS].filter((key) => !["displayEnabled", "expectedVersion"].includes(key)));
@@ -1283,7 +1313,7 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false, all
     "subjectKey", "baseToken", "baseName", "tableId", "tableName", "projectId",
     "displayEnabled", "lifecycle", "configVersion", "trigger", "title", "execution",
     "packageRoute", "upload", "metadata", "statusField", "reviewStatusField", "documentField", "namingField", "stages", "delivery",
-    "createdAt", "updatedAt",
+    "packageOptions", "createdAt", "updatedAt",
   ]);
   const unknownTopLevel = Object.keys(value).find((key) => !allowedTopLevel.has(key));
   if (unknownTopLevel) throw new ApiError(400, "UNKNOWN_FIELD", `Unknown subject field '${unknownTopLevel}'`);
@@ -1396,13 +1426,28 @@ export function validateSubjectConfig(value, { projectLegacyTrigger = false, all
       throw new ApiError(400, error.code ?? "INVALID_FIELD", error.message);
     }
   }
+  // Structural only: whether the package template accepts these options is checked by the
+  // store, which knows the package. A cleared value (null) removes the options.
+  if (value.packageOptions === null) delete value.packageOptions;
+  else if (Object.hasOwn(value, "packageOptions")) {
+    try {
+      value.packageOptions = normalizePackageOptions(value.packageOptions, { requireComplete: value.lifecycle === "enabled" });
+    } catch (error) { throw packageOptionsError(error); }
+  }
   return value;
 }
 
 export function createFeishuWorkflowStore({ database, validateConfig = null, packageAliases = null, validatePackageWorkflow = null,
-  validateVmWorkflowActivation = null, syncSubject = null } = {}) {
+  validateVmWorkflowActivation = null, syncSubject = null, packageWorkflowTemplate = null } = {}) {
   if (!database?.database) throw new TypeError("database is required");
   const db = database.database;
+  /** The registered package's workflow template, or null when the alias is unknown here. */
+  async function templateForAlias(alias) {
+    if (typeof packageWorkflowTemplate !== "function" || typeof alias !== "string" || !alias.trim()) return null;
+    const template = await packageWorkflowTemplate(alias);
+    if (template === null || template === undefined) return null;
+    try { return normalizePackageWorkflowTemplate(template); } catch { return null; }
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS feishu_package_workflow_drafts (
     subject_key TEXT NOT NULL REFERENCES feishu_subjects(subject_key) ON DELETE CASCADE,
     package_alias TEXT NOT NULL,
@@ -2008,6 +2053,17 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
         throw new ApiError(400, "INVALID_FIELD", "dryRun must be boolean");
       }
       const configuration = validateShareDocument(value);
+      for (const base of configuration.bases) {
+        for (const subject of base.subjects) {
+          if (subject.packageOptions === undefined) continue;
+          const template = await templateForAlias(subject.packageRoute?.packageAlias);
+          try { assertPackageOptionsForTemplate(subject, template); } catch (error) {
+            throw new ApiError(400, error.code, `${subject.tableName}: ${error.message}`, {
+              path: `bases.${base.baseToken}.subjects.${subject.tableId}.packageOptions`,
+            });
+          }
+        }
+      }
       const validatedAliases = new Set();
       if (typeof validatePackageWorkflow === "function") {
         for (const base of configuration.bases) {
@@ -2185,14 +2241,16 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     async getPackageWorkflowProfile(subjectKey, packageAlias) {
       return readProfile(rowSubject(getSubject(parseSubjectKey(subjectKey).subjectKey)), packageAlias);
     },
-    async savePackageWorkflowProfile(subjectKey, packageAlias, { expectedRevision, config }) {
+    async savePackageWorkflowProfile(subjectKey, packageAlias, { expectedRevision, config }, { workflowTemplate } = {}) {
       const key = parseSubjectKey(subjectKey).subjectKey;
+      const template = workflowTemplate ?? await templateForAlias(packageAlias);
       db.exec("BEGIN IMMEDIATE");
       try {
         const subject = rowSubject(getSubject(key));
         const profile = readProfile(subject, packageAlias);
         checkProfileRevision(profile, expectedRevision);
         const next = profileSubject(subject, config, packageAlias, { checkMetadata: true });
+        assertPackageOptionsForTemplate(next, template);
         assertStrictPhasedAttachments(next, { allowIncompleteBindings: true });
         assertDeliveryConfiguration(next, "draft");
         const saved = writeProfile(subject, packageAlias, packageProfileConfig(next));
@@ -2351,11 +2409,12 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       }
       // This store owns the document/ZIP contract. Other package templates
       // keep their drafts separately and cannot replace this subject version.
+      const patchAlias = patch.packageRoute && Object.hasOwn(patch.packageRoute, "packageAlias")
+        ? patch.packageRoute.packageAlias : rowSubject(getSubject(key)).packageRoute?.packageAlias;
       if (typeof validatePackageWorkflow === "function") {
-        const alias = patch.packageRoute && Object.hasOwn(patch.packageRoute, "packageAlias")
-          ? patch.packageRoute.packageAlias : rowSubject(getSubject(key)).packageRoute?.packageAlias;
-        if (typeof alias === "string" && alias.trim()) await validatePackageWorkflow(alias);
+        if (typeof patchAlias === "string" && patchAlias.trim()) await validatePackageWorkflow(patchAlias);
       }
+      const patchTemplate = await templateForAlias(patchAlias);
       const timestamp = now();
       db.exec("BEGIN IMMEDIATE");
       try {
@@ -2396,6 +2455,11 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           lifecycle: "draft",
           configVersion: current.config_version + 1,
         };
+        // Options inherited from another package's baseline do not follow the subject to a
+        // package whose template does not use them; options sent explicitly are checked below.
+        if (!Object.hasOwn(rawChanges, "packageOptions") && patchTemplate && !isEditPackageTemplate(patchTemplate)) {
+          delete merged.packageOptions;
+        }
         const phasedPatch = ["statusField", "reviewStatusField", "documentField", "namingField", "stages"]
           .some((field) => Object.hasOwn(rawChanges, field));
         if (
@@ -2410,6 +2474,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
           merged.stages = projectLegacyUploadTarget(merged.stages, merged.upload);
         }
         const next = validate(merged, { projectLegacyTrigger: Object.hasOwn(rawChanges, "stages"), allowIncompleteBindings: true });
+        assertPackageOptionsForTemplate(next, patchTemplate);
         assertStrictPhasedAttachments(next, { allowIncompleteBindings: true });
         assertDeliveryConfiguration(next, "draft");
         db.prepare("UPDATE feishu_subjects SET lifecycle='draft', config_version=?, config_json=?, display_enabled=?, updated_at=? WHERE subject_key=?")
@@ -2549,6 +2614,7 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
     const profile = profileRequest ? readProfile(currentSubject, profileRequest.packageAlias) : null;
     if (profile) checkProfileRevision(profile, profileRequest.expectedRevision, { requireSaved: true });
     const currentConfig = profile ? profileSubject(currentSubject, profile.config, profileRequest.packageAlias) : currentSubject;
+    let activationTemplate = null;
     if (lifecycle === "enabled") {
       if (typeof currentConfig.packageRoute?.packageAlias !== "string" || !currentConfig.packageRoute.packageAlias.trim()) {
         throw new ApiError(409, "PACKAGE_ALIAS_REQUIRED", "请选择剪辑包后再启用学科流程");
@@ -2556,6 +2622,8 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       if (typeof validatePackageWorkflow === "function") {
         await validatePackageWorkflow(currentConfig.packageRoute.packageAlias);
       }
+      activationTemplate = await templateForAlias(currentConfig.packageRoute.packageAlias);
+      assertPackageOptionsForTemplate(currentConfig, activationTemplate, { activation: true });
       assertStrictPhasedAttachments(currentConfig);
       assertPhasedNamingField(currentConfig);
       assertTriggerMetadata(currentConfig);
@@ -2610,7 +2678,10 @@ export function createFeishuWorkflowStore({ database, validateConfig = null, pac
       const next = lifecycle === "enabled"
         ? validate(lifecycleCandidate, { projectLegacyTrigger: true })
         : validateLifecycleSnapshot(lifecycleCandidate);
-      if (lifecycle === "enabled") assertDeliveryConfiguration(next, "activation");
+      if (lifecycle === "enabled") {
+        assertPackageOptionsForTemplate(next, activationTemplate, { activation: true });
+        assertDeliveryConfiguration(next, "activation");
+      }
       if (typeof syncSubject === "function") {
         // Keep the local transaction open until Bridge accepts the same
         // validated snapshot.  A failed loopback sync rolls back the local

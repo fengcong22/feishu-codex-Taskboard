@@ -270,3 +270,45 @@ test("writes and reads the exact canonical manifest", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+const EDIT_TEMPLATE = { id: "document_edit_zip", version: 1 };
+const MANIFEST_OPTIONS = { self_edit: true, default_sfx: true, bgm: false, preset: "civics-medium" };
+
+test("package_options is accepted only for a document_edit_zip run and is part of the digest", () => {
+  const created = createSourceManifest(input({ package_options: MANIFEST_OPTIONS }), { workflowTemplate: EDIT_TEMPLATE });
+  assert.deepEqual(created.manifest.package_options, MANIFEST_OPTIONS);
+  assert.notEqual(created.sha256, createSourceManifest(input(), { workflowTemplate: EDIT_TEMPLATE }).sha256);
+  for (const workflowTemplate of [undefined, { id: "document_draft_zip", version: 1 }]) {
+    assert.throws(
+      () => createSourceManifest(input({ package_options: MANIFEST_OPTIONS }), { workflowTemplate }),
+      (error) => error.code === "SOURCE_MANIFEST_FIELD_UNSUPPORTED" && /manifest\.package_options is unsupported/u.test(error.message),
+    );
+  }
+});
+
+test("package_options must hold exactly the four set options", () => {
+  for (const value of [
+    { ...MANIFEST_OPTIONS, bgm: null },
+    { ...MANIFEST_OPTIONS, preset: "unknown-preset" },
+    { ...MANIFEST_OPTIONS, extra: true },
+    { self_edit: true, default_sfx: true, bgm: false },
+    "civics-medium",
+  ]) {
+    assert.throws(() => createSourceManifest(input({ package_options: value }), { workflowTemplate: EDIT_TEMPLATE }),
+      /SOURCE_MANIFEST_INVALID: package_options/u);
+  }
+});
+
+test("a document_edit_zip manifest round-trips its package_options through disk", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "source-manifest-options-"));
+  try {
+    const target = path.join(directory, "source-manifest.json");
+    const written = await writeSourceManifest(target, input({ package_options: MANIFEST_OPTIONS }), { workflowTemplate: EDIT_TEMPLATE });
+    const loaded = await readSourceManifest(target, { workflowTemplate: EDIT_TEMPLATE });
+    assert.equal(loaded.sha256, written.sha256);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")).package_options, MANIFEST_OPTIONS);
+    await assert.rejects(readSourceManifest(target), { code: "SOURCE_MANIFEST_FIELD_UNSUPPORTED" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
