@@ -1,5 +1,6 @@
 import type {
   ActorIdentity,
+  BridgeDeliveryIssues,
   AiChatCatalog,
   AiChatAttachmentInput,
   AiChatRun,
@@ -309,6 +310,22 @@ export async function listProjects(options: { includeArchived?: boolean; signal?
   const query = normalized.includeArchived === undefined ? "" : `?includeArchived=${normalized.includeArchived ? "true" : "false"}`;
   const data = await request<{ projects: Project[] }>(`/api/projects${query}`, { signal: normalized.signal });
   return data.projects;
+}
+
+export function getBridgeDeliveryIssues(signal?: AbortSignal): Promise<BridgeDeliveryIssues> {
+  return request<BridgeDeliveryIssues>("/api/local/feishu/bridge/delivery-issues", { signal });
+}
+
+export function acknowledgeBridgeDeadLetters(eventIds: string[]): Promise<{ acknowledged: string[]; skipped: string[] }> {
+  return request("/api/local/feishu/bridge/dead-letters/acknowledge", {
+    method: "POST", headers: { "X-Taskboard-Client": "web" }, body: JSON.stringify({ eventIds }),
+  });
+}
+
+export function startBridgeListener(): Promise<{ listener: { state: string | null } }> {
+  return request("/api/local/feishu/bridge/listener/start", {
+    method: "POST", headers: { "X-Taskboard-Client": "web" }, body: "{}",
+  });
 }
 
 export async function getAutomaticExecutionSettings(signal?: AbortSignal): Promise<AutomaticExecutionSettings> {

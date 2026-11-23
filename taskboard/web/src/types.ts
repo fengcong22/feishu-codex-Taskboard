@@ -1372,7 +1372,7 @@ export interface LinkHealth {
     stale: boolean;
     detail: string | null;
     listener: { state: string | null; lastEventAt: string | null; lastError: string | null } | null;
-    queue: { pending: number | null; processing: number | null; retryWait: number | null; deadLetter: number | null } | null;
+    queue: { pending: number | null; processing: number | null; retryWait: number | null; deadLetter: number | null; deadLetterAcknowledged?: number | null } | null;
   };
   vmSession: {
     status: string | null;
@@ -1382,4 +1382,25 @@ export interface LinkHealth {
   } | null;
   automaticExecution: { enabled: boolean; version: number | null } | null;
   intervalMs: number;
+}
+
+/** One Bridge event that has not succeeded: waiting for a retry or a dead letter. */
+export interface BridgeDeliveryIssue {
+  eventId: string;
+  deliveryState: "retry_wait" | "dead_letter";
+  source: "feishu" | "simulation";
+  tableId: string | null;
+  recordId: string | null;
+  recordTitle: string | null;
+  errorCode: string | null;
+  attempts: number;
+  nextAttemptAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  acknowledgedAt: string | null;
+}
+
+export interface BridgeDeliveryIssues {
+  total: number;
+  items: BridgeDeliveryIssue[];
 }
